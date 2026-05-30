@@ -1,0 +1,26 @@
+[
+    {
+        "m": 8,
+        "k": 8,
+        "n": 8,
+        "name": "gemm_8x8x8_batch"
+    },
+    {
+        "m": 16,
+        "k": 16,
+        "n": 16,
+        "name": "gemm_16x16x16_batch"
+    },
+    {
+        "m": 16,
+        "k": 8,
+        "n": 8,
+        "name": "gemm_16x8x8_batch"
+    },
+    {
+        "m": 16,
+        "k": 8,
+        "n": 16,
+        "name": "gemm_16x8x16_asym"
+    }
+]

@@ -1,0 +1,33 @@
+# Local notes and generated documentation
+docs/
+
+# Generated packages, synthesis runs, and scratch experiments
+generated/
+output*/
+experiments/
+
+# Python cache and test cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Catapult and simulator output
+*.log
+*.jou
+*.rpt
+*.wlf
+*.vcd
+*.fsdb
+*.key
+*.tar.gz
+catapult.log
+*_proj/
+*_prj/
+*.v1/
+SIF/
+
+# Local editor and OS files
+.DS_Store
+*~
+*.swp
+*.swo
