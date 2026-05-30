@@ -153,7 +153,7 @@ def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper"):
                 blk.append(f"        if (slice_reset) begin")
                 for dd in range(d):
                     blk.append(f"            {aca}_pipe[{dd}] <= 1'b0;")
-                blk.append(f"        end else if (en) begin")
+                blk.append(f"        end else if (transaction_active) begin")
                 blk.append(f"            {acd}_pipe[0] <= c_data_{r}_{c};")
                 blk.append(f"            {aca}_pipe[0] <= c_avail_{r}_{c};")
                 for dd in range(1, d):
@@ -172,15 +172,15 @@ def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper"):
             f"    wire row_avail_{r} = aca_{r}_{grid_cols-1};"
         )
 
-    # ── Output mux inside always block ───────────────────────────────────────
+    # ── Output mux ───────────────────────────────────────────────────────────
     mux_lines = []
     for r in range(grid_rows):
-        mux_lines.append(f"                if (row_avail_{r}) begin")
+        mux_lines.append(f"        if (row_avail_{r}) begin")
         for c in range(grid_cols):
             mux_lines.append(
-                f"                    c_row[{c}*128 +: 128] <= acd_{r}_{c};"
+                f"            row_mux[{c}*128 +: 128] = acd_{r}_{c};"
             )
-        mux_lines.append(f"                end")
+        mux_lines.append(f"        end")
 
     any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
 
@@ -212,14 +212,22 @@ module {module_name}(
     localparam integer TOTAL_OUT_ROWS  = {total_output_rows};
 
     reg [15:0] cycle;
-    reg [15:0] out_row_count;
+    reg transaction_active;
     reg [{a_width-1}:0] a_rows_d;
     reg [{b_width-1}:0] b_cols_d;
     reg in_valid_d;
+    reg [{c_width-1}:0] row_mux;
+    reg [{c_width-1}:0] out_fifo [0:TOTAL_OUT_ROWS-1];
+    reg [15:0] out_wr_ptr;
+    reg [15:0] out_rd_ptr;
+    reg [15:0] out_count;
+    reg [15:0] out_row_count;
 
     wire transaction_start = en & in_valid & (cycle == 0 || cycle >= TOTAL_CYCLES);
     wire slice_reset = rst | transaction_start;
     wire slice_start;
+    wire output_take = en & (out_count != 0);
+    wire feed_beat = transaction_start | (en & in_valid & transaction_active & (cycle < {k}));
 
     // Buffer one input beat so the slice start pulse is visible before the
     // tensor_slice samples beat zero. A new in_valid after TOTAL_CYCLES starts
@@ -227,24 +235,33 @@ module {module_name}(
     always @(posedge clk) begin
         if (rst) begin
             cycle <= 16'd0;
+            transaction_active <= 1'b0;
             a_rows_d <= {a_width}'d0;
             b_cols_d <= {b_width}'d0;
             in_valid_d <= 1'b0;
         end else if (transaction_start) begin
             a_rows_d <= a_rows;
             b_cols_d <= b_cols;
-            in_valid_d <= in_valid;
+            in_valid_d <= 1'b1;
             cycle <= 16'd1;
-        end else if (en && cycle < TOTAL_CYCLES) begin
-            a_rows_d <= a_rows;
-            b_cols_d <= b_cols;
-            in_valid_d <= in_valid;
+            transaction_active <= 1'b1;
+        end else if (cycle != 0 && cycle < TOTAL_CYCLES) begin
+            if (feed_beat) begin
+                a_rows_d <= a_rows;
+                b_cols_d <= b_cols;
+                in_valid_d <= 1'b1;
+            end else begin
+                in_valid_d <= 1'b0;
+            end
             cycle <= cycle + 1;
+            if (cycle + 1 >= TOTAL_CYCLES) begin
+                transaction_active <= 1'b0;
+            end
         end
     end
 
     // Launch one cycle after the first input beat is captured.
-    assign slice_start = en & (cycle == 16'd1);
+    assign slice_start = (cycle == 16'd1);
 
     // ---- Wire declarations ----
     wire [{grid_rows*grid_cols-1}:0] done_mat_mul;
@@ -267,22 +284,48 @@ module {module_name}(
 
     wire any_avail = {any_avail_expr};
 
-    // ---- Output logic ----
+    always @(*) begin
+        row_mux = {c_width}'d0;
+{chr(10).join(mux_lines)}
+    end
+
+    // ---- Output FIFO/hold logic ----
+    integer fifo_i;
     always @(posedge clk) begin
         if (slice_reset) begin
-            c_row         <= {c_width}'d0;
-            out_valid     <= 1'b0;
-            out_last      <= 1'b0;
+            out_wr_ptr    <= 16'd0;
+            out_rd_ptr    <= 16'd0;
+            out_count     <= 16'd0;
             out_row_count <= 16'd0;
-        end else if (en) begin
-            out_valid <= any_avail;
-            if (any_avail) begin
-                out_row_count <= out_row_count + 1;
-                out_last      <= (out_row_count + 1 == TOTAL_OUT_ROWS);
-{chr(10).join(mux_lines)}
-            end else begin
-                out_last <= 1'b0;
+            for (fifo_i = 0; fifo_i < TOTAL_OUT_ROWS; fifo_i = fifo_i + 1) begin
+                out_fifo[fifo_i] <= {c_width}'d0;
             end
+        end else begin
+            if (any_avail) begin
+                out_fifo[out_wr_ptr] <= row_mux;
+                out_wr_ptr <= out_wr_ptr + 1;
+            end
+            if (output_take) begin
+                out_rd_ptr <= out_rd_ptr + 1;
+                out_row_count <= out_row_count + 1;
+            end
+            case ({{any_avail, output_take}})
+                2'b10: out_count <= out_count + 1;
+                2'b01: out_count <= out_count - 1;
+                default: out_count <= out_count;
+            endcase
+        end
+    end
+
+    always @(*) begin
+        if (out_count != 0) begin
+            c_row = out_fifo[out_rd_ptr];
+            out_valid = 1'b1;
+            out_last = (out_row_count + 1 == TOTAL_OUT_ROWS);
+        end else begin
+            c_row = {c_width}'d0;
+            out_valid = 1'b0;
+            out_last = 1'b0;
         end
     end
 

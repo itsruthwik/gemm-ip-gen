@@ -174,7 +174,7 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42):
 module tb_{m}x{k}x{n};
     // ---- DUT ports ----
     reg  clk = 0;
-    reg  rst = 0;
+    reg  rst = 1;
     reg  en  = 1;
     reg  in_valid = 0;
     reg  [{a_bytes*8-1}:0] a_rows = 0;
@@ -199,7 +199,7 @@ module tb_{m}x{k}x{n};
         $display("=== TB {m}x{k}x{n} start ===");
         #20;
         @(posedge clk);
-        rst      = 1;
+        rst      = 0;
         in_valid = 1;
 {stim_block}
         in_valid = 0;
@@ -239,7 +239,7 @@ module tb_{m}x{k}x{n};
 
     // ---- Sample and check output ----
     always @(posedge clk) begin
-        if (!rst) begin
+        if (rst) begin
             cycle_ctr <= 0;
         end else begin
             cycle_ctr <= cycle_ctr + 1;

@@ -190,6 +190,7 @@ void {name}_gemm_ip_stream(
 
     static {name}_ccore gemm;
     int captured = 0;
+    ac_int<1, false> feed_dependency = 0;
     ac_int<{a_bits}, false> last_a_rows = 0;
     ac_int<{b_bits}, false> last_b_cols = 0;
 
@@ -220,16 +221,20 @@ void {name}_gemm_ip_stream(
         last_b_cols = b_cols;
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
-        gemm.run(last_a_rows, last_b_cols, 1, c_row, v, l);
+        ac_int<1, false> feed_valid = 1;
+        gemm.run(last_a_rows, last_b_cols, feed_valid, c_row, v, l);
+        feed_dependency |= v;
     }}
 
     #pragma hls_pipeline_init_interval 1
     DRAIN_WRITE: for (int i = 0; i < {blind + m}; i++) {{
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
-        gemm.run(last_a_rows, last_b_cols, 0, c_row, v, l);
-        if (v) {{
-            if (captured < {m}) {{
+        ac_int<1, false> drain_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, drain_valid, c_row, v, l);
+        ac_int<1, false> output_valid = v | feed_dependency;
+        if (output_valid) {{
+            if (v && captured < {m}) {{
                 res_T out_pack;
                 #pragma hls_unroll
                 for (int col = 0; col < {n}; col++) {{
@@ -252,7 +257,100 @@ void {name}_gemm_ip_stream(
     DRAIN_PADDED_ROWS: for (int i = 0; i < {mr - m}; i++) {{
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
-        gemm.run(last_a_rows, last_b_cols, 0, c_row, v, l);
+        ac_int<1, false> drain_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, drain_valid, c_row, v, l);
+    }}
+}}
+
+template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
+void {name}_gemm_ip_array(
+    a_beat_T a_beats[CONFIG_T::gemm_k],
+    b_beat_T b_beats[CONFIG_T::gemm_k],
+    bias_T biases[CONFIG_T::gemm_n],
+    res_T results[CONFIG_T::gemm_m]
+) {{
+    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
+    static_assert(CONFIG_T::gemm_k == {k}, "Generated GEMM wrapper requires matching gemm_k.");
+    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
+    static_assert(a_beat_T::size == CONFIG_T::gemm_m,
+                  "a_beat_T must carry one tensor-slice activation beat across GEMM rows.");
+    static_assert(CONFIG_T::transpose_weights,
+                  "Generated GEMM IP wrapper expects transposed weights.");
+    static_assert(b_beat_T::size == CONFIG_T::gemm_n,
+                  "b_beat_T must carry one tensor-slice weight beat across GEMM output columns.");
+    static_assert(res_T::size == CONFIG_T::gemm_n,
+                  "res_T must carry one full GEMM result row.");
+
+    static {name}_ccore gemm;
+    int captured = 0;
+    ac_int<1, false> feed_dependency = 0;
+    ac_int<{a_bits}, false> last_a_rows = 0;
+    ac_int<{b_bits}, false> last_b_cols = 0;
+
+    #pragma hls_pipeline_init_interval 1
+    FEED_ARRAY: for (int kk = 0; kk < {k}; kk++) {{
+        ac_int<{a_bits}, false> a_rows = 0;
+        ac_int<{b_bits}, false> b_cols = 0;
+        a_beat_T activation_rows = a_beats[kk];
+        b_beat_T weight_cols = b_beats[kk];
+
+        #pragma hls_unroll
+        ROW_PACK_ARRAY: for (int row = 0; row < {m}; row++) {{
+            int row_tile = row / 8;
+            int row_local = row % 8;
+            a_rows.set_slc(row_tile * 64 + row_local * 8,
+                           {name}_to_gemm_int8(activation_rows[row]));
+        }}
+
+        #pragma hls_unroll
+        COL_PACK_ARRAY: for (int col = 0; col < {n}; col++) {{
+            int col_tile = col / 8;
+            int col_local = col % 8;
+            b_cols.set_slc(col_tile * 64 + col_local * 8,
+                           {name}_to_gemm_int8(weight_cols[col]));
+        }}
+
+        last_a_rows = a_rows;
+        last_b_cols = b_cols;
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        ac_int<1, false> feed_valid = 1;
+        gemm.run(last_a_rows, last_b_cols, feed_valid, c_row, v, l);
+        feed_dependency |= v;
+    }}
+
+    #pragma hls_pipeline_init_interval 1
+    DRAIN_ARRAY: for (int i = 0; i < {blind + m}; i++) {{
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        ac_int<1, false> drain_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, drain_valid, c_row, v, l);
+        ac_int<1, false> output_valid = v | feed_dependency;
+        if (output_valid) {{
+            if (v && captured < {m}) {{
+                res_T out_pack;
+                #pragma hls_unroll
+                for (int col = 0; col < {n}; col++) {{
+                    int col_tile = col / 8;
+                    int col_local = col % 8;
+                    ac_int<8, true> raw_val = c_row.template slc<8>(col_tile * 128 + col_local * 8);
+                    typename CONFIG_T::accum_t biased =
+                        static_cast<typename CONFIG_T::accum_t>(raw_val.to_int()) +
+                        static_cast<typename CONFIG_T::accum_t>(biases[col]);
+                    out_pack[col] = static_cast<typename res_T::value_type>(biased);
+                }}
+                results[captured] = out_pack;
+            }}
+            captured++;
+        }}
+    }}
+
+    #pragma hls_pipeline_init_interval 1
+    DRAIN_ARRAY_PADDED_ROWS: for (int i = 0; i < {mr - m}; i++) {{
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        ac_int<1, false> drain_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, drain_valid, c_row, v, l);
     }}
 }}
 
@@ -297,7 +395,50 @@ template <typename T, unsigned N> struct array {
 """
 
 
-def gen_tb(name, m, k, n):
+def gen_tb(name, m, k, n, interface="stream"):
+    if interface == "array":
+        call_setup = f"""\
+    a_beat_t a_beats[{k}];
+    b_beat_t b_beats[{k}];
+    res_t results[{m}];
+
+    for (int kk = 0; kk < {k}; kk++) {{
+        for (int i = 0; i < {m}; i++) {{
+            a_beats[kk][i] = activations[i][kk];
+        }}
+        for (int j = 0; j < {n}; j++) {{
+            b_beats[kk][j] = weights[j][kk];
+        }}
+    }}
+
+    nnet::{name}_gemm_ip_array<a_beat_t, b_beat_t, int, res_t, {name}_config>(
+        a_beats, b_beats, biases, results);
+"""
+        read_result = "        res_t out = results[i];"
+    else:
+        call_setup = f"""\
+    ac_channel<a_beat_t> a_beat_stream;
+    ac_channel<b_beat_t> b_beat_stream;
+    ac_channel<res_t> res_stream;
+
+    for (int kk = 0; kk < {k}; kk++) {{
+        a_beat_t a_beat;
+        b_beat_t b_beat;
+        for (int i = 0; i < {m}; i++) {{
+            a_beat[i] = activations[i][kk];
+        }}
+        for (int j = 0; j < {n}; j++) {{
+            b_beat[j] = weights[j][kk];
+        }}
+        a_beat_stream.write(a_beat);
+        b_beat_stream.write(b_beat);
+    }}
+
+    nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, int, res_t, {name}_config>(
+        a_beat_stream, b_beat_stream, biases, res_stream);
+"""
+        read_result = "        res_t out = res_stream.read();"
+
     return f"""\
 #include <stdio.h>
 
@@ -320,9 +461,6 @@ typedef nnet::array<ac_int<8, true>, {n}> b_beat_t;
 typedef nnet::array<ac_int<16, true>, {n}> res_t;
 
 int main() {{
-    ac_channel<a_beat_t> a_beat_stream;
-    ac_channel<b_beat_t> b_beat_stream;
-    ac_channel<res_t> res_stream;
     ac_int<8, true> activations[{m}][{k}];
     ac_int<8, true> weights[{n}][{k}];
     int biases[{n}];
@@ -341,24 +479,10 @@ int main() {{
         }}
     }}
 
-    for (int kk = 0; kk < {k}; kk++) {{
-        a_beat_t a_beat;
-        b_beat_t b_beat;
-        for (int i = 0; i < {m}; i++) {{
-            a_beat[i] = activations[i][kk];
-        }}
-        for (int j = 0; j < {n}; j++) {{
-            b_beat[j] = weights[j][kk];
-        }}
-        a_beat_stream.write(a_beat);
-        b_beat_stream.write(b_beat);
-    }}
-
-    nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, int, res_t, {name}_config>(
-        a_beat_stream, b_beat_stream, biases, res_stream);
+{call_setup}
 
     for (int i = 0; i < {m}; i++) {{
-        res_t out = res_stream.read();
+{read_result}
         for (int j = 0; j < {n}; j++) {{
             int acc = biases[j];
             int gemm_acc = 0;
@@ -386,7 +510,28 @@ int main() {{
 """
 
 
-def gen_inst_cpp(name, m, k, n):
+def gen_inst_cpp(name, m, k, n, interface="stream"):
+    if interface == "array":
+        top_signature = f"""\
+    a_beat_t a_beats[{k}],
+    b_beat_t b_beats[{k}],
+    int biases[{n}],
+    res_t results[{m}]
+) {{
+    nnet::{name}_gemm_ip_array<a_beat_t, b_beat_t, int, res_t, {name}_config>(
+        a_beats, b_beats, biases, results);
+}}"""
+    else:
+        top_signature = f"""\
+    ac_channel<a_beat_t> &a_beat_stream,
+    ac_channel<b_beat_t> &b_beat_stream,
+    int biases[{n}],
+    ac_channel<res_t> &res_stream
+) {{
+    nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, int, res_t, {name}_config>(
+        a_beat_stream, b_beat_stream, biases, res_stream);
+}}"""
+
     return f"""\
 #include "nnet_types.h"
 #include "{name}_gemm_ip.h"
@@ -408,18 +553,27 @@ typedef nnet::array<ac_int<16, true>, {n}> res_t;
 
 #pragma hls_design top
 void {name}_top(
-    ac_channel<a_beat_t> &a_beat_stream,
-    ac_channel<b_beat_t> &b_beat_stream,
-    int biases[{n}],
-    ac_channel<res_t> &res_stream
-) {{
-    nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, int, res_t, {name}_config>(
-        a_beat_stream, b_beat_stream, biases, res_stream);
-}}
+{top_signature}
 """
 
 
-def gen_tcl(name, m, k, n):
+def gen_tcl(name, m, k, n, interface="stream"):
+    if interface == "array":
+        map_lines = f"""\
+# Array top-level package smoke synthesis. hls4ml integration instantiates the
+# ccore through the generated combined header rather than this standalone top.
+directive set /{name}_top/a_beats:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_top/b_beats:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_top/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_top/results:rsc -MAP_TO_MODULE ccs_ioport.ccs_out_wait"""
+    else:
+        map_lines = f"""\
+# Phase 5: Map streams to real streaming resources
+directive set /{name}_top/a_beat_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_top/b_beat_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_top/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_top/res_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_out_wait"""
+
     return f"""\
 set project_name "{name}_proj"
 set solution_name "{name}_sol"
@@ -458,11 +612,7 @@ go libraries
 
 directive set -CLOCKS {{clk {{-CLOCK_PERIOD 10.0 -CLOCK_EDGE rising -CLOCK_UNCERTAINTY 0.0 -CLOCK_HIGH_TIME 5.0 -RESET_SYNC_NAME rst -RESET_ASYNC_NAME arst_n -RESET_KIND both -RESET_SYNC_ACTIVE high -RESET_ASYNC_ACTIVE low}}}}
 
-# Phase 5: Map streams to real streaming resources
-directive set /{name}_top/a_beat_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_top/b_beat_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_top/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_top/res_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_out_wait
+{map_lines}
 
 go assembly
 go architect
@@ -475,20 +625,55 @@ puts "{name} Catapult run complete."
 """
 
 
+def _dispatch_condition(item):
+    shape_condition = (
+        f"CONFIG_T::gemm_m == {item['m']} &&\n"
+        f"                  CONFIG_T::gemm_k == {item['k']} &&\n"
+        f"                  CONFIG_T::gemm_n == {item['n']}"
+    )
+    if item.get("gemm_ip_index") is not None:
+        return (
+            f"CONFIG_T::gemm_ip_id == {item['gemm_ip_index']} &&\n"
+            f"                  {shape_condition}"
+        )
+    return shape_condition
+
+
 def gen_combined_header(items):
     includes = "\n".join(f'#include "{item["name"]}/{item["name"]}_gemm_ip.h"' for item in items)
-    branches = []
+    stream_branches = []
+    array_branches = []
     for item in items:
-        branches.append(
-            f"""\
-    if constexpr (CONFIG_T::gemm_m == {item["m"]} &&
-                  CONFIG_T::gemm_k == {item["k"]} &&
-                  CONFIG_T::gemm_n == {item["n"]}) {{
-        {item["name"]}_gemm_ip_stream<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
-            a_beat_stream, b_beat_stream, biases, res_stream);
+        target = item.get("interface", "stream")
+        branch = f"""\
+    if constexpr ({_dispatch_condition(item)}) {{
+        {item["name"]}_gemm_ip_{target}<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
+            TARGET_ARGS);
     }}"""
-        )
-    branches_text = " else ".join(branches)
+        if target == "array":
+            array_branches.append(branch.replace("TARGET_ARGS", "a_beats, b_beats, biases, results"))
+        else:
+            stream_branches.append(branch.replace("TARGET_ARGS", "a_beat_stream, b_beat_stream, biases, res_stream"))
+    stream_branches_text = " else ".join(stream_branches)
+    array_branches_text = " else ".join(array_branches)
+    if not stream_branches_text:
+        stream_branches_text = """\
+    static_assert(CONFIG_T::gemm_m == 0,
+                  "No generated stream GEMM IP implementation is present in this package.");"""
+    else:
+        stream_branches_text += """ else {
+        static_assert(CONFIG_T::gemm_m == 0,
+                      "No generated stream GEMM IP implementation matches this CONFIG_T.");
+    }"""
+    if not array_branches_text:
+        array_branches_text = """\
+    static_assert(CONFIG_T::gemm_m == 0,
+                  "No generated array GEMM IP implementation is present in this package.");"""
+    else:
+        array_branches_text += """ else {
+        static_assert(CONFIG_T::gemm_m == 0,
+                      "No generated array GEMM IP implementation matches this CONFIG_T.");
+    }"""
     return f"""\
 #ifndef GEMM_IP_COMBINED_H_
 #define GEMM_IP_COMBINED_H_
@@ -505,10 +690,17 @@ void gemm_ip_stream(
     bias_T biases[CONFIG_T::gemm_n],
     ac_channel<res_T> &res_stream
 ) {{
-    {branches_text} else {{
-        static_assert(CONFIG_T::gemm_m == 0,
-                      "No generated GEMM IP implementation matches this CONFIG_T shape.");
-    }}
+{stream_branches_text}
+}}
+
+template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
+void gemm_ip_array(
+    a_beat_T a_beats[CONFIG_T::gemm_k],
+    b_beat_T b_beats[CONFIG_T::gemm_k],
+    bias_T biases[CONFIG_T::gemm_n],
+    res_T results[CONFIG_T::gemm_m]
+) {{
+{array_branches_text}
 }}
 
 template <class data_T, class weight_T, class bias_T, class res_T, typename CONFIG_T>
@@ -559,6 +751,8 @@ def gen_integration_manifest(items):
     for item in items:
         cores.append({
             "name": item["name"],
+            "interface": item.get("interface", "stream"),
+            "protocol": item.get("protocol", {}),
             "entity": f"{item['name']}_core",
             "rtl": f"{item['name']}/{item['name']}_core.v",
             "m": item["m"],
@@ -584,7 +778,9 @@ def gen_blackbox_tcl(items):
     return "\n".join(lines) + "\n"
 
 
-def generate_catapult_pkg(m, k, n, name, output_dir):
+def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream"):
+    if interface not in ("stream", "array"):
+        raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -599,25 +795,39 @@ def generate_catapult_pkg(m, k, n, name, output_dir):
     (pkg_dir / f"{name}_gemm_ip.h").write_text(
         gen_public_header(name, m, k, n, grid_rows, grid_cols)
     )
-    (pkg_dir / f"{name}_inst.cpp").write_text(gen_inst_cpp(name, m, k, n))
-    (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(name, m, k, n))
-    (pkg_dir / "run_catapult.tcl").write_text(gen_tcl(name, m, k, n))
-    print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n})")
+    (pkg_dir / f"{name}_inst.cpp").write_text(gen_inst_cpp(name, m, k, n, interface))
+    (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(name, m, k, n, interface))
+    (pkg_dir / "run_catapult.tcl").write_text(gen_tcl(name, m, k, n, interface))
+    print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface})")
 
 
 def _normalize_config_items(cfg):
     if isinstance(cfg, list):
+        for item in cfg:
+            item.setdefault("interface", "stream")
+            item.setdefault("protocol", {})
+            item.setdefault("gemm_ip_id", item.get("name"))
+            item.setdefault("gemm_ip_index", None)
         return cfg
     if isinstance(cfg, dict):
         if "m" in cfg and "k" in cfg and "n" in cfg and "name" in cfg:
+            cfg.setdefault("interface", "stream")
+            cfg.setdefault("protocol", {})
+            cfg.setdefault("gemm_ip_id", cfg.get("name"))
+            cfg.setdefault("gemm_ip_index", None)
             return [cfg]
         items = []
         for name, item in cfg.items():
+            interface = item.get("interface", "stream")
             items.append({
                 "name": name,
                 "m": item.get("gemm_m", 1),
-                "k": item["n_in"],
-                "n": item["n_out"],
+                "k": item.get("gemm_k", item["n_in"]),
+                "n": item.get("gemm_n", item["n_out"]),
+                "interface": interface,
+                "protocol": item.get("protocol", {}),
+                "gemm_ip_id": item.get("gemm_ip_id", name),
+                "gemm_ip_index": item.get("gemm_ip_index"),
             })
         return items
     raise TypeError("Unsupported config format")
@@ -630,6 +840,7 @@ if __name__ == "__main__":
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--n", type=int, default=8)
     parser.add_argument("--name", type=str, default="gemm_8x8x8")
+    parser.add_argument("--interface", choices=("stream", "array"), default="stream")
     parser.add_argument("--output_dir", type=str, default="./output")
     args = parser.parse_args()
 
@@ -637,9 +848,9 @@ if __name__ == "__main__":
         cfg = json.loads(Path(args.config).read_text())
         items = _normalize_config_items(cfg)
         for item in items:
-            generate_catapult_pkg(item["m"], item["k"], item["n"], item["name"], args.output_dir)
+            generate_catapult_pkg(item["m"], item["k"], item["n"], item["name"], args.output_dir, item.get("interface", "stream"))
         (Path(args.output_dir) / "gemm_ip_combined.h").write_text(gen_combined_header(items))
         (Path(args.output_dir) / "integration_manifest.json").write_text(gen_integration_manifest(items) + "\n")
         (Path(args.output_dir) / "catapult_gemm_blackboxes.tcl").write_text(gen_blackbox_tcl(items))
     else:
-        generate_catapult_pkg(args.m, args.k, args.n, args.name, args.output_dir)
+        generate_catapult_pkg(args.m, args.k, args.n, args.name, args.output_dir, args.interface)
