@@ -3,7 +3,13 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from generate_catapult_pkg import _normalize_config_items, gen_combined_header, generate_catapult_pkg
+from generate_catapult_pkg import (
+    _is_ac_integer_type,
+    _normalize_config_items,
+    gen_combined_header,
+    gen_public_header,
+    generate_catapult_pkg,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tensor-slice"))
 from generate_verilog_grid import generate_grid_verilog
@@ -270,3 +276,59 @@ endmodule
     sim_res = subprocess.run(["vvp", str(sim_path)], cwd=tmp_path, text=True, capture_output=True)
     assert sim_res.returncode == 0, sim_res.stdout + sim_res.stderr
     assert "SPARSE_EN_PROTOCOL_PASSED" in sim_res.stdout
+
+
+# ---------------------------------------------------------------------------
+# Output precision / type-aware assignment tests
+# ---------------------------------------------------------------------------
+
+def test_is_ac_integer_type():
+    """The helper correctly classifies integer vs fixed-point type strings."""
+    assert _is_ac_integer_type("int<8>") is True
+    assert _is_ac_integer_type("uint<8>") is True
+    assert _is_ac_integer_type("ac_int<8,true>") is True
+    assert _is_ac_integer_type("ac_uint<8>") is True
+    assert _is_ac_integer_type("int<8,true>") is True
+    assert _is_ac_integer_type(" int<8> ") is True  # whitespace tolerance
+
+    assert _is_ac_integer_type("fixed<16,6,TRN,WRAP,0>") is False
+    assert _is_ac_integer_type("ufixed<16,6,TRN,WRAP,0>") is False
+    assert _is_ac_integer_type("ac_fixed<16,6,true>") is False
+    assert _is_ac_integer_type("float<25,2,8,TRN>") is False
+    assert _is_ac_integer_type(None) is False
+    assert _is_ac_integer_type("") is False
+    assert _is_ac_integer_type("ap_int<8>") is False  # not handled
+
+
+def test_output_assignment_uses_to_int_for_integer_result(tmp_path):
+    """Integer ``output_precision`` produces ``biased.to_int()`` in the header."""
+    generate_catapult_pkg(4, 8, 4, "test_int", tmp_path, output_precision="int<8>")
+    header = (tmp_path / "test_int" / "test_int_gemm_ip.h").read_text()
+
+    # Both the stream and array output assignment sites must use to_int()
+    stream_matches = header.count("biased.to_int()")
+    assert stream_matches >= 2, (
+        f"Expected at least 2 occurrences of 'biased.to_int()' "
+        f"in integer-result header, found {stream_matches}"
+    )
+
+
+def test_output_assignment_omits_to_int_for_fixed_result(tmp_path):
+    """Fixed-point ``output_precision`` omits ``biased.to_int()`` from the header."""
+    generate_catapult_pkg(4, 8, 4, "test_fixed", tmp_path,
+                          output_precision="fixed<16,6,TRN,WRAP,0>")
+    header = (tmp_path / "test_fixed" / "test_fixed_gemm_ip.h").read_text()
+
+    assert "biased.to_int()" not in header, (
+        "Fixed-point result header must not contain biased.to_int()"
+    )
+
+
+def test_output_assignment_defaults_to_biased_when_no_precision(tmp_path):
+    """When ``output_precision`` is not provided the header defaults to ``biased``."""
+    generate_catapult_pkg(4, 8, 4, "test_default", tmp_path)
+    header = (tmp_path / "test_default" / "test_default_gemm_ip.h").read_text()
+
+    assert "biased.to_int()" not in header, (
+        "Default (no precision) header should not contain biased.to_int()"
+    )

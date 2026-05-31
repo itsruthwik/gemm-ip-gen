@@ -22,6 +22,25 @@ from pathlib import Path
 import sys
 
 
+def _is_ac_integer_type(type_name):
+    """Check if a type name string represents an integer type (rather than fixed-point).
+
+    Accepts both hls4ml internal format (``int<N>`` / ``uint<N>`` as written by
+    ``gemm_config.json``) and raw C++ AC datatype names (``ac_int<N,W>`` /
+    ``ac_uint<N>``).  Returns False for ``None``, unknown strings, and all
+    fixed-point type strings (``fixed<...>``, ``ac_fixed<...>``, etc.).
+    """
+    if not isinstance(type_name, str):
+        return False
+    compact = type_name.replace(" ", "")
+    return (
+        compact.startswith("int<")
+        or compact.startswith("uint<")
+        or compact.startswith("ac_int<")
+        or compact.startswith("ac_uint<")
+    )
+
+
 def _load_tensor_slice_generators():
     ts_dir = Path(__file__).resolve().parent / "tensor-slice"
     ts_dir_str = str(ts_dir)
@@ -43,7 +62,7 @@ def dead_cycles(grid_cols):
     return dead_cycles_raw(grid_cols) + 1
 
 
-def gen_public_header(name, m, k, n, grid_rows, grid_cols):
+def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None):
     a_bits = grid_rows * 64
     b_bits = grid_cols * 64
     c_bits = grid_cols * 128
@@ -51,6 +70,14 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols):
     first_out = latency_cycles(k, grid_rows, grid_cols)
     blind = dead_cycles(grid_cols)
     drain = blind + mr
+
+    # Choose the RHS expression for the final output assignment based on the
+    # configured result type.  Integer types (ac_int / ac_uint) need an explicit
+    # ``.to_int()`` call because directly casting an ``ac_fixed`` accumulator to
+    # an ``ac_int`` may fail to compile or produce unexpected truncation.
+    # Fixed-point types should preserve the normal AC-datatype conversion
+    # (rounding / saturation) by omitting ``.to_int()``.
+    assign_expr = "biased.to_int()" if _is_ac_integer_type(result_type) else "biased"
 
     return f"""\
 #ifndef {name.upper()}_GEMM_IP_H
@@ -245,7 +272,7 @@ void {name}_gemm_ip_stream(
                     typename CONFIG_T::accum_t biased =
                         static_cast<typename CONFIG_T::accum_t>(raw_val.to_int()) +
                         static_cast<typename CONFIG_T::accum_t>(biases[col]);
-                    out_pack[col] = static_cast<typename res_T::value_type>(biased);
+                    out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
                 }}
                 res_stream.write(out_pack);
             }}
@@ -337,7 +364,7 @@ void {name}_gemm_ip_array(
                     typename CONFIG_T::accum_t biased =
                         static_cast<typename CONFIG_T::accum_t>(raw_val.to_int()) +
                         static_cast<typename CONFIG_T::accum_t>(biases[col]);
-                    out_pack[col] = static_cast<typename res_T::value_type>(biased);
+                    out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
                 }}
                 results[captured] = out_pack;
             }}
@@ -778,7 +805,7 @@ def gen_blackbox_tcl(items):
     return "\n".join(lines) + "\n"
 
 
-def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream"):
+def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     pkg_dir = Path(output_dir) / name
@@ -793,7 +820,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream"):
     (pkg_dir / f"{name}_core.v").write_text(grid_v + "\n\n" + ts_src.read_text())
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
     (pkg_dir / f"{name}_gemm_ip.h").write_text(
-        gen_public_header(name, m, k, n, grid_rows, grid_cols)
+        gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=output_precision)
     )
     (pkg_dir / f"{name}_inst.cpp").write_text(gen_inst_cpp(name, m, k, n, interface))
     (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(name, m, k, n, interface))
@@ -828,6 +855,7 @@ def _normalize_config_items(cfg):
                 "protocol": item.get("protocol", {}),
                 "gemm_ip_id": item.get("gemm_ip_id", name),
                 "gemm_ip_index": item.get("gemm_ip_index"),
+                "output_precision": item.get("output_precision"),
             })
         return items
     raise TypeError("Unsupported config format")
@@ -848,7 +876,12 @@ if __name__ == "__main__":
         cfg = json.loads(Path(args.config).read_text())
         items = _normalize_config_items(cfg)
         for item in items:
-            generate_catapult_pkg(item["m"], item["k"], item["n"], item["name"], args.output_dir, item.get("interface", "stream"))
+            generate_catapult_pkg(
+                item["m"], item["k"], item["n"], item["name"],
+                args.output_dir,
+                interface=item.get("interface", "stream"),
+                output_precision=item.get("output_precision"),
+            )
         (Path(args.output_dir) / "gemm_ip_combined.h").write_text(gen_combined_header(items))
         (Path(args.output_dir) / "integration_manifest.json").write_text(gen_integration_manifest(items) + "\n")
         (Path(args.output_dir) / "catapult_gemm_blackboxes.tcl").write_text(gen_blackbox_tcl(items))
