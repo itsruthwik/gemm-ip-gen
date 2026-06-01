@@ -42,6 +42,7 @@ module tensor_slice_int8(
     reg signed [7:0] a_reg [0:7][0:7];
     reg signed [7:0] b_reg [0:7][0:7];
     reg signed [31:0] acc [0:7][0:7];
+    reg preload_done;
     
     // Internal staggering registers
     reg [7:0] a_stagger [0:7][0:7];
@@ -99,6 +100,7 @@ module tensor_slice_int8(
 
     always @(posedge clk) begin
         if (reset || pe_reset) begin
+            preload_done <= 1'b0;
             clk_cnt <= 0; op_active <= 0; readout_active <= 0; c_avail <= 0; readout_ptr <= 0;
             for (k=0; k<256; k=k+1) begin
                 a_hist[k] <= 64'b0;
@@ -112,6 +114,16 @@ module tensor_slice_int8(
                 for (c=0; c<8; c=c+1) begin
                     a_reg[r][c] <= 0; b_reg[r][c] <= 0; acc[r][c] <= 0;
                     a_stagger[r][c] <= 0; b_stagger[r][c] <= 0;
+                end
+            end
+        end else if (preload && !launch_op && !op_active) begin
+            preload_done <= 1'b1;
+            for (r=0; r<8; r=r+1) begin
+                for (c=0; c<8; c=c+1) begin
+                    if (validity_mask_a_rows[r] && validity_mask_b_cols[c])
+                        acc[r][c] <= {{24{b_data[c*8 + 7]}}, b_data[c*8 +: 8]};
+                    else
+                        acc[r][c] <= 32'sd0;
                 end
             end
         end else if (launch_op) begin
@@ -136,10 +148,12 @@ module tensor_slice_int8(
 
             for (r=0; r<8; r=r+1) begin
                 for (c=0; c<8; c=c+1) begin
-                    a_reg[r][c] <= 0; b_reg[r][c] <= 0; acc[r][c] <= 0;
+                    a_reg[r][c] <= 0; b_reg[r][c] <= 0;
+                    if (!preload_done) acc[r][c] <= 0;
                     a_stagger[r][c] <= 0; b_stagger[r][c] <= 0;
                 end
             end
+            preload_done <= 1'b0;
 
             // 1. Input Staggering and Masking
             for (r=0; r<8; r=r+1) begin

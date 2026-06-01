@@ -88,7 +88,7 @@ def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper"):
             .start_mat_mul(slice_start),
             .done_mat_mul(done_mat_mul[{r*grid_cols+c}]),
             .a_data(in_valid_d ? a_rows_d[{r}*64 +: 64] : 64'b0),
-            .b_data(in_valid_d ? b_cols_d[{c}*64 +: 64] : 64'b0),
+            .b_data(preload_valid ? bias_cols[{c}*64 +: 64] : (in_valid_d ? b_cols_d[{c}*64 +: 64] : 64'b0)),
             .a_data_in(a_chain_{r}_{c}),
             .b_data_in(b_chain_{r}_{c}),
             .a_data_out(a_chain_{r}_{c+1}),
@@ -99,7 +99,7 @@ def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper"):
             .validity_mask_a_cols_b_rows({vm(k_mask_val)}),
             .validity_mask_b_cols({vm(col_mask_vals[c])}),
             .slice_dtype(2'd0), .slice_mode(1'b0), .op(3'd0),
-            .preload(1'b0), .no_rounding(1'b0),
+            .preload(preload_valid), .no_rounding(1'b0),
             .final_mat_mul_size(8'd{k}),
             .a_loc(5'd{r}),
             .b_loc(5'd{c})
@@ -199,10 +199,12 @@ module {module_name}(
     input  wire                   clk,
     input  wire                   rst,        // 1=reset, 0=running
     input  wire                   en,
-    input  wire [{a_width-1}:0]  a_rows,     // packed A column-tiles, one K-step
-    input  wire [{b_width-1}:0]  b_cols,     // packed B row-tiles,    one K-step
+    input  wire [{a_width-1}:0]   a_rows,     // packed A column-tiles, one K-step
+    input  wire [{b_width-1}:0]   b_cols,     // packed B row-tiles,    one K-step
+    input  wire [{b_width-1}:0]   bias_cols,  // packed bias tiles, one per column-tile
+    input  wire                   preload_valid,
     input  wire                   in_valid,
-    output reg  [{c_width-1}:0]  c_row,
+    output reg  [{c_width-1}:0]   c_row,
     output reg                    out_valid,
     output reg                    out_last
 );
@@ -223,8 +225,8 @@ module {module_name}(
     reg [15:0] out_count;
     reg [15:0] out_row_count;
 
-    wire transaction_start = en & in_valid & (cycle == 0 || cycle >= TOTAL_CYCLES);
-    wire slice_reset = rst | transaction_start;
+    wire transaction_start = en & in_valid & !preload_valid & (cycle == 0 || cycle >= TOTAL_CYCLES);
+    wire slice_reset = rst;
     wire slice_start;
     wire output_take = en & (out_count != 0);
     wire feed_beat = transaction_start | (en & in_valid & transaction_active & (cycle < {k}));
@@ -245,7 +247,7 @@ module {module_name}(
             in_valid_d <= 1'b1;
             cycle <= 16'd1;
             transaction_active <= 1'b1;
-        end else if (cycle != 0 && cycle < TOTAL_CYCLES) begin
+            end else if (cycle != 0 && cycle < TOTAL_CYCLES) begin
             if (feed_beat) begin
                 a_rows_d <= a_rows;
                 b_cols_d <= b_cols;

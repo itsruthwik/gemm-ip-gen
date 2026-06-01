@@ -77,7 +77,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None):
     # an ``ac_int`` may fail to compile or produce unexpected truncation.
     # Fixed-point types should preserve the normal AC-datatype conversion
     # (rounding / saturation) by omitting ``.to_int()``.
-    assign_expr = "biased.to_int()" if _is_ac_integer_type(result_type) else "biased"
+    assign_expr = "value.to_int()" if _is_ac_integer_type(result_type) else "value"
 
     return f"""\
 #ifndef {name.upper()}_GEMM_IP_H
@@ -105,6 +105,8 @@ class {name}_ccore {{
     void run(
         ac_int<{a_bits}, false>  a_rows,
         ac_int<{b_bits}, false>  b_cols,
+        ac_int<{b_bits}, false>  bias_cols,
+        ac_int<1, false>         preload_valid,
         ac_int<1, false>         in_valid,
         ac_int<{c_bits}, false>& c_row,
         ac_int<1, false>&        out_valid,
@@ -129,7 +131,7 @@ class {name}_ccore {{
         c_row = 0;
         c_row.set_slc(0, a_rows);
         c_row.set_slc({a_bits}, b_cols);
-        c_row[0] = c_row[0] ^ in_valid[0];
+        c_row[0] = c_row[0] ^ bias_cols[0] ^ preload_valid[0] ^ in_valid[0];
         out_valid = in_valid;
         out_last = in_valid;
 #else
@@ -137,6 +139,7 @@ class {name}_ccore {{
         static ac_int<{b_bits}, false> b_buf[{k}];
         static int clk_cnt = 0;
         static bool running = false;
+        static ac_int<{b_bits}, false> bias_buf = 0;
 
         c_row = 0;
         out_valid = 0;
@@ -146,6 +149,7 @@ class {name}_ccore {{
             if (!running) {{
                 clk_cnt = 0;
                 running = true;
+                bias_buf = bias_cols;
             }}
             if (clk_cnt < {k}) {{
                 a_buf[clk_cnt] = a_rows;
@@ -163,7 +167,10 @@ class {name}_ccore {{
                 for (int cl = 0; cl < 8; cl++) {{
                     int actual_col = ct * 8 + cl;
                     ac_int<32, true> acc = 0;
+                    // Apply bias from bias_buf
+                    ac_int<8, true> bias_el = bias_buf.slc<8>(ct * 64 + cl * 8);
                     if (actual_row < {m} && actual_col < {n}) {{
+                        acc = bias_el;
                         for (int kk = 0; kk < {k}; kk++) {{
                             ac_int<8, true> a_el = a_buf[kk].slc<8>(row_tile * 64 + row_local * 8);
                             ac_int<8, true> b_el = b_buf[kk].slc<8>(ct * 64 + cl * 8);
@@ -220,6 +227,26 @@ void {name}_gemm_ip_stream(
     ac_int<1, false> feed_dependency = 0;
     ac_int<{a_bits}, false> last_a_rows = 0;
     ac_int<{b_bits}, false> last_b_cols = 0;
+    ac_int<{b_bits}, false> bias_packed = 0;
+    ac_int<1, false> preload_valid = 1;
+    ac_int<1, false> preload_in_valid = 0;
+    ac_int<{a_bits}, false> preload_a_rows = 0;
+    ac_int<{b_bits}, false> preload_b_cols = 0;
+
+    #pragma hls_unroll
+    BIAS_PACK: for (int col = 0; col < {n}; col++) {{
+        int col_tile = col / 8;
+        int col_local = col % 8;
+        bias_packed.set_slc(col_tile * 64 + col_local * 8,
+                            {name}_to_gemm_int8(biases[col]));
+    }}
+
+    #pragma hls_pipeline_init_interval 1
+    PRELOAD_BIAS: for (int kk = 0; kk < {k}; kk++) {{
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        gemm.run(preload_a_rows, preload_b_cols, bias_packed, preload_valid, preload_in_valid, c_row, v, l);
+    }}
 
     #pragma hls_pipeline_init_interval 1
     FEED: for (int kk = 0; kk < {k}; kk++) {{
@@ -249,7 +276,8 @@ void {name}_gemm_ip_stream(
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = 1;
-        gemm.run(last_a_rows, last_b_cols, feed_valid, c_row, v, l);
+        ac_int<1, false> feed_preload_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
         feed_dependency |= v;
     }}
 
@@ -258,20 +286,19 @@ void {name}_gemm_ip_stream(
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> drain_valid = 0;
-        gemm.run(last_a_rows, last_b_cols, drain_valid, c_row, v, l);
+        ac_int<1, false> drain_preload_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
         ac_int<1, false> output_valid = v | feed_dependency;
         if (output_valid) {{
             if (v && captured < {m}) {{
                 res_T out_pack;
                 #pragma hls_unroll
                 for (int col = 0; col < {n}; col++) {{
-
                     int col_tile = col / 8;
                     int col_local = col % 8;
                     ac_int<8, true> raw_val = c_row.template slc<8>(col_tile * 128 + col_local * 8);
-                    typename CONFIG_T::accum_t biased =
-                        static_cast<typename CONFIG_T::accum_t>(raw_val.to_int()) +
-                        static_cast<typename CONFIG_T::accum_t>(biases[col]);
+                    typename CONFIG_T::accum_t value =
+                        static_cast<typename CONFIG_T::accum_t>(raw_val.to_int());
                     out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
                 }}
                 res_stream.write(out_pack);
@@ -285,7 +312,8 @@ void {name}_gemm_ip_stream(
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> drain_valid = 0;
-        gemm.run(last_a_rows, last_b_cols, drain_valid, c_row, v, l);
+        ac_int<1, false> drain_preload_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
     }}
 }}
 
@@ -313,6 +341,26 @@ void {name}_gemm_ip_array(
     ac_int<1, false> feed_dependency = 0;
     ac_int<{a_bits}, false> last_a_rows = 0;
     ac_int<{b_bits}, false> last_b_cols = 0;
+    ac_int<{b_bits}, false> bias_packed = 0;
+    ac_int<1, false> preload_valid = 1;
+    ac_int<1, false> preload_in_valid = 0;
+    ac_int<{a_bits}, false> preload_a_rows = 0;
+    ac_int<{b_bits}, false> preload_b_cols = 0;
+
+    #pragma hls_unroll
+    BIAS_PACK_ARRAY: for (int col = 0; col < {n}; col++) {{
+        int col_tile = col / 8;
+        int col_local = col % 8;
+        bias_packed.set_slc(col_tile * 64 + col_local * 8,
+                            {name}_to_gemm_int8(biases[col]));
+    }}
+
+    #pragma hls_pipeline_init_interval 1
+    PRELOAD_BIAS_ARRAY: for (int kk = 0; kk < {k}; kk++) {{
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        gemm.run(preload_a_rows, preload_b_cols, bias_packed, preload_valid, preload_in_valid, c_row, v, l);
+    }}
 
     #pragma hls_pipeline_init_interval 1
     FEED_ARRAY: for (int kk = 0; kk < {k}; kk++) {{
@@ -342,7 +390,8 @@ void {name}_gemm_ip_array(
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = 1;
-        gemm.run(last_a_rows, last_b_cols, feed_valid, c_row, v, l);
+        ac_int<1, false> feed_preload_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
         feed_dependency |= v;
     }}
 
@@ -351,7 +400,8 @@ void {name}_gemm_ip_array(
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> drain_valid = 0;
-        gemm.run(last_a_rows, last_b_cols, drain_valid, c_row, v, l);
+        ac_int<1, false> drain_preload_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
         ac_int<1, false> output_valid = v | feed_dependency;
         if (output_valid) {{
             if (v && captured < {m}) {{
@@ -361,9 +411,8 @@ void {name}_gemm_ip_array(
                     int col_tile = col / 8;
                     int col_local = col % 8;
                     ac_int<8, true> raw_val = c_row.template slc<8>(col_tile * 128 + col_local * 8);
-                    typename CONFIG_T::accum_t biased =
-                        static_cast<typename CONFIG_T::accum_t>(raw_val.to_int()) +
-                        static_cast<typename CONFIG_T::accum_t>(biases[col]);
+                    typename CONFIG_T::accum_t value =
+                        static_cast<typename CONFIG_T::accum_t>(raw_val.to_int());
                     out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
                 }}
                 results[captured] = out_pack;
@@ -377,7 +426,8 @@ void {name}_gemm_ip_array(
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> drain_valid = 0;
-        gemm.run(last_a_rows, last_b_cols, drain_valid, c_row, v, l);
+        ac_int<1, false> drain_preload_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
     }}
 }}
 
@@ -511,17 +561,15 @@ int main() {{
     for (int i = 0; i < {m}; i++) {{
 {read_result}
         for (int j = 0; j < {n}; j++) {{
-            int acc = biases[j];
-            int gemm_acc = 0;
+            int gemm_acc = biases[j];
             for (int kk = 0; kk < {k}; kk++) {{
                 gemm_acc += activations[i][kk].to_int() * weights[j][kk].to_int();
             }}
             if (gemm_acc > 127) gemm_acc = 127;
             else if (gemm_acc < -128) gemm_acc = -128;
-            acc += gemm_acc;
-            if (out[j].to_int() != acc) {{
+            if (out[j].to_int() != gemm_acc) {{
                 printf("Mismatch row %d col %d: got %d expected %d\\n",
-                       i, j, out[j].to_int(), acc);
+                       i, j, out[j].to_int(), gemm_acc);
                 failed = 1;
             }}
         }}

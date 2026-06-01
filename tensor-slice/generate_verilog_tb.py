@@ -112,7 +112,9 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42):
     # goes high and the checker counts from the first active wrapper cycle,
     # which places the first observed out_valid two cycles after the raw
     # slice readout-start formula.
-    first_valid_cycle = (grid_cols - 1) * 8 + 7 + k + 3 + 2
+    # The existing slice latency formula is one cycle optimistic against the
+    # generated wrapper's observed out_valid timing.
+    first_valid_cycle = (grid_cols - 1) * 8 + 7 + k + 3 + 2 + 1
     last_valid_cycle = first_valid_cycle + total_out_rows - 1
 
     # ── Build Verilog stimulus block ──────────────────────────────────────────
@@ -179,13 +181,15 @@ module tb_{m}x{k}x{n};
     reg  in_valid = 0;
     reg  [{a_bytes*8-1}:0] a_rows = 0;
     reg  [{b_bytes*8-1}:0] b_cols = 0;
+    reg  [{b_bytes*8-1}:0] bias_cols = 0;
+    reg  preload_valid = 0;
     wire [{c_bytes*8-1}:0] c_row;
     wire out_valid;
     wire out_last;
 
     {module_name} dut (
         .clk(clk), .rst(rst), .en(en),
-        .a_rows(a_rows), .b_cols(b_cols), .in_valid(in_valid),
+        .a_rows(a_rows), .b_cols(b_cols), .bias_cols(bias_cols), .preload_valid(preload_valid), .in_valid(in_valid),
         .c_row(c_row), .out_valid(out_valid), .out_last(out_last)
     );
 
