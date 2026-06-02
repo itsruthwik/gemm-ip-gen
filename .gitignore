@@ -11,6 +11,11 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
 # Catapult and simulator output
 *.log
 *.jou

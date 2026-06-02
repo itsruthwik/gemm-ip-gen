@@ -3,7 +3,12 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from generate_catapult_pkg import (
+# Ensure the package is importable
+_src_dir = str(Path(__file__).resolve().parent.parent / "src")
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
+from gemm_ip.catapult import (
     _is_ac_integer_type,
     _normalize_config_items,
     gen_combined_header,
@@ -11,8 +16,11 @@ from generate_catapult_pkg import (
     generate_catapult_pkg,
 )
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "tensor-slice"))
-from generate_verilog_grid import generate_grid_verilog
+# Ensure tensor-slice generators are importable
+_ts_dir = str(Path(__file__).resolve().parent.parent / "src" / "tensor-slice")
+if _ts_dir not in sys.path:
+    sys.path.insert(0, _ts_dir)
+from generate_catapult_rtl import generate_grid_verilog
 
 
 def test_normalize_config_preserves_protocol_and_defaults_to_stream():
@@ -376,9 +384,9 @@ endmodule
 """
     )
 
+    ts_v_path = str(Path(__file__).resolve().parent.parent / "src" / "tensor-slice" / "tensor_slice_int8.v")
     compile_res = subprocess.run(
-        ["iverilog", "-g2012", "-o", str(sim_path), str(tb_path), str(rtl_path), "tensor-slice/tensor_slice_int8.v"],
-        cwd=Path(__file__).resolve().parent,
+        ["iverilog", "-g2012", "-o", str(sim_path), str(tb_path), str(rtl_path), ts_v_path],
         text=True,
         capture_output=True,
     )

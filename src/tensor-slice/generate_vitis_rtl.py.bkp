@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""
+Generate a single self-contained Vitis HLS blackbox GEMM RTL module.
+
+Produces ONE Verilog module with the tensor-slice grid, cycle counter,
+output alignment, and Vitis protocol adapter all inline — no sub-modules.
+The tensor_slice_int8.v hardblock must be compiled alongside.
+"""
+
+from _generate_rtl_common import (
+    grid_rows, grid_cols, k_steps_ceil,
+    a_width_bits, b_width_bits, c_width_bits,
+    tail_mask_hex, vm, tile_comment,
+    total_cycles as _total_cycles,
+)
+
+
+def _pr(w):
+    return f"[{w - 1}:0]" if w > 1 else ""
+
+
+def _z(w):
+    return f"{w}'d0"
+
+
+def generate_vitis_rtl(m, k, n, module_name="gemm_vitis"):
+    """Return a single self-contained Vitis GEMM RTL Verilog string."""
+    gr = grid_rows(m)
+    gc = grid_cols(n)
+    ks = k_steps_ceil(k)
+    ns = gr * gc
+    aw = a_width_bits(m)
+    bw = b_width_bits(n)
+    cw = c_width_bits(n)
+    grid_cw = gc * 128  # int16 output from tiles
+
+    ar, br, cr, gcr = _pr(aw), _pr(bw), _pr(cw), _pr(grid_cw)
+    za, zb = _z(aw), _z(bw)
+
+    # Total cycle count — shared Catapult formula
+    total_cycles = _total_cycles(m, k, n)
+
+    # Tensor-slice instances
+    slices = []
+    for r in range(gr):
+        for c in range(gc):
+            idx = r * gc + c
+            slices.append(f"""\
+    tensor_slice_int8 slice_r{r}_c{c} (
+        .clk(ap_clk), .reset(ap_rst), .pe_reset(ap_rst),
+        .start_mat_mul(slice_start), .done_mat_mul(done_slices[{idx}]),
+        .a_data(in_valid_d ? a_rows_d[{r} * 64 +: 64] : 64'd0),
+        .b_data(preload_valid ? bias_reg[{c} * 64 +: 64] : (in_valid_d ? b_cols_d[{c} * 64 +: 64] : 64'd0)),
+        .a_data_in(a_chain[{r}][{c}]), .a_data_out(a_chain[{r}][{c + 1}]),
+        .b_data_in(b_chain[{r}][{c}]), .b_data_out(b_chain[{r + 1}][{c}]),
+        .c_data_out(c_data[{idx}]), .c_data_available(c_available[{idx}]),
+        .validity_mask_a_rows(row_valid_masks[{r}]),
+        .validity_mask_a_cols_b_rows(k_valid_mask),
+        .validity_mask_b_cols(col_valid_masks[{c}]),
+        .slice_dtype(2'd0), .slice_mode(1'b0), .op(3'd0),
+        .preload(preload_valid), .no_rounding(1'b0),
+        .final_mat_mul_size(8'd{k}),
+        .a_loc(5'd{r}), .b_loc(5'd{c})
+    );""")
+
+    # Edge assignments for systolic chain
+    edge_a = "\n".join(f"    assign a_chain[{r}][0] = a_edge[{r}];" for r in range(gr))
+    edge_b = "\n".join(f"    assign b_chain[0][{c}] = b_edge[{c}];" for c in range(gc))
+
+    # Tail mask initialization
+    row_mask_init = "\n".join(
+        f"            row_valid_masks[{r}] <= {vm(tail_mask_hex(m, r))};" for r in range(gr))
+    col_mask_init = "\n".join(
+        f"            col_valid_masks[{c}] <= {vm(tail_mask_hex(n, c))};" for c in range(gc))
+
+    # Alignment shift registers and valid tracking per tile.
+    # Matches the Catapult core: pipe shifts are gated by transaction_active,
+    # BOTH data and availability are piped so they stay aligned.
+    # c_valid_r is a pulse (set on pipe output, cleared otherwise).
+    align_lines = []
+    for r in range(gr):
+        for c in range(gc):
+            idx = r * gc + c
+            dly = (gc - 1 - c) * 8  # cycles to align to last column
+            if dly > 0:
+                # Gated shift pipe (same as Catapult core — data + avail)
+                align_lines.append(
+                    f"            if (transaction_active) begin\n"
+                    f"                c_data_pipe_{idx}_0 <= c_data[{idx}];\n"
+                    f"                avail_pipe_{idx}_0 <= c_available[{idx}];"
+                )
+                for dd in range(1, dly):
+                    align_lines.append(
+                        f"                c_data_pipe_{idx}_{dd} <= c_data_pipe_{idx}_{dd-1};\n"
+                        f"                avail_pipe_{idx}_{dd} <= avail_pipe_{idx}_{dd-1};"
+                    )
+                align_lines.append(f"            end")
+                # Pulse the aligned valid: set on pipe output, clear otherwise.
+                # Use PIPED data, not live c_data.
+                align_lines.append(
+                    f"            if (avail_pipe_{idx}_{dly-1}) begin\n"
+                    f"                c_data_aligned_{idx} <= c_data_pipe_{idx}_{dly-1};\n"
+                    f"                c_valid_r[{idx}] <= 1'b1;\n"
+                    f"            end else begin\n"
+                    f"                c_valid_r[{idx}] <= 1'b0;\n"
+                    f"            end"
+                )
+            else:
+                # No alignment delay: pulse c_valid_r directly from c_available
+                align_lines.append(
+                    f"            if (c_available[{idx}]) begin\n"
+                    f"                c_data_aligned_{idx} <= c_data[{idx}];\n"
+                    f"                c_valid_r[{idx}] <= 1'b1;\n"
+                    f"            end else begin\n"
+                    f"                c_valid_r[{idx}] <= 1'b0;\n"
+                    f"            end"
+                )
+    align_body = "\n".join(align_lines)
+
+    # Row-available wires
+    row_avail = []
+    for r in range(gr):
+        cols = " && ".join(f"c_valid_r[{r * gc + c}]" for c in range(gc))
+        row_avail.append(f"    wire row_avail_{r} = {cols};")
+    any_avail_expr = " || ".join(f"row_avail_{r}" for r in range(gr))
+
+    # Row mux assignments
+    mux_assign = []
+    for r in range(gr):
+        for c in range(gc):
+            idx = r * gc + c
+            mux_assign.append(
+                f"            row_mux[{c} * 128 +: 128] = c_data_aligned_{idx};"
+            )
+    mux_body = "\n".join(mux_assign)
+
+    total_out_rows = gr * 8
+
+    # Declare alignment pipe registers (data + availability like Catapult)
+    pipe_regs = []
+    for r in range(gr):
+        for c in range(gc):
+            idx = r * gc + c
+            dly = (gc - 1 - c) * 8
+            if dly > 0:
+                for dd in range(dly):
+                    pipe_regs.append(f"    reg [127:0] c_data_pipe_{idx}_{dd};")
+                    pipe_regs.append(f"    reg         avail_pipe_{idx}_{dd};")
+            pipe_regs.append(f"    reg [127:0] c_data_aligned_{idx};")
+    pipe_decls = "\n".join(pipe_regs)
+
+    return f"""\
+`timescale 1ns / 1ps
+// Auto-generated by generate_vitis_rtl.py
+// M={m}, K={k}, N={n}  |  Grid: {gr}x{gc}  |  K_STEPS={ks}
+{tile_comment(m, k, n, gr, gc, ks)}
+module {module_name} (
+    ap_clk, ap_rst, ap_start, ap_ready, ap_done, ap_idle, ap_continue,
+    a_tdata, a_tvalid, a_tready,
+    bias_tdata, bias_tvalid, bias_tready,
+    b_tdata, b_tvalid, b_tready,
+    c_tdata, c_tvalid, c_tready
+);
+    input  wire         ap_clk, ap_rst, ap_start, ap_continue;
+    output reg          ap_ready, ap_done, ap_idle;
+    input  wire {ar} a_tdata;
+    input  wire         a_tvalid;
+    output wire         a_tready;
+    input  wire {br} bias_tdata;
+    input  wire         bias_tvalid;
+    output wire         bias_tready;
+    input  wire {br} b_tdata;
+    input  wire         b_tvalid;
+    output wire         b_tready;
+    output reg  {cr} c_tdata;
+    output reg          c_tvalid;
+    input  wire         c_tready;
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Constants
+    // ═════════════════════════════════════════════════════════════════════════
+    localparam IDLE=3'd0, READ_BIAS=3'd1, PRELOAD=3'd2, FEED=3'd3;
+    localparam COMPUTE=3'd4, DRAIN=3'd5, DONE=3'd6;
+    localparam TC = {total_cycles};
+
+    reg [2:0] state;
+    reg [15:0] k_cnt, drain_cnt;
+    reg [{bw - 1}:0] bias_reg;
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Grid cycle counter (same as Catapult grid)
+    // ═════════════════════════════════════════════════════════════════════════
+    reg [15:0] cycle;
+    reg transaction_active;
+    reg preload_valid, in_valid_d;
+    reg grid_en;
+
+    // Use FSM state directly for grid-counter gating.
+    // `in_feed = (state == FEED)` avoids cross-block NBA races by using
+    // the FSM state directly, which is already stable at the posedge.
+    wire in_feed = (state == FEED);
+    wire ts = grid_en & in_feed & (cycle == 0 || cycle >= TC);
+    wire fb = ts | (grid_en & in_feed & transaction_active & (cycle < {k}));
+
+    // Combinatorial: follow a_tdata immediately (no register delay)
+    reg [{aw - 1}:0] a_rows;
+    reg [{bw - 1}:0] b_cols;
+    always @(*) begin
+        a_rows = (state == FEED) ? a_tdata : {za};
+        b_cols = (state == FEED) ? b_tdata : {zb};
+    end
+
+    reg [{aw - 1}:0] a_rows_d;
+    reg [{bw - 1}:0] b_cols_d;
+
+    assign slice_start = (cycle == 16'd1);
+    assign a_tready    = (state == FEED) && (k_cnt < {k});
+    assign b_tready    = (state == FEED) && (k_cnt < {k});
+    assign bias_tready = (state == READ_BIAS);
+
+    always @(posedge ap_clk) begin
+        if (ap_rst) begin
+            cycle <= 16'd0;
+            transaction_active <= 1'b0;
+            a_rows_d <= {za};
+            b_cols_d <= {zb};
+            in_valid_d <= 1'b0;
+        end else if (ts) begin
+            a_rows_d <= a_rows;
+            b_cols_d <= b_cols;
+            in_valid_d <= 1'b1;
+            cycle <= 16'd1;
+            transaction_active <= 1'b1;
+        end else if (cycle != 0 && cycle < TC) begin
+            if (fb) begin
+                a_rows_d <= a_rows;
+                b_cols_d <= b_cols;
+                in_valid_d <= 1'b1;
+            end else begin
+                in_valid_d <= 1'b0;
+            end
+            cycle <= cycle + 1;
+            if (cycle + 1 >= TC) transaction_active <= 1'b0;
+        end
+    end
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Systolic chain + tensor-slice instances
+    // ═════════════════════════════════════════════════════════════════════════
+
+    wire [63:0] a_chain[0:{gr - 1}][0:{gc}];
+    wire [63:0] b_chain[0:{gr}][0:{gc - 1}];
+    wire [127:0] c_data[0:{ns - 1}];
+    wire [{ns - 1}:0] done_slices, c_available;
+
+{edge_a}
+{edge_b}
+
+{chr(10).join(slices)}
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Output alignment + FIFO (same as Catapult grid)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    reg [{ns - 1}:0] c_valid_r;
+    reg [7:0] row_valid_masks[0:{gr - 1}];
+    reg [7:0] col_valid_masks[0:{gc - 1}];
+    reg [7:0] k_valid_mask;
+    reg [63:0] a_edge[0:{gr - 1}];
+    reg [63:0] b_edge[0:{gc - 1}];
+    integer r, c, i;
+
+    // Alignment pipe registers
+{pipe_decls}
+
+    always @(posedge ap_clk) begin
+        if (ap_rst) begin
+            for (i = 0; i < {ns}; i = i + 1) c_valid_r[i] <= 1'b0;
+        end else begin
+{align_body}
+        end
+    end
+
+    // Row-available
+{chr(10).join(row_avail)}
+    wire any_avail = {any_avail_expr};
+
+    // Output FIFO
+    reg [{grid_cw - 1}:0] row_mux;
+    reg [{grid_cw - 1}:0] out_fifo[0:{total_out_rows - 1}];
+    reg [15:0] out_wr_ptr, out_rd_ptr, out_count;
+
+    always @(posedge ap_clk) begin
+        if (ap_rst) begin
+            out_wr_ptr <= 0; out_rd_ptr <= 0; out_count <= 0;
+            for (i = 0; i < {total_out_rows}; i = i + 1) out_fifo[i] <= 0;
+        end else if (grid_en) begin
+            if (any_avail && out_count < {total_out_rows}) begin
+{mux_body}
+                out_fifo[out_wr_ptr] <= row_mux;
+                out_wr_ptr <= out_wr_ptr + 1;
+                out_count <= out_count + 1;
+            end
+        end
+    end
+
+    wire out_valid = (out_count != 0);
+    wire out_last  = (out_rd_ptr + 1 == {m}) && (out_count == 1);
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Output packing: int8 bytes from 128-bit grid tiles -> 64-bit stream
+    //
+    //  The tensor-slice produces 128-bit tiles where int8 results sit at byte
+    //  offsets (bits [col*8 +: 8]), exactly matching the Catapult golden
+    //  packing.  We take the lower 64 bits of each 128-bit tile, which
+    //  contains the first 8 int8 values.  No saturation is needed — the
+    //  tensor-slice's internal int32 accumulators are already clamped.
+    // ═════════════════════════════════════════════════════════════════════════
+    function [{cw - 1}:0] pack_row;
+        input [{grid_cw - 1}:0] row_in;
+        integer t;
+    begin
+        for (t = 0; t < {gc}; t = t + 1) begin
+            pack_row[t * 64 +: 64] = row_in[t * 128 +: 64];
+        end
+    end
+    endfunction
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Vitis control FSM
+    // ═════════════════════════════════════════════════════════════════════════
+    always @(posedge ap_clk) begin
+        if (ap_rst) begin
+            state <= IDLE;
+            ap_ready <= 0; ap_done <= 0; ap_idle <= 1;
+            k_cnt <= 0; drain_cnt <= 0; bias_reg <= 0;
+            c_tdata <= 0; c_tvalid <= 0;
+            grid_en <= 0; preload_valid <= 0;
+            for (i = 0; i < {gr}; i = i + 1) a_edge[i] <= 0;
+            for (i = 0; i < {gc}; i = i + 1) b_edge[i] <= 0;
+{row_mask_init}
+{col_mask_init}
+            k_valid_mask <= {vm(tail_mask_hex(k, ks - 1))};
+        end else case (state)
+            IDLE: begin
+                ap_ready <= 0; ap_done <= 0; ap_idle <= 1;
+                k_cnt <= 0; drain_cnt <= 0; c_tvalid <= 0;
+                grid_en <= 0; preload_valid <= 0;
+                if (ap_start) begin state <= READ_BIAS; ap_idle <= 0; end
+            end
+            READ_BIAS: begin
+                if (bias_tvalid) begin
+                    bias_reg <= bias_tdata;
+                    state <= PRELOAD;
+                    k_cnt <= 0; grid_en <= 1; preload_valid <= 1;
+                end
+            end
+            PRELOAD: begin
+                k_cnt <= k_cnt + 1;
+                if (k_cnt + 1 >= {k}) begin
+                    state <= FEED;
+                    k_cnt <= 0; preload_valid <= 0;
+                end
+            end
+            FEED: begin
+                if (a_tvalid && b_tvalid) begin
+                    k_cnt <= k_cnt + 1;
+                    if (k_cnt + 1 >= {k}) begin
+                        state <= COMPUTE;
+                    end
+                end
+            end
+            COMPUTE: begin
+                if (out_valid) begin state <= DRAIN; drain_cnt <= 0; end
+            end
+            DRAIN: begin
+                if (out_valid && (c_tready || !c_tvalid)) begin
+                    c_tdata   <= pack_row(out_fifo[out_rd_ptr]);
+                    out_rd_ptr <= out_rd_ptr + 1;
+                    c_tvalid  <= 1;
+                    drain_cnt <= drain_cnt + 1;
+                    if (drain_cnt + 1 >= {m}) begin
+                        state <= DONE;
+                    end
+                end
+            end
+            DONE: begin
+                c_tvalid <= 0;
+                grid_en <= 0; preload_valid <= 0;
+                ap_done <= 1; ap_ready <= 1;
+                if (ap_continue) begin state <= IDLE; ap_done <= 0; ap_ready <= 0; end
+            end
+        endcase
+    end
+
+endmodule
+"""
+
+
+if __name__ == "__main__":
+    import sys
+    m, k, n = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+    name = sys.argv[4] if len(sys.argv) > 4 else "gemm_vitis"
+    print(generate_vitis_rtl(m, k, n, name))
