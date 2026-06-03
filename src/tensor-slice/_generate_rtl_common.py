@@ -38,16 +38,32 @@ def vm(val):
     return f"8'h{val:02X}"
 
 
-def total_cycles(m, k, n, P=3):
+def total_cycles(m, k, n, P=3, feed_mode="direct"):
     """Total cycle count for the grid counter.
 
-    Uses the proven Catapult formula: done_cycle of the bottom-right tile
-    = (gr-1 + gc-1)*8 + 7 + k + P + 9.
-    Shared by both Catapult and Vitis RTL generators.
+    Direct row/col: preload(1) + collect(max(M,N)) + transition(1) +
+    feed(8 beats simultaneous) + grid propagation + stagger + MAC + margin.
+
+    Chained row/col: preload(1) + collect(max(M,N)) + transition(1) +
+    feed(max(M,N) beats) + last-tile loc_delay + local compute +
+    output alignment + FIFO drain margin.
     """
     gr = grid_rows(m)
     gc = grid_cols(n)
-    return (gr - 1 + gc - 1) * 8 + 7 + k + P + 9
+    input_beats = max(m, n)
+
+    if feed_mode == "chained":
+        # Conservative: collect + feed(8) + last tile location + local compute
+        # + output alignment (per-column + per-tile-row) + readout + margin
+        last_loc = (gr - 1 + gc - 1) * 8
+        local_compute = 7 + k + P
+        output_align = (gc - 1) * 8 + (gr - 1) * gc * 8
+        margin = 16
+        return 1 + input_beats + 1 + 8 + last_loc + local_compute + output_align + 8 + margin
+
+    # Direct mode
+    compute_drain = (gr - 1 + gc - 1) * 8 + 7 + P + 9
+    return 1 + input_beats + 1 + 8 + compute_drain
 
 
 def tile_comment(m, k, n, gr, gc, ks):

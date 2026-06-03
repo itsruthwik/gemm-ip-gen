@@ -20,13 +20,14 @@ from _generate_rtl_common import tail_mask_hex, vm, total_cycles as _total_cycle
 
 # ── main generator ────────────────────────────────────────────────────────────
 
-def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper"):
+def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="direct"):
     """
     Parameters
     ----------
     m : int   Output rows  (A rows)
     k : int   Inner dimension
     n : int   Output cols  (B cols)
+    feed_mode : str   "direct" (current) or "chained" (new location-aware)
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
@@ -35,22 +36,53 @@ def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper"):
     b_width = grid_cols * 64
     c_width = grid_cols * 128   # 8 INT16 values per column tile
 
-    # ── Latency math ─────────────────────────────────────────────────────────
-    # Uses shared formula from _generate_rtl_common (Catapult-proven).
-    TOTAL_CYCLES = _total_cycles(m, k, n)
+    # ── Mode selection ───────────────────────────────────────────────────────
+    is_chained = (feed_mode == "chained")
+    chain_mode_bit = "1'b1" if is_chained else "1'b0"
+    # Chained: FEED must cover all tiles' capture windows: max_loc_delay + 8
+    max_loc_delay = (grid_rows - 1 + grid_cols - 1) * 8
+    feed_len = max_loc_delay + 8 if is_chained else 8
+    a_loc_val = lambda r: f"5'd{r}" if is_chained else "5'd0"
+    b_loc_val = lambda c: f"5'd{c}" if is_chained else "5'd0"
 
-    # ── Alignment: align each column c to the last column ────────────────────
-    # Slice (r, c) readout starts at readout_start(r,c).
-    # Slice (r, GRID_COLS-1) readout starts at readout_start(r, GRID_COLS-1).
-    # To align column c to GRID_COLS-1, we delay by:
-    #   align_delay(c) = (GRID_COLS-1 - c) * 8
-    def align_delay(c):
-        return (grid_cols - 1 - c) * 8
+    # ── Latency math ─────────────────────────────────────────────────────────
+    TOTAL_CYCLES = _total_cycles(m, k, n, feed_mode=feed_mode)
+
+    # ── Alignment ────────────────────────────────────────────────────────────
+    if is_chained:
+        # Per-column + per-tile-row delay for output sequencing.
+        def align_delay(c):
+            return (grid_cols - 1 - c) * 8
+    else:
+        def align_delay(c):
+            return 0  # no per-column delay (direct feed)
 
     # ── Build mask literals ───────────────────────────────────────────────────
     k_mask_val    = tail_mask_hex(k, 0)
     row_mask_vals = [tail_mask_hex(m, r) for r in range(grid_rows)]
     col_mask_vals = [tail_mask_hex(n, c) for c in range(grid_cols)]
+
+    # ── Per-tile data wires ──────────────────────────────────────────────────
+    # In chained mode, each tile captures during its local window:
+    # local_feed = feed_idx - (r+c)*8 gives 0..7 for that tile.
+    data_wires = []
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            a_base = r * 8
+            b_base = c * 8
+            a_hi   = (r + 1) * 64 - 1
+            a_lo   = r * 64
+            b_hi   = (c + 1) * 64 - 1
+            b_lo   = c * 64
+            if is_chained:
+                loc_offset = (r + c) * 8
+                data_wires.append(f"    wire signed [15:0] lf_{r}_{c} = $signed(feed_idx) - {loc_offset};")
+                data_wires.append(f"    wire lv_{r}_{c} = in_valid_d && (lf_{r}_{c} >= 0) && (lf_{r}_{c} < 8);")
+                data_wires.append(f"    wire [63:0] a_data_{r}_{c} = ({c} == 0 && lv_{r}_{c}) ? a_buf[{a_base} + lf_{r}_{c}][{a_hi}:{a_lo}] : 64'b0;")
+                data_wires.append(f"    wire [63:0] b_data_{r}_{c} = ({r} == 0 && lv_{r}_{c}) ? b_buf[{b_base} + lf_{r}_{c}][{b_hi}:{b_lo}] : 64'b0;")
+            else:
+                data_wires.append(f"    wire [63:0] a_data_{r}_{c} = in_valid_d ? a_buf[{a_base} + feed_idx][{a_hi}:{a_lo}] : 64'b0;")
+                data_wires.append(f"    wire [63:0] b_data_{r}_{c} = in_valid_d ? b_buf[{b_base} + feed_idx][{b_hi}:{b_lo}] : 64'b0;")
 
     # ── Slice instantiations ──────────────────────────────────────────────────
     inst_lines = []
@@ -61,8 +93,8 @@ def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper"):
             .clk(clk), .reset(slice_reset), .pe_reset(slice_reset),
             .start_mat_mul(slice_start),
             .done_mat_mul(done_mat_mul[{r*grid_cols+c}]),
-            .a_data(in_valid_d ? a_rows_d[{r}*64 +: 64] : 64'b0),
-            .b_data(preload_valid ? bias_cols[{c}*64 +: 64] : (in_valid_d ? b_cols_d[{c}*64 +: 64] : 64'b0)),
+            .a_data(a_data_{r}_{c}),
+            .b_data(preload_valid ? bias_cols[{c}*64 +: 64] : b_data_{r}_{c}),
             .a_data_in(a_chain_{r}_{c}),
             .b_data_in(b_chain_{r}_{c}),
             .a_data_out(a_chain_{r}_{c+1}),
@@ -75,8 +107,9 @@ def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper"):
             .slice_dtype(2'd0), .slice_mode(1'b0), .op(3'd0),
             .preload(preload_valid), .no_rounding(1'b0),
             .final_mat_mul_size(8'd{k}),
-            .a_loc(5'd{r}),
-            .b_loc(5'd{c})
+            .a_loc({a_loc_val(r)}),  // {feed_mode} feed
+            .b_loc({b_loc_val(c)}),
+            .rowcol_chain_mode({chain_mode_bit})
         );""")
     insts = "\n".join(inst_lines)
 
@@ -109,7 +142,7 @@ def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper"):
 
     for r in range(grid_rows):
         for c in range(grid_cols):
-            d     = align_delay(c)
+            d     = align_delay(c) + r * 8  # per-column + tile-row staggering
             acd   = f"acd_{r}_{c}"    # aligned c_data
             aca   = f"aca_{r}_{c}"    # aligned c_avail
             if d == 0:
@@ -183,15 +216,23 @@ module {module_name}(
     output reg                    out_last
 );
 
-    // ---- Control ----
+    // ---- Control (buffered row/col) ----
+    localparam integer INPUT_BEATS     = {max(m,n)};
+    localparam integer FEED_BEATS      = {feed_len};
     localparam integer TOTAL_CYCLES    = {TOTAL_CYCLES};
     localparam integer TOTAL_OUT_ROWS  = {total_output_rows};
 
+    // FSM: IDLE -> COLLECT (buffer max(M,N) beats) -> FEED (replay 8 beats) -> DRAIN
+    localparam [1:0] FSM_IDLE=2'd0, FSM_COLLECT=2'd1, FSM_FEED=2'd2, FSM_DRAIN=2'd3;
+
+    reg [1:0] fsm_state;
     reg [15:0] cycle;
+    reg [15:0] beat_cnt;
+    reg [15:0] feed_idx;
+    reg [{a_width-1}:0] a_buf [0:INPUT_BEATS-1];
+    reg [{b_width-1}:0] b_buf [0:INPUT_BEATS-1];
     reg transaction_active;
-    reg [{a_width-1}:0] a_rows_d;
-    reg [{b_width-1}:0] b_cols_d;
-    reg in_valid_d;
+    wire in_valid_d = (fsm_state == FSM_FEED);  // combinational: no NBA delay on launch
     reg [{c_width-1}:0] row_mux;
     reg [{c_width-1}:0] out_fifo [0:TOTAL_OUT_ROWS-1];
     reg [15:0] out_wr_ptr;
@@ -199,50 +240,73 @@ module {module_name}(
     reg [15:0] out_count;
     reg [15:0] out_row_count;
 
-    wire transaction_start = en & in_valid & !preload_valid & (cycle == 0 || cycle >= TOTAL_CYCLES);
     wire slice_reset = rst;
     wire slice_start;
     wire output_take = en & (out_count != 0);
-    wire feed_beat = transaction_start | (en & in_valid & transaction_active & (cycle < {k}));
 
-    // Buffer one input beat so the slice start pulse is visible before the
-    // tensor_slice samples beat zero. A new in_valid after TOTAL_CYCLES starts
-    // a fresh transaction without relying on top-level reset.
     always @(posedge clk) begin
         if (rst) begin
+            fsm_state <= FSM_IDLE;
             cycle <= 16'd0;
+            beat_cnt <= 16'd0;
+            feed_idx <= 16'd0;
             transaction_active <= 1'b0;
-            a_rows_d <= {a_width}'d0;
-            b_cols_d <= {b_width}'d0;
-            in_valid_d <= 1'b0;
-        end else if (transaction_start) begin
-            a_rows_d <= a_rows;
-            b_cols_d <= b_cols;
-            in_valid_d <= 1'b1;
-            cycle <= 16'd1;
-            transaction_active <= 1'b1;
-            end else if (cycle != 0 && cycle < TOTAL_CYCLES) begin
-            if (feed_beat) begin
-                a_rows_d <= a_rows;
-                b_cols_d <= b_cols;
-                in_valid_d <= 1'b1;
-            end else begin
-                in_valid_d <= 1'b0;
-            end
-            cycle <= cycle + 1;
-            if (cycle + 1 >= TOTAL_CYCLES) begin
-                transaction_active <= 1'b0;
-            end
+        end else if (en) begin
+            case (fsm_state)
+                FSM_IDLE: begin
+                    cycle <= 16'd0;
+                    if (preload_valid) begin
+                        // bias loaded directly via b_data mux; move to COLLECT
+                        fsm_state <= FSM_COLLECT;
+                        beat_cnt <= 16'd0;
+                    end
+                end
+
+                FSM_COLLECT: begin
+                    cycle <= cycle + 1;
+                    if (in_valid) begin
+                        a_buf[beat_cnt] <= a_rows;
+                        b_buf[beat_cnt] <= b_cols;
+                        beat_cnt <= beat_cnt + 1;
+                    end
+                    // Transition when enough beats collected (NBA, so +1 cycle)
+                    if (beat_cnt >= INPUT_BEATS) begin
+                        fsm_state <= FSM_FEED;
+                        feed_idx <= 16'd0;
+                        transaction_active <= 1'b1;
+                    end
+                end
+
+                FSM_FEED: begin
+                    cycle <= cycle + 1;
+                    feed_idx <= feed_idx + 1;
+                    if (feed_idx + 1 >= FEED_BEATS) begin
+                        fsm_state <= FSM_DRAIN;
+                    end
+                end
+
+                FSM_DRAIN: begin
+                    cycle <= cycle + 1;
+                    if (cycle + 1 >= TOTAL_CYCLES) begin
+                        transaction_active <= 1'b0;
+                        fsm_state <= FSM_IDLE;
+                    end
+                end
+            endcase
         end
     end
 
-    // Launch one cycle after the first input beat is captured.
-    assign slice_start = (cycle == 16'd1);
+    // Launch tensor_slice on the first FEED cycle (feed_idx=0).
+    assign slice_start = (fsm_state == FSM_FEED) && (feed_idx == 16'd0);
+
 
     // ---- Wire declarations ----
     wire [{grid_rows*grid_cols-1}:0] done_mat_mul;
 
 {chr(10).join(chain_wires)}
+
+    // ---- Per-tile data wires (row/col buffer indexing) ----
+{chr(10).join(data_wires)}
 
     // ---- Systolic chain boundaries ----
 {chr(10).join(boundary)}

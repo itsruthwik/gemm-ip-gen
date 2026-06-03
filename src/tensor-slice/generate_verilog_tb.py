@@ -8,7 +8,7 @@ Supports two protocols via ``--protocol catapult|vitis``:
   ``a_rows/b_cols/bias_cols``, ``preload_valid/in_valid``, and checks
   ``c_row/out_valid/out_last``.
 
-- **vitis**: Drives ``{wrapper}`` with ``ap_clk/ap_rst/ap_start/…``,
+- **vitis**: Drives ``{wrapper}`` with ``ap_clk/ap_rst/ap_ce``,
   AXI-stream FIFO handshake (``a_tdata/a_tvalid/a_tready``,
   ``bias_tdata/…``, ``b_tdata/…``), and reads ``c_tdata/c_tvalid``.
 
@@ -24,31 +24,39 @@ from pathlib import Path
 # ── Low-level helpers (shared) ─────────────────────────────────────────────────
 
 
-def pack_a_cycle(A, k_step, grid_rows, m):
-    """Pack one K-cycle slice of A into a single integer."""
+def pack_a_row(A, t, grid_rows, m):
+    """Pack one row t of A into grid_rows*64 bits (row/col contract).
+
+    Row t goes to tile-row (t // 8), filling the 8 K-bytes of that row.
+    Other tile-row lanes get 0.
+    """
     val = 0
-    for r in range(grid_rows):
-        for row in range(8):
-            actual_row = r * 8 + row
-            if actual_row < m:
-                byte = int(A[actual_row, k_step]) & 0xFF
-            else:
-                byte = 0
-            val |= byte << ((r * 8 + row) * 8)
+    K = A.shape[1]  # inner dimension (K)
+    tile_r = t // 8
+    if t < m:
+        row_word = 0
+        for k in range(K):
+            byte = int(A[t, k]) & 0xFF
+            row_word |= byte << (k * 8)
+        val = row_word << (tile_r * 64)
     return val
 
 
-def pack_b_cycle(B, k_step, grid_cols, n):
-    """Pack one K-cycle slice of B into a single integer."""
+def pack_b_col(B, col_idx, grid_cols, n):
+    """Pack one column of B into grid_cols*64 bits (row/col contract).
+
+    Column col_idx goes to tile-col (col_idx // 8), filling the 8 K-rows.
+    Other tile-col lanes get 0.
+    """
     val = 0
-    for c in range(grid_cols):
-        for col in range(8):
-            actual_col = c * 8 + col
-            if actual_col < n:
-                byte = int(B[k_step, actual_col]) & 0xFF
-            else:
-                byte = 0
-            val |= byte << ((c * 8 + col) * 8)
+    K = B.shape[0]  # inner dimension (K)
+    tile_c = col_idx // 8
+    if col_idx < n:
+        col_word = 0
+        for k in range(K):
+            byte = int(B[k, col_idx]) & 0xFF
+            col_word |= byte << (k * 8)
+        val = col_word << (tile_c * 64)
     return val
 
 
@@ -114,11 +122,12 @@ def _random_matrices(m, k, n, seed):
 def _gen_all_stimulus(m, k, n, num_vectors, base_seed):
     """Generate stimulus and golden data for *num_vectors* random tests.
 
+    Row/col contract: one A row + one B column per beat, max(M,N) beats total.
     Returns golden in Catapult format: grid_rows*8 rows (zero-padded beyond m).
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
-    total_rows = grid_rows * 8
+    input_beats = max(m, n)  # row/col: one row + one col per cycle
 
     all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
 
@@ -126,8 +135,8 @@ def _gen_all_stimulus(m, k, n, num_vectors, base_seed):
         seed = base_seed + v
         A, B, biases, C_sat = _random_matrices(m, k, n, seed)
 
-        a_stim = [pack_a_cycle(A, kk, grid_rows, m) for kk in range(k)]
-        b_stim = [pack_b_cycle(B, kk, grid_cols, n) for kk in range(k)]
+        a_stim = [pack_a_row(A, t, grid_rows, m) for t in range(input_beats)]
+        b_stim = [pack_b_col(B, t, grid_cols, n) for t in range(input_beats)]
         all_a_stim.append(a_stim)
         all_b_stim.append(b_stim)
         all_bias.append(pack_bias(biases, grid_cols, n))
@@ -145,7 +154,7 @@ def _gen_all_stimulus_vitis(m, k, n, num_vectors, base_seed):
     """Same as _gen_all_stimulus but golden uses Vitis packing (gc*64 bits/row, grid_rows*8 rows)."""
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
-    total_rows = grid_rows * 8
+    input_beats = max(m, n)  # row/col: one row + one col per cycle
 
     all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
 
@@ -153,8 +162,8 @@ def _gen_all_stimulus_vitis(m, k, n, num_vectors, base_seed):
         seed = base_seed + v
         A, B, biases, C_sat = _random_matrices(m, k, n, seed)
 
-        a_stim = [pack_a_cycle(A, kk, grid_rows, m) for kk in range(k)]
-        b_stim = [pack_b_cycle(B, kk, grid_cols, n) for kk in range(k)]
+        a_stim = [pack_a_row(A, t, grid_rows, m) for t in range(input_beats)]
+        b_stim = [pack_b_col(B, t, grid_cols, n) for t in range(input_beats)]
         all_a_stim.append(a_stim)
         all_b_stim.append(b_stim)
         all_bias.append(pack_bias(biases, grid_cols, n))
@@ -179,6 +188,7 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
+    input_beats = max(m, n)  # row/col: one A row + one B col per cycle
     a_bytes = grid_rows * 8
     b_bytes = grid_cols * 8
     c_bytes = grid_cols * 16
@@ -192,9 +202,9 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
     # Build memory initialization blocks
     a_init, b_init, bias_init, golden_init = [], [], [], []
     for v in range(num_vectors):
-        for kk in range(k):
-            a_init.append(f"        a_stim[{v}][{kk}] = {hex_literal(all_a_stim[v][kk], a_bytes)};")
-            b_init.append(f"        b_stim[{v}][{kk}] = {hex_literal(all_b_stim[v][kk], b_bytes)};")
+        for t in range(input_beats):
+            a_init.append(f"        a_stim[{v}][{t}] = {hex_literal(all_a_stim[v][t], a_bytes)};")
+            b_init.append(f"        b_stim[{v}][{t}] = {hex_literal(all_b_stim[v][t], b_bytes)};")
         bias_init.append(f"        bias_stim[{v}] = {hex_literal(all_bias[v], b_bytes)};")
         for row in range(total_out_rows):
             golden_init.append(f"        golden[{v}][{row}] = {hex_literal(all_golden[v][row], c_bytes)};")
@@ -204,13 +214,14 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
 
     return f"""\
 `timescale 1ns/1ps
-// Auto-generated Catapult-core multi-vector testbench
+// Auto-generated Catapult-core multi-vector testbench  (row/col streaming)
 // M={m}, K={k}, N={n}  |  base_seed={base_seed}  |  {num_vectors} vectors
 // All vectors: brief rst pulse between runs (pe_reset required)
 
 module tb_catapult_{m}x{k}x{n};
 
     localparam NV = {num_vectors};
+    localparam INPUT_BEATS = {input_beats};
     localparam TOTAL_ROWS = {total_out_rows};
 
     reg  clk = 0;
@@ -235,8 +246,8 @@ module tb_catapult_{m}x{k}x{n};
     always #5 clk = ~clk;
 
     // Stimulus & golden memories
-    reg [{aw - 1}:0] a_stim    [0:NV-1][0:{k - 1}];
-    reg [{bw - 1}:0] b_stim    [0:NV-1][0:{k - 1}];
+    reg [{aw - 1}:0] a_stim    [0:NV-1][0:INPUT_BEATS - 1];
+    reg [{bw - 1}:0] b_stim    [0:NV-1][0:INPUT_BEATS - 1];
     reg [{bw - 1}:0] bias_stim [0:NV-1];
     reg [{cw - 1}:0] golden    [0:NV-1][0:TOTAL_ROWS - 1];
 
@@ -248,7 +259,7 @@ module tb_catapult_{m}x{k}x{n};
     end
 
     integer vec_idx, out_row_idx;
-    integer kk;
+    integer t;
     integer pass_count, fail_count;
     integer cycle_ctr, out_last_count;
 
@@ -274,14 +285,14 @@ module tb_catapult_{m}x{k}x{n};
             @(posedge clk);
             preload_valid <= 0;
 
-            // Feed K steps — set in_valid + first beat together (matches original timing)
+            // Feed INPUT_BEATS row/col pairs — set in_valid + first beat together
             in_valid <= 1;
             a_rows <= a_stim[vec_idx][0];
             b_cols <= b_stim[vec_idx][0];
             @(posedge clk);
-            for (kk = 1; kk < {k}; kk = kk + 1) begin
-                a_rows <= a_stim[vec_idx][kk];
-                b_cols <= b_stim[vec_idx][kk];
+            for (t = 1; t < INPUT_BEATS; t = t + 1) begin
+                a_rows <= a_stim[vec_idx][t];
+                b_cols <= b_stim[vec_idx][t];
                 @(posedge clk);
             end
             in_valid <= 0;
@@ -346,6 +357,7 @@ def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_b
     """Generate a multi-vector Vitis testbench (simple valid/ready/last protocol)."""
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
+    input_beats = max(m, n)  # row/col: one A row + one B col per cycle
     a_bytes = grid_rows * 8
     b_bytes = grid_cols * 8
     c_bytes = grid_cols * 8
@@ -358,9 +370,9 @@ def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_b
 
     a_init, b_init, bias_init, golden_init = [], [], [], []
     for v in range(num_vectors):
-        for kk in range(k):
-            a_init.append(f"        a_stim[{v}][{kk}] = {hex_literal(all_a_stim[v][kk], a_bytes)};")
-            b_init.append(f"        b_stim[{v}][{kk}] = {hex_literal(all_b_stim[v][kk], b_bytes)};")
+        for t in range(input_beats):
+            a_init.append(f"        a_stim[{v}][{t}] = {hex_literal(all_a_stim[v][t], a_bytes)};")
+            b_init.append(f"        b_stim[{v}][{t}] = {hex_literal(all_b_stim[v][t], b_bytes)};")
         bias_init.append(f"        bias_stim[{v}] = {hex_literal(all_bias[v], b_bytes)};")
         for row in range(total_out_rows):
             golden_init.append(f"        golden[{v}][{row}] = {hex_literal(all_golden[v][row], c_bytes)};")
@@ -370,15 +382,17 @@ def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_b
 
     return f"""\
 `timescale 1ns/1ps
-// Auto-generated Vitis-RTL multi-vector testbench  (simple valid/ready/last)
+// Auto-generated Vitis-RTL multi-vector testbench  (row/col streaming, valid/ready/last)
 // M={m}, K={k}, N={n}  |  base_seed={base_seed}  |  {num_vectors} vectors
 
 module tb_vitis_{m}x{k}x{n};
 
     localparam NV = {num_vectors};
+    localparam INPUT_BEATS = {input_beats};
 
-    reg  clk = 0;
-    reg  rst = 1;
+    reg  ap_clk = 0;
+    reg  ap_rst = 1;
+    reg  ap_ce = 1;
 
     reg  [{aw - 1}:0] a_tdata = 0;
     reg        a_tvalid = 0;
@@ -395,22 +409,20 @@ module tb_vitis_{m}x{k}x{n};
     wire [{cw - 1}:0] c_tdata;
     wire       c_tvalid;
     reg        c_tready = 1;
-    wire       c_tlast;
 
     {module_name} dut (
-        .clk(clk), .rst(rst),
+        .ap_clk(ap_clk), .ap_rst(ap_rst), .ap_ce(ap_ce),
         .a_tdata(a_tdata), .a_tvalid(a_tvalid), .a_tready(a_tready),
         .bias_tdata(bias_tdata), .bias_tvalid(bias_tvalid), .bias_tready(bias_tready),
         .b_tdata(b_tdata), .b_tvalid(b_tvalid), .b_tready(b_tready),
-        .c_tdata(c_tdata), .c_tvalid(c_tvalid), .c_tready(c_tready),
-        .c_tlast(c_tlast)
+        .c_tdata(c_tdata), .c_tvalid(c_tvalid), .c_tready(c_tready)
     );
 
-    always #5 clk = ~clk;
+    always #5 ap_clk = ~ap_clk;
 
     // Stimulus & golden memories
-    reg [{aw - 1}:0] a_stim    [0:NV-1][0:{k - 1}];
-    reg [{bw - 1}:0] b_stim    [0:NV-1][0:{k - 1}];
+    reg [{aw - 1}:0] a_stim    [0:NV-1][0:INPUT_BEATS - 1];
+    reg [{bw - 1}:0] b_stim    [0:NV-1][0:INPUT_BEATS - 1];
     reg [{bw - 1}:0] bias_stim [0:NV-1];
     reg [{cw - 1}:0] golden    [0:NV-1][0:{total_out_rows - 1}];
 
@@ -422,7 +434,7 @@ module tb_vitis_{m}x{k}x{n};
     end
 
     integer vec_idx, out_row_idx;
-    integer kk;
+    integer t;
     integer pass_count, fail_count;
 
     initial begin
@@ -433,35 +445,37 @@ module tb_vitis_{m}x{k}x{n};
             $display("--- Vector %0d (seed %0d) ---", vec_idx, {base_seed} + vec_idx);
             out_row_idx = 0;
 
-            // Reset between vectors
-            rst <= 1;
-            repeat (2) @(posedge clk);
-            rst <= 0;
+            // Even vectors: full reset.  Odd vectors: back-to-back without reset.
+            if (vec_idx == 0 || (vec_idx % 2) == 0) begin
+                ap_rst <= 1;
+                repeat (2) @(posedge ap_clk);
+                ap_rst <= 0;
+            end
 
             // Feed bias (1 beat)
-            @(posedge clk);
+            @(posedge ap_clk);
             bias_tdata  <= bias_stim[vec_idx];
             bias_tvalid <= 1;
-            @(posedge clk);
+            @(posedge ap_clk);
             bias_tvalid <= 0;
 
-            // Feed A+B (K beats)
+            // Feed A+B (INPUT_BEATS row/col pairs)
             a_tdata <= a_stim[vec_idx][0];
             b_tdata <= b_stim[vec_idx][0];
             a_tvalid <= 1;
             b_tvalid <= 1;
-            while (!a_tready || !b_tready) @(posedge clk);
-            for (kk = 1; kk < {k}; kk = kk + 1) begin
-                a_tdata <= a_stim[vec_idx][kk];
-                b_tdata <= b_stim[vec_idx][kk];
-                @(posedge clk);
+            @(posedge ap_clk);
+            for (t = 1; t < INPUT_BEATS; t = t + 1) begin
+                a_tdata <= a_stim[vec_idx][t];
+                b_tdata <= b_stim[vec_idx][t];
+                @(posedge ap_clk);
             end
             a_tvalid <= 0;
             b_tvalid <= 0;
 
             // Drain results (all grid_rows*8 rows, including zero-padded)
             for (int i = 0; i < {total_out_rows}; i++) begin
-                while (!c_tvalid) @(posedge clk);
+                while (!c_tvalid) @(posedge ap_clk);
 {vt_first_out}
 {vt_last_out}
                 if (c_tdata !== golden[vec_idx][out_row_idx]) begin
@@ -471,11 +485,7 @@ module tb_vitis_{m}x{k}x{n};
                     pass_count = pass_count + 1;
                 end
                 out_row_idx = out_row_idx + 1;
-                if (i == {total_out_rows} - 1 && !c_tlast) begin
-                    $display("FAIL vec %0d c_tlast not asserted with last beat", vec_idx);
-                    fail_count = fail_count + 1;
-                end
-                @(posedge clk);
+                @(posedge ap_clk);
             end
         end
 
@@ -520,8 +530,9 @@ def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_
     """Single-vector testbench (backward compat — used for manual timing runs)."""
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
-    a_stim = [pack_a_cycle(A, kk, grid_rows, m) for kk in range(k)]
-    b_stim = [pack_b_cycle(B, kk, grid_cols, n) for kk in range(k)]
+    input_beats = max(m, n)  # row/col: one row + one col per cycle
+    a_stim = [pack_a_row(A, t, grid_rows, m) for t in range(input_beats)]
+    b_stim = [pack_b_col(B, t, grid_cols, n) for t in range(input_beats)]
     bias_packed = pack_bias(biases, grid_cols, n)
     golden = []
     for actual_row in range(m):

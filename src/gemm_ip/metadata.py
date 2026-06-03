@@ -86,8 +86,17 @@ def k_steps(k):
 # ── Latency formulas ───────────────────────────────────────────────────────────
 
 
-def latency_cycles(k_steps_val, grid_rows_val, grid_cols_val):
-    """First output available at this cycle (0-based)."""
+def latency_cycles(k_steps_val, grid_rows_val, grid_cols_val, m=None, n=None):
+    """First output available at this cycle (0-based).
+
+    Buffered row/col: preload(1) + collect(max(M,N)) + transition(1) +
+    feed(8) + tile computation.  Uses same formula as total_cycles() in
+    _generate_rtl_common.py, minus the readout/output margin.
+    """
+    if m is not None and n is not None:
+        # New row/col formula: preload + collect + transition + feed + tile_start
+        return 1 + max(m, n) + 1 + 8 + 7 + 3 + (grid_rows_val - 1 + grid_cols_val - 1) * 8
+    # Backward compat: old K-position formula
     return (grid_cols_val - 1) * 8 + k_steps_val * 8 + 10
 
 

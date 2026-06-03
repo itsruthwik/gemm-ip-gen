@@ -79,7 +79,7 @@ class TestConfigNormalization:
 
 
 PREFIXED_FILES = ["_wrapper.cpp", ".v", "_wrapper.json", "_gemm_ip.h", "_tb.cpp", "_design.cpp"]
-UNPREFIXED_FILES = ["run_vitis.tcl"]
+UNPREFIXED_FILES = ["run_vitis.tcl", "run_vitis.py", "hls_config.cfg", "tensor_slice_int8.v"]
 
 
 class TestFilePresence:
@@ -111,6 +111,32 @@ class TestFilePresence:
         files = os.listdir(pkg_dir)
         assert f"{item['emit_name']}_wrapper.cpp" in files
 
+    def test_run_vitis_uses_blackbox_json(self, tmp_output):
+        item = _gen_item()
+        generate_vitis_pkg(item, tmp_output)
+        script_path = Path(tmp_output) / item["emit_name"] / "run_vitis.tcl"
+        content = script_path.read_text()
+        assert f"add_files -blackbox {item['emit_name']}/{item['emit_name']}_wrapper.json" in content
+        assert f"add_files {item['emit_name']}/{item['emit_name']}.v" not in content
+
+    def test_python_hls_config_uses_blackbox_json(self, tmp_output):
+        item = _gen_item()
+        generate_vitis_pkg(item, tmp_output)
+        cfg_path = Path(tmp_output) / item["emit_name"] / "hls_config.cfg"
+        content = cfg_path.read_text()
+        assert f"syn.top={item['emit_name']}_design" in content
+        assert f"syn.file={item['emit_name']}/{item['emit_name']}_design.cpp" in content
+        assert f"tb.file={item['emit_name']}/{item['emit_name']}_tb.cpp" in content
+        assert f"syn.blackbox.file={item['emit_name']}/{item['emit_name']}_wrapper.json" in content
+
+    def test_python_runner_creates_hls_component(self, tmp_output):
+        item = _gen_item()
+        generate_vitis_pkg(item, tmp_output)
+        script_path = Path(tmp_output) / item["emit_name"] / "run_vitis.py"
+        content = script_path.read_text()
+        assert "client.create_hls_component" in content
+        assert "comp.run(operation)" in content
+
 
 # ─── 3. JSON descriptor validity ──────────────────────────────────────────────
 
@@ -123,7 +149,7 @@ class TestJsonDescriptor:
         with open(json_path) as f:
             desc = json.load(f)
         assert desc["c_function_name"] == f"{item['emit_name']}_wrapper"
-        assert desc["rtl_top_module_name"] == item["emit_name"]
+        assert desc["rtl_top_module_name"] == f"{item['emit_name']}_wrapper"
 
     def test_stream_parameters(self, tmp_output):
         item = _gen_item()
@@ -131,13 +157,13 @@ class TestJsonDescriptor:
         json_path = Path(tmp_output) / item["emit_name"] / f"{item['emit_name']}_wrapper.json"
         with open(json_path) as f:
             desc = json.load(f)
-        params = {p["name"]: p for p in desc["c_parameters"]}
+        params = {p["c_name"]: p for p in desc["c_parameters"]}
         assert "a_stream" in params
         assert "b_stream" in params
         assert "bias_stream" in params
         assert "c_stream" in params
-        assert params["a_stream"]["direction"] == "in"
-        assert params["c_stream"]["direction"] == "out"
+        assert params["a_stream"]["c_port_direction"] == "in"
+        assert params["c_stream"]["c_port_direction"] == "out"
 
     def test_blackbox_metadata(self, tmp_output):
         item = _gen_item(m=14, k=6, n=6)
@@ -145,13 +171,15 @@ class TestJsonDescriptor:
         json_path = Path(tmp_output) / item["emit_name"] / f"{item['emit_name']}_wrapper.json"
         with open(json_path) as f:
             desc = json.load(f)
-        meta = desc["blackbox_metadata"]
-        assert meta["gemm_m"] == 14
-        assert meta["gemm_k"] == 6
-        assert meta["gemm_n"] == 6
-        assert meta["bias_location"] == "inside_blackbox"
-        assert meta["input_type"] == "int8"
-        assert meta["output_type"] == "int8"
+        assert "rtl_common_signal" in desc
+        assert desc["rtl_common_signal"]["module_clock"] == "ap_clk"
+        assert desc["rtl_common_signal"]["module_reset"] == "ap_rst"
+        assert desc["rtl_common_signal"]["module_clock_enable"] == "ap_ce"
+        assert desc["rtl_common_signal"]["ap_ctrl_chain_protocol_idle"] == ""
+        assert desc["rtl_common_signal"]["ap_ctrl_chain_protocol_start"] == ""
+        assert desc["rtl_common_signal"]["ap_ctrl_chain_protocol_ready"] == ""
+        assert desc["rtl_common_signal"]["ap_ctrl_chain_protocol_done"] == ""
+        assert desc["rtl_common_signal"]["ap_ctrl_chain_protocol_continue"] == ""
 
     def test_fifo_map(self, tmp_output):
         item = _gen_item()
@@ -159,13 +187,10 @@ class TestJsonDescriptor:
         json_path = Path(tmp_output) / item["emit_name"] / f"{item['emit_name']}_wrapper.json"
         with open(json_path) as f:
             desc = json.load(f)
-        fifo = desc["fifo_map"]
-        assert "a_stream" in fifo
-        assert "bias_stream" in fifo
-        assert "c_stream" in fifo
-        assert fifo["a_stream"]["data"] == "a_tdata"
-        assert fifo["a_stream"]["valid"] == "a_tvalid"
-        assert fifo["a_stream"]["ready"] == "a_tready"
+        params = {p["c_name"]: p for p in desc["c_parameters"]}
+        assert params["a_stream"]["rtl_ports"]["FIFO_data_read_in"] == "a_tdata"
+        assert params["a_stream"]["rtl_ports"]["FIFO_empty_flag"] == "a_tvalid"
+        assert params["c_stream"]["rtl_ports"]["FIFO_data_write_out"] == "c_tdata"
 
     def test_rtl_files_listed(self, tmp_output):
         item = _gen_item()
@@ -331,7 +356,7 @@ class TestRtlPorts:
         generate_vitis_pkg(item, tmp_output)
         v_path = Path(tmp_output) / item["emit_name"] / f"{item['emit_name']}.v"
         content = v_path.read_text()
-        for signal in ["clk", "rst", "c_tlast"]:
+        for signal in ["ap_clk", "ap_rst", "ap_ce"]:
             assert signal in content, f"Missing {signal}"
 
     def test_has_fifo_ports(self, tmp_output):
@@ -342,8 +367,9 @@ class TestRtlPorts:
         for port in ["a_tdata", "a_tvalid", "a_tready",
                      "bias_tdata", "bias_tvalid", "bias_tready",
                      "b_tdata", "b_tvalid", "b_tready",
-                     "c_tdata", "c_tvalid", "c_tready", "c_tlast"]:
+                     "c_tdata", "c_tvalid", "c_tready"]:
             assert port in content, f"Missing port {port}"
+        assert "c_tlast" not in content
 
     def test_grid_core_instantiated(self, tmp_output):
         """Single .v file contains tensor_slice instances + Vitis ctrl."""
@@ -352,7 +378,6 @@ class TestRtlPorts:
         v_path = Path(tmp_output) / item["emit_name"] / f"{item['emit_name']}.v"
         content = v_path.read_text()
         assert "tensor_slice" in content
-        assert "c_tlast" in content
         assert "a_tdata" in content
 
 
@@ -405,6 +430,11 @@ def _unpack_b_beat(pkt, c, cl):
     return (pkt >> (c * 64 + cl * 8)) & 0xFF
 
 
+def _to_int8(byte_val):
+    """Interpret an unpacked byte as a signed int8 value."""
+    return byte_val - 256 if byte_val & 0x80 else byte_val
+
+
 def _cpp_model_gemm(m, k, n, activations, weights, biases):
     """Simulate the C++ wrapper model arithmetic (fixed protocol).
 
@@ -436,11 +466,11 @@ def _cpp_model_gemm(m, k, n, activations, weights, biases):
             for c in range(gc):
                 for rl in range(8):
                     actual_row = r * 8 + rl
-                    a_val = np.int8(_unpack_a_beat(a_pkt, r, rl)) if actual_row < m else 0
+                    a_val = _to_int8(_unpack_a_beat(a_pkt, r, rl)) if actual_row < m else 0
                     for cl in range(8):
                         actual_col = c * 8 + cl
-                        b_val = np.int8(_unpack_b_beat(b_pkt, c, cl)) if actual_col < n else 0
-                        acc[r, c, rl, cl] += int(a_val) * int(b_val)
+                        b_val = _to_int8(_unpack_b_beat(b_pkt, c, cl)) if actual_col < n else 0
+                        acc[r, c, rl, cl] += a_val * b_val
 
     # Add bias + saturate
     result = np.zeros((m, n), dtype=np.int8)

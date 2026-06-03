@@ -20,13 +20,14 @@ from _generate_rtl_common import tail_mask_hex, vm, total_cycles as _total_cycle
 
 # ── main generator ────────────────────────────────────────────────────────────
 
-def generate_vitis_rtl(m, k, n, module_name="gemm_vitis"):
+def generate_vitis_rtl(m, k, n, module_name="gemm_vitis", feed_mode="direct"):
     """
     Parameters
     ----------
     m : int   Output rows  (A rows)
     k : int   Inner dimension
     n : int   Output cols  (B cols)
+    feed_mode : str   "direct" (current) or "chained" (new location-aware)
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
@@ -35,24 +36,51 @@ def generate_vitis_rtl(m, k, n, module_name="gemm_vitis"):
     b_width = grid_cols * 64
     c_width = grid_cols * 128   # 8 INT16 values per column tile
 
-    # ── Latency math ─────────────────────────────────────────────────────────
-    # Uses shared formula from _generate_rtl_common (Catapult-proven).
-    TOTAL_CYCLES = _total_cycles(m, k, n)
+    # ── Mode selection ───────────────────────────────────────────────────────
+    is_chained = (feed_mode == "chained")
+    chain_mode_bit = "1'b1" if is_chained else "1'b0"
+    max_loc_delay = (grid_rows - 1 + grid_cols - 1) * 8
+    feed_len = max_loc_delay + 8 if is_chained else 8
 
-    # ── Alignment: align each column c to the last column ────────────────────
-    # Slice (r, c) readout starts at readout_start(r,c).
-    # Slice (r, GRID_COLS-1) readout starts at readout_start(r, GRID_COLS-1).
-    # To align column c to GRID_COLS-1, we delay by:
-    #   align_delay(c) = (GRID_COLS-1 - c) * 8
-    def align_delay(c):
-        return (grid_cols - 1 - c) * 8
+    # ── Latency math ─────────────────────────────────────────────────────────
+    TOTAL_CYCLES = _total_cycles(m, k, n, feed_mode=feed_mode)
+
+    # ── Alignment ────────────────────────────────────────────────────────────
+    if is_chained:
+        def align_delay(r, c):
+            return (grid_cols - 1 - c) * 8 + r * grid_cols * 8
+    else:
+        def align_delay(r, c):
+            return r * 8
 
     # ── Build mask literals ───────────────────────────────────────────────────
     k_mask_val    = tail_mask_hex(k, 0)
     row_mask_vals = [tail_mask_hex(m, r) for r in range(grid_rows)]
     col_mask_vals = [tail_mask_hex(n, c) for c in range(grid_cols)]
 
+    # ── Per-tile data wires ──────────────────────────────────────────────────
+    data_wires = []
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            a_base = r * 8
+            b_base = c * 8
+            a_hi   = (r + 1) * 64 - 1
+            a_lo   = r * 64
+            b_hi   = (c + 1) * 64 - 1
+            b_lo   = c * 64
+            if is_chained:
+                loc_offset = (r + c) * 8
+                data_wires.append(f"    wire signed [15:0] lf_{r}_{c} = $signed(feed_idx) - {loc_offset};")
+                data_wires.append(f"    wire lv_{r}_{c} = in_valid_d && (lf_{r}_{c} >= 0) && (lf_{r}_{c} < 8);")
+                data_wires.append(f"    wire [63:0] a_data_{r}_{c} = ({c} == 0 && lv_{r}_{c}) ? a_buf[{a_base} + lf_{r}_{c}][{a_hi}:{a_lo}] : 64'b0;")
+                data_wires.append(f"    wire [63:0] b_data_{r}_{c} = ({r} == 0 && lv_{r}_{c}) ? b_buf[{b_base} + lf_{r}_{c}][{b_hi}:{b_lo}] : 64'b0;")
+            else:
+                data_wires.append(f"    wire [63:0] a_data_{r}_{c} = in_valid_d ? a_buf[{a_base} + feed_idx][{a_hi}:{a_lo}] : 64'b0;")
+                data_wires.append(f"    wire [63:0] b_data_{r}_{c} = in_valid_d ? b_buf[{b_base} + feed_idx][{b_hi}:{b_lo}] : 64'b0;")
+
     # ── Slice instantiations ──────────────────────────────────────────────────
+    a_loc_val = lambda r: f"5'd{r}" if is_chained else "5'd0"
+    b_loc_val = lambda c: f"5'd{c}" if is_chained else "5'd0"
     inst_lines = []
     for r in range(grid_rows):
         for c in range(grid_cols):
@@ -61,8 +89,8 @@ def generate_vitis_rtl(m, k, n, module_name="gemm_vitis"):
             .clk(clk), .reset(slice_reset), .pe_reset(slice_reset),
             .start_mat_mul(slice_start),
             .done_mat_mul(done_mat_mul[{r*grid_cols+c}]),
-            .a_data(in_valid_d ? a_rows_d[{r}*64 +: 64] : 64'b0),
-            .b_data(preload_valid ? bias_cols[{c}*64 +: 64] : (in_valid_d ? b_cols_d[{c}*64 +: 64] : 64'b0)),
+            .a_data(a_data_{r}_{c}),
+            .b_data(preload_valid ? bias_cols[{c}*64 +: 64] : b_data_{r}_{c}),
             .a_data_in(a_chain_{r}_{c}),
             .b_data_in(b_chain_{r}_{c}),
             .a_data_out(a_chain_{r}_{c+1}),
@@ -75,8 +103,9 @@ def generate_vitis_rtl(m, k, n, module_name="gemm_vitis"):
             .slice_dtype(2'd0), .slice_mode(1'b0), .op(3'd0),
             .preload(preload_valid), .no_rounding(1'b0),
             .final_mat_mul_size(8'd{k}),
-            .a_loc(5'd{r}),
-            .b_loc(5'd{c})
+            .a_loc({a_loc_val(r)}),
+            .b_loc({b_loc_val(c)}),
+            .rowcol_chain_mode({chain_mode_bit})
         );""")
     insts = "\n".join(inst_lines)
 
@@ -109,7 +138,7 @@ def generate_vitis_rtl(m, k, n, module_name="gemm_vitis"):
 
     for r in range(grid_rows):
         for c in range(grid_cols):
-            d     = align_delay(c)
+            d     = align_delay(r, c)
             acd   = f"acd_{r}_{c}"    # aligned c_data
             aca   = f"aca_{r}_{c}"    # aligned c_avail
             if d == 0:
@@ -172,8 +201,9 @@ def generate_vitis_rtl(m, k, n, module_name="gemm_vitis"):
 `timescale 1ns/1ps
 
 module {module_name}(
-    input  wire                   clk,
-    input  wire                   rst,
+    input  wire                   ap_clk,
+    input  wire                   ap_rst,
+    input  wire                   ap_ce,
 
     // AXI-Stream inputs
     input  wire [{a_width-1}:0]   a_tdata,
@@ -189,62 +219,69 @@ module {module_name}(
     output wire                   b_tready,
 
     // AXI-Stream output
-    output reg  [{c_stream_width-1}:0] c_tdata,
-    output reg                     c_tvalid,
-    input  wire                    c_tready,
-    output reg                     c_tlast
+    output wire [{c_stream_width-1}:0] c_tdata,
+    output wire                    c_tvalid,
+    input  wire                    c_tready
 );
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  Protocol FSM — drives internal Catapult signals from AXI-Stream
     // ═══════════════════════════════════════════════════════════════════════════
-    localparam FSM_IDLE=3'd0, FSM_BIAS=3'd1, FSM_PRELOAD=3'd2;
-    localparam FSM_FEED=3'd3, FSM_DRAIN=3'd4;
+    // Map Vitis port names to internal Catapult signal names
+    wire clk = ap_clk;
+    wire rst = ap_rst;
+    localparam FSM_IDLE=3'd0, FSM_PRELOAD=3'd1;
+    localparam FSM_COLLECT=3'd2, FSM_FEED=3'd3, FSM_DRAIN=3'd4;
 
     reg [2:0]  fsm_state;
     reg [15:0] fsm_cnt;
+    reg [15:0] feed_idx;
 
-    // Internal Catapult control signals (driven by FSM, not external)
+    // Beat buffers: collect max(M,N) beats during COLLECT, then feed consecutively
+    reg [{a_width-1}:0] a_buf [0:{max(m,n)-1}];
+    reg [{b_width-1}:0] b_buf [0:{max(m,n)-1}];
+
+    // Independent per-channel write pointers.  Each channel captures beats as
+    // they arrive (tolerating FIFO read-latency skew from asymmetric widths).
+    // Beats are paired by index when both channels have collected K entries.
+    reg [15:0] a_wr_ptr;
+    reg [15:0] b_wr_ptr;
+
+    // Internal control signals
     reg        en;
-    wire [{a_width-1}:0] a_rows_int;
-    wire [{b_width-1}:0] b_cols_int;
     reg [{b_width-1}:0] bias_cols_int;
     reg        preload_valid;
     reg        in_valid;
 
-    // Combinatorial: a_rows_int/b_cols_int follow tdata immediately in FEED
-    assign a_rows_int = (fsm_state == FSM_FEED) ? a_tdata : {a_width}'d0;
-    assign b_cols_int = (fsm_state == FSM_FEED) ? b_tdata : {b_width}'d0;
+    // AXI-Stream ready signals.
+    // Vitis may select FIFO implementations with different read latencies for
+    // asymmetric widths (e.g. 128-bit vs 64-bit).  Each channel independently
+    // accepts beats up to K — no cross-channel dependency, no deadlock.
+    assign bias_tready = (fsm_state == FSM_IDLE);
+    assign a_tready    = ((fsm_state == FSM_PRELOAD || fsm_state == FSM_COLLECT) && (a_wr_ptr < {max(m,n)}));
+    assign b_tready    = ((fsm_state == FSM_PRELOAD || fsm_state == FSM_COLLECT) && (b_wr_ptr < {max(m,n)}));
 
-    // Output signals from Catapult core (internal regs, readable as wires)
-    // Declared below in Catapult core section
-
-    // AXI-Stream ready signals
-    assign bias_tready = (fsm_state == FSM_BIAS);
-    assign a_tready    = (fsm_state == FSM_FEED) && (fsm_cnt < {k});
-    assign b_tready    = (fsm_state == FSM_FEED) && (fsm_cnt < {k});
-
-    // Preload: drive bias into grid for K cycles
-    // Feed:   drive A/B data for K cycles
+    // Preload → Collect → Feed pipeline
     always @(posedge clk) begin
         if (rst) begin
             fsm_state <= FSM_IDLE;
             fsm_cnt   <= 0;
+            feed_idx  <= 0;
+            a_wr_ptr  <= 0;
+            b_wr_ptr  <= 0;
             en        <= 0;
             bias_cols_int <= 0;
             preload_valid <= 0;
             in_valid      <= 0;
-            c_tdata   <= 0;
-            c_tvalid  <= 0;
-            c_tlast   <= 0;
-        end else begin
-            c_tvalid <= 0;  // default: pulse
-            c_tlast  <= 0;
-
+        end else if (ap_ce) begin
             case (fsm_state)
                 FSM_IDLE: begin
                     en <= 0; preload_valid <= 0; in_valid <= 0;
-                    if (bias_tvalid) begin
+                    // Clear wr_ptrs in IDLE so a_tready/b_tready see 0
+                    // in PRELOAD (combinational, reads old reg values).
+                    a_wr_ptr  <= 0;
+                    b_wr_ptr  <= 0;
+                    if (bias_tvalid && bias_tready) begin
                         bias_cols_int <= bias_tdata;
                         fsm_state <= FSM_PRELOAD;
                         fsm_cnt   <= 0;
@@ -254,35 +291,56 @@ module {module_name}(
                 end
 
                 FSM_PRELOAD: begin
-                    // 1 cycle is sufficient — bias loads via primary b_data port
-                    // on every tile simultaneously (no chain propagation needed)
-                    fsm_state <= FSM_FEED;
-                    fsm_cnt   <= 0;
+                    // Bias was preloaded on the IDLE→PRELOAD transition.
+                    // Accept first A/B beat here to avoid 1-cycle handshake gap.
+                    // wr_ptrs already 0 from IDLE; capture bumps them to 1.
+                    fsm_state <= FSM_COLLECT;
                     preload_valid <= 0;
-                    in_valid  <= 1;
+                    in_valid  <= 0;
+                    if (a_tvalid && a_tready) begin
+                        a_buf[0] <= a_tdata;
+                        a_wr_ptr <= 1;
+                    end
+                    if (b_tvalid && b_tready) begin
+                        b_buf[0] <= b_tdata;
+                        b_wr_ptr <= 1;
+                    end
+                end
+
+                FSM_COLLECT: begin
+                    // Each channel captured independently — tolerates FIFO skew.
+                    if (a_tvalid && a_tready) begin
+                        a_buf[a_wr_ptr] <= a_tdata;
+                        a_wr_ptr <= a_wr_ptr + 1;
+                    end
+                    if (b_tvalid && b_tready) begin
+                        b_buf[b_wr_ptr] <= b_tdata;
+                        b_wr_ptr <= b_wr_ptr + 1;
+                    end
+                    // Transition when both channels have collected K beats
+                    if (a_wr_ptr >= {max(m,n)} && b_wr_ptr >= {max(m,n)}) begin
+                        fsm_state <= FSM_FEED;
+                        fsm_cnt   <= 0;
+                        feed_idx  <= 0;
+                        in_valid  <= 1;
+                    end
                 end
 
                 FSM_FEED: begin
-                    // a_rows_int/b_cols_int are combinatorial (follow tdata)
-                    // Just count beats — grid counter captures via wires
-                    if (a_tvalid && b_tvalid) begin
-                        fsm_cnt <= fsm_cnt + 1;
-                        if (fsm_cnt + 1 >= {k}) begin
-                            fsm_state <= FSM_DRAIN;
-                            fsm_cnt   <= 0;
-                            in_valid  <= 0;
-                        end
+                    // Feed buffered beats on consecutive cycles.
+                    // No dependency on tvalid — data is from local buffers.
+                    feed_idx <= feed_idx + 1;
+                    if (feed_idx + 1 >= FEED_BEATS) begin
+                        fsm_state <= FSM_DRAIN;
+                        fsm_cnt   <= 0;
+                        in_valid  <= 0;
                     end
                 end
 
                 FSM_DRAIN: begin
-                    // Drive c_tdata/c_tvalid from Catapult output FIFO
-                    if (out_valid && (c_tready || !c_tvalid)) begin
-                        c_tdata  <= pack_c_row(c_row);
-                        c_tvalid <= 1;
+                    if (output_take) begin
                         fsm_cnt  <= fsm_cnt + 1;
                         if (out_last) begin
-                            c_tlast   <= 1;
                             fsm_state <= FSM_IDLE;
                             en        <= 0;
                         end
@@ -292,9 +350,7 @@ module {module_name}(
         end
     end
 
-    // ── Map internal signals to Catapult core port names ─────────────────────
-    wire [{a_width-1}:0] a_rows    = a_rows_int;
-    wire [{b_width-1}:0] b_cols    = b_cols_int;
+    // ── Map bias to internal name ─────────────────────────────────────────────
     wire [{b_width-1}:0] bias_cols = bias_cols_int;
 
     // ── Output packing: extract int8 bytes from each 128-bit tile ────────────
@@ -312,18 +368,17 @@ module {module_name}(
     endfunction
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Catapult-proven grid core (identical to generate_catapult_rtl.py)
+    //  Direct-feed grid core (row/col, matched to Catapult generator)
     // ═══════════════════════════════════════════════════════════════════════════
 
     // ---- Control ----
+    localparam integer FEED_BEATS      = {feed_len};
     localparam integer TOTAL_CYCLES    = {TOTAL_CYCLES};
     localparam integer TOTAL_OUT_ROWS  = {total_output_rows};
 
     reg [15:0] cycle;
-    reg transaction_active;
-    reg [{a_width-1}:0] a_rows_d;
-    reg [{b_width-1}:0] b_cols_d;
-    reg in_valid_d;
+    wire transaction_active = (fsm_state == FSM_COLLECT) || (fsm_state == FSM_FEED) || (fsm_state == FSM_DRAIN);
+    wire in_valid_d = (fsm_state == FSM_FEED);
     reg [{c_width-1}:0] row_mux;
     reg [{c_width-1}:0] out_fifo [0:TOTAL_OUT_ROWS-1];
     reg [15:0] out_wr_ptr;
@@ -331,50 +386,32 @@ module {module_name}(
     reg [15:0] out_count;
     reg [15:0] out_row_count;
 
-    // Internal output signals (was external in Catapult, now internal)
     reg  [{c_width-1}:0] c_row;
     reg                   out_valid;
     reg                   out_last;
 
-    wire transaction_start = en & in_valid & !preload_valid & (cycle == 0 || cycle >= TOTAL_CYCLES);
     wire slice_reset = rst;
+    wire clear_fifo = (fsm_state == FSM_PRELOAD);
     wire slice_start;
-    wire output_take = en & (out_count != 0);
-    wire feed_beat = transaction_start | (en & in_valid & transaction_active & (cycle < {k}));
+    wire output_take = en & (fsm_state == FSM_DRAIN) & (out_count != 0) & c_tready;
+    assign c_tvalid = output_take;
+    assign c_tdata = output_take ? pack_c_row(c_row) : {c_stream_width}'d0;
 
-    // Buffer one input beat so the slice start pulse is visible before the
-    // tensor_slice samples beat zero. A new in_valid after TOTAL_CYCLES starts
-    // a fresh transaction without relying on top-level reset.
+    // Track cycle counter (free-running during transaction)
     always @(posedge clk) begin
         if (rst) begin
             cycle <= 16'd0;
-            transaction_active <= 1'b0;
-            a_rows_d <= {a_width}'d0;
-            b_cols_d <= {b_width}'d0;
-            in_valid_d <= 1'b0;
-        end else if (transaction_start) begin
-            a_rows_d <= a_rows;
-            b_cols_d <= b_cols;
-            in_valid_d <= 1'b1;
-            cycle <= 16'd1;
-            transaction_active <= 1'b1;
-            end else if (cycle != 0 && cycle < TOTAL_CYCLES) begin
-            if (feed_beat) begin
-                a_rows_d <= a_rows;
-                b_cols_d <= b_cols;
-                in_valid_d <= 1'b1;
+        end else if (ap_ce) begin
+            if (fsm_state != FSM_IDLE) begin
+                cycle <= cycle + 1;
             end else begin
-                in_valid_d <= 1'b0;
-            end
-            cycle <= cycle + 1;
-            if (cycle + 1 >= TOTAL_CYCLES) begin
-                transaction_active <= 1'b0;
+                cycle <= 16'd0;
             end
         end
     end
 
-    // Launch one cycle after the first input beat is captured.
-    assign slice_start = (cycle == 16'd1);
+    // Launch tensor_slice on first FEED cycle (feed_idx=0)
+    assign slice_start = (fsm_state == FSM_FEED) && (feed_idx == 16'd0);
 
     // ---- Wire declarations ----
     wire [{grid_rows*grid_cols-1}:0] done_mat_mul;
@@ -383,6 +420,9 @@ module {module_name}(
 
     // ---- Systolic chain boundaries ----
 {chr(10).join(boundary)}
+
+    // ---- Per-tile data wires (row/col buffer indexing) ----
+{chr(10).join(data_wires)}
 
     // ---- Slice instantiations ----
 {insts}
@@ -405,7 +445,7 @@ module {module_name}(
     // ---- Output FIFO/hold logic ----
     integer fifo_i;
     always @(posedge clk) begin
-        if (slice_reset) begin
+        if (slice_reset || clear_fifo) begin
             out_wr_ptr    <= 16'd0;
             out_rd_ptr    <= 16'd0;
             out_count     <= 16'd0;
@@ -413,7 +453,7 @@ module {module_name}(
             for (fifo_i = 0; fifo_i < TOTAL_OUT_ROWS; fifo_i = fifo_i + 1) begin
                 out_fifo[fifo_i] <= {c_width}'d0;
             end
-        end else begin
+        end else if (ap_ce) begin
             if (any_avail) begin
                 out_fifo[out_wr_ptr] <= row_mux;
                 out_wr_ptr <= out_wr_ptr + 1;

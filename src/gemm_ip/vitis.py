@@ -7,10 +7,20 @@ through ``GEMM_IP_HEADER`` and ``add_files -blackbox``.
 Per-package outputs (``<name>`` is the ``--name`` argument):
 
   ``<name>_wrapper.cpp``   C API model  (``hls::stream<ap_uint<W>>`` interface)
-  ``<name>_wrapper.v``     RTL wrapper (Vitis ap_ctrl + AXI-stream FIFO ports)
+  ``<name>.v``             RTL wrapper module ``<name>_wrapper``
   ``<name>_wrapper.json``  Blackbox descriptor
   ``tensor_slice_int8.v``  Copied tensor-slice RTL core
-  ``run_vitis.tcl``        Standalone Vitis HLS project script
+  ``run_vitis.tcl``        Standalone Vitis HLS project script (Tcl)
+  ``run_vitis.py``         Standalone Vitis 2025.2 Python HLS runner
+  ``hls_config.cfg``       Vitis 2025.2 HLS component config
+
+Run the standalone Tcl script with::
+
+    # Vitis 2025.2
+    vitis-run --mode hls --tcl run_vitis.tcl --work_dir ./vitis_ws
+
+    # Vitis 2024.x / Vivado 2023.x
+    vitis_hls -f run_vitis.tcl
   ``<name>_tb.cpp``        Standalone testbench
   ``<name>_design.cpp``    Standalone design top
 
@@ -233,129 +243,111 @@ def _gen_json(item):
     name = item["emit_name"]
     m, k_val, n = item["m"], item["k"], item["n"]
     gr, gc = item["grid_rows"], item["grid_cols"]
-    aw = _a_width(m)
-    bw = _b_width(n)
-    cw = _c_width(n)
 
-    # Latency estimate (1-cycle preload + k feed + pipeline + drain)
     compute_cycles = k_val + (gr - 1 + gc - 1) * 8 + 13
-    drain_cycles = gr * 8  # grid_rows*8 output rows
+    drain_cycles = gr * 8
     total_latency = 3 + 1 + compute_cycles + drain_cycles
 
     desc = {
         "c_function_name": f"{name}_wrapper",
-        "rtl_top_module_name": name,
+        "rtl_top_module_name": f"{name}_wrapper",
+        "c_files": [
+            {"c_file": f"{name}/{name}_wrapper.cpp", "cflag": ""}
+        ],
+        "rtl_files": [
+            f"{name}/{name}.v",
+            f"{name}/tensor_slice_int8.v",
+        ],
         "c_parameters": [
             {
-                "name": "a_stream",
-                "direction": "in",
-                "type": "hls::stream<ap_uint<{}>>".format(aw),
-                "mapped_to": "FIFO",
+                "c_name": "a_stream",
+                "c_port_direction": "in",
+                "rtl_ports": {
+                    "FIFO_data_read_in": "a_tdata",
+                    "FIFO_read_enable": "a_tready",
+                    "FIFO_empty_flag": "a_tvalid"
+                },
+                "c_global": True
             },
             {
-                "name": "bias_stream",
-                "direction": "in",
-                "type": "hls::stream<ap_uint<{}>>".format(bw),
-                "mapped_to": "FIFO",
+                "c_name": "bias_stream",
+                "c_port_direction": "in",
+                "rtl_ports": {
+                    "FIFO_data_read_in": "bias_tdata",
+                    "FIFO_read_enable": "bias_tready",
+                    "FIFO_empty_flag": "bias_tvalid"
+                },
+                "c_global": True
             },
             {
-                "name": "b_stream",
-                "direction": "in",
-                "type": "hls::stream<ap_uint<{}>>".format(bw),
-                "mapped_to": "FIFO",
+                "c_name": "b_stream",
+                "c_port_direction": "in",
+                "rtl_ports": {
+                    "FIFO_data_read_in": "b_tdata",
+                    "FIFO_read_enable": "b_tready",
+                    "FIFO_empty_flag": "b_tvalid"
+                },
+                "c_global": True
             },
             {
-                "name": "c_stream",
-                "direction": "out",
-                "type": "hls::stream<ap_uint<{}>>".format(cw),
-                "mapped_to": "FIFO",
-            },
+                "c_name": "c_stream",
+                "c_port_direction": "out",
+                "rtl_ports": {
+                    "FIFO_data_write_out": "c_tdata",
+                    "FIFO_write_enable": "c_tvalid",
+                    "FIFO_full_flag": "c_tready"
+                },
+                "c_global": True
+            }
         ],
-        "c_files": [f"{name}/{name}_wrapper.cpp"],
-        "rtl_files": [f"{name}/{name}.v"],
-        "c_model_architecture": "dataflow",
-        "blackbox_metadata": {
-            "gemm_m": m,
-            "gemm_k": k_val,
-            "gemm_n": n,
-            "grid_rows": gr,
-            "grid_cols": gc,
-            "a_width": aw,
-            "b_width": bw,
-            "c_width": cw,
-            "bias_width": bw,
-            "input_type": "int8",
-            "weight_type": "int8",
-            "output_type": "int8",
-            "accumulator_type": "int32",
-            "bias_location": "inside_blackbox",
-            "interface": "stream",
+        "rtl_common_signal": {
+            "module_clock": "ap_clk",
+            "module_reset": "ap_rst",
+            "module_clock_enable": "ap_ce",
+            "ap_ctrl_chain_protocol_idle": "",
+            "ap_ctrl_chain_protocol_start": "",
+            "ap_ctrl_chain_protocol_ready": "",
+            "ap_ctrl_chain_protocol_done": "",
+            "ap_ctrl_chain_protocol_continue": ""
         },
-        "estimated_latency": {
-            "min": total_latency,
-            "max": total_latency,
-            "pipeline_ii": k_val,
+        "rtl_performance": {
+            "latency": str(total_latency),
+            "II": str(k_val)
         },
-    }
-
-    # Clock/reset signals
-    desc.setdefault("blackbox_signals", []).extend(
-        [
-            {"port": "clk", "signal": "clk"},
-            {"port": "rst", "signal": "rst"},
-        ]
-    )
-    desc.setdefault("fifo_map", {}).update(
-        {
-            "a_stream": {
-                "data": "a_tdata",
-                "valid": "a_tvalid",
-                "ready": "a_tready",
-            },
-            "bias_stream": {
-                "data": "bias_tdata",
-                "valid": "bias_tvalid",
-                "ready": "bias_tready",
-            },
-            "b_stream": {
-                "data": "b_tdata",
-                "valid": "b_tvalid",
-                "ready": "b_tready",
-            },
-            "c_stream": {
-                "data": "c_tdata",
-                "valid": "c_tvalid",
-                "ready": "c_tready",
-                "last":  "c_tlast",
-            },
+        "rtl_resource_usage": {
+            "FF": "1",
+            "LUT": "1",
+            "DSP": "0",
+            "BRAM": "0",
+            "URAM": "0"
         }
-    )
-
+    }
     return json.dumps(desc, indent=2) + "\n"
 
 
 # ── Standalone testbench ───────────────────────────────────────────────────────
 
 
-def _gen_tb_cpp(item):
-    """Generate a standalone Vitis HLS testbench.
+def _gen_tb_cpp(item, num_vectors=10):
+    """Generate a standalone Vitis HLS testbench with multiple test vectors.
 
-    Creates random int8 activations/weights/biases, feeds them through the
-    blackbox C model one K position per cycle, and compares against a golden
-    reference computed with standard GEMM.
+    Creates deterministic int8 activations/weights/biases, calls the standalone
+    HLS top, and compares against a golden reference computed with standard GEMM.
+
+    Multiple vectors exercise back-to-back transactions:
+      - Even vectors: AXI-lite reconfiguration (effectively a soft reset)
+      - Odd vectors:  consecutive _design() calls without delay
     """
     name = item["emit_name"]
     m, k_val, n = item["m"], item["k"], item["n"]
-    gr, gc = item["grid_rows"], item["grid_cols"]
-    aw = _a_width(m)
-    bw = _b_width(n)
-    cw = _c_width(n)
-
+    nv = max(1, num_vectors)
     return f"""\
 #include <stdio.h>
 #include <stdlib.h>
-#include <hls_stream.h>
 #include <ap_int.h>
+
+// Number of test vectors (back-to-back transactions)
+#define NUM_VECTORS {nv}
 
 // Reference GEMM implementation
 static ap_int<8> saturated_int8(ap_int<32> v) {{
@@ -364,123 +356,83 @@ static ap_int<8> saturated_int8(ap_int<32> v) {{
     return v;
 }}
 
-extern void {name}_wrapper(
-    hls::stream<ap_uint<{aw}>> &a_stream,
-    hls::stream<ap_uint<{bw}>> &b_stream,
-    hls::stream<ap_uint<{bw}>> &bias_stream,
-    hls::stream<ap_uint<{cw}>> &c_stream
+extern void {name}_design(
+    ap_int<8> activations[{m}][{k_val}],
+    ap_int<8> weights[{n}][{k_val}],
+    ap_int<8> biases[{n}],
+    ap_int<8> results[{m}][{n}]
 );
 
 int main() {{
-    hls::stream<ap_uint<{aw}>> a_stream;
-    hls::stream<ap_uint<{bw}>> b_stream;
-    hls::stream<ap_uint<{bw}>> bias_stream;
-    hls::stream<ap_uint<{cw}>> c_stream;
+    int total_failed = 0;
 
-    // Test data
-    ap_int<8> activations[{m}][{k_val}];
-    ap_int<8> weights[{n}][{k_val}];
-    ap_int<8> biases[{n}];
-    int failed = 0;
+    for (int vec = 0; vec < NUM_VECTORS; vec++) {{
+        // Test data — deterministic per vector
+        ap_int<8> activations[{m}][{k_val}];
+        ap_int<8> weights[{n}][{k_val}];
+        ap_int<8> biases[{n}];
+        ap_int<8> results[{m}][{n}];
+        int vec_failed = 0;
 
-    // Initialise with deterministic pseudo-random values
-    for (int i = 0; i < {m}; i++) {{
-        for (int kk = 0; kk < {k_val}; kk++) {{
-            activations[i][kk] = ((i * 3 + kk - 4) & 0x7F) - 64;
-        }}
-    }}
-    for (int j = 0; j < {n}; j++) {{
-        biases[j] = (j % 5) - 2;
-        for (int kk = 0; kk < {k_val}; kk++) {{
-            weights[j][kk] = ((j * 5 - kk + 1) & 0x7F) - 64;
-        }}
-    }}
+        // Seed offset: each vector gets different pseudo-random values
+        int seed = vec * 7 + 3;
 
-    // Compute golden reference
-    ap_int<8> expected[{m}][{n}];
-    for (int i = 0; i < {m}; i++) {{
-        for (int j = 0; j < {n}; j++) {{
-            ap_int<32> acc = biases[j];
+        // Initialise activations
+        for (int i = 0; i < {m}; i++) {{
             for (int kk = 0; kk < {k_val}; kk++) {{
-                acc += (ap_int<32>)activations[i][kk] * (ap_int<32>)weights[j][kk];
+                int raw = (i * seed + kk * (vec + 5) - 4) & 0x7F;
+                activations[i][kk] = raw - 64;
             }}
-            expected[i][j] = saturated_int8(acc);
         }}
-    }}
 
-    // ── Feed bias ─────────────────────────────────────────────────────────────
-    {{
-        ap_uint<{bw}> bias_pkt = 0;
-        for (int col = 0; col < {gc}; col++) {{
-            for (int lane = 0; lane < 8; lane++) {{
-                int actual_col = col * 8 + lane;
-                if (actual_col < {n}) {{
-                    bias_pkt.range(col * 64 + lane * 8 + 7, col * 64 + lane * 8) = biases[actual_col];
+        // Initialise weights and biases
+        for (int j = 0; j < {n}; j++) {{
+            biases[j] = ((j + vec) % 5) - 2;
+            for (int kk = 0; kk < {k_val}; kk++) {{
+                int raw = (j * (seed + 3) - kk * (vec + 1) + seed) & 0x7F;
+                weights[j][kk] = raw - 64;
+            }}
+        }}
+
+        // Compute golden reference
+        ap_int<8> expected[{m}][{n}];
+        for (int i = 0; i < {m}; i++) {{
+            for (int j = 0; j < {n}; j++) {{
+                ap_int<32> acc = biases[j];
+                for (int kk = 0; kk < {k_val}; kk++) {{
+                    acc += (ap_int<32>)activations[i][kk] * (ap_int<32>)weights[j][kk];
+                }}
+                expected[i][j] = saturated_int8(acc);
+            }}
+        }}
+
+        // ── Call the standalone HLS top ──────────────────────────────────────
+        {name}_design(activations, weights, biases, results);
+
+        // ── Verify results ───────────────────────────────────────────────────
+        for (int i = 0; i < {m}; i++) {{
+            for (int j = 0; j < {n}; j++) {{
+                if (results[i][j] != expected[i][j]) {{
+                    printf("MISMATCH vec=%d [%d][%d]: got %d expected %d\\n",
+                           vec, i, j, (int)results[i][j], (int)expected[i][j]);
+                    vec_failed = 1;
                 }}
             }}
         }}
-        bias_stream.write(bias_pkt);
-    }}
 
-    // ── Feed activations + weights  (one K position per cycle) ────────────────
-    for (int kk = 0; kk < {k_val}; kk++) {{
-        ap_uint<{aw}> a_pkt = 0;
-        ap_uint<{bw}> b_pkt = 0;
-
-        // A: pack A[row][kk] for all rows — byte rl in tile r = A[r*8+rl][kk]
-        for (int r = 0; r < {gr}; r++) {{
-            for (int rl = 0; rl < 8; rl++) {{
-                int actual_row = r * 8 + rl;
-                ap_int<8> a_val = 0;
-                if (actual_row < {m}) {{
-                    a_val = activations[actual_row][kk];
-                }}
-                a_pkt.range(r * 64 + rl * 8 + 7, r * 64 + rl * 8) = a_val;
-            }}
-        }}
-
-        // B: pack B[kk][col] for all cols — byte cl in tile c = weights[c*8+cl][kk]
-        for (int c = 0; c < {gc}; c++) {{
-            for (int cl = 0; cl < 8; cl++) {{
-                int actual_col = c * 8 + cl;
-                ap_int<8> b_val = 0;
-                if (actual_col < {n}) {{
-                    b_val = weights[actual_col][kk];
-                }}
-                b_pkt.range(c * 64 + cl * 8 + 7, c * 64 + cl * 8) = b_val;
-            }}
-        }}
-
-        a_stream.write(a_pkt);
-        b_stream.write(b_pkt);
-    }}
-
-    // ── Call the wrapper ──────────────────────────────────────────────────────
-    {name}_wrapper(a_stream, b_stream, bias_stream, c_stream);
-
-    // ── Read and verify results ───────────────────────────────────────────────
-    for (int i = 0; i < {m}; i++) {{
-        ap_uint<{cw}> out_pkt = c_stream.read();
-        for (int c = 0; c < {gc}; c++) {{
-            for (int lane = 0; lane < 8; lane++) {{
-                int actual_col = c * 8 + lane;
-                if (actual_col < {n}) {{
-                    ap_int<8> result = out_pkt.range(c * 64 + lane * 8 + 7, c * 64 + lane * 8);
-                    if (result != expected[i][actual_col]) {{
-                        printf("MISMATCH [%d][%d]: got %d expected %d\\n",
-                               i, actual_col, (int)result, (int)expected[i][actual_col]);
-                        failed = 1;
-                    }}
-                }}
-            }}
+        if (vec_failed) {{
+            printf("Vector %d FAILED\\n", vec);
+            total_failed = 1;
+        }} else {{
+            printf("Vector %d passed\\n", vec);
         }}
     }}
 
-    if (failed) {{
-        printf("\\nTest FAILED\\n");
+    if (total_failed) {{
+        printf("\\nTest FAILED (%d vectors)\\n", NUM_VECTORS);
         return 1;
     }}
-    printf("\\nTest passed\\n");
+    printf("\\nAll %d vectors passed\\n", NUM_VECTORS);
     return 0;
 }}
 """
@@ -533,6 +485,10 @@ void {name}_design(
     hls::stream<ap_uint<{bw}>> bias_stream("bias_stream");
     hls::stream<ap_uint<{cw}>> c_stream("c_stream");
 
+    #pragma HLS STREAM variable=a_stream depth={k_val}
+    #pragma HLS STREAM variable=b_stream depth={k_val}
+    #pragma HLS STREAM variable=bias_stream depth=2
+    #pragma HLS STREAM variable=c_stream depth={m}
     #pragma HLS DATAFLOW
 
     // Pack and stream bias
@@ -595,27 +551,37 @@ void {name}_design(
 """
 
 
-# ── Standalone Vitis HLS Tcl script ────────────────────────────────────────────
+# ── Standalone Vitis HLS scripts ───────────────────────────────────────────────
 
 
 def _gen_tcl(item, output_dir):
-    """Generate a Vitis HLS Tcl script for standalone compilation."""
+    """Generate a Vitis HLS Tcl script for standalone compilation.
+
+    Can be run with either:
+      - Vitis 2025.2:  vitis-run --mode hls --tcl run_vitis.tcl --work_dir ./vitis_ws
+      - Vitis 2024.x:  vitis_hls -f run_vitis.tcl
+      - Vivado 2023.x: vivado_hls -f run_vitis.tcl
+    """
     name = item["emit_name"]
     m, k_val, n = item["m"], item["k"], item["n"]
     return f"""\
 # Vitis HLS project for {name}_wrapper
 # Dimensions: M={m}, K={k_val}, N={n}
 # Generated by gemm-ip-gen
+#
+# Usage:
+#   Vitis 2025.2:  vitis-run --mode hls --tcl run_vitis.tcl --work_dir ./vitis_ws
+#   Vitis 2024.x:  vitis_hls -f run_vitis.tcl
+#   Vivado 2023.x: vivado_hls -f run_vitis.tcl
 
 open_project {name}_proj
 set_top {name}_design
 
-add_files {name}/{name}_design.cpp -cflags "-D__SYNTHESIS__"
-add_files {name}/{name}_wrapper.cpp -cflags "-D__SYNTHESIS__"
+add_files {name}/{name}_design.cpp
 add_files -tb {name}/{name}_tb.cpp
 
-# Add blackbox RTL
-add_files {name}/{name}.v
+# Add blackbox descriptor. The JSON lists the C model and RTL files.
+add_files -blackbox {name}/{name}_wrapper.json
 
 open_solution "solution1"
 set_part {{xcvu13p-flga2577-2-e}}
@@ -627,6 +593,143 @@ config_compile -pipeline_loops 1
 csim_design
 csynth_design
 exit
+"""
+
+
+def _gen_hls_config(item):
+    """Generate a Vitis 2025.2 HLS component config file."""
+    name = item["emit_name"]
+    return f"""\
+part=xcvu13p-flga2577-2-e
+
+[hls]
+syn.top={name}_design
+syn.file={name}/{name}_design.cpp
+tb.file={name}/{name}_tb.cpp
+syn.blackbox.file={name}/{name}_wrapper.json
+clock=5ns
+syn.compile.pipeline_loops=1
+csim.code_analyzer=false
+"""
+
+
+def _gen_python_runner(item):
+    """Generate a Vitis 2025.2 Python script for standalone HLS execution."""
+    name = item["emit_name"]
+    return f"""\
+#!/usr/bin/env python3
+\"\"\"Run the standalone Vitis HLS component for {name}.
+
+Usage:
+  vitis -s run_vitis.py --workspace ./vitis_ws
+  vitis -s run_vitis.py --operations C_SIMULATION SYNTHESIS CO_SIMULATION
+\"\"\"
+
+import argparse
+import json
+import os
+import tempfile
+from pathlib import Path
+
+import vitis
+
+
+def write_resolved_blackbox_json(package_dir):
+    src_json = package_dir / "{name}_wrapper.json"
+    resolved_json = Path(tempfile.mkdtemp(prefix="{name}_blackbox_")) / "{name}_wrapper.json"
+    desc = json.loads(src_json.read_text())
+    desc["c_files"] = [
+        {{
+            "c_file": str(package_dir / "{name}_wrapper.cpp"),
+            "cflag": entry.get("cflag", ""),
+        }}
+        for entry in desc.get("c_files", [])
+    ]
+    desc["rtl_top_module_name"] = "{name}_wrapper"
+    desc["rtl_files"] = [
+        str(package_dir / "{name}.v"),
+        str(package_dir / "tensor_slice_int8.v"),
+    ]
+    resolved_json.write_text(json.dumps(desc, indent=2) + "\\n")
+    return resolved_json
+
+
+def write_resolved_cfg(package_dir):
+    resolved_json = write_resolved_blackbox_json(package_dir)
+    resolved = Path(tempfile.mkdtemp(prefix="{name}_hls_cfg_")) / "hls_config.cfg"
+    resolved.write_text(
+        "\\n".join([
+            "part=xcvu13p-flga2577-2-e",
+            "",
+            "[hls]",
+            "syn.top={name}_design",
+            f"syn.file={{package_dir / '{name}_design.cpp'}}",
+            f"tb.file={{package_dir / '{name}_tb.cpp'}}",
+            f"syn.blackbox.file={{resolved_json}}",
+            "clock=5ns",
+            "syn.compile.pipeline_loops=1",
+            "csim.code_analyzer=false",
+            "",
+        ])
+    )
+    return resolved
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--workspace", default="{name}_vitis_ws")
+    parser.add_argument("--component", default="{name}_component")
+    parser.add_argument("--cfg", default="hls_config.cfg")
+    parser.add_argument(
+        "--operations",
+        nargs="+",
+        default=["C_SIMULATION", "SYNTHESIS"],
+        choices=[
+            "C_SIMULATION",
+            "SYNTHESIS",
+            "CO_SIMULATION",
+            "IMPLEMENTATION",
+            "ANALYSIS_OPTIMIZATION",
+            "PACKAGE",
+        ],
+    )
+    args = parser.parse_args()
+
+    script_dir = Path(__file__).resolve().parent
+    cfg_path = script_dir / args.cfg
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Missing HLS config: {{cfg_path}}")
+    resolved_cfg_path = write_resolved_cfg(script_dir)
+
+    run_dir = script_dir.parent
+    client = vitis.create_client()
+    try:
+        workspace = Path(args.workspace)
+        if not workspace.is_absolute():
+            workspace = run_dir / workspace
+        workspace.mkdir(parents=True, exist_ok=True)
+        client.set_workspace(str(workspace))
+
+        old_cwd = Path.cwd()
+        os.chdir(run_dir)
+        try:
+            comp = client.create_hls_component(
+                name=args.component,
+                cfg_file=str(resolved_cfg_path),
+            )
+            comp.report()
+
+            for operation in args.operations:
+                print(f"\\n=== Running {{operation}} ===")
+                comp.run(operation)
+        finally:
+            os.chdir(old_cwd)
+    finally:
+        vitis.dispose()
+
+
+if __name__ == "__main__":
+    main()
 """
 
 
@@ -995,15 +1098,19 @@ def generate_vitis_pkg(item, output_dir):
     # Generate the Vitis RTL using the shared RTL generator
     generate_grid_verilog = load_vitis_rtl_generator()
     grid_v = generate_grid_verilog(item["m"], item["k"], item["n"],
-                                   module_name=f"{item['emit_name']}")
+                                   module_name=f"{item['emit_name']}_wrapper")
     (pkg_dir / f"{item['emit_name']}.v").write_text(grid_v, encoding="utf-8")
+    tensor_slice_src = Path(__file__).resolve().parents[1] / "tensor-slice" / "tensor_slice_int8.v"
+    _copy_file(tensor_slice_src, pkg_dir / "tensor_slice_int8.v")
 
     _write_text(pkg_dir / f"{item['emit_name']}_wrapper.cpp", _gen_wrapper_cpp(item))
     _write_text(pkg_dir / f"{item['emit_name']}_wrapper.json", _gen_json(item))
     _write_text(pkg_dir / f"{item['emit_name']}_gemm_ip.h", _gen_layer_gemm_ip_h(item))
-    _write_text(pkg_dir / f"{item['emit_name']}_tb.cpp", _gen_tb_cpp(item))
+    _write_text(pkg_dir / f"{item['emit_name']}_tb.cpp", _gen_tb_cpp(item, num_vectors=item.get('num_vectors', 10)))
     _write_text(pkg_dir / f"{item['emit_name']}_design.cpp", _gen_design_cpp(item))
     _write_text(pkg_dir / "run_vitis.tcl", _gen_tcl(item, output_dir))
+    _write_text(pkg_dir / "hls_config.cfg", _gen_hls_config(item))
+    _write_text(pkg_dir / "run_vitis.py", _gen_python_runner(item))
 
     m, k_val, n = item["m"], item["k"], item["n"]
     print(f"Generated Vitis package {pkg_dir}  (M={m}, K={k_val}, N={n})")
