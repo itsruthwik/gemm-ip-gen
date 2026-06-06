@@ -95,19 +95,18 @@ The Vitis blackbox uses three input streams and one output stream, all
 
 ```
 void <name>_wrapper(
-    hls::stream<ap_uint<A_WIDTH>>& a_stream,      // K_steps beats
-    hls::stream<ap_uint<B_WIDTH>>& b_stream,      // K_steps beats
+    hls::stream<ap_uint<A_WIDTH>>& a_stream,      // k_chunks × max(M,N) row beats
+    hls::stream<ap_uint<B_WIDTH>>& b_stream,      // k_chunks × max(M,N) column beats
     hls::stream<ap_uint<B_WIDTH>>& bias_stream,   // 1 beat
     hls::stream<ap_uint<C_WIDTH>>& c_stream       // M beats
 );
 ```
 
-Protocol sequence inside the wrapper:
+Protocol sequence (row/col streaming):
 1. Read bias from `bias_stream` (1 beat)
-2. Preload bias into tensor-slice grid (K_steps cycles)
-3. Feed activation/weight data (K_steps cycles)
-4. Compute — pipeline latency through grid
-5. Drain M result beats (saturated int16→int8)
+2. For each K-chunk (0..k_chunks-1):
+   - Feed `max(M,N)` A row beats and `max(M,N)` B column beats
+3. Drain M result beats (saturated int32→int8)
 
 ## Width formulas (Vitis)
 
@@ -121,21 +120,46 @@ Protocol sequence inside the wrapper:
 ## Testing
 
 ```bash
-# Run all tests
-pytest test_generate_catapult_pkg.py -v
+# Run all tests (100 tests)
+pytest tests/ -v
 
-# Backend-specific tests (when Vitis tests are added)
-pytest test_generate_vitis_pkg.py -v
+# RTL simulation only (20 Catapult + 20 Vitis + 6 structural)
+pytest tests/test_rtl_sim.py -v
+
+# Catapult package tests (9 tests)
+pytest tests/test_catapult.py -v
+
+# Vitis package tests (45 tests)
+pytest tests/test_vitis.py -v
 ```
 
-Catapult tests cover config normalisation, combined-header dispatch
-(including duplicate-shape array layers dispatched by `gemm_ip_id`),
-single-package generation, and a sparse-`en` Icarus RTL regression.
+RTL simulation tests cover all 10 DEFAULT_CASES configs (K≤8 and K>8):
+sequential 10-vector, back-to-back 2-vector pipelined (shadow FIFO, II=9
+for 8×8×8), and synth structural smoke with `-DSYNTHESIS` iverilog flag.
+All tests use the combined core (`ifndef SYNTHESIS` behavioral model, `else`
+synth wrapper). Catapult package tests validate C++ header emission,
+`CCS_MAIN` SCVerify TB, TCL instantiation names, and bias wiring.
+
+## Catapult SCVerify
+
+For Catapult 2026.1+ with QuestaSIM:
+
+```bash
+python -m gemm_ip --m 8 --k 8 --n 8 --name gemm_8x8x8 --output_dir ./pkg
+cd pkg/gemm_8x8x8
+catapult -shell -f run_catapult.tcl   # synthesis (38 cycles, nangate-45nm)
+cd gemm_8x8x8_proj/gemm_8x8x8_sol.v1
+echo 'QuestaSIM_Path := /path/to/questasim' > scverify/ccs_env.mk
+make -f scverify/Verify_concat_sim_rtl_v_msim.mk sim
+```
+
+The combined core uses `ifndef SYNTHESIS` (behavioral grid for simulation)
+and `else` (structural synth wrapper for synthesis). SCVerify compares the
+C++ golden against the RTL behavioral model automatically.
 
 ## Reference
 
-- `docs/INTEGRATION.md` — hls4ml contract and verification expectations
-- `docs/wrapper_timing_model.md` — dead-cycle formula and latency targets
-- `tensor-slice/` — RTL hardblock and grid generator
-- `vitis_support_plan.md` — Vitis backend implementation plan
-- `vitis_support_notes.md` — Implementation progress and decisions
+- `docs/rtl_contract.md` — RTL port interfaces, data layout, synth protocol
+- `docs/gemm-ip-integration.md` — hls4ml contract, wrapper phases, verification
+- `docs/wrapper_timing_model.md` — latency formulas, blackbox binding
+- `src/tensor-slice/` — RTL generators, testbench generators, slice RTL

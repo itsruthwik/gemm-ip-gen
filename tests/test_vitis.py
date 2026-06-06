@@ -20,7 +20,6 @@ from gemm_ip.metadata import (
     bias_stream_width,
     grid_rows,
     grid_cols,
-    k_steps,
     tail_mask_hex,
 )
 from gemm_ip.vitis import (
@@ -67,7 +66,6 @@ class TestConfigNormalization:
         item = _gen_item(m=14, n=6, k=6)
         assert item["grid_rows"] == 2  # ceil(14/8)
         assert item["grid_cols"] == 1  # ceil(6/8)
-        assert item["k_steps"] == 1    # ceil(6/8)
 
     def test_emit_name_sanitized(self):
         item = _gen_item(name="my.layer/1")
@@ -232,7 +230,6 @@ class TestStreamWidths:
         assert c_stream_width(5) == 64
         assert grid_rows(5) == 1
         assert grid_cols(5) == 1
-        assert k_steps(5) == 1  # ceil(5/8)
 
 
 # ─── 5. Tail dimension masks ───────────────────────────────────────────────────

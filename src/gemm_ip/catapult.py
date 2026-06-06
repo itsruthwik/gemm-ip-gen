@@ -8,6 +8,7 @@ dispatch header for hls4ml integration.
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from gemm_ip.metadata import (
@@ -20,16 +21,28 @@ from gemm_ip.metadata import (
 )
 
 
-def latency_cycles(k, grid_rows, grid_cols):
-    return (grid_cols - 1) * 8 + k + 10
+def latency_cycles(m, k, n, grid_rows, grid_cols):
+    """First-output cycle offset for the C++ simulation model.
+
+    Matches the double-buffer behavioral grid timing:
+      first_out = k_chunks × max(M,N) + max(0, K+N − k_chunks×max(M,N))
+    This is the cycle where out_valid fires in the simulation model,
+    offset from clk_cnt = 0 (first in_valid beat).
+    """
+    k_chunks = _ceil_div(k, LANE_WIDTH)
+    input_beats = max(m, n)
+    wait = max(0, k + n - k_chunks * input_beats)
+    return k_chunks * input_beats + wait
 
 
-def dead_cycles_raw(grid_cols):
-    return (grid_cols - 1) * 8 + 10
+def dead_cycles_raw(m, k, n, grid_cols):
+    """Drain dead cycles before the C++ wrapper starts capturing output."""
+    return latency_cycles(m, k, n, grid_rows=1, grid_cols=grid_cols) + 1
 
 
-def dead_cycles(grid_cols):
-    return dead_cycles_raw(grid_cols) + 1
+def dead_cycles(m, k, n, grid_cols):
+    """Drain dead cycles + 1-cycle padding."""
+    return dead_cycles_raw(m, k, n, grid_cols) + 1
 
 
 def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None):
@@ -37,8 +50,11 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None):
     b_bits = grid_cols * 64
     c_bits = grid_cols * 128
     mr = grid_rows * 8
-    first_out = latency_cycles(k, grid_rows, grid_cols)
-    blind = dead_cycles(grid_cols)
+    k_chunks = _ceil_div(k, LANE_WIDTH)
+    input_beats = max(m, n)
+    total_beats = k_chunks * input_beats
+    first_out = latency_cycles(m, k, n, grid_rows, grid_cols)
+    blind = dead_cycles(m, k, n, grid_cols)
     drain = blind + mr
 
     # Choose the RHS expression for the final output assignment based on the
@@ -105,8 +121,8 @@ class {name}_ccore {{
         out_valid = in_valid;
         out_last = in_valid;
 #else
-        static ac_int<{a_bits}, false> a_buf[{k}];
-        static ac_int<{b_bits}, false> b_buf[{k}];
+        static ac_int<{a_bits}, false> a_buf[{total_beats}];
+        static ac_int<{b_bits}, false> b_buf[{total_beats}];
         static int clk_cnt = 0;
         static bool running = false;
         static ac_int<{b_bits}, false> bias_buf = 0;
@@ -121,7 +137,7 @@ class {name}_ccore {{
                 running = true;
                 bias_buf = bias_cols;
             }}
-            if (clk_cnt < {k}) {{
+            if (clk_cnt < {total_beats}) {{
                 a_buf[clk_cnt] = a_rows;
                 b_buf[clk_cnt] = b_cols;
             }}
@@ -142,8 +158,10 @@ class {name}_ccore {{
                     if (actual_row < {m} && actual_col < {n}) {{
                         acc = bias_el;
                         for (int kk = 0; kk < {k}; kk++) {{
-                            ac_int<8, true> a_el = a_buf[kk].slc<8>(row_tile * 64 + row_local * 8);
-                            ac_int<8, true> b_el = b_buf[kk].slc<8>(ct * 64 + cl * 8);
+                            int k_chunk = kk / 8;
+                            int k_lane = kk % 8;
+                            ac_int<8, true> a_el = a_buf[k_chunk * {input_beats} + actual_row].slc<8>(row_tile * 64 + k_lane * 8);
+                            ac_int<8, true> b_el = b_buf[k_chunk * {input_beats} + actual_col].slc<8>(ct * 64 + k_lane * 8);
                             acc += a_el * b_el;
                         }}
                     }}
@@ -170,27 +188,27 @@ class {name}_ccore {{
 
 template <class src_T>
 ac_int<8, true> {name}_to_gemm_int8(const src_T &value) {{
-    return static_cast<ac_int<8, true> >(value.to_int());
+    return static_cast<ac_int<8, true> >(static_cast<int>(value));
 }}
 
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
 void {name}_gemm_ip_stream(
-    ac_channel<a_beat_T> &a_beat_stream,
-    ac_channel<b_beat_T> &b_beat_stream,
+    ac_channel<a_beat_T> &a_stream,
+    ac_channel<b_beat_T> &b_stream,
     bias_T biases[CONFIG_T::gemm_n],
     ac_channel<res_T> &res_stream
 ) {{
     static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
-    static_assert(CONFIG_T::gemm_k == {k}, "Generated GEMM wrapper requires matching gemm_k.");
     static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
-    static_assert(a_beat_T::size == CONFIG_T::gemm_m,
-                  "a_beat_T must carry one tensor-slice activation beat across GEMM rows.");
+    static_assert(a_beat_T::size == CONFIG_T::gemm_k,
+                  "a_beat_T must carry one A-row K-width beat.");
     static_assert(CONFIG_T::transpose_weights,
                   "Generated GEMM IP wrapper expects transposed weights.");
-    static_assert(b_beat_T::size == CONFIG_T::gemm_n,
-                  "b_beat_T must carry one tensor-slice weight beat across GEMM output columns.");
+    static_assert(b_beat_T::size == CONFIG_T::gemm_k,
+                  "b_beat_T must carry one B-col K-width beat.");
     static_assert(res_T::size == CONFIG_T::gemm_n,
                   "res_T must carry one full GEMM result row.");
+
 
     static {name}_ccore gemm;
     int captured = 0;
@@ -198,8 +216,6 @@ void {name}_gemm_ip_stream(
     ac_int<{a_bits}, false> last_a_rows = 0;
     ac_int<{b_bits}, false> last_b_cols = 0;
     ac_int<{b_bits}, false> bias_packed = 0;
-    ac_int<1, false> preload_valid = 1;
-    ac_int<1, false> preload_in_valid = 0;
     ac_int<{a_bits}, false> preload_a_rows = 0;
     ac_int<{b_bits}, false> preload_b_cols = 0;
 
@@ -211,48 +227,65 @@ void {name}_gemm_ip_stream(
                             {name}_to_gemm_int8(biases[col]));
     }}
 
+    // Read M A rows (each row = K-wide beat) and N B cols (each col = K-wide beat)
+    a_beat_T a_rows_arr[{m}];
+    b_beat_T b_cols_arr[{n}];
     #pragma hls_pipeline_init_interval 1
-    PRELOAD_BIAS: for (int kk = 0; kk < {k}; kk++) {{
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        gemm.run(preload_a_rows, preload_b_cols, bias_packed, preload_valid, preload_in_valid, c_row, v, l);
+    READ_A_ROWS: for (int row = 0; row < {m}; row++) {{
+        a_rows_arr[row] = a_stream.read();
+    }}
+    #pragma hls_pipeline_init_interval 1
+    READ_B_COLS: for (int col = 0; col < {n}; col++) {{
+        b_cols_arr[col] = b_stream.read();
     }}
 
+    // Feed M A rows and N B columns to the grid core as 8-lane K chunks.
+    // Step 0 preloads bias, steps 1+ feed data beats.
     #pragma hls_pipeline_init_interval 1
-    FEED: for (int kk = 0; kk < {k}; kk++) {{
+    FEED: for (int step = 0; step < {k_chunks * input_beats + 1}; step++) {{
+        int eff_step = (step == 0) ? 0 : step - 1;
+        int kc = eff_step / {input_beats};
+        int t = eff_step % {input_beats};
         ac_int<{a_bits}, false> a_rows = 0;
         ac_int<{b_bits}, false> b_cols = 0;
-        a_beat_T activation_rows = a_beat_stream.read();
-        b_beat_T weight_cols = b_beat_stream.read();
 
-        #pragma hls_unroll
-        ROW_PACK: for (int row = 0; row < {m}; row++) {{
-            int row_tile = row / 8;
-            int row_local = row % 8;
-            a_rows.set_slc(row_tile * 64 + row_local * 8,
-                           {name}_to_gemm_int8(activation_rows[row]));
+        if (step > 0 && t < {m}) {{
+            a_beat_T a_beat = a_rows_arr[t];
+            #pragma hls_unroll
+            ROW_PACK: for (int kl = 0; kl < 8; kl++) {{
+                int kk = kc * 8 + kl;
+                int row_tile = t / 8;
+                if (kk < {k}) {{
+                    a_rows.set_slc(row_tile * 64 + kl * 8,
+                                   {name}_to_gemm_int8(a_beat[kk]));
+                }}
+            }}
         }}
-
-        #pragma hls_unroll
-        COL_PACK: for (int col = 0; col < {n}; col++) {{
-            int col_tile = col / 8;
-            int col_local = col % 8;
-            b_cols.set_slc(col_tile * 64 + col_local * 8,
-                           {name}_to_gemm_int8(weight_cols[col]));
+        if (step > 0 && t < {n}) {{
+            b_beat_T b_beat = b_cols_arr[t];
+            #pragma hls_unroll
+            COL_PACK: for (int kl = 0; kl < 8; kl++) {{
+                int kk = kc * 8 + kl;
+                int col_tile = t / 8;
+                if (kk < {k}) {{
+                    b_cols.set_slc(col_tile * 64 + kl * 8,
+                                   {name}_to_gemm_int8(b_beat[kk]));
+                }}
+            }}
         }}
 
         last_a_rows = a_rows;
         last_b_cols = b_cols;
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
-        ac_int<1, false> feed_valid = 1;
-        ac_int<1, false> feed_preload_valid = 0;
+        ac_int<1, false> feed_valid = (step == 0) ? 0 : 1;
+        ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
         gemm.run(last_a_rows, last_b_cols, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
         feed_dependency |= v;
     }}
 
     #pragma hls_pipeline_init_interval 1
-    DRAIN_WRITE: for (int i = 0; i < {blind + m}; i++) {{
+    DRAIN: for (int i = 0; i < {blind + m}; i++) {{
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> drain_valid = 0;
@@ -289,22 +322,13 @@ void {name}_gemm_ip_stream(
 
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
 void {name}_gemm_ip_array(
-    a_beat_T a_beats[CONFIG_T::gemm_k],
-    b_beat_T b_beats[CONFIG_T::gemm_k],
+    a_beat_T a_rows[CONFIG_T::gemm_m],
+    b_beat_T weight_cols[CONFIG_T::gemm_n],
     bias_T biases[CONFIG_T::gemm_n],
     res_T results[CONFIG_T::gemm_m]
 ) {{
     static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
-    static_assert(CONFIG_T::gemm_k == {k}, "Generated GEMM wrapper requires matching gemm_k.");
     static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
-    static_assert(a_beat_T::size == CONFIG_T::gemm_m,
-                  "a_beat_T must carry one tensor-slice activation beat across GEMM rows.");
-    static_assert(CONFIG_T::transpose_weights,
-                  "Generated GEMM IP wrapper expects transposed weights.");
-    static_assert(b_beat_T::size == CONFIG_T::gemm_n,
-                  "b_beat_T must carry one tensor-slice weight beat across GEMM output columns.");
-    static_assert(res_T::size == CONFIG_T::gemm_n,
-                  "res_T must carry one full GEMM result row.");
 
     static {name}_ccore gemm;
     int captured = 0;
@@ -312,8 +336,6 @@ void {name}_gemm_ip_array(
     ac_int<{a_bits}, false> last_a_rows = 0;
     ac_int<{b_bits}, false> last_b_cols = 0;
     ac_int<{b_bits}, false> bias_packed = 0;
-    ac_int<1, false> preload_valid = 1;
-    ac_int<1, false> preload_in_valid = 0;
     ac_int<{a_bits}, false> preload_a_rows = 0;
     ac_int<{b_bits}, false> preload_b_cols = 0;
 
@@ -325,42 +347,47 @@ void {name}_gemm_ip_array(
                             {name}_to_gemm_int8(biases[col]));
     }}
 
+    // Feed M A rows and N B columns as 8-lane K chunks.
+    // Step 0 preloads bias, steps 1+ feed data beats.
     #pragma hls_pipeline_init_interval 1
-    PRELOAD_BIAS_ARRAY: for (int kk = 0; kk < {k}; kk++) {{
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        gemm.run(preload_a_rows, preload_b_cols, bias_packed, preload_valid, preload_in_valid, c_row, v, l);
-    }}
+    FEED_ARRAY: for (int step = 0; step < {k_chunks * input_beats + 1}; step++) {{
+        int eff_step = (step == 0) ? 0 : step - 1;
+        int kc = eff_step / {input_beats};
+        int t = eff_step % {input_beats};
+        ac_int<{a_bits}, false> a_rows_packed = 0;
+        ac_int<{b_bits}, false> b_cols_packed = 0;
 
-    #pragma hls_pipeline_init_interval 1
-    FEED_ARRAY: for (int kk = 0; kk < {k}; kk++) {{
-        ac_int<{a_bits}, false> a_rows = 0;
-        ac_int<{b_bits}, false> b_cols = 0;
-        a_beat_T activation_rows = a_beats[kk];
-        b_beat_T weight_cols = b_beats[kk];
-
-        #pragma hls_unroll
-        ROW_PACK_ARRAY: for (int row = 0; row < {m}; row++) {{
-            int row_tile = row / 8;
-            int row_local = row % 8;
-            a_rows.set_slc(row_tile * 64 + row_local * 8,
-                           {name}_to_gemm_int8(activation_rows[row]));
+        if (step > 0 && t < {m}) {{
+            a_beat_T a_beat = a_rows[t];
+            #pragma hls_unroll
+            for (int kl = 0; kl < 8; kl++) {{
+                int kk = kc * 8 + kl;
+                int row_tile = t / 8;
+                if (kk < {k}) {{
+                    a_rows_packed.set_slc(row_tile * 64 + kl * 8,
+                                          {name}_to_gemm_int8(a_beat[kk]));
+                }}
+            }}
+        }}
+        if (step > 0 && t < {n}) {{
+            b_beat_T b_beat = weight_cols[t];
+            #pragma hls_unroll
+            for (int kl = 0; kl < 8; kl++) {{
+                int kk = kc * 8 + kl;
+                int col_tile = t / 8;
+                if (kk < {k}) {{
+                    b_cols_packed.set_slc(col_tile * 64 + kl * 8,
+                                          {name}_to_gemm_int8(b_beat[kk]));
+                }}
+            }}
         }}
 
-        #pragma hls_unroll
-        COL_PACK_ARRAY: for (int col = 0; col < {n}; col++) {{
-            int col_tile = col / 8;
-            int col_local = col % 8;
-            b_cols.set_slc(col_tile * 64 + col_local * 8,
-                           {name}_to_gemm_int8(weight_cols[col]));
-        }}
-
-        last_a_rows = a_rows;
-        last_b_cols = b_cols;
+        last_a_rows = a_rows_packed;
+        last_b_cols = b_cols_packed;
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
-        ac_int<1, false> feed_valid = 1;
-        ac_int<1, false> feed_preload_valid = 0;
+        ac_int<1, false> feed_valid = (step == 0) ? 0 : 1;
+        ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
         gemm.run(last_a_rows, last_b_cols, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
         feed_dependency |= v;
     }}
@@ -445,49 +472,66 @@ template <typename T, unsigned N> struct array {
 def gen_tb(name, m, k, n, interface="stream"):
     if interface == "array":
         call_setup = f"""\
-    a_beat_t a_beats[{k}];
-    b_beat_t b_beats[{k}];
+    a_beat_t a_rows[{m}];
+    b_beat_t weight_cols[{n}];
     res_t results[{m}];
 
-    for (int kk = 0; kk < {k}; kk++) {{
-        for (int i = 0; i < {m}; i++) {{
-            a_beats[kk][i] = activations[i][kk];
+    for (int i = 0; i < {m}; i++) {{
+        for (int kk = 0; kk < {k}; kk++) {{
+            a_rows[i][kk] = activations[i][kk];
         }}
-        for (int j = 0; j < {n}; j++) {{
-            b_beats[kk][j] = weights[j][kk];
+    }}
+    for (int j = 0; j < {n}; j++) {{
+        for (int kk = 0; kk < {k}; kk++) {{
+            weight_cols[j][kk] = weights[j][kk];
         }}
     }}
 
+#ifdef CCS_SCVERIFY
+    CCS_DESIGN({name}_inst)(a_rows, weight_cols, biases, results);
+#else
     nnet::{name}_gemm_ip_array<a_beat_t, b_beat_t, int, res_t, {name}_config>(
-        a_beats, b_beats, biases, results);
+        a_rows, weight_cols, biases, results);
+#endif
 """
         read_result = "        res_t out = results[i];"
     else:
         call_setup = f"""\
-    ac_channel<a_beat_t> a_beat_stream;
-    ac_channel<b_beat_t> b_beat_stream;
+    ac_channel<a_beat_t> a_stream;
+    ac_channel<b_beat_t> b_stream;
     ac_channel<res_t> res_stream;
 
-    for (int kk = 0; kk < {k}; kk++) {{
+    for (int i = 0; i < {m}; i++) {{
         a_beat_t a_beat;
+        for (int kk = 0; kk < {k}; kk++) {{
+            a_beat[kk] = activations[i][kk];
+        }}
+        a_stream.write(a_beat);
+    }}
+    for (int j = 0; j < {n}; j++) {{
         b_beat_t b_beat;
-        for (int i = 0; i < {m}; i++) {{
-            a_beat[i] = activations[i][kk];
+        for (int kk = 0; kk < {k}; kk++) {{
+            b_beat[kk] = weights[j][kk];
         }}
-        for (int j = 0; j < {n}; j++) {{
-            b_beat[j] = weights[j][kk];
-        }}
-        a_beat_stream.write(a_beat);
-        b_beat_stream.write(b_beat);
+        b_stream.write(b_beat);
     }}
 
+#ifdef CCS_SCVERIFY
+    CCS_DESIGN({name}_inst)(a_stream, b_stream, biases, res_stream);
+#else
     nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, int, res_t, {name}_config>(
-        a_beat_stream, b_beat_stream, biases, res_stream);
+        a_stream, b_stream, biases, res_stream);
+#endif
 """
         read_result = "        res_t out = res_stream.read();"
 
     return f"""\
+#ifdef CCS_SCVERIFY
+#include "mc_testbench.h"
+#include "mc_scverify.h"
+#else
 #include <stdio.h>
+#endif
 
 #include "nnet_types.h"
 #include "{name}_gemm_ip.h"
@@ -507,7 +551,11 @@ typedef nnet::array<ac_int<8, true>, {m}> a_beat_t;
 typedef nnet::array<ac_int<8, true>, {n}> b_beat_t;
 typedef nnet::array<ac_int<16, true>, {n}> res_t;
 
+#ifdef CCS_SCVERIFY
+CCS_MAIN(int argc, char *argv[]) {{
+#else
 int main() {{
+#endif
     ac_int<8, true> activations[{m}][{k}];
     ac_int<8, true> weights[{n}][{k}];
     int biases[{n}];
@@ -545,38 +593,44 @@ int main() {{
         }}
     }}
 
+#ifdef CCS_SCVERIFY
+    CCS_RETURN(failed);
+#else
     if (failed) {{
         printf("Test FAILED\\n");
         return 1;
     }}
     printf("Test passed\\n");
     return 0;
+#endif
 }}
 """
 
 
 def gen_inst_cpp(name, m, k, n, interface="stream"):
+    from gemm_ip.metadata import grid_rows, grid_cols
     if interface == "array":
         top_signature = f"""\
-    a_beat_t a_beats[{k}],
-    b_beat_t b_beats[{k}],
+    a_beat_t a_rows[{m}],
+    b_beat_t weight_cols[{n}],
     int biases[{n}],
     res_t results[{m}]
 ) {{
     nnet::{name}_gemm_ip_array<a_beat_t, b_beat_t, int, res_t, {name}_config>(
-        a_beats, b_beats, biases, results);
+        a_rows, weight_cols, biases, results);
 }}"""
     else:
         top_signature = f"""\
-    ac_channel<a_beat_t> &a_beat_stream,
-    ac_channel<b_beat_t> &b_beat_stream,
+    ac_channel<a_beat_t> &a_stream,
+    ac_channel<b_beat_t> &b_stream,
     int biases[{n}],
     ac_channel<res_t> &res_stream
 ) {{
     nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, int, res_t, {name}_config>(
-        a_beat_stream, b_beat_stream, biases, res_stream);
+        a_stream, b_stream, biases, res_stream);
 }}"""
-
+    a_w = grid_rows(m) * 8
+    b_w = grid_cols(n) * 8
     return f"""\
 #include "nnet_types.h"
 #include "{name}_gemm_ip.h"
@@ -592,12 +646,12 @@ struct {name}_config {{
     typedef int accum_t;
 }};
 
-typedef nnet::array<ac_int<8, true>, {m}> a_beat_t;
-typedef nnet::array<ac_int<8, true>, {n}> b_beat_t;
+typedef nnet::array<ac_int<8, true>, {k}> a_beat_t;
+typedef nnet::array<ac_int<8, true>, {k}> b_beat_t;
 typedef nnet::array<ac_int<16, true>, {n}> res_t;
 
 #pragma hls_design top
-void {name}_top(
+void {name}_inst(
 {top_signature}
 """
 
@@ -607,17 +661,17 @@ def gen_tcl(name, m, k, n, interface="stream"):
         map_lines = f"""\
 # Array top-level package smoke synthesis. hls4ml integration instantiates the
 # ccore through the generated combined header rather than this standalone top.
-directive set /{name}_top/a_beats:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_top/b_beats:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_top/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_top/results:rsc -MAP_TO_MODULE ccs_ioport.ccs_out_wait"""
+directive set /{name}_inst/a_beats:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_inst/b_beats:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_inst/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_inst/results:rsc -MAP_TO_MODULE ccs_ioport.ccs_out_wait"""
     else:
         map_lines = f"""\
 # Phase 5: Map streams to real streaming resources
-directive set /{name}_top/a_beat_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_top/b_beat_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_top/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_top/res_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_out_wait"""
+directive set /{name}_inst/a_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_inst/b_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_inst/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+directive set /{name}_inst/res_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_out_wait"""
 
     return f"""\
 set project_name "{name}_proj"
@@ -646,7 +700,7 @@ directive set -CHAN_IO_PROTOCOL use_library
 directive set -TIMING_CHECKS true
 
 go new
-solution design set {name}_top -top
+solution design set {name}_inst -top
 go analyze
 go compile
 
@@ -696,9 +750,9 @@ def gen_combined_header(items):
             TARGET_ARGS);
     }}"""
         if target == "array":
-            array_branches.append(branch.replace("TARGET_ARGS", "a_beats, b_beats, biases, results"))
+            array_branches.append(branch.replace("TARGET_ARGS", "a_rows, weight_cols, biases, results"))
         else:
-            stream_branches.append(branch.replace("TARGET_ARGS", "a_beat_stream, b_beat_stream, biases, res_stream"))
+            stream_branches.append(branch.replace("TARGET_ARGS", "a_stream, b_stream, biases, res_stream"))
     stream_branches_text = " else ".join(stream_branches)
     array_branches_text = " else ".join(array_branches)
     if not stream_branches_text:
@@ -730,8 +784,8 @@ namespace nnet {{
 
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
 void gemm_ip_stream(
-    ac_channel<a_beat_T> &a_beat_stream,
-    ac_channel<b_beat_T> &b_beat_stream,
+    ac_channel<a_beat_T> &a_stream,
+    ac_channel<b_beat_T> &b_stream,
     bias_T biases[CONFIG_T::gemm_n],
     ac_channel<res_T> &res_stream
 ) {{
@@ -740,8 +794,8 @@ void gemm_ip_stream(
 
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
 void gemm_ip_array(
-    a_beat_T a_beats[CONFIG_T::gemm_k],
-    b_beat_T b_beats[CONFIG_T::gemm_k],
+    a_beat_T a_rows[CONFIG_T::gemm_m],
+    b_beat_T weight_cols[CONFIG_T::gemm_n],
     bias_T biases[CONFIG_T::gemm_n],
     res_T results[CONFIG_T::gemm_m]
 ) {{
@@ -755,8 +809,8 @@ void gemm_ip_stream_sim(
     bias_T biases[CONFIG_T::n_out],
     ac_channel<res_T> &res_stream
 ) {{
-    typedef nnet::array<typename data_T::value_type, CONFIG_T::gemm_m> a_beat_t;
-    typedef nnet::array<weight_T, CONFIG_T::gemm_n> b_beat_t;
+    typedef nnet::array<typename data_T::value_type, CONFIG_T::gemm_k> a_beat_t;
+    typedef nnet::array<weight_T, CONFIG_T::gemm_k> b_beat_t;
     ac_channel<a_beat_t> a_beat_stream;
     ac_channel<b_beat_t> b_beat_stream;
     data_T activation_rows[CONFIG_T::gemm_m];
@@ -768,16 +822,19 @@ void gemm_ip_stream_sim(
         activation_rows[row] = data_stream.read();
     }}
 
-    for (unsigned int kk = 0; kk < CONFIG_T::gemm_k; kk++) {{
+    for (unsigned int row = 0; row < CONFIG_T::gemm_m; row++) {{
         a_beat_t a_beat;
-        b_beat_t b_beat;
-        for (unsigned int row = 0; row < CONFIG_T::gemm_m; row++) {{
-            a_beat[row] = activation_rows[row][kk];
-        }}
-        for (unsigned int col = 0; col < CONFIG_T::gemm_n; col++) {{
-            b_beat[col] = weights[col * CONFIG_T::gemm_k + kk];
+        for (unsigned int kk = 0; kk < CONFIG_T::gemm_k; kk++) {{
+            a_beat[kk] = activation_rows[row][kk];
         }}
         a_beat_stream.write(a_beat);
+    }}
+
+    for (unsigned int col = 0; col < CONFIG_T::gemm_n; col++) {{
+        b_beat_t b_beat;
+        for (unsigned int kk = 0; kk < CONFIG_T::gemm_k; kk++) {{
+            b_beat[kk] = weights[col * CONFIG_T::gemm_k + kk];
+        }}
         b_beat_stream.write(b_beat);
     }}
 
@@ -832,9 +889,13 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
 
-    generate_grid_verilog = load_catapult_rtl_generator()
-    grid_v = generate_grid_verilog(m, k, n, module_name=f"{name}_core")
-    (pkg_dir / f"{name}_core.v").write_text(grid_v + "\n\n" + TENSOR_SLICE_SRC.read_text())
+    # The combined core (ifndef SYNTHESIS) is in the tensor-slice module
+    ts_dir = str(Path(__file__).resolve().parent.parent / "tensor-slice")
+    if ts_dir not in sys.path:
+        sys.path.insert(0, ts_dir)
+    from generate_catapult_rtl import generate_combined_core_verilog
+    grid_v = generate_combined_core_verilog(m, k, n, module_name=f"{name}_core")
+    (pkg_dir / f"{name}_core.v").write_text(grid_v)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
     (pkg_dir / f"{name}_gemm_ip.h").write_text(
         gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=output_precision)

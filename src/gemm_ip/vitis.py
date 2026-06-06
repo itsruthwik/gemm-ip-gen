@@ -65,7 +65,6 @@ from gemm_ip.metadata import (
     bias_stream_width as _bias_width,
     grid_rows,
     grid_cols,
-    k_steps,
     tail_mask_hex,
     vm,
     verilog_tile_comment,
@@ -97,17 +96,12 @@ def _copy_file(src, dst):
 def _gen_wrapper_cpp(item):
     """Generate the C API model for Vitis HLS blackbox integration.
 
-    The model:
+    The model follows the synthesis wrapper stream contract:
       1. Reads 1 bias beat from bias_stream, caches it
-      2. Loops K times (one per K position): reads A and B beats,
-         computes outer product of A-column-vector × B-row-vector
-      3. Saturates int32 accumulators to int8
+      2. Reads K_CHUNKS * max(M, N) row/column beats.  For each K chunk,
+         beat t carries A row t's 8 K lanes and B column t's 8 K lanes.
+      3. Reconstructs public row/column matrices, computes A @ B + bias
       4. Writes M result beats to c_stream
-
-    Protocol per cycle kk:
-      - A packet: for each row tile r, byte rl = A[r*8+rl][kk]
-      - B packet: for each col tile c, byte cl = B[kk][c*8+cl]
-      - Outer product: acc[r][c][rl][cl] += A_byte[rl] * B_byte[cl]
     """
     name = item["emit_name"]
     m, k_val, n = item["m"], item["k"], item["n"]
@@ -115,6 +109,8 @@ def _gen_wrapper_cpp(item):
     aw = _a_width(m)
     bw = _b_width(n)
     cw = _c_width(n)
+    k_chunks = _ceil_div(k_val, LANE_WIDTH)
+    input_beats = max(m, n)
 
     return f"""\
 #include <hls_stream.h>
@@ -122,7 +118,7 @@ def _gen_wrapper_cpp(item):
 
 // ── Behavioral C model for {name} ─────────────────────────────────────────────
 // Dimensions: M={m}, K={k_val}, N={n}
-// Grid: {gr}×{gc} tiles, {k_val} K cycles (1 per K position)
+// Grid: {gr}x{gc} tiles, {k_chunks} K chunks, {input_beats} row/col beats per chunk
 // Stream widths: A={aw}, B={bw}, C={cw}
 
 static ap_int<8> saturated_int8(ap_int<32> v) {{
@@ -137,9 +133,10 @@ void {name}_wrapper(
     hls::stream<ap_uint<{bw}>> &bias_stream,
     hls::stream<ap_uint<{cw}>> &c_stream
 ) {{
-    // Grid-sized accumulator buffer
-    ap_int<32> acc_buf[{gr}][{gc}][8][8];
-    #pragma HLS ARRAY_PARTITION variable=acc_buf complete dim=0
+    ap_int<8> a_rows[{m}][{k_val}];
+    ap_int<8> b_cols[{n}][{k_val}];
+    #pragma HLS ARRAY_PARTITION variable=a_rows complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=b_cols complete dim=0
 
     // Bias register
     ap_int<8> bias_vals[{n}];
@@ -162,45 +159,33 @@ void {name}_wrapper(
     }}
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Phase 2: Clear accumulators
+    // Phase 2: Read chunk-local row/column beats
     // ═══════════════════════════════════════════════════════════════════════
-    ClearAcc:
-    for (int r = 0; r < {gr}; r++) {{
-        for (int c = 0; c < {gc}; c++) {{
-            for (int rl = 0; rl < 8; rl++) {{
-                for (int cl = 0; cl < 8; cl++) {{
-                    acc_buf[r][c][rl][cl] = 0;
+    ReadChunks:
+    for (int kc = 0; kc < {k_chunks}; kc++) {{
+        for (int t = 0; t < {input_beats}; t++) {{
+            #pragma HLS PIPELINE II=1
+            ap_uint<{aw}> a_pkt = a_stream.read();
+            ap_uint<{bw}> b_pkt = b_stream.read();
+            if (t < {m}) {{
+                int row_tile = t / 8;
+                int row_local = t % 8;
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        a_rows[t][kk] = a_pkt.range(row_tile * 64 + kl * 8 + 7,
+                                                    row_tile * 64 + kl * 8);
+                    }}
                 }}
             }}
-        }}
-    }}
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Phase 3: Feed K beats (one per K position), accumulate outer products
-    // ═══════════════════════════════════════════════════════════════════════
-    FeedK:
-    for (int kk = 0; kk < {k_val}; kk++) {{
-        #pragma HLS PIPELINE II=1
-        ap_uint<{aw}> a_pkt = a_stream.read();
-        ap_uint<{bw}> b_pkt = b_stream.read();
-
-    FeedTile:
-        for (int r = 0; r < {gr}; r++) {{
-            for (int c = 0; c < {gc}; c++) {{
-                // Outer product: each A row-lane × each B col-lane
-                for (int rl = 0; rl < 8; rl++) {{
-                    int actual_row = r * 8 + rl;
-                    ap_int<8> a_val = 0;
-                    if (actual_row < {m}) {{
-                        a_val = a_pkt.range(r * 64 + rl * 8 + 7, r * 64 + rl * 8);
-                    }}
-                    for (int cl = 0; cl < 8; cl++) {{
-                        int actual_col = c * 8 + cl;
-                        ap_int<8> b_val = 0;
-                        if (actual_col < {n}) {{
-                            b_val = b_pkt.range(c * 64 + cl * 8 + 7, c * 64 + cl * 8);
-                        }}
-                        acc_buf[r][c][rl][cl] += a_val * b_val;
+            if (t < {n}) {{
+                int col_tile = t / 8;
+                int col_local = t % 8;
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        b_cols[t][kk] = b_pkt.range(col_tile * 64 + kl * 8 + 7,
+                                                    col_tile * 64 + kl * 8);
                     }}
                 }}
             }}
@@ -208,22 +193,23 @@ void {name}_wrapper(
     }}
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Phase 4: Add bias, saturate, write results
+    // Phase 3: Compute GEMM, add bias, saturate, write results
     // ═══════════════════════════════════════════════════════════════════════
     DrainRows:
     for (int actual_row = 0; actual_row < {m}; actual_row++) {{
         #pragma HLS PIPELINE II=1
-        int r = actual_row / 8;
-        int rl = actual_row % 8;
         ap_uint<{cw}> out_pkt = 0;
 
     PackCol:
         for (int c = 0; c < {gc}; c++) {{
             for (int cl = 0; cl < 8; cl++) {{
                 int actual_col = c * 8 + cl;
-                ap_int<32> acc = acc_buf[r][c][rl][cl];
+                ap_int<32> acc = 0;
                 if (actual_col < {n}) {{
                     acc += bias_vals[actual_col];
+                    for (int kk = 0; kk < {k_val}; kk++) {{
+                        acc += (ap_int<32>)a_rows[actual_row][kk] * (ap_int<32>)b_cols[actual_col][kk];
+                    }}
                 }}
                 ap_int<8> result = saturated_int8(acc);
                 out_pkt.range(c * 64 + cl * 8 + 7, c * 64 + cl * 8) = result;
@@ -244,9 +230,10 @@ def _gen_json(item):
     m, k_val, n = item["m"], item["k"], item["n"]
     gr, gc = item["grid_rows"], item["grid_cols"]
 
-    compute_cycles = k_val + (gr - 1 + gc - 1) * 8 + 13
-    drain_cycles = gr * 8
-    total_latency = 3 + 1 + compute_cycles + drain_cycles
+    k_chunks_val = (k_val + 7) // 8
+    input_beats_val = max(m, n)
+    beh_grid = k_chunks_val * input_beats_val + max(0, k_val + n - k_chunks_val * input_beats_val) + m
+    total_latency = beh_grid + 4  # Vitis wrapper overhead: bias + tvalid/tready handshake + negedge detect
 
     desc = {
         "c_function_name": f"{name}_wrapper",
@@ -312,7 +299,7 @@ def _gen_json(item):
         },
         "rtl_performance": {
             "latency": str(total_latency),
-            "II": str(k_val)
+            "II": str(total_latency)
         },
         "rtl_resource_usage": {
             "FF": "1",
@@ -329,27 +316,25 @@ def _gen_json(item):
 
 
 def _gen_tb_cpp(item, num_vectors=10):
-    """Generate a standalone Vitis HLS testbench with multiple test vectors.
+    """Generate a standalone Vitis HLS testbench driving the hls4ml stream interface.
 
-    Creates deterministic int8 activations/weights/biases, calls the standalone
-    HLS top, and compares against a golden reference computed with standard GEMM.
-
-    Multiple vectors exercise back-to-back transactions:
-      - Even vectors: AXI-lite reconfiguration (effectively a soft reset)
-      - Odd vectors:  consecutive _design() calls without delay
+    Feeds M K-wide A beats + N K-wide B beats via hls::stream, captures
+    M N-wide result beats, and compares against a triple-nested-loop golden.
     """
     name = item["emit_name"]
     m, k_val, n = item["m"], item["k"], item["n"]
     nv = max(1, num_vectors)
+    a_beat_w = k_val * 8
+    b_beat_w = k_val * 8
+    c_row_w  = n * 8
     return f"""\
 #include <stdio.h>
 #include <stdlib.h>
+#include <hls_stream.h>
 #include <ap_int.h>
 
-// Number of test vectors (back-to-back transactions)
 #define NUM_VECTORS {nv}
 
-// Reference GEMM implementation
 static ap_int<8> saturated_int8(ap_int<32> v) {{
     if (v > 127) return 127;
     if (v < -128) return -128;
@@ -357,27 +342,27 @@ static ap_int<8> saturated_int8(ap_int<32> v) {{
 }}
 
 extern void {name}_design(
-    ap_int<8> activations[{m}][{k_val}],
-    ap_int<8> weights[{n}][{k_val}],
-    ap_int<8> biases[{n}],
-    ap_int<8> results[{m}][{n}]
+    hls::stream<ap_uint<{a_beat_w}>> &a_beat_stream,
+    hls::stream<ap_uint<{b_beat_w}>> &b_beat_stream,
+    ap_int<8>                        biases[{n}],
+    hls::stream<ap_uint<{c_row_w}>> &res_stream
 );
 
 int main() {{
     int total_failed = 0;
 
     for (int vec = 0; vec < NUM_VECTORS; vec++) {{
-        // Test data — deterministic per vector
+        hls::stream<ap_uint<{a_beat_w}>> a_beats("a_beats");
+        hls::stream<ap_uint<{b_beat_w}>> b_beats("b_beats");
+        hls::stream<ap_uint<{c_row_w}>> res_beats("res_beats");
+
         ap_int<8> activations[{m}][{k_val}];
         ap_int<8> weights[{n}][{k_val}];
         ap_int<8> biases[{n}];
-        ap_int<8> results[{m}][{n}];
-        int vec_failed = 0;
 
-        // Seed offset: each vector gets different pseudo-random values
         int seed = vec * 7 + 3;
 
-        // Initialise activations
+        // ── Generate deterministic test data ──────────────────────────────
         for (int i = 0; i < {m}; i++) {{
             for (int kk = 0; kk < {k_val}; kk++) {{
                 int raw = (i * seed + kk * (vec + 5) - 4) & 0x7F;
@@ -385,7 +370,6 @@ int main() {{
             }}
         }}
 
-        // Initialise weights and biases
         for (int j = 0; j < {n}; j++) {{
             biases[j] = ((j + vec) % 5) - 2;
             for (int kk = 0; kk < {k_val}; kk++) {{
@@ -394,7 +378,7 @@ int main() {{
             }}
         }}
 
-        // Compute golden reference
+        // ── Golden reference ───────────────────────────────────────────────
         ap_int<8> expected[{m}][{n}];
         for (int i = 0; i < {m}; i++) {{
             for (int j = 0; j < {n}; j++) {{
@@ -406,15 +390,34 @@ int main() {{
             }}
         }}
 
-        // ── Call the standalone HLS top ──────────────────────────────────────
-        {name}_design(activations, weights, biases, results);
-
-        // ── Verify results ───────────────────────────────────────────────────
+        // ── Stream K-wide A rows ───────────────────────────────────────────
         for (int i = 0; i < {m}; i++) {{
+            ap_uint<{a_beat_w}> a_beat = 0;
+            for (int kk = 0; kk < {k_val}; kk++)
+                a_beat.range(kk * 8 + 7, kk * 8) = activations[i][kk];
+            a_beats.write(a_beat);
+        }}
+
+        // ── Stream K-wide B columns ────────────────────────────────────────
+        for (int j = 0; j < {n}; j++) {{
+            ap_uint<{b_beat_w}> b_beat = 0;
+            for (int kk = 0; kk < {k_val}; kk++)
+                b_beat.range(kk * 8 + 7, kk * 8) = weights[j][kk];
+            b_beats.write(b_beat);
+        }}
+
+        // ── Call design ────────────────────────────────────────────────────
+        {name}_design(a_beats, b_beats, biases, res_beats);
+
+        // ── Check N-wide result rows ───────────────────────────────────────
+        int vec_failed = 0;
+        for (int i = 0; i < {m}; i++) {{
+            ap_uint<{c_row_w}> res = res_beats.read();
             for (int j = 0; j < {n}; j++) {{
-                if (results[i][j] != expected[i][j]) {{
+                ap_int<8> got = res.range(j * 8 + 7, j * 8);
+                if (got != expected[i][j]) {{
                     printf("MISMATCH vec=%d [%d][%d]: got %d expected %d\\n",
-                           vec, i, j, (int)results[i][j], (int)expected[i][j]);
+                           vec, i, j, (int)got, (int)expected[i][j]);
                     vec_failed = 1;
                 }}
             }}
@@ -442,10 +445,13 @@ int main() {{
 
 
 def _gen_design_cpp(item):
-    """Generate a standalone Vitis HLS design top that wraps the blackbox.
+    """Generate a standalone Vitis HLS design top with the hls4ml stream interface.
 
-    Packs memory-mapped arrays into streams (one K position per cycle),
-    calls the blackbox wrapper, and unpacks results.
+    For K ≤ 8 (single chunk): streams K-wide beats directly into chunk beats
+    without buffering, minimising latency and resource usage.
+
+    For K > 8 (multi-chunk): buffers K-wide A rows and B columns, then replays
+    them as 8-lane K-chunk beats into the blackbox wrapper.
     """
     name = item["emit_name"]
     m, k_val, n = item["m"], item["k"], item["n"]
@@ -453,99 +459,166 @@ def _gen_design_cpp(item):
     aw = _a_width(m)
     bw = _b_width(n)
     cw = _c_width(n)
+    k_chunks = _ceil_div(k_val, LANE_WIDTH)
+    input_beats = max(m, n)
 
-    bw_str = str(bw)
-    cw_str = str(cw)
+    a_beat_w = k_val * 8
+    b_beat_w = k_val * 8
+    c_row_w  = n * 8
+
+    # Build the chunk-streaming section: direct for single-chunk, buffered for multi-chunk
+    if k_chunks == 1:
+        chunk_section = f"""\
+    // Single-chunk (K={k_val} <= 8): K-wide beats streamed directly into chunk beats
+    for (int t = 0; t < {input_beats}; t++) {{
+        #pragma HLS PIPELINE II=1
+        ap_uint<{aw}> a_pkt = 0;
+        if (t < {m}) {{
+            ap_uint<{a_beat_w}> a_beat = a_beat_stream.read();
+            int row_tile = t / 8;
+            for (int kl = 0; kl < 8; kl++) {{
+                int kk = kl;
+                if (kk < {k_val}) {{
+                    a_pkt.range(row_tile * 64 + kl * 8 + 7, row_tile * 64 + kl * 8) =
+                        a_beat.range(kk * 8 + 7, kk * 8);
+                }}
+            }}
+        }}
+        a_chunk.write(a_pkt);
+
+        ap_uint<{bw}> b_pkt = 0;
+        if (t < {n}) {{
+            ap_uint<{b_beat_w}> b_beat = b_beat_stream.read();
+            int col_tile = t / 8;
+            for (int kl = 0; kl < 8; kl++) {{
+                int kk = kl;
+                if (kk < {k_val}) {{
+                    b_pkt.range(col_tile * 64 + kl * 8 + 7, col_tile * 64 + kl * 8) =
+                        b_beat.range(kk * 8 + 7, kk * 8);
+                }}
+            }}
+        }}
+        b_chunk.write(b_pkt);
+    }}"""
+    else:
+        chunk_section = f"""\
+    // Multi-chunk (K={k_val} > 8, {k_chunks} chunks): buffer then replay
+    ap_int<8> a_buf[{m}][{k_val}];
+    ap_int<8> b_buf[{n}][{k_val}];
+    #pragma HLS ARRAY_PARTITION variable=a_buf complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=b_buf complete dim=0
+
+    for (int i = 0; i < {m}; i++) {{
+        ap_uint<{a_beat_w}> a_beat = a_beat_stream.read();
+        for (int kk = 0; kk < {k_val}; kk++)
+            a_buf[i][kk] = a_beat.range(kk * 8 + 7, kk * 8);
+    }}
+
+    for (int j = 0; j < {n}; j++) {{
+        ap_uint<{b_beat_w}> b_beat = b_beat_stream.read();
+        for (int kk = 0; kk < {k_val}; kk++)
+            b_buf[j][kk] = b_beat.range(kk * 8 + 7, kk * 8);
+    }}
+
+    for (int kc = 0; kc < {k_chunks}; kc++) {{
+        for (int t = 0; t < {input_beats}; t++) {{
+            ap_uint<{aw}> a_pkt = 0;
+            ap_uint<{bw}> b_pkt = 0;
+
+            if (t < {m}) {{
+                int row_tile = t / 8;
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        a_pkt.range(row_tile * 64 + kl * 8 + 7, row_tile * 64 + kl * 8) =
+                            a_buf[t][kk];
+                    }}
+                }}
+            }}
+
+            if (t < {n}) {{
+                int col_tile = t / 8;
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        b_pkt.range(col_tile * 64 + kl * 8 + 7, col_tile * 64 + kl * 8) =
+                            b_buf[t][kk];
+                    }}
+                }}
+            }}
+
+            a_chunk.write(a_pkt);
+            b_chunk.write(b_pkt);
+        }}
+    }}"""
+
     return f"""\
 #include <hls_stream.h>
 #include <ap_int.h>
 
 extern void {name}_wrapper(
     hls::stream<ap_uint<{aw}>> &a_stream,
-    hls::stream<ap_uint<{bw_str}>> &b_stream,
-    hls::stream<ap_uint<{bw_str}>> &bias_stream,
-    hls::stream<ap_uint<{cw_str}>> &c_stream
+    hls::stream<ap_uint<{bw}>> &b_stream,
+    hls::stream<ap_uint<{bw}>> &bias_stream,
+    hls::stream<ap_uint<{cw}>> &c_stream
 );
 
-// Memory-mapped top for standalone Vitis HLS validation
+// hls4ml-interface standalone top: K-wide streams -> chunked blackbox -> N-wide results
 void {name}_design(
-    ap_int<8> activations[{m}][{k_val}],
-    ap_int<8> weights[{n}][{k_val}],
-    ap_int<8> biases[{n}],
-    ap_int<8> results[{m}][{n}]
+    hls::stream<ap_uint<{a_beat_w}>> &a_beat_stream,
+    hls::stream<ap_uint<{b_beat_w}>> &b_beat_stream,
+    ap_int<8>                        biases[{n}],
+    hls::stream<ap_uint<{c_row_w}>> &res_stream
 ) {{
-    #pragma HLS INTERFACE s_axilite port=activations
-    #pragma HLS INTERFACE s_axilite port=weights
-    #pragma HLS INTERFACE s_axilite port=biases
-    #pragma HLS INTERFACE s_axilite port=results
-    #pragma HLS INTERFACE s_axilite port=return
+    #pragma HLS INTERFACE ap_ctrl_none port=return
 
-    hls::stream<ap_uint<{aw}>> a_stream("a_stream");
-    hls::stream<ap_uint<{bw}>> b_stream("b_stream");
-    hls::stream<ap_uint<{bw}>> bias_stream("bias_stream");
-    hls::stream<ap_uint<{cw}>> c_stream("c_stream");
+    // Internal chunked streams for the blackbox wrapper
+    hls::stream<ap_uint<{aw}>> a_chunk("a_chunk");
+    hls::stream<ap_uint<{bw}>> b_chunk("b_chunk");
+    hls::stream<ap_uint<{bw}>> bias_chunk("bias_chunk");
+    hls::stream<ap_uint<{cw}>> c_chunk("c_chunk");
 
-    #pragma HLS STREAM variable=a_stream depth={k_val}
-    #pragma HLS STREAM variable=b_stream depth={k_val}
-    #pragma HLS STREAM variable=bias_stream depth=2
-    #pragma HLS STREAM variable=c_stream depth={m}
+    #pragma HLS STREAM variable=a_chunk depth={k_chunks * input_beats}
+    #pragma HLS STREAM variable=b_chunk depth={k_chunks * input_beats}
+    #pragma HLS STREAM variable=bias_chunk depth=2
+    #pragma HLS STREAM variable=c_chunk depth={m}
     #pragma HLS DATAFLOW
 
-    // Pack and stream bias
-    ap_uint<{bw}> bias_pkt = 0;
-    for (int c = 0; c < {gc}; c++) {{
-        for (int lane = 0; lane < 8; lane++) {{
-            int actual_col = c * 8 + lane;
-            if (actual_col < {n}) {{
-                bias_pkt.range(c * 64 + lane * 8 + 7, c * 64 + lane * 8) = biases[actual_col];
-            }}
-        }}
-    }}
-    bias_stream.write(bias_pkt);
-
-    // Stream A and B — one K position per cycle
-    for (int kk = 0; kk < {k_val}; kk++) {{
-        ap_uint<{aw}> a_pkt = 0;
-        ap_uint<{bw}> b_pkt = 0;
-
-        // A: pack A[row][kk] for all rows
-        for (int r = 0; r < {gr}; r++) {{
-            for (int rl = 0; rl < 8; rl++) {{
-                int actual_row = r * 8 + rl;
-                if (actual_row < {m}) {{
-                    a_pkt.range(r * 64 + rl * 8 + 7, r * 64 + rl * 8) = activations[actual_row][kk];
-                }}
-            }}
-        }}
-
-        // B: pack B[col][kk] for all cols
-        for (int c = 0; c < {gc}; c++) {{
-            for (int cl = 0; cl < 8; cl++) {{
-                int actual_col = c * 8 + cl;
-                if (actual_col < {n}) {{
-                    b_pkt.range(c * 64 + cl * 8 + 7, c * 64 + cl * 8) = weights[actual_col][kk];
-                }}
-            }}
-        }}
-
-        a_stream.write(a_pkt);
-        b_stream.write(b_pkt);
-    }}
-
-    // Call wrapper
-    {name}_wrapper(a_stream, b_stream, bias_stream, c_stream);
-
-    // Unpack results
-    for (int i = 0; i < {m}; i++) {{
-        ap_uint<{cw}> out_pkt = c_stream.read();
+    // -- Pack bias ----------------------------------------------------------
+    {{
+        ap_uint<{bw}> bias_pkt = 0;
         for (int c = 0; c < {gc}; c++) {{
             for (int lane = 0; lane < 8; lane++) {{
                 int actual_col = c * 8 + lane;
                 if (actual_col < {n}) {{
-                    results[i][actual_col] = out_pkt.range(c * 64 + lane * 8 + 7, c * 64 + lane * 8);
+                    bias_pkt.range(c * 64 + lane * 8 + 7, c * 64 + lane * 8) =
+                        biases[actual_col];
                 }}
             }}
         }}
+        bias_chunk.write(bias_pkt);
+    }}
+
+{chunk_section}
+
+    // -- Blackbox wrapper --------------------------------------------------
+    {name}_wrapper(a_chunk, b_chunk, bias_chunk, c_chunk);
+
+    // -- Unpack chunked output rows -> N-wide hls4ml result beats ----------
+    for (int i = 0; i < {m}; i++) {{
+        #pragma HLS PIPELINE II=1
+        ap_uint<{cw}> out_pkt = c_chunk.read();
+        ap_uint<{c_row_w}> row = 0;
+        for (int c = 0; c < {gc}; c++) {{
+            for (int lane = 0; lane < 8; lane++) {{
+                int actual_col = c * 8 + lane;
+                if (actual_col < {n}) {{
+                    row.range(actual_col * 8 + 7, actual_col * 8) =
+                        out_pkt.range(c * 64 + lane * 8 + 7, c * 64 + lane * 8);
+                }}
+            }}
+        }}
+        res_stream.write(row);
     }}
 }}
 """
@@ -756,7 +829,7 @@ def gen_combined_header(items):
     for item in items:
         name = item["emit_name"]
         m_val, k_val, n_val = item["m"], item["k"], item["n"]
-        gr, gc, ks = item["grid_rows"], item["grid_cols"], item["k_steps"]
+        gr, gc = item["grid_rows"], item["grid_cols"]
         aw = _a_width(m_val)
         bw = _b_width(n_val)
         cw = _c_width(n_val)
@@ -842,8 +915,8 @@ void gemm_ip_stream(
 
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
 void gemm_ip_array(
-    a_beat_T a_beats[CONFIG_T::gemm_k],
-    b_beat_T b_beats[CONFIG_T::gemm_k],
+    a_beat_T a_beats[CONFIG_T::gemm_m],
+    b_beat_T b_beats[CONFIG_T::gemm_n],
     bias_T biases[CONFIG_T::gemm_n],
     res_T results[CONFIG_T::gemm_m]
 ) {{
@@ -861,15 +934,10 @@ void gemm_ip_stream_sim(
 ) {{
     // Direct scalar computation avoids stream deadlocks in C simulation.
     // Same reference logic as hls4ml's behavioral model.
-    typename data_T::value_type activations[CONFIG_T::gemm_m][CONFIG_T::gemm_k];
+    data_T activations[CONFIG_T::gemm_m];
 
     for (unsigned i = 0; i < CONFIG_T::gemm_m; i++) {{
-        for (unsigned kp = 0; kp < CONFIG_T::gemm_k / data_T::size; kp++) {{
-            data_T a_pack = data_stream.read();
-            for (unsigned k = 0; k < data_T::size; k++) {{
-                activations[i][kp * data_T::size + k] = a_pack[k];
-            }}
-        }}
+        activations[i] = data_stream.read();
     }}
 
     for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {{
@@ -903,9 +971,9 @@ def _gen_layer_gemm_ip_h(item):
       - ``{name}_gemm_ip_stream`` — packs typed beats → ap_uint, calls blackbox
       - ``{name}_gemm_ip_array``   — same math, array-based
 
-    Protocol: hls4ml feeds K beats of A (M-wide) and K beats of B (N-wide),
-    one per K position.  The adapter packs each beat into the stream layout
-    expected by the blackbox (row-major bytes within tiles).
+    Protocol: hls4ml feeds M A rows and N B columns, each K-wide.  The
+    adapter buffers those public row/column beats and replays them to the
+    blackbox as 8-lane K chunks.
     """
     name = item["emit_name"]
     m_val, k_val, n_val = item["m"], item["k"], item["n"]
@@ -913,6 +981,8 @@ def _gen_layer_gemm_ip_h(item):
     aw = _a_width(m_val)
     bw = _b_width(n_val)
     cw = _c_width(n_val)
+    k_chunks = _ceil_div(k_val, LANE_WIDTH)
+    input_beats = max(m_val, n_val)
 
     return f"""\
 #ifndef {name.upper()}_GEMM_IP_H_
@@ -953,8 +1023,8 @@ void {name}_gemm_ip_stream(
     hls::stream<ap_uint<{bw}>> bias_packed("bias_packed");
     hls::stream<ap_uint<{cw}>> c_packed("c_packed");
 
-    #pragma HLS STREAM variable=a_packed depth={k_val}
-    #pragma HLS STREAM variable=b_packed depth={k_val}
+    #pragma HLS STREAM variable=a_packed depth={k_chunks * input_beats}
+    #pragma HLS STREAM variable=b_packed depth={k_chunks * input_beats}
     #pragma HLS STREAM variable=bias_packed depth=1
     #pragma HLS STREAM variable=c_packed depth={m_val}
 
@@ -973,39 +1043,50 @@ void {name}_gemm_ip_stream(
         bias_packed.write(bias_pkt);
     }}
 
-    // ── Pack K beats (one per K position) ─────────────────────────────────────
-    for (int kk = 0; kk < {k_val}; kk++) {{
+    a_beat_T a_rows[{m_val}];
+    b_beat_T b_cols[{n_val}];
+
+    for (int row = 0; row < {m_val}; row++) {{
         #pragma HLS PIPELINE II=1
-        a_beat_T a_beat = a_beat_stream.read();
-        b_beat_T b_beat = b_beat_stream.read();
+        a_rows[row] = a_beat_stream.read();
+    }}
+    for (int col = 0; col < {n_val}; col++) {{
+        #pragma HLS PIPELINE II=1
+        b_cols[col] = b_beat_stream.read();
+    }}
 
-        ap_uint<{aw}> a_pkt = 0;
-        ap_uint<{bw}> b_pkt = 0;
+    // ── Pack row/column beats as 8-lane K chunks ──────────────────────────────
+    for (int kc = 0; kc < {k_chunks}; kc++) {{
+        for (int t = 0; t < {input_beats}; t++) {{
+            #pragma HLS PIPELINE II=1
+            ap_uint<{aw}> a_pkt = 0;
+            ap_uint<{bw}> b_pkt = 0;
 
-        // A: pack a_beat[row] for all rows — one byte per row in each tile
-        for (int r = 0; r < {gr}; r++) {{
-            for (int rl = 0; rl < 8; rl++) {{
-                int actual_row = r * 8 + rl;
-                if (actual_row < {m_val}) {{
-                    a_pkt.range(r * 64 + rl * 8 + 7, r * 64 + rl * 8) =
-                        static_cast<ap_int<8>>(a_beat[actual_row]);
+            if (t < {m_val}) {{
+                int row_tile = t / 8;
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        a_pkt.range(row_tile * 64 + kl * 8 + 7, row_tile * 64 + kl * 8) =
+                            static_cast<ap_int<8>>(a_rows[t][kk]);
+                    }}
                 }}
             }}
-        }}
 
-        // B: pack b_beat[col] for all cols — one byte per col in each tile
-        for (int c = 0; c < {gc}; c++) {{
-            for (int cl = 0; cl < 8; cl++) {{
-                int actual_col = c * 8 + cl;
-                if (actual_col < {n_val}) {{
-                    b_pkt.range(c * 64 + cl * 8 + 7, c * 64 + cl * 8) =
-                        static_cast<ap_int<8>>(b_beat[actual_col]);
+            if (t < {n_val}) {{
+                int col_tile = t / 8;
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        b_pkt.range(col_tile * 64 + kl * 8 + 7, col_tile * 64 + kl * 8) =
+                            static_cast<ap_int<8>>(b_cols[t][kk]);
+                    }}
                 }}
             }}
-        }}
 
-        a_packed.write(a_pkt);
-        b_packed.write(b_pkt);
+            a_packed.write(a_pkt);
+            b_packed.write(b_pkt);
+        }}
     }}
 
     // ── Call blackbox ─────────────────────────────────────────────────────────
@@ -1030,8 +1111,8 @@ void {name}_gemm_ip_stream(
 
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
 void {name}_gemm_ip_array(
-    a_beat_T a_beats[CONFIG_T::gemm_k],
-    b_beat_T b_beats[CONFIG_T::gemm_k],
+    a_beat_T a_beats[CONFIG_T::gemm_m],
+    b_beat_T b_beats[CONFIG_T::gemm_n],
     bias_T biases[CONFIG_T::gemm_n],
     res_T results[CONFIG_T::gemm_m]
 ) {{
@@ -1039,9 +1120,11 @@ void {name}_gemm_ip_array(
     hls::stream<a_beat_T> a_str;
     hls::stream<b_beat_T> b_str;
     hls::stream<res_T> r_str;
-    for (unsigned kk = 0; kk < CONFIG_T::gemm_k; kk++) {{
-        a_str.write(a_beats[kk]);
-        b_str.write(b_beats[kk]);
+    for (unsigned row = 0; row < CONFIG_T::gemm_m; row++) {{
+        a_str.write(a_beats[row]);
+    }}
+    for (unsigned col = 0; col < CONFIG_T::gemm_n; col++) {{
+        b_str.write(b_beats[col]);
     }}
     {name}_gemm_ip_stream<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
         a_str, b_str, biases, r_str);

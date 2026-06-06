@@ -29,6 +29,9 @@ def pack_a_row(A, t, grid_rows, m):
 
     Row t goes to tile-row (t // 8), filling the 8 K-bytes of that row.
     Other tile-row lanes get 0.
+
+    NOTE: For K > 8 this overflows 64-bit tile-row slots.  Use
+    ``pack_a_chunk`` for the chunked K>8 protocol.
     """
     val = 0
     K = A.shape[1]  # inner dimension (K)
@@ -42,11 +45,33 @@ def pack_a_row(A, t, grid_rows, m):
     return val
 
 
+def pack_a_chunk(A, t, chunk, grid_rows, m, k):
+    """Pack 8 K-bytes of row t starting at chunk*8.
+
+    Each tile-row gets exactly 8 bytes (64 bits).  For K>8 the chunks
+    are serialised across beats: chunk 0→k=0..7, chunk 1→k=8..15, etc.
+    """
+    val = 0
+    tile_r = t // 8
+    if t < m:
+        row_word = 0
+        k_start = chunk * 8
+        k_end = min(k, (chunk + 1) * 8)
+        for kk in range(k_start, k_end):
+            byte = int(A[t, kk]) & 0xFF
+            row_word |= byte << ((kk % 8) * 8)
+        val = row_word << (tile_r * 64)
+    return val
+
+
 def pack_b_col(B, col_idx, grid_cols, n):
     """Pack one column of B into grid_cols*64 bits (row/col contract).
 
     Column col_idx goes to tile-col (col_idx // 8), filling the 8 K-rows.
     Other tile-col lanes get 0.
+
+    NOTE: For K > 8 this overflows 64-bit tile-col slots.  Use
+    ``pack_b_chunk`` for the chunked K>8 protocol.
     """
     val = 0
     K = B.shape[0]  # inner dimension (K)
@@ -56,6 +81,21 @@ def pack_b_col(B, col_idx, grid_cols, n):
         for k in range(K):
             byte = int(B[k, col_idx]) & 0xFF
             col_word |= byte << (k * 8)
+        val = col_word << (tile_c * 64)
+    return val
+
+
+def pack_b_chunk(B, col_idx, chunk, grid_cols, n, k):
+    """Pack 8 K-bytes of column col_idx starting at chunk*8."""
+    val = 0
+    tile_c = col_idx // 8
+    if col_idx < n:
+        col_word = 0
+        k_start = chunk * 8
+        k_end = min(k, (chunk + 1) * 8)
+        for kk in range(k_start, k_end):
+            byte = int(B[kk, col_idx]) & 0xFF
+            col_word |= byte << ((kk % 8) * 8)
         val = col_word << (tile_c * 64)
     return val
 
@@ -122,12 +162,15 @@ def _random_matrices(m, k, n, seed):
 def _gen_all_stimulus(m, k, n, num_vectors, base_seed):
     """Generate stimulus and golden data for *num_vectors* random tests.
 
-    Row/col contract: one A row + one B column per beat, max(M,N) beats total.
+    Row/col contract: one A row + one B column per beat.
+    K ≤ 8: max(M,N) beats total.
+    K > 8: k_chunks × max(M,N) beats — each chunk carries 8 K-bytes.
     Returns golden in Catapult format: grid_rows*8 rows (zero-padded beyond m).
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     input_beats = max(m, n)  # row/col: one row + one col per cycle
+    k_chunks = (k + 7) // 8
 
     all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
 
@@ -135,8 +178,11 @@ def _gen_all_stimulus(m, k, n, num_vectors, base_seed):
         seed = base_seed + v
         A, B, biases, C_sat = _random_matrices(m, k, n, seed)
 
-        a_stim = [pack_a_row(A, t, grid_rows, m) for t in range(input_beats)]
-        b_stim = [pack_b_col(B, t, grid_cols, n) for t in range(input_beats)]
+        a_stim, b_stim = [], []
+        for chunk in range(k_chunks):
+            for t in range(input_beats):
+                a_stim.append(pack_a_chunk(A, t, chunk, grid_rows, m, k))
+                b_stim.append(pack_b_chunk(B, t, chunk, grid_cols, n, k))
         all_a_stim.append(a_stim)
         all_b_stim.append(b_stim)
         all_bias.append(pack_bias(biases, grid_cols, n))
@@ -155,6 +201,7 @@ def _gen_all_stimulus_vitis(m, k, n, num_vectors, base_seed):
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     input_beats = max(m, n)  # row/col: one row + one col per cycle
+    k_chunks = (k + 7) // 8
 
     all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
 
@@ -162,8 +209,11 @@ def _gen_all_stimulus_vitis(m, k, n, num_vectors, base_seed):
         seed = base_seed + v
         A, B, biases, C_sat = _random_matrices(m, k, n, seed)
 
-        a_stim = [pack_a_row(A, t, grid_rows, m) for t in range(input_beats)]
-        b_stim = [pack_b_col(B, t, grid_cols, n) for t in range(input_beats)]
+        a_stim, b_stim = [], []
+        for chunk in range(k_chunks):
+            for t in range(input_beats):
+                a_stim.append(pack_a_chunk(A, t, chunk, grid_rows, m, k))
+                b_stim.append(pack_b_chunk(B, t, chunk, grid_cols, n, k))
         all_a_stim.append(a_stim)
         all_b_stim.append(b_stim)
         all_bias.append(pack_bias(biases, grid_cols, n))
@@ -180,15 +230,21 @@ def _gen_all_stimulus_vitis(m, k, n, num_vectors, base_seed):
 # ── Catapult testbench ─────────────────────────────────────────────────────────
 
 
-def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False):
-    """Generate a multi-vector Catapult testbench with alternating reset/no-reset.
+def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False):
+    """Generate a multi-vector Catapult testbench.
 
-    Even vectors: full reset (catches init-path bugs).
-    Odd vectors:  back-to-back without reset (catches state-leakage bugs).
+    back2back=False (default): Reset between every vector; check each vector
+        before feeding the next.  Even vectors get reset, odd vectors don't.
+
+    back2back=True: Reset only on the first vector; feed all vectors in quick
+        succession; outputs are checked sequentially by out_last count.
+        Tests double-buffer pipelining.
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     input_beats = max(m, n)  # row/col: one A row + one B col per cycle
+    k_chunks = (k + 7) // 8
+    total_input_beats = k_chunks * input_beats
     a_bytes = grid_rows * 8
     b_bytes = grid_cols * 8
     c_bytes = grid_cols * 16
@@ -197,12 +253,13 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
     cw = c_bytes * 8
 
     num_vectors = len(all_a_stim)
-    total_out_rows = grid_rows * 8
+    total_out_rows = m
+    b2b_flag = 1 if back2back else 0
 
     # Build memory initialization blocks
     a_init, b_init, bias_init, golden_init = [], [], [], []
     for v in range(num_vectors):
-        for t in range(input_beats):
+        for t in range(total_input_beats):
             a_init.append(f"        a_stim[{v}][{t}] = {hex_literal(all_a_stim[v][t], a_bytes)};")
             b_init.append(f"        b_stim[{v}][{t}] = {hex_literal(all_b_stim[v][t], b_bytes)};")
         bias_init.append(f"        bias_stim[{v}] = {hex_literal(all_bias[v], b_bytes)};")
@@ -212,16 +269,199 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
     t_first_out = '                if (out_row_idx == 0) $display("T:first_output=%0d", $realtime);' if timing else ""
     t_last_out  = '            $display("T:last_output=%0d", $realtime);' if timing else ""
 
+    mode_tag = "back2back" if back2back else "sequential"
+    if back2back:
+        # ── Back-to-back initial block ──
+        init_block = f"""
+    initial begin
+        $display("=== Catapult TB {m}x{k}x{n}  ({num_vectors} vectors) ===");
+        pass_count = 0; fail_count = 0;
+        out_last_count = 0;
+        out_row_idx = 0;
+
+        $display("MODE back2back");
+
+        for (vec_idx = 0; vec_idx < NV; vec_idx = vec_idx + 1) begin
+            $display("--- Vector %0d (seed %0d) ---", vec_idx, {base_seed} + vec_idx);
+
+            // Reset only on first vector
+            if (vec_idx == 0) begin
+                preload_valid <= 0; in_valid <= 0;
+                rst <= 1;
+                @(posedge clk);
+                rst <= 0; en <= 1;
+                @(posedge clk);
+            end
+
+            // Preload bias
+            preload_valid <= 1;
+            bias_cols <= bias_stim[vec_idx];
+            @(posedge clk);
+            preload_valid <= 0;
+
+            // Feed data
+            in_valid <= 1;
+            a_rows <= a_stim[vec_idx][0];
+            b_cols <= b_stim[vec_idx][0];
+            @(posedge clk);
+            for (t = 1; t < TOTAL_INPUT_BEATS; t = t + 1) begin
+                a_rows <= a_stim[vec_idx][t];
+                b_cols <= b_stim[vec_idx][t];
+                @(posedge clk);
+            end
+            in_valid <= 0;
+            a_rows <= 0;
+            b_cols <= 0;
+        end
+
+        // Wait for all out_last events
+        cycle_ctr = 0;
+        while (out_last_count < NV && cycle_ctr < 2000) begin
+            @(posedge clk);
+            cycle_ctr = cycle_ctr + 1;
+        end
+        if (out_last_count != NV) begin
+            $display("TIMEOUT: only %0d out_last events, expected %0d", out_last_count, NV);
+            fail_count = fail_count + 1;
+        end
+        @(posedge clk);
+
+        if (fail_count == 0) $display("ALL_PASS  (%0d vectors)", NV);
+        else $display("FAILURES=%0d", fail_count);
+        $finish;
+    end
+"""
+        # ── Back-to-back output checking always block ──
+        always_block = f"""
+    always @(posedge clk) begin
+        if (out_last) begin
+{t_last_out}
+            if (out_row_idx != TOTAL_ROWS - 1)
+                $display("FAIL vec %0d out_last row %0d", out_last_count, out_row_idx);
+            out_last_count <= out_last_count + 1;
+        end
+        if (out_valid) begin
+            if (out_row_idx < TOTAL_ROWS) begin
+{t_first_out}
+                if (c_row !== golden[out_last_count][out_row_idx]) begin
+                    $display("FAIL vec %0d row %0d: got %h expected %h", out_last_count, out_row_idx, c_row, golden[out_last_count][out_row_idx]);
+                    fail_count = fail_count + 1;
+                end else begin
+                    pass_count = pass_count + 1;
+                end
+                out_row_idx <= out_row_idx + 1;
+            end else begin
+                $display("FAIL vec %0d extra row %0d", out_last_count, out_row_idx);
+                fail_count = fail_count + 1;
+            end
+        end
+        if (out_last) out_row_idx <= 0;
+    end
+"""
+    else:
+        # ── Sequential initial block ──
+        init_block = f"""
+    initial begin
+        $display("=== Catapult TB {m}x{k}x{n}  ({num_vectors} vectors) ===");
+        pass_count = 0; fail_count = 0;
+
+        $display("MODE sequential");
+
+        for (vec_idx = 0; vec_idx < NV; vec_idx = vec_idx + 1) begin
+            $display("--- Vector %0d (seed %0d) ---", vec_idx, {base_seed} + vec_idx);
+            out_row_idx = 0;
+
+            // Even vectors: full reset.  Odd vectors: back-to-back without reset.
+            if (vec_idx == 0 || (vec_idx % 2) == 0) begin
+                preload_valid <= 0; in_valid <= 0;
+                rst <= 1;
+                @(posedge clk);
+                rst <= 0; en <= 1;
+                @(posedge clk);
+            end
+
+            // Preload bias
+            preload_valid <= 1;
+            bias_cols <= bias_stim[vec_idx];
+            @(posedge clk);
+            preload_valid <= 0;
+
+            // Feed data
+            in_valid <= 1;
+            a_rows <= a_stim[vec_idx][0];
+            b_cols <= b_stim[vec_idx][0];
+            @(posedge clk);
+            for (t = 1; t < TOTAL_INPUT_BEATS; t = t + 1) begin
+                a_rows <= a_stim[vec_idx][t];
+                b_cols <= b_stim[vec_idx][t];
+                @(posedge clk);
+            end
+            in_valid <= 0;
+            a_rows <= 0;
+            b_cols <= 0;
+
+            // Wait for out_last with cycle-count timeout
+            cycle_ctr = 0;
+            while (!out_last && cycle_ctr < 2000) begin
+                @(posedge clk);
+                cycle_ctr = cycle_ctr + 1;
+            end
+            if (cycle_ctr >= 2000) begin
+                $display("TIMEOUT vec %0d", vec_idx);
+                fail_count = fail_count + 1;
+            end
+            @(posedge clk);
+
+            if (out_row_idx != TOTAL_ROWS) begin
+                $display("FAIL vec %0d row count: got %0d expected %0d", vec_idx, out_row_idx, TOTAL_ROWS);
+                fail_count = fail_count + 1;
+            end
+        end
+
+        if (fail_count == 0) $display("ALL_PASS  (%0d vectors)", NV);
+        else $display("FAILURES=%0d", fail_count);
+        $finish;
+    end
+"""
+        # ── Sequential output checking always block ──
+        always_block = f"""
+    always @(posedge clk) begin
+        if (out_last) begin
+{t_last_out}
+            out_last_count = out_last_count + 1;
+            if (out_row_idx != TOTAL_ROWS - 1) begin
+                $display("FAIL vec %0d out_last row %0d", vec_idx, out_row_idx);
+                fail_count = fail_count + 1;
+            end
+        end
+        if (out_valid && out_row_idx < TOTAL_ROWS) begin
+{t_first_out}
+            if (c_row !== golden[vec_idx][out_row_idx]) begin
+                $display("FAIL vec %0d row %0d: got %h expected %h", vec_idx, out_row_idx, c_row, golden[vec_idx][out_row_idx]);
+                fail_count = fail_count + 1;
+            end else begin
+                pass_count = pass_count + 1;
+            end
+            out_row_idx <= out_row_idx + 1;
+        end else if (out_valid) begin
+            $display("FAIL vec %0d extra row %0d", vec_idx, out_row_idx);
+            fail_count = fail_count + 1;
+        end
+    end
+"""
+
     return f"""\
 `timescale 1ns/1ps
 // Auto-generated Catapult-core multi-vector testbench  (row/col streaming)
 // M={m}, K={k}, N={n}  |  base_seed={base_seed}  |  {num_vectors} vectors
-// All vectors: brief rst pulse between runs (pe_reset required)
+// mode: {mode_tag}
 
 module tb_catapult_{m}x{k}x{n};
 
     localparam NV = {num_vectors};
     localparam INPUT_BEATS = {input_beats};
+    localparam K_CHUNKS = {k_chunks};
+    localparam TOTAL_INPUT_BEATS = {total_input_beats};
     localparam TOTAL_ROWS = {total_out_rows};
 
     reg  clk = 0;
@@ -246,8 +486,8 @@ module tb_catapult_{m}x{k}x{n};
     always #5 clk = ~clk;
 
     // Stimulus & golden memories
-    reg [{aw - 1}:0] a_stim    [0:NV-1][0:INPUT_BEATS - 1];
-    reg [{bw - 1}:0] b_stim    [0:NV-1][0:INPUT_BEATS - 1];
+    reg [{aw - 1}:0] a_stim    [0:NV-1][0:TOTAL_INPUT_BEATS - 1];
+    reg [{bw - 1}:0] b_stim    [0:NV-1][0:TOTAL_INPUT_BEATS - 1];
     reg [{bw - 1}:0] bias_stim [0:NV-1];
     reg [{cw - 1}:0] golden    [0:NV-1][0:TOTAL_ROWS - 1];
 
@@ -262,89 +502,9 @@ module tb_catapult_{m}x{k}x{n};
     integer t;
     integer pass_count, fail_count;
     integer cycle_ctr, out_last_count;
+{init_block}
 
-    initial begin
-        $display("=== Catapult TB {m}x{k}x{n}  ({num_vectors} vectors) ===");
-        pass_count = 0; fail_count = 0;
-
-        for (vec_idx = 0; vec_idx < NV; vec_idx = vec_idx + 1) begin
-            $display("--- Vector %0d (seed %0d) ---", vec_idx, {base_seed} + vec_idx);
-            out_row_idx = 0; out_last_count = 0;
-
-            // Reset between vectors (Catapult requires pe_reset)
-            preload_valid <= 0; in_valid <= 0;
-            rst <= 1;
-            @(posedge clk);
-            rst <= 0;
-            en  <= 1;
-            @(posedge clk);
-
-            // Preload bias (1 cycle — bias loads via primary b_data port on all tiles)
-            preload_valid <= 1;
-            bias_cols <= bias_stim[vec_idx];
-            @(posedge clk);
-            preload_valid <= 0;
-
-            // Feed INPUT_BEATS row/col pairs — set in_valid + first beat together
-            in_valid <= 1;
-            a_rows <= a_stim[vec_idx][0];
-            b_cols <= b_stim[vec_idx][0];
-            @(posedge clk);
-            for (t = 1; t < INPUT_BEATS; t = t + 1) begin
-                a_rows <= a_stim[vec_idx][t];
-                b_cols <= b_stim[vec_idx][t];
-                @(posedge clk);
-            end
-            in_valid <= 0;
-            a_rows <= 0;
-            b_cols <= 0;
-
-            // Wait for out_last with cycle-count timeout
-            cycle_ctr = 0;
-            while (!out_last && cycle_ctr < 2000) begin
-                @(posedge clk);
-                cycle_ctr = cycle_ctr + 1;
-            end
-            if (cycle_ctr >= 2000) begin
-                $display("TIMEOUT vec %0d", vec_idx);
-                fail_count = fail_count + 1;
-            end
-            @(posedge clk);  // one more cycle for output pipeline
-
-            if (out_row_idx != TOTAL_ROWS) begin
-                $display("FAIL vec %0d row count: got %0d expected %0d", vec_idx, out_row_idx, TOTAL_ROWS);
-                fail_count = fail_count + 1;
-            end
-        end
-
-        if (fail_count == 0) $display("ALL_PASS  (%0d vectors)", NV);
-        else $display("FAILURES=%0d", fail_count);
-        $finish;
-    end
-
-    always @(posedge clk) begin
-        if (out_last) begin
-{t_last_out}
-            out_last_count = out_last_count + 1;
-            if (out_row_idx != TOTAL_ROWS - 1) begin
-                $display("FAIL vec %0d out_last row %0d", vec_idx, out_row_idx);
-                fail_count = fail_count + 1;
-            end
-        end
-        if (out_valid && out_row_idx < TOTAL_ROWS) begin
-{t_first_out}
-            if (c_row !== golden[vec_idx][out_row_idx]) begin
-                $display("FAIL vec %0d row %0d: got %h expected %h", vec_idx, out_row_idx, c_row, golden[vec_idx][out_row_idx]);
-                fail_count = fail_count + 1;
-            end else begin
-                pass_count = pass_count + 1;
-            end
-            out_row_idx <= out_row_idx + 1;
-        end else if (out_valid) begin
-            $display("FAIL vec %0d extra row %0d", vec_idx, out_row_idx);
-            fail_count = fail_count + 1;
-        end
-    end
+{always_block}
 
 endmodule
 """
@@ -353,11 +513,19 @@ endmodule
 # ── Vitis testbench ────────────────────────────────────────────────────────────
 
 
-def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False):
-    """Generate a multi-vector Vitis testbench (simple valid/ready/last protocol)."""
+def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False):
+    """Generate a multi-vector Vitis testbench.
+
+    back2back=False (default): Drain each vector completely before feeding the next.
+
+    back2back=True: Feed all vectors in quick succession; drain all outputs
+        afterwards.  Tests double-buffer pipelining.
+    """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     input_beats = max(m, n)  # row/col: one A row + one B col per cycle
+    k_chunks = (k + 7) // 8
+    total_input_beats = k_chunks * input_beats
     a_bytes = grid_rows * 8
     b_bytes = grid_cols * 8
     c_bytes = grid_cols * 8
@@ -366,29 +534,162 @@ def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_b
     cw = c_bytes * 8
 
     num_vectors = len(all_a_stim)
-    total_out_rows = grid_rows * 8
+    total_out_rows = m
+    b2b_flag = 1 if back2back else 0
 
     a_init, b_init, bias_init, golden_init = [], [], [], []
     for v in range(num_vectors):
-        for t in range(input_beats):
+        for t in range(total_input_beats):
             a_init.append(f"        a_stim[{v}][{t}] = {hex_literal(all_a_stim[v][t], a_bytes)};")
             b_init.append(f"        b_stim[{v}][{t}] = {hex_literal(all_b_stim[v][t], b_bytes)};")
         bias_init.append(f"        bias_stim[{v}] = {hex_literal(all_bias[v], b_bytes)};")
         for row in range(total_out_rows):
             golden_init.append(f"        golden[{v}][{row}] = {hex_literal(all_golden[v][row], c_bytes)};")
 
-    vt_first_out = '            if (out_row_idx == 0) $display("T:first_output=%0d", $realtime);' if timing else ""
-    vt_last_out  = f'            if (out_row_idx == {total_out_rows} - 1) $display("T:last_output=%0d", $realtime);' if timing else ""
+    vt_first_out = '                if (out_row_idx == 0) $display("T:first_output=%0d", $realtime);' if timing else ""
+    vt_last_out  = f'                if (out_row_idx == {total_out_rows} - 1) $display("T:last_output=%0d", $realtime);' if timing else ""
+
+    mode_tag = "back2back" if back2back else "sequential"
+
+    if back2back:
+        init_block = f"""
+    initial begin
+        $display("=== Vitis TB {m}x{k}x{n}  ({num_vectors} vectors) ===");
+        pass_count = 0; fail_count = 0;
+        out_last_count = 0;
+        out_row_idx = 0;
+        $display("MODE back2back");
+
+        for (vec_idx = 0; vec_idx < NV; vec_idx = vec_idx + 1) begin
+            $display("--- Vector %0d (seed %0d) ---", vec_idx, {base_seed} + vec_idx);
+
+            // Reset only on first vector
+            if (vec_idx == 0) begin
+                ap_rst <= 1;
+                repeat (2) @(posedge ap_clk);
+                ap_rst <= 0;
+            end
+
+            // Feed bias
+            @(posedge ap_clk);
+            bias_tdata  <= bias_stim[vec_idx];
+            bias_tvalid <= 1;
+            @(posedge ap_clk);
+            bias_tvalid <= 0;
+
+            // Feed A+B
+            a_tdata <= a_stim[vec_idx][0];
+            b_tdata <= b_stim[vec_idx][0];
+            a_tvalid <= 1;
+            b_tvalid <= 1;
+            @(posedge ap_clk);
+            for (t = 1; t < TOTAL_INPUT_BEATS; t = t + 1) begin
+                a_tdata <= a_stim[vec_idx][t];
+                b_tdata <= b_stim[vec_idx][t];
+                @(posedge ap_clk);
+            end
+            a_tvalid <= 0;
+            b_tvalid <= 0;
+        end
+
+        // Drain ALL results from all vectors sequentially
+        while (out_last_count < NV) begin
+            while (!c_tvalid) @(posedge ap_clk);
+{vt_first_out}
+{vt_last_out}
+            if (c_tdata !== golden[out_last_count][out_row_idx]) begin
+                $display("FAIL vec %0d row %0d: got %h expected %h", out_last_count, out_row_idx, c_tdata, golden[out_last_count][out_row_idx]);
+                fail_count = fail_count + 1;
+            end else begin
+                pass_count = pass_count + 1;
+            end
+            out_row_idx = out_row_idx + 1;
+            if (out_row_idx == {total_out_rows}) begin
+                out_last_count = out_last_count + 1;
+                out_row_idx = 0;
+            end
+            @(posedge ap_clk);
+        end
+
+        if (fail_count == 0) $display("ALL_PASS  (%0d vectors)", NV);
+        else $display("FAILURES=%0d", fail_count);
+        $finish;
+    end
+"""
+    else:
+        init_block = f"""
+    initial begin
+        $display("=== Vitis TB {m}x{k}x{n}  ({num_vectors} vectors) ===");
+        pass_count = 0; fail_count = 0;
+        $display("MODE sequential");
+
+        for (vec_idx = 0; vec_idx < NV; vec_idx = vec_idx + 1) begin
+            $display("--- Vector %0d (seed %0d) ---", vec_idx, {base_seed} + vec_idx);
+            out_row_idx = 0;
+
+            // Even vectors: full reset.  Odd vectors: back-to-back without reset.
+            if (vec_idx == 0 || (vec_idx % 2) == 0) begin
+                ap_rst <= 1;
+                repeat (2) @(posedge ap_clk);
+                ap_rst <= 0;
+            end
+
+            // Feed bias
+            @(posedge ap_clk);
+            bias_tdata  <= bias_stim[vec_idx];
+            bias_tvalid <= 1;
+            @(posedge ap_clk);
+            bias_tvalid <= 0;
+
+            // Feed A+B
+            a_tdata <= a_stim[vec_idx][0];
+            b_tdata <= b_stim[vec_idx][0];
+            a_tvalid <= 1;
+            b_tvalid <= 1;
+            @(posedge ap_clk);
+            for (t = 1; t < TOTAL_INPUT_BEATS; t = t + 1) begin
+                a_tdata <= a_stim[vec_idx][t];
+                b_tdata <= b_stim[vec_idx][t];
+                @(posedge ap_clk);
+            end
+            a_tvalid <= 0;
+            b_tvalid <= 0;
+
+            // Drain results
+            for (int i = 0; i < {total_out_rows}; i++) begin
+                while (!c_tvalid) @(posedge ap_clk);
+{vt_first_out}
+{vt_last_out}
+                if (c_tdata !== golden[vec_idx][out_row_idx]) begin
+                    $display("FAIL vec %0d row %0d: got %h expected %h", vec_idx, out_row_idx, c_tdata, golden[vec_idx][out_row_idx]);
+                    fail_count = fail_count + 1;
+                end else begin
+                    pass_count = pass_count + 1;
+                end
+                out_row_idx = out_row_idx + 1;
+                @(posedge ap_clk);
+            end
+        end
+
+        if (fail_count == 0) $display("ALL_PASS  (%0d vectors)", NV);
+        else $display("FAILURES=%0d", fail_count);
+        $finish;
+    end
+"""
 
     return f"""\
 `timescale 1ns/1ps
 // Auto-generated Vitis-RTL multi-vector testbench  (row/col streaming, valid/ready/last)
 // M={m}, K={k}, N={n}  |  base_seed={base_seed}  |  {num_vectors} vectors
+// mode: {mode_tag}
 
 module tb_vitis_{m}x{k}x{n};
 
     localparam NV = {num_vectors};
     localparam INPUT_BEATS = {input_beats};
+    localparam K_CHUNKS = {k_chunks};
+    localparam TOTAL_INPUT_BEATS = {total_input_beats};
+    localparam TOTAL_ROWS = {total_out_rows};
 
     reg  ap_clk = 0;
     reg  ap_rst = 1;
@@ -421,8 +722,8 @@ module tb_vitis_{m}x{k}x{n};
     always #5 ap_clk = ~ap_clk;
 
     // Stimulus & golden memories
-    reg [{aw - 1}:0] a_stim    [0:NV-1][0:INPUT_BEATS - 1];
-    reg [{bw - 1}:0] b_stim    [0:NV-1][0:INPUT_BEATS - 1];
+    reg [{aw - 1}:0] a_stim    [0:NV-1][0:TOTAL_INPUT_BEATS - 1];
+    reg [{bw - 1}:0] b_stim    [0:NV-1][0:TOTAL_INPUT_BEATS - 1];
     reg [{bw - 1}:0] bias_stim [0:NV-1];
     reg [{cw - 1}:0] golden    [0:NV-1][0:{total_out_rows - 1}];
 
@@ -436,63 +737,8 @@ module tb_vitis_{m}x{k}x{n};
     integer vec_idx, out_row_idx;
     integer t;
     integer pass_count, fail_count;
-
-    initial begin
-        $display("=== Vitis TB {m}x{k}x{n}  ({num_vectors} vectors) ===");
-        pass_count = 0; fail_count = 0;
-
-        for (vec_idx = 0; vec_idx < NV; vec_idx = vec_idx + 1) begin
-            $display("--- Vector %0d (seed %0d) ---", vec_idx, {base_seed} + vec_idx);
-            out_row_idx = 0;
-
-            // Even vectors: full reset.  Odd vectors: back-to-back without reset.
-            if (vec_idx == 0 || (vec_idx % 2) == 0) begin
-                ap_rst <= 1;
-                repeat (2) @(posedge ap_clk);
-                ap_rst <= 0;
-            end
-
-            // Feed bias (1 beat)
-            @(posedge ap_clk);
-            bias_tdata  <= bias_stim[vec_idx];
-            bias_tvalid <= 1;
-            @(posedge ap_clk);
-            bias_tvalid <= 0;
-
-            // Feed A+B (INPUT_BEATS row/col pairs)
-            a_tdata <= a_stim[vec_idx][0];
-            b_tdata <= b_stim[vec_idx][0];
-            a_tvalid <= 1;
-            b_tvalid <= 1;
-            @(posedge ap_clk);
-            for (t = 1; t < INPUT_BEATS; t = t + 1) begin
-                a_tdata <= a_stim[vec_idx][t];
-                b_tdata <= b_stim[vec_idx][t];
-                @(posedge ap_clk);
-            end
-            a_tvalid <= 0;
-            b_tvalid <= 0;
-
-            // Drain results (all grid_rows*8 rows, including zero-padded)
-            for (int i = 0; i < {total_out_rows}; i++) begin
-                while (!c_tvalid) @(posedge ap_clk);
-{vt_first_out}
-{vt_last_out}
-                if (c_tdata !== golden[vec_idx][out_row_idx]) begin
-                    $display("FAIL vec %0d row %0d: got %h expected %h", vec_idx, out_row_idx, c_tdata, golden[vec_idx][out_row_idx]);
-                    fail_count = fail_count + 1;
-                end else begin
-                    pass_count = pass_count + 1;
-                end
-                out_row_idx = out_row_idx + 1;
-                @(posedge ap_clk);
-            end
-        end
-
-        if (fail_count == 0) $display("ALL_PASS  (%0d vectors)", NV);
-        else $display("FAILURES=%0d", fail_count);
-        $finish;
-    end
+    integer out_last_count;
+{init_block}
 
 endmodule
 """
@@ -502,7 +748,7 @@ endmodule
 
 
 def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="catapult",
-                num_vectors=10, timing=False):
+                num_vectors=10, timing=False, back2back=False):
     """Generate a self-checking multi-vector Verilog testbench.
 
     Args:
@@ -512,18 +758,20 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
         protocol: ``"catapult"`` or ``"vitis"``.
         num_vectors: Number of random test vectors (default 10).
         timing: If True, emit ``$display`` with ``$realtime`` at key events.
+        back2back: If True, feed vectors in quick succession without waiting
+            for output before starting the next vector (tests double-buffer
+            pipelining). Outputs are checked sequentially by out_last count.
 
-    Even vectors run with reset; odd vectors run back-to-back without reset.
     Returns:
         Verilog source as a string.
     """
     if protocol == "vitis":
         all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_vitis(
             m, k, n, num_vectors, seed)
-        return _gen_vitis_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing)
+        return _gen_vitis_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back)
     all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus(
         m, k, n, num_vectors, seed)
-    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing)
+    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back)
 
 
 def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_sat, timing=False):
@@ -531,8 +779,12 @@ def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     input_beats = max(m, n)  # row/col: one row + one col per cycle
-    a_stim = [pack_a_row(A, t, grid_rows, m) for t in range(input_beats)]
-    b_stim = [pack_b_col(B, t, grid_cols, n) for t in range(input_beats)]
+    k_chunks = (k + 7) // 8
+    a_stim, b_stim = [], []
+    for chunk in range(k_chunks):
+        for t in range(input_beats):
+            a_stim.append(pack_a_chunk(A, t, chunk, grid_rows, m, k))
+            b_stim.append(pack_b_chunk(B, t, chunk, grid_cols, n, k))
     bias_packed = pack_bias(biases, grid_cols, n)
     golden = []
     for actual_row in range(m):
@@ -542,7 +794,7 @@ def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_
     if protocol == "vitis":
         return _gen_vitis_tb(m, k, n, module_name, seed, [a_stim], [b_stim], [bias_packed], [golden], timing=timing)
     # Catapult: need (grid_rows*8) rows of golden
-    total_out_rows = grid_rows * 8
+    total_out_rows = m
     cat_golden = []
     for rt in range(grid_rows):
         for row in range(8):

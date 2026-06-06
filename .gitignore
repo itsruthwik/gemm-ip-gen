@@ -6,6 +6,21 @@ generated/
 output*/
 experiments/
 
+# HLS project scratch directories
+bb_*/
+bb_all/
+bb_fix/
+bb_sv/
+cosim_*/
+debug_*/
+final/
+final_fix/
+final_pkg/
+fixed_output/
+indep_*/
+staging_*/
+sv_test/
+
 # Python cache and test cache
 __pycache__/
 *.py[cod]
@@ -31,8 +46,18 @@ catapult.log
 *.v1/
 SIF/
 
+# Backup files
+*.bkp
+
 # Local editor and OS files
 .DS_Store
 *~
 *.swp
 *.swo
+
+
+.*
+
+
+catapult_pkgs/
+vitis_run*

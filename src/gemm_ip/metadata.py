@@ -58,6 +58,24 @@ def grid_cols(n):
     return _ceil_div(n, LANE_WIDTH)
 
 
+def k_chunks(k):
+    """Number of 8-lane K chunks needed to cover *k* reduction lanes."""
+    return _ceil_div(k, LANE_WIDTH)
+
+
+def k_chunk_size(k, chunk_index):
+    """Valid K lanes in one 8-lane chunk."""
+    remain = int(k) - int(chunk_index) * LANE_WIDTH
+    if remain <= 0:
+        return 0
+    return min(LANE_WIDTH, remain)
+
+
+def k_chunk_mask(k, chunk_index):
+    """8-bit validity mask for one K chunk."""
+    return tail_mask_hex(k, chunk_index)
+
+
 def a_stream_width(m):
     """Bit-width of the activation stream packet for *m* rows."""
     return grid_rows(m) * 64
@@ -78,26 +96,25 @@ def bias_stream_width(n):
     return b_stream_width(n)
 
 
-def k_steps(k):
-    """Number of K-slice iterations (inner dimension steps)."""
-    return _ceil_div(k, LANE_WIDTH)
-
-
 # ── Latency formulas ───────────────────────────────────────────────────────────
 
 
-def latency_cycles(k_steps_val, grid_rows_val, grid_cols_val, m=None, n=None):
-    """First output available at this cycle (0-based).
-
-    Buffered row/col: preload(1) + collect(max(M,N)) + transition(1) +
-    feed(8) + tile computation.  Uses same formula as total_cycles() in
-    _generate_rtl_common.py, minus the readout/output margin.
+def latency_cycles(k_val, grid_rows_val, grid_cols_val, m=None, n=None,
+                   k=None, feed_mode="direct"):
+    """First output available at this cycle (0-based).  APPROXIMATE — for
+    exact transaction control use _generate_rtl_common.total_cycles().
     """
-    if m is not None and n is not None:
-        # New row/col formula: preload + collect + transition + feed + tile_start
-        return 1 + max(m, n) + 1 + 8 + 7 + 3 + (grid_rows_val - 1 + grid_cols_val - 1) * 8
-    # Backward compat: old K-position formula
-    return (grid_cols_val - 1) * 8 + k_steps_val * 8 + 10
+    import sys as _sys
+    from pathlib import Path as _Path
+    _ts_dir = str(_Path(__file__).resolve().parent.parent / "tensor-slice")
+    if _ts_dir not in _sys.path:
+        _sys.path.insert(0, _ts_dir)
+    from _generate_rtl_common import total_cycles as _tc  # noqa: E402
+    if m is not None and n is not None and k is not None:
+        # Conservative: total_cycles minus output FIFO drain margin (~20 cycles)
+        return max(0, _tc(m, k, n, feed_mode=feed_mode) - 20 - (grid_rows_val * 8))
+    # Fallback
+    return (grid_cols_val - 1) * 8 + k_val + 10
 
 
 def dead_cycles_raw(grid_cols_val):
@@ -184,7 +201,6 @@ def _normalize_item(item):
 
     item["grid_rows"] = grid_rows(item["m"])
     item["grid_cols"] = grid_cols(item["n"])
-    item["k_steps"] = k_steps(item["k"])
     item["emit_name"] = _safe_name(item.get("name", f"gemm_{m}x{k}x{n}"))
 
     item.setdefault("interface", "stream")
@@ -199,13 +215,11 @@ def verilog_tile_comment(item):
     """Return a Verilog comment summarising grid dimensions and tail masks."""
     gr = item["grid_rows"]
     gc = item["grid_cols"]
-    ks = item["k_steps"]
     return (
         f"// Dimensions: n_in={item['k']}, n_out={item['n']}, m={item['m']}\n"
-        f"// GRID_ROWS={gr}, GRID_COLS={gc}, K_STEPS={ks}\n"
+        f"// GRID_ROWS={gr}, GRID_COLS={gc}\n"
         f"// A tail mask (rows after tile {gr - 1}): {vm(tail_mask_hex(item['m'], gr - 1))}\n"
         f"// B tail mask (cols after tile {gc - 1}): {vm(tail_mask_hex(item['n'], gc - 1))}\n"
-        f"// K tail mask (inner dim tile {ks - 1}):   {vm(tail_mask_hex(item['k'], ks - 1))}\n"
     )
 
 

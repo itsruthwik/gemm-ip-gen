@@ -4,9 +4,11 @@
 
 ## Contents
 
-- `tensor_slice_int8.v`: standalone 8x8 int8 systolic slice RTL
-- `generate_verilog_grid.py`: generates tiled RTL wrappers around this slice
-- `generate_verilog_tb.py`: generates self-checking wrapper-level Verilog testbenches
+- `tensor_slice_int8.v`: standalone 8×8 int8 systolic slice RTL
+- `generate_catapult_rtl.py`: generates Catapult RTL wrappers (behavioral sim, synth, combined core)
+- `generate_vitis_rtl.py`: generates Vitis RTL wrappers (behavioral sim, synth)
+- `generate_verilog_tb.py`: generates self-checking Verilog testbenches for both protocols
+- `_generate_rtl_common.py`: shared helpers (tail mask, cycle counter)
 - `tb/`: standalone slice testbenches and regressions
 
 ## Interface Summary
@@ -37,35 +39,43 @@ Masking support:
 - `validity_mask_b_cols`: spatial column mask
 - `validity_mask_a_cols_b_rows`: temporal inner-dimension mask
 
-## Deterministic Latency
+## Grid-Level Latency
 
-For matmul mode, completion is determined from:
+The behavioral grid model uses a parameterized formula:
 
-`(a_loc + b_loc) * 8 + 7 + K + P - 1 + 8`
+```
+beh = k_chunks × max(M,N) + max(0, K+N − k_chunks × max(M,N)) + M  (+1 sync)
+wrap = beh + 3  (Catapult wrapper overhead)
+II   = k_chunks × max(M,N) + 1  (back-to-back, shadow FIFO)
+```
 
-where:
+Validated results (RTL sim):
 
-- `K = final_mat_mul_size`
-- `P = 3`
-
-Validated examples:
-
-- `8x8`, `a_loc=0`, `b_loc=0`: first valid at `launch + 17`, done at `launch + 25`
-- `5x5`, `a_loc=0`, `b_loc=0`: first valid at `launch + 14`, done at `launch + 22`
-- `8x8`, `a_loc=1`, `b_loc=1`: first valid at `launch + 33`, done at `launch + 41`
+| Shape    | beh | seq II | b2b II |
+|----------|-----|--------|--------|
+| 8×8×8   |  25 |     29 |      9 |
+| 16×8×8  |  33 |     37 |     17 |
+| 16×8×16 |  41 |     45 |     17 |
+| 8×16×8  |  33 |     37 |     17 |
+| 16×16×16|  49 |     53 |     33 |
+| 9×17×10 |  40 |     44 |     31 |
 
 ## Verification
 
-Standalone regressions live in `tb/`.
+Standalone slice regressions live in `tb/`.
 
-Useful coverage:
+Wrapper-level verification:
+
+```bash
+# All RTL simulation tests (46 tests)
+pytest tests/test_rtl_sim.py -v
+
+# Combined core verification (Catapult package test)
+pytest tests/test_catapult.py -v
+```
+
+Useful slice coverage:
 
 - `tb_tensor_slice_regression.v`: baseline, back-to-back launch, chained-input timing
 - `tb_tensor_slice_mask_regression.v`: non-8x8 and mask behavior
 - size-specific smoke benches such as `tb_5x5.v`, `tb_12x10.v`, `tb_16x16.v`
-
-Wrapper-level verification is run from the common layer with:
-
-```bash
-python3 verify_generated_wrappers.py
-```

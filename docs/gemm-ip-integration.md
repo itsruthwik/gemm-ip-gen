@@ -49,26 +49,22 @@ void gemm_ip_stream(
 
 ## Stream Contract
 
-The wrapper expects one GEMM transaction per call.
+The wrapper expects one GEMM transaction per call. Data is fed as row/col
+streaming with K-chunks:
 
-For each `kk` from `0` to `CONFIG_T::gemm_k - 1`:
+- `a_beat_stream` carries `max(M,N)` beats per K-chunk. Each beat is one
+  activation row with K elements packed into `grid_rows × 64` bits.
+- `b_beat_stream` carries `max(M,N)` beats per K-chunk. Each beat is one
+  weight column with K elements packed into `grid_cols × 64` bits.
+- Total beats per transaction: `k_chunks × max(M,N)` for each of A and B.
+- The wrapper packs beats directly into the blackbox inputs `a_rows` and
+  `b_cols` without building temporary local matrices.
 
-- `a_beat_stream.read()` returns one activation beat containing all active GEMM
-  rows for that `kk`
-- `b_beat_stream.read()` returns one weight beat containing all active GEMM output
-  columns for that `kk`
-- the wrapper packs those two beats directly into the hardblock inputs
-  `a_rows` and `b_cols`
-
-This is the required low-latency contract. The generated wrapper must not build
-temporary local matrices, prepack arrays, or reinterpret a row-major weight stream
-inside the wrapper.
-
-The current static checks enforce:
+Static checks enforce:
 
 - `CONFIG_T::gemm_m`, `CONFIG_T::gemm_k`, and `CONFIG_T::gemm_n` match the package
-- `a_beat_T::size == CONFIG_T::gemm_m`
-- `b_beat_T::size == CONFIG_T::gemm_n`
+- `a_beat_T::size == CONFIG_T::gemm_k`
+- `b_beat_T::size == CONFIG_T::gemm_k`
 - `res_T::size == CONFIG_T::gemm_n`
 - `CONFIG_T::transpose_weights == true`
 
@@ -78,14 +74,18 @@ not do row-major-to-column-beat reshaping.
 
 ## Wrapper Phases
 
-The generated wrapper has three hardblock-facing phases:
+The generated wrapper has these phases:
 
-1. `FEED`: read one activation beat and one weight beat per `kk`, pack directly,
-   and call the GEMM blackbox with `in_valid = 1`.
-2. `DRAIN_WRITE`: keep stepping the stateful blackbox with `in_valid = 0`, capture
-   valid output rows, add bias, and write `res_stream`.
-3. `DRAIN_PADDED_ROWS`: drain any padded tile rows that exist because tensor-slice
-   tiles are eight rows high.
+1. `BIAS_PACK`: unrolled loop packing bias array into a wide `bias_cols` word.
+2. `READ_A_ROWS` / `READ_B_COLS`: pipelined (II=1) reads from `ac_channel` input
+   streams into local beat arrays.
+3. `FEED`: merged bias-preload + data-feed loop. Step 0 asserts `preload_valid=1,
+   in_valid=0` (bias load). Steps 1..`k_chunks×max(M,N)` assert `preload_valid=0,
+   in_valid=1` and pack row/col beats into `a_rows` / `b_cols`.
+4. `DRAIN`: keeps stepping the stateful blackbox with `in_valid=0`, captures
+   valid output rows, and writes to `res_stream`.
+5. `DRAIN_PADDED_ROWS`: drains any padded tile rows because tensor-slice tiles are
+   eight rows high.
 
 The blackbox binding uses:
 
@@ -104,10 +104,11 @@ not by declaring the full hardblock latency to Catapult.
 
 For each generated package:
 
-1. Standalone C-simulation should pass using `<name>_tb.cpp`.
-2. Standalone Catapult synthesis should complete using `run_catapult.tcl`.
-3. RTL/SCVerify should pass for representative shapes before using the package as
-   an hls4ml integration baseline.
-4. The `8x8x8` package should remain close to the earlier standalone low-latency
-   behavior. Large latency regressions usually mean wrapper-side packing or
-   buffering has re-entered the feed path.
+1. Standalone RTL simulation via iverilog passes for all DEFAULT_CASES (10 configs,
+   sequential + back-to-back).
+2. Standalone Catapult synthesis completes using `run_catapult.tcl` (38 cycles at 10ns
+   for 8×8×8 on nangate-45nm).
+3. SCVerify RTL vs C++ co-simulation passes (0 comparison errors) — the C++ simulation
+   model and behavioral Verilog model produce identical output.
+4. Synth structural smoke compiles with `-DSYNTHESIS` flag using a stub
+   `tensor_slice_int8`.

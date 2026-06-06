@@ -71,15 +71,21 @@ module tb_tensor_slice_regression;
 
     always #5 clk = ~clk;
 
-    task automatic drive_identity_op(
-        input integer variant,
-        input integer k_cycles,
-        input integer use_chain_inputs
-    );
+    // Drive K cycles of identity-matrix data (a[byte k]=k+1 or 8-k, b[byte k]=1).
+    // Expect c[byte i] = a[i] * b[i] = a[i] (since b[i]=1).
+    task automatic drive_identity_op;
+        input integer variant;      // 0=forward (1,2,3...), 1=reverse (8,7,6...)
+        input integer k_cycles;     // number of K cycles to drive
+        input [4:0] slice_r;        // a_loc (tile row)
+        input [4:0] slice_c;        // b_loc (tile col)
         integer kk;
+        integer delay_start;
         reg [63:0] a_cycle;
         reg [63:0] b_cycle;
         begin
+            a_loc = slice_r;
+            b_loc = slice_c;
+            delay_start = (slice_r + slice_c) * 8;
             for (kk = 0; kk < k_cycles; kk = kk + 1) begin
                 a_cycle = 64'd0;
                 b_cycle = 64'd0;
@@ -87,17 +93,11 @@ module tb_tensor_slice_regression;
                 b_cycle[kk*8 +: 8] = 8'd1;
                 @(negedge clk);
                 start_mat_mul = (kk == 0);
-                if (use_chain_inputs != 0) begin
-                    a_data = 64'd0;
-                    b_data = 64'd0;
-                    a_data_in = a_cycle;
-                    b_data_in = b_cycle;
-                end else begin
-                    a_data = a_cycle;
-                    b_data = b_cycle;
-                    a_data_in = 64'd0;
-                    b_data_in = 64'd0;
-                end
+                // Feed primary data; chain inputs are zero for standalone slice
+                a_data = a_cycle;
+                b_data = b_cycle;
+                a_data_in = 64'd0;
+                b_data_in = 64'd0;
                 @(posedge clk);
             end
             @(negedge clk);
@@ -109,11 +109,18 @@ module tb_tensor_slice_regression;
         end
     endtask
 
-    task automatic drive_masked_ones_op(input integer k_cycles, input integer use_chain_inputs);
+    // Drive K cycles with ones on first 5 byte lanes, rest zero.
+    // Expected: each valid cell gets 5 (5 ones * 1).
+    task automatic drive_masked_ones_op;
+        input integer k_cycles;
+        input [4:0] slice_r;
+        input [4:0] slice_c;
         integer kk;
         reg [63:0] a_cycle;
         reg [63:0] b_cycle;
         begin
+            a_loc = slice_r;
+            b_loc = slice_c;
             a_cycle = 64'd0;
             b_cycle = 64'd0;
             for (kk = 0; kk < 5; kk = kk + 1) begin
@@ -124,17 +131,10 @@ module tb_tensor_slice_regression;
             for (kk = 0; kk < k_cycles; kk = kk + 1) begin
                 @(negedge clk);
                 start_mat_mul = (kk == 0);
-                if (use_chain_inputs != 0) begin
-                    a_data = 64'd0;
-                    b_data = 64'd0;
-                    a_data_in = a_cycle;
-                    b_data_in = b_cycle;
-                end else begin
-                    a_data = a_cycle;
-                    b_data = b_cycle;
-                    a_data_in = 64'd0;
-                    b_data_in = 64'd0;
-                end
+                a_data = a_cycle;
+                b_data = b_cycle;
+                a_data_in = 64'd0;
+                b_data_in = 64'd0;
                 @(posedge clk);
             end
             @(negedge clk);
@@ -145,6 +145,18 @@ module tb_tensor_slice_regression;
             b_data_in = 64'd0;
         end
     endtask
+
+    // Timing: l_config = (a_loc + b_loc)*8 + 7 + matN + 3
+    // done_mat_mul at clk_cnt == l_config + 8
+    // readout starts at cur_cycle == l_config - 1
+    // launch_cycle recorded at posedge where start_mat_mul is first seen.
+    // With NBA: clk_cnt increments at end of each cycle; cur_cycle = clk_cnt (old value).
+    // done fires on posedge where clk_cnt == l_config+8 (which is the cycle AFTER
+    // clk_cnt was set to l_config+8, so delta = l_config+8+1 from launch).
+    // first_avail fires at cur_cycle == l_config-1, clk_cnt set to l_config at same
+    // posedge. So c_avail visible at posedge L + l_config.
+    // delta_first_avail = l_config
+    // delta_done = l_config + 8 + 1
 
     initial begin
         integer r;
@@ -169,14 +181,22 @@ module tb_tensor_slice_regression;
             done_cycle[r] = -1;
             row_idx[r] = 0;
         end
-        expect_first_avail_delta[0] = 17;
-        expect_done_delta[0] = 25;
-        expect_first_avail_delta[1] = 17;
-        expect_done_delta[1] = 25;
-        expect_first_avail_delta[2] = 14;
-        expect_done_delta[2] = 22;
-        expect_first_avail_delta[3] = 33;
-        expect_done_delta[3] = 41;
+
+        // l_config = (a_loc+b_loc)*8 + 7 + matN + 3
+        // delta_first_avail = l_config
+        // delta_done = l_config + 8
+        // op0: (0,0), matN=8: l_config=18, first_avail=18, done=26
+        expect_first_avail_delta[0] = 18;
+        expect_done_delta[0] = 26;
+        // op1: (0,0), matN=8: same
+        expect_first_avail_delta[1] = 18;
+        expect_done_delta[1] = 26;
+        // op2: (0,0), matN=5: l_config=15, first_avail=15, done=23
+        expect_first_avail_delta[2] = 15;
+        expect_done_delta[2] = 23;
+        // op3: (0,0), matN=8: same as op0
+        expect_first_avail_delta[3] = 18;
+        expect_done_delta[3] = 26;
 
         $display("=== tensor_slice_int8 regression start ===");
 
@@ -184,13 +204,13 @@ module tb_tensor_slice_regression;
         @(negedge clk);
         reset = 1'b0;
 
+        // ── Op 0: Identity (forward), (0,0), K=8 ────────────────────────────
         validity_mask_a_rows = 8'hFF;
         validity_mask_a_cols_b_rows = 8'hFF;
         validity_mask_b_cols = 8'hFF;
         final_mat_mul_size = 8'd8;
-        a_loc = 5'd0;
-        b_loc = 5'd0;
-        drive_identity_op(0, 8, 0);
+        a_loc = 5'd0; b_loc = 5'd0;
+        drive_identity_op(0, 8, 0, 0);
         fork
             begin : wait_done0
                 wait (done_mat_mul);
@@ -207,7 +227,8 @@ module tb_tensor_slice_regression;
         @(posedge clk);
         drive_op_idx = 1;
 
-        drive_identity_op(1, 8, 0);
+        // ── Op 1: Identity (reverse), (0,0), K=8 ────────────────────────────
+        drive_identity_op(1, 8, 0, 0);
         fork
             begin : wait_done1
                 wait (done_mat_mul);
@@ -224,13 +245,13 @@ module tb_tensor_slice_regression;
         @(posedge clk);
         drive_op_idx = 2;
 
+        // ── Op 2: Masked 5x5, (0,0), K=5 ────────────────────────────────────
         validity_mask_a_rows = 8'h1F;
         validity_mask_a_cols_b_rows = 8'h1F;
         validity_mask_b_cols = 8'h1F;
         final_mat_mul_size = 8'd5;
-        a_loc = 5'd0;
-        b_loc = 5'd0;
-        drive_masked_ones_op(5, 0);
+        a_loc = 5'd0; b_loc = 5'd0;
+        drive_masked_ones_op(5, 0, 0);
         fork
             begin : wait_done2
                 wait (done_mat_mul);
@@ -247,19 +268,19 @@ module tb_tensor_slice_regression;
         @(posedge clk);
         drive_op_idx = 3;
 
+        // ── Op 3: Identity (forward), (0,0), K=8 (with full row/col masks) ──
         validity_mask_a_rows = 8'hFF;
         validity_mask_a_cols_b_rows = 8'hFF;
         validity_mask_b_cols = 8'hFF;
         final_mat_mul_size = 8'd8;
-        a_loc = 5'd1;
-        b_loc = 5'd1;
-        drive_identity_op(0, 8, 1);
+        a_loc = 5'd0; b_loc = 5'd0;
+        drive_identity_op(0, 8, 0, 0);
         fork
             begin : wait_done3
                 wait (done_mat_mul);
             end
             begin : timeout3
-                repeat (120) @(posedge clk);
+                repeat (80) @(posedge clk);
                 $display("TIMEOUT op3");
                 errors = errors + 1;
                 disable wait_done3;

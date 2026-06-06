@@ -21,94 +21,83 @@ drains the remaining padded rows.
 
 ## Input Feed Contract
 
-The low-latency feed path is one beat per `kk`:
+The feed path is row/col streaming with K-chunks:
 
 ```text
-for kk in 0..K-1:
-    a_beat = a_beat_stream.read()
-    b_beat = b_beat_stream.read()
-    pack a_beat directly into a_rows
-    pack b_beat directly into b_cols
-    gemm.run(a_rows, b_cols, in_valid=1, ...)
+k_chunks = ceil(K / 8)
+input_beats = max(M, N)
+
+for step in 0..(k_chunks * input_beats):
+    if step == 0:  preload_valid = 1, in_valid = 0  (bias preload)
+    if step > 0:   preload_valid = 0, in_valid = 1  (data feed)
+    beat t = (step-1) % input_beats, chunk kc = (step-1) / input_beats
+    pack a_beat[t] into a_rows (K lanes kc*8..kc*8+7)
+    pack b_beat[t] into b_cols (K lanes kc*8..kc*8+7)
+    gemm.run(a_rows, b_cols, bias_cols, preload_valid, in_valid, ...)
 ```
-
-Do not add:
-
-- local activation matrices
-- local weight matrices
-- prepacked beat arrays
-- row-major weight reshaping
-- shift-register or random-access repacking schemes
-
-Those approaches move work into the Catapult wrapper and have previously caused
-large latency regressions or memory-port scheduling failures.
 
 ## Dead-Cycle Formula
 
-The first valid output row depends on column-wise systolic propagation.
+Matches the double-buffer behavioral grid timing:
 
 ```python
-def latency_cycles(k, grid_cols):
-    return (grid_cols - 1) * 8 + k + 10
+def latency_cycles(m, k, n, grid_rows, grid_cols):
+    k_chunks = ceil(k / 8)
+    input_beats = max(m, n)
+    wait = max(0, k + n - k_chunks * input_beats)
+    return k_chunks * input_beats + wait
 
-def dead_cycles_raw(grid_cols):
-    return (grid_cols - 1) * 8 + 10
+def dead_cycles_raw(m, k, n, grid_cols):
+    return latency_cycles(m, k, n, grid_rows=1, grid_cols=grid_cols) + 1
 
-def dead_cycles(grid_cols):
-    return dead_cycles_raw(grid_cols) + 1
+def dead_cycles(m, k, n, grid_cols):
+    return dead_cycles_raw(m, k, n, grid_cols) + 1
 ```
 
-`dead_cycles_raw` is the number of cycles between the end of input feed and the
-first physical valid output. `dead_cycles` adds the registered boundary implied by
-the Catapult blackbox declaration:
-
-```cpp
-.latency(1)
-.init_delay(1)
+Grid-level latency:
 ```
-
-The key property is that `dead_cycles_raw` depends on `grid_cols`, not on
-`grid_rows`. Additional tile rows increase the number of output rows to drain;
-they do not delay the first row.
+beh  = k_chunks × max(M,N) + max(0, K+N − k_chunks×max(M,N)) + M  (+1 sync)
+wrap = beh + 3   (Catapult wrapper: bias + transition + register)
+II   = k_chunks × max(M,N) + 1   (back-to-back with shadow FIFO)
+```
 
 Examples:
 
-| Shape | `grid_rows` | `grid_cols` | `dead_cycles_raw` | `dead_cycles` |
-|---|---:|---:|---:|---:|
-| `8x8x8` | 1 | 1 | 10 | 11 |
-| `16x8x8` | 2 | 1 | 10 | 11 |
-| `16x16x16` | 2 | 2 | 18 | 19 |
-| `32x32x32` | 4 | 4 | 34 | 35 |
+| Shape | k_chunks | first_out | blind | beh | wrap | b2b II |
+|---|---:|---:|---:|---:|---:|---:|
+| 8×8×8 | 1 | 16 | 18 | 25 | 28 | 9 |
+| 16×8×8 | 1 | 16 | 18 | 33 | 36 | 17 |
+| 16×16×16 | 2 | 32 | 34 | 49 | 52 | 33 |
+| 9×17×10 | 3 | 30 | 32 | 40 | 43 | 31 |
 
 ## Active Wrapper Schedule
 
-The current hls4ml-native wrapper uses a single shape-specific function with:
+The generated wrapper uses a single merged FEED loop (bias preload folded into step 0):
 
-- `FEED`: `K` iterations
-- `DRAIN_WRITE`: `dead_cycles(grid_cols) + M` iterations
-- `DRAIN_PADDED_ROWS`: `MR - M` iterations
+- `BIAS_PACK`: N iterations (unrolled)
+- `READ_A_ROWS`: M iterations, II=1 pipelined
+- `READ_B_COLS`: N iterations, II=1 pipelined
+- `FEED`: `k_chunks × max(M,N) + 1` iterations (step 0 = preload, steps 1+ = data), II=1 pipelined
+- `DRAIN`: `dead_cycles + M` iterations, II=1 pipelined
+- `DRAIN_PADDED_ROWS`: `MR - M` iterations, II=1 pipelined
 
-`DRAIN_WRITE` checks `out_valid` and only writes real rows while `captured < M`.
-`DRAIN_PADDED_ROWS` keeps stepping the hardblock long enough to consume any padded
-tile rows.
-
-For `8x8x8`, the desired structure is therefore:
+For `8x8x8`:
 
 ```text
-FEED              8 iterations
-DRAIN_WRITE      19 iterations
-DRAIN_PADDED     0 iterations
+BIAS_PACK          8 iterations (unrolled)
+READ_A_ROWS        8 iterations (II=1)
+READ_B_COLS        8 iterations (II=1)
+FEED               9 iterations (II=1, step 0 = bias preload)
+DRAIN             26 iterations (II=1)
+DRAIN_PADDED       0 iterations
 ```
 
-The earlier standalone passing package reported approximately:
+Catapult 2026.1 synthesis (nangate-45nm):
 
-- `/core` latency: `28` cycles
-- `/core` throughput: `31` cycles
-- `FEED`: 8 iterations, II=1
-- `DRAIN_WRITE`: 19 iterations, II=1
-
-Those numbers are the practical latency target for the hls4ml-native wrapper when
-the feed path remains direct.
+- `/core` latency: `38` cycles
+- `/core` throughput: `40` cycles
+- `FEED + READ_A_ROWS + READ_B_COLS` merged: 17 iterations, II=1
+- `DRAIN`: 28 iterations, II=1
 
 ## Blackbox Binding
 
@@ -135,14 +124,9 @@ RTL latency makes Catapult schedule excessive pipeline depth around the blackbox
 
 ## Latency Regression Signals
 
-The following are signs that the wrapper has drifted away from the intended design:
-
-- `FEED` takes much more than `K` useful cycles.
+- `FEED` has more than `k_chunks × max(M,N) + 1` iterations.
 - Catapult reports large local array load loops before `FEED`.
-- Weight-side packing dominates the schedule.
-- Generated code contains `PREPACK_BEATS`, `a_packed`, `b_packed`, or local
-  matrix buffers in the hardblock wrapper path.
-- `8x8x8` wrapper latency is far above the old standalone result.
-
-When this happens, restore the direct per-`kk` beat feed before debugging the
-hardblock itself.
+- `preload_valid` is hardwired to `1'b0` in the Catapult-generated RTL (means `feed_preload_valid` is compile-time constant).
+- `READ_A_ROWS`/`READ_B_COLS` use `hls_unroll` instead of `hls_pipeline_init_interval 1` — causes RAM port scheduling failures.
+- Separate `PRELOAD_BIAS` loop exists instead of being folded into FEED step 0.
+- SCVerify reports non-zero comparison errors when C++ sim model uses old per-KK data indexing.
