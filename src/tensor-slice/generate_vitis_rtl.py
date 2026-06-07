@@ -69,29 +69,6 @@ module {module_name}(
     assign c_tdata = behav_c_tdata;
     assign c_tvalid = behav_c_tvalid;
 
-    reg [31:0] wrap_cyc;
-    reg        wrap_first;
-    reg        wrap_prev_tvalid;
-
-    always @(posedge ap_clk) begin
-        if (ap_rst) begin
-            wrap_cyc <= 32'd0;
-            wrap_first <= 1'b1;
-            wrap_prev_tvalid <= 1'b0;
-        end else if (ap_ce) begin
-            wrap_cyc <= wrap_cyc + 1;
-            wrap_prev_tvalid <= behav_c_tvalid;
-            if (bias_tvalid && bias_tready && wrap_first) begin
-                $display("WRAP_START wrap_cyc=%0d", wrap_cyc);
-                wrap_first <= 1'b0;
-            end
-            if (wrap_prev_tvalid && !behav_c_tvalid) begin
-                $display("WRAP_DONE wrap_cyc=%0d", wrap_cyc);
-                wrap_first <= 1'b1;
-            end
-        end
-    end
-
 endmodule
 
 module {behav_name}(

@@ -2,6 +2,7 @@ import sys
 import shutil
 import subprocess
 from pathlib import Path
+import pytest
 
 # Ensure the package is importable
 _src_dir = str(Path(__file__).resolve().parent.parent / "src")
@@ -50,11 +51,53 @@ def test_normalize_config_preserves_protocol_and_defaults_to_stream():
     by_name = {item["name"]: item for item in items}
 
     assert by_name["dense1"]["interface"] == "stream"
+    assert by_name["dense1"]["gemm_k_spatial"] == 1
     assert by_name["dense1"]["k"] == 8
     assert by_name["dense1"]["n"] == 4
     assert by_name["query"]["interface"] == "array"
     assert by_name["query"]["protocol"]["kind"] == "catapult_ccore_array"
     assert by_name["query"]["gemm_ip_index"] == 17
+
+
+def test_normalize_config_defaults_gemm_k_spatial_to_full_k_chunks():
+    cfg = {
+        "conv": {
+            "n_in": 72,
+            "n_out": 8,
+            "gemm_m": 16,
+            "gemm_k": 72,
+            "gemm_n": 8,
+        },
+    }
+
+    items = _normalize_config_items(cfg)
+
+    assert items[0]["gemm_k_spatial"] == 9
+
+
+def test_normalize_config_preserves_gemm_k_spatial():
+    cfg = {
+        "conv": {
+            "n_in": 72,
+            "n_out": 8,
+            "gemm_m": 16,
+            "gemm_k": 72,
+            "gemm_n": 8,
+            "gemm_k_spatial": 3,
+        },
+    }
+
+    items = _normalize_config_items(cfg)
+
+    assert items[0]["gemm_k_spatial"] == 3
+
+
+def test_normalize_config_rejects_invalid_gemm_k_spatial():
+    with pytest.raises(ValueError, match="gemm_k_spatial must be >= 1"):
+        _normalize_config_items({"name": "bad", "m": 8, "k": 16, "n": 8, "gemm_k_spatial": 0})
+
+    with pytest.raises(ValueError, match="exceeds K_CHUNKS"):
+        _normalize_config_items({"name": "bad", "m": 8, "k": 16, "n": 8, "gemm_k_spatial": 3})
 
 
 def test_combined_header_emits_stream_array_and_layer_id_dispatch():
@@ -66,10 +109,12 @@ def test_combined_header_emits_stream_array_and_layer_id_dispatch():
     header = gen_combined_header(items)
 
     assert "void gemm_ip_stream(" in header
+    assert "void gemm_ip_stream_const_weights(" in header
     assert "void gemm_ip_array(" in header
     assert "CONFIG_T::gemm_ip_id == 3" in header
     assert "CONFIG_T::gemm_ip_id == 7" in header
     assert "dense1_gemm_ip_stream" in header
+    assert "dense1_gemm_ip_stream_const_weights" in header
     assert "query_gemm_ip_array" in header
 
 
@@ -183,6 +228,7 @@ def test_stream_and_array_pass_bias_cols(tmp_path):
     generate_catapult_pkg(4, 8, 4, "test_s", tmp_path, interface="stream")
     h = (tmp_path / "test_s" / "test_s_gemm_ip.h").read_text()
     # Check that bias_packed is passed to all gemm.run() calls
+    assert "void test_s_gemm_ip_stream_const_weights" in h, "Stream wrapper must contain const-weight entry point"
     assert "bias_packed" in h, "Stream wrapper must contain bias_packed"
     # Preload is now folded into FEED step 0 (feed_preload_valid = (step==0)?1:0)
     assert "feed_preload_valid = (step == 0) ? 1 : 0" in h, \
@@ -203,3 +249,78 @@ def test_stream_and_array_pass_bias_cols(tmp_path):
     assert "gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l)" in h, \
         "Array wrapper drain call must pass bias_packed"
 
+
+def test_stream_const_weights_prepacks_a_replay_without_read_a_rows(tmp_path):
+    """Const-weight stream wrapper reads A rows in FEED and replays packed K chunks."""
+    generate_catapult_pkg(16, 72, 8, "test_areplay", tmp_path, interface="stream", gemm_k_spatial=3)
+    h = (tmp_path / "test_areplay" / "test_areplay_gemm_ip.h").read_text()
+
+    assert "void test_areplay_gemm_ip_stream_const_weights" in h
+    assert "READ_A_ROWS" not in h
+    assert "a_rows_arr" not in h
+    assert "ac_int<128, false> a_replay[9][16]" in h
+    assert "if (kc == 0)" in h
+    assert "a_beat_T a_beat = a_stream.read()" in h
+    assert "ROW_PACK_DIRECT" in h
+    assert "PREPACK_REPLAY" in h
+    assert "ROW_PACK_REPLAY" in h
+    assert "a_replay[replay_kc][t] = replay_rows" in h
+    assert "a_rows = a_replay[kc][t]" in h
+    assert "b_beat_T b_beat = weight_cols[t]" in h
+
+
+def test_stream_const_weights_full_k_spatial_has_no_a_replay(tmp_path):
+    generate_catapult_pkg(16, 72, 8, "test_fullk", tmp_path, interface="stream")
+    h = (tmp_path / "test_fullk" / "test_fullk_gemm_ip.h").read_text()
+
+    assert "void test_fullk_gemm_ip_stream_const_weights" in h
+    assert "a_replay" not in h
+    assert "ROW_PACK_FULL_KC" in h
+    assert "COL_PACK_FULL_KC" in h
+    assert "FEED: for (int step = 0; step < 17; step++)" in h
+    assert "ac_int<1152, false>  a_rows" in h
+    assert "ac_int<576, false>  b_cols" in h
+
+
+def test_array_full_k_spatial_feeds_logical_rows_once(tmp_path):
+    generate_catapult_pkg(24, 24, 24, "test_array_fullk", tmp_path, interface="array")
+    h = (tmp_path / "test_array_fullk" / "test_array_fullk_gemm_ip.h").read_text()
+
+    assert "void test_array_fullk_gemm_ip_array" in h
+    assert "FEED_ARRAY: for (int step = 0; step < 25; step++)" in h
+    assert "ROW_PACK_ARRAY_FULL_KC" in h
+    assert "COL_PACK_ARRAY_FULL_KC" in h
+    assert "k_chunks * input_beats" not in h
+
+
+def test_array_partial_k_spatial_keeps_time_tiled_feed(tmp_path):
+    generate_catapult_pkg(24, 24, 24, "test_array_partialk", tmp_path, interface="array", gemm_k_spatial=1)
+    h = (tmp_path / "test_array_partialk" / "test_array_partialk_gemm_ip.h").read_text()
+
+    assert "void test_array_partialk_gemm_ip_array" in h
+    assert "FEED_ARRAY: for (int step = 0; step < 73; step++)" in h
+    assert "int kc = eff_step / 24" in h
+    assert "ROW_PACK_ARRAY_FULL_KC" not in h
+
+
+def test_catapult_header_reads_int16_result_lanes(tmp_path):
+    generate_catapult_pkg(4, 8, 4, "test_i16lane", tmp_path)
+    h = (tmp_path / "test_i16lane" / "test_i16lane_gemm_ip.h").read_text()
+
+    assert "c_row.template slc<16>(col_tile * 128 + col_local * 16)" in h
+    assert "c_row.template slc<8>(col_tile * 128 + col_local * 8)" not in h
+
+
+def test_generate_k_spatial_package_warns_and_emits_partitions(tmp_path, capsys):
+    generate_catapult_pkg(16, 72, 8, "test_ksp", tmp_path, gemm_k_spatial=3)
+    captured = capsys.readouterr()
+    rtl = (tmp_path / "test_ksp" / "test_ksp_core.v").read_text()
+
+    assert "gemm_k_spatial=3 is experimental" in captured.err
+    assert "K_SPATIAL=3" in rtl
+    assert "K_SPATIAL_PARTITION 0: chunks 0..2" in rtl
+    assert "K_SPATIAL_PARTITION 1: chunks 3..5" in rtl
+    assert "K_SPATIAL_PARTITION 2: chunks 6..8" in rtl
+    assert rtl.count('(* black_box = "true" *) (* keep = "true" *) tensor_slice_int8') == 6
+    assert "partial outputs are INT16" in rtl
+    assert "sat_int8_to_i16" in rtl

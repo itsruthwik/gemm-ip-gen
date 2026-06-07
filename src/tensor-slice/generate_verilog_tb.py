@@ -100,6 +100,26 @@ def pack_b_chunk(B, col_idx, chunk, grid_cols, n, k):
     return val
 
 
+def pack_a_full_k_spatial(A, t, grid_rows, m, k):
+    """Pack all K chunks of one A row into a widened full-K spatial beat."""
+    val = 0
+    k_chunks = (k + 7) // 8
+    chunk_width = grid_rows * 64
+    for chunk in range(k_chunks):
+        val |= pack_a_chunk(A, t, chunk, grid_rows, m, k) << (chunk * chunk_width)
+    return val
+
+
+def pack_b_full_k_spatial(B, col_idx, grid_cols, n, k):
+    """Pack all K chunks of one B column into a widened full-K spatial beat."""
+    val = 0
+    k_chunks = (k + 7) // 8
+    chunk_width = grid_cols * 64
+    for chunk in range(k_chunks):
+        val |= pack_b_chunk(B, col_idx, chunk, grid_cols, n, k) << (chunk * chunk_width)
+    return val
+
+
 def pack_bias(biases, grid_cols, n):
     """Pack bias array into a single integer (same layout as B)."""
     val = 0
@@ -117,8 +137,7 @@ def pack_bias(biases, grid_cols, n):
 def pack_c_row(C_sat, r_tile, row_in_tile, grid_cols, m, n, protocol="catapult"):
     """Pack one output row of C.
 
-    Catapult grid: 128 bits per column tile — data at byte offsets 0,8,16…
-    within each tile (lower 64 bits valid, upper 64 zero-padded).
+    Catapult grid: 128 bits per column tile — eight signed INT16 result lanes.
     Vitis wrapper: 64 bits per column tile — 8 int8 lanes packed adjacently.
     """
     actual_row = r_tile * 8 + row_in_tile
@@ -127,14 +146,18 @@ def pack_c_row(C_sat, r_tile, row_in_tile, grid_cols, m, n, protocol="catapult")
         tile_val = 0
         for col in range(8):
             actual_col = c * 8 + col
-            if actual_row < m and actual_col < n:
-                byte = int(C_sat[actual_row, actual_col]) & 0xFF
-            else:
-                byte = 0
             if protocol == "vitis":
+                if actual_row < m and actual_col < n:
+                    byte = int(C_sat[actual_row, actual_col]) & 0xFF
+                else:
+                    byte = 0
                 tile_val |= byte << (col * 8)
             else:
-                tile_val |= byte << (col * 8)
+                if actual_row < m and actual_col < n:
+                    lane = int(C_sat[actual_row, actual_col]) & 0xFFFF
+                else:
+                    lane = 0
+                tile_val |= lane << (col * 16)
         if protocol == "vitis":
             val |= tile_val << (c * 64)
         else:
@@ -196,6 +219,39 @@ def _gen_all_stimulus(m, k, n, num_vectors, base_seed):
     return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols
 
 
+def _gen_all_stimulus_catapult_full_k_spatial(m, k, n, num_vectors, base_seed):
+    """Generate widened full-K spatial Catapult stimulus.
+
+    Each beat carries one logical A row and one logical B column, with all
+    K chunks packed spatially into widened A/B words.
+    """
+    grid_rows = (m + 7) // 8
+    grid_cols = (n + 7) // 8
+    input_beats = max(m, n)
+
+    all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
+
+    for v in range(num_vectors):
+        seed = base_seed + v
+        A, B, biases, C_sat = _random_matrices(m, k, n, seed)
+
+        a_stim, b_stim = [], []
+        for t in range(input_beats):
+            a_stim.append(pack_a_full_k_spatial(A, t, grid_rows, m, k))
+            b_stim.append(pack_b_full_k_spatial(B, t, grid_cols, n, k))
+        all_a_stim.append(a_stim)
+        all_b_stim.append(b_stim)
+        all_bias.append(pack_bias(biases, grid_cols, n))
+
+        golden = []
+        for rt in range(grid_rows):
+            for row in range(8):
+                golden.append(pack_c_row(C_sat, rt, row, grid_cols, m, n, "catapult"))
+        all_golden.append(golden)
+
+    return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols
+
+
 def _gen_all_stimulus_vitis(m, k, n, num_vectors, base_seed):
     """Same as _gen_all_stimulus but golden uses Vitis packing (gc*64 bits/row, grid_rows*8 rows)."""
     grid_rows = (m + 7) // 8
@@ -230,7 +286,7 @@ def _gen_all_stimulus_vitis(m, k, n, num_vectors, base_seed):
 # ── Catapult testbench ─────────────────────────────────────────────────────────
 
 
-def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False):
+def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, full_k_spatial=False):
     """Generate a multi-vector Catapult testbench.
 
     back2back=False (default): Reset between every vector; check each vector
@@ -244,12 +300,17 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
     grid_cols = (n + 7) // 8
     input_beats = max(m, n)  # row/col: one A row + one B col per cycle
     k_chunks = (k + 7) // 8
-    total_input_beats = k_chunks * input_beats
+    total_input_beats = input_beats if full_k_spatial else k_chunks * input_beats
     a_bytes = grid_rows * 8
     b_bytes = grid_cols * 8
+    bias_bytes = b_bytes
+    if full_k_spatial:
+        a_bytes *= k_chunks
+        b_bytes *= k_chunks
     c_bytes = grid_cols * 16
     aw = a_bytes * 8
     bw = b_bytes * 8
+    biasw = bias_bytes * 8
     cw = c_bytes * 8
 
     num_vectors = len(all_a_stim)
@@ -262,14 +323,15 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
         for t in range(total_input_beats):
             a_init.append(f"        a_stim[{v}][{t}] = {hex_literal(all_a_stim[v][t], a_bytes)};")
             b_init.append(f"        b_stim[{v}][{t}] = {hex_literal(all_b_stim[v][t], b_bytes)};")
-        bias_init.append(f"        bias_stim[{v}] = {hex_literal(all_bias[v], b_bytes)};")
+        bias_init.append(f"        bias_stim[{v}] = {hex_literal(all_bias[v], bias_bytes)};")
         for row in range(total_out_rows):
             golden_init.append(f"        golden[{v}][{row}] = {hex_literal(all_golden[v][row], c_bytes)};")
 
     t_first_out = '                if (out_row_idx == 0) $display("T:first_output=%0d", $realtime);' if timing else ""
     t_last_out  = '            $display("T:last_output=%0d", $realtime);' if timing else ""
 
-    mode_tag = "back2back" if back2back else "sequential"
+    mode_tag = "full-k-spatial " if full_k_spatial else ""
+    mode_tag += "back2back" if back2back else "sequential"
     if back2back:
         # ── Back-to-back initial block ──
         init_block = f"""
@@ -471,7 +533,7 @@ module tb_catapult_{m}x{k}x{n};
     reg  in_valid = 0;
     reg  [{aw - 1}:0] a_rows = 0;
     reg  [{bw - 1}:0] b_cols = 0;
-    reg  [{bw - 1}:0] bias_cols = 0;
+    reg  [{biasw - 1}:0] bias_cols = 0;
     wire [{cw - 1}:0] c_row;
     wire out_valid;
     wire out_last;
@@ -488,7 +550,7 @@ module tb_catapult_{m}x{k}x{n};
     // Stimulus & golden memories
     reg [{aw - 1}:0] a_stim    [0:NV-1][0:TOTAL_INPUT_BEATS - 1];
     reg [{bw - 1}:0] b_stim    [0:NV-1][0:TOTAL_INPUT_BEATS - 1];
-    reg [{bw - 1}:0] bias_stim [0:NV-1];
+    reg [{biasw - 1}:0] bias_stim [0:NV-1];
     reg [{cw - 1}:0] golden    [0:NV-1][0:TOTAL_ROWS - 1];
 
     initial begin
@@ -748,7 +810,7 @@ endmodule
 
 
 def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="catapult",
-                num_vectors=10, timing=False, back2back=False):
+                num_vectors=10, timing=False, back2back=False, full_k_spatial=False):
     """Generate a self-checking multi-vector Verilog testbench.
 
     Args:
@@ -769,9 +831,13 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
         all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_vitis(
             m, k, n, num_vectors, seed)
         return _gen_vitis_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back)
-    all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus(
-        m, k, n, num_vectors, seed)
-    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back)
+    if full_k_spatial:
+        all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_catapult_full_k_spatial(
+            m, k, n, num_vectors, seed)
+    else:
+        all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus(
+            m, k, n, num_vectors, seed)
+    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back, full_k_spatial=full_k_spatial)
 
 
 def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_sat, timing=False):

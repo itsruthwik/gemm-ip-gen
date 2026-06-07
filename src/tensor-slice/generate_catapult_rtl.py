@@ -18,22 +18,83 @@ from pathlib import Path
 from _generate_rtl_common import tail_mask_hex, vm, total_cycles as _total_cycles
 
 
-def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper"):
+def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatial=False):
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     a_width = grid_rows * 64
     b_width = grid_cols * 64
+    a_chunk_width = a_width
+    b_chunk_width = b_width
     c_width = grid_cols * 128
     input_beats = max(m, n)
     k_chunks = (k + 7) // 8
-    total_input_beats = k_chunks * input_beats
+    if full_k_spatial:
+        a_width *= k_chunks
+        b_width *= k_chunks
+    bias_width = grid_cols * 64
+    total_input_beats = input_beats if full_k_spatial else k_chunks * input_beats
     total_output_rows = m
-    latency = max(0, k + n - k_chunks * input_beats)
+    latency = max(0, k + n - total_input_beats)
     behav_name = f"{module_name}_behav_grid"
+    mode_comment = (
+        "Full K-spatial behavioral MxKxN GEMM. Not intended for synthesis."
+        if full_k_spatial
+        else "Chunked behavioral MxKxN GEMM. Not intended for synthesis."
+    )
+    collect_unpack = f"""\
+                        chunk_idx = beat_count / INPUT_BEATS;
+                        beat_in_chunk = beat_count % INPUT_BEATS;
+                        if (beat_in_chunk < {m}) begin
+                            for (lane = 0; lane < 8; lane = lane + 1) begin
+                                kk = chunk_idx * 8 + lane;
+                                if (kk < {k}) begin
+                                    if (coll_buf == 0)
+                                        amat_0[beat_in_chunk][kk] = a_rows[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                    else
+                                        amat_1[beat_in_chunk][kk] = a_rows[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                end
+                            end
+                        end
+                        if (beat_in_chunk < {n}) begin
+                            for (lane = 0; lane < 8; lane = lane + 1) begin
+                                kk = chunk_idx * 8 + lane;
+                                if (kk < {k}) begin
+                                    if (coll_buf == 0)
+                                        bmat_0[kk][beat_in_chunk] = b_cols[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                    else
+                                        bmat_1[kk][beat_in_chunk] = b_cols[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                end
+                            end
+                        end"""
+    shadow_unpack = collect_unpack.replace("beat_count", "shadow_beat").replace("coll_buf", "pending_buf")
+    if full_k_spatial:
+        collect_unpack = f"""\
+                        beat_in_chunk = beat_count;
+                        if (beat_in_chunk < {m}) begin
+                            for (kk = 0; kk < {k}; kk = kk + 1) begin
+                                chunk_idx = kk / 8;
+                                lane = kk % 8;
+                                if (coll_buf == 0)
+                                    amat_0[beat_in_chunk][kk] = a_rows[chunk_idx * {a_chunk_width} + (beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                else
+                                    amat_1[beat_in_chunk][kk] = a_rows[chunk_idx * {a_chunk_width} + (beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                            end
+                        end
+                        if (beat_in_chunk < {n}) begin
+                            for (kk = 0; kk < {k}; kk = kk + 1) begin
+                                chunk_idx = kk / 8;
+                                lane = kk % 8;
+                                if (coll_buf == 0)
+                                    bmat_0[kk][beat_in_chunk] = b_cols[chunk_idx * {b_chunk_width} + (beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                else
+                                    bmat_1[kk][beat_in_chunk] = b_cols[chunk_idx * {b_chunk_width} + (beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                            end
+                        end"""
+        shadow_unpack = collect_unpack.replace("beat_count", "shadow_beat").replace("coll_buf", "pending_buf")
 
     return f"""\
 // Auto-generated simulation model by generate_catapult_rtl.py
-// Chunked behavioral MxKxN GEMM. Not intended for synthesis.
+// {mode_comment}
 // Dimensions: M={m}, K={k}, N={n}
 `timescale 1ns/1ps
 
@@ -43,7 +104,7 @@ module {module_name}(
     input  wire                   en,
     input  wire [{a_width-1}:0]   a_rows,
     input  wire [{b_width-1}:0]   b_cols,
-    input  wire [{b_width-1}:0]   bias_cols,
+    input  wire [{bias_width-1}:0]   bias_cols,
     input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
@@ -54,9 +115,6 @@ module {module_name}(
     wire [{c_width-1}:0] behav_c_row;
     wire                 behav_out_valid;
     wire                 behav_out_last;
-
-    reg [31:0] wrap_cyc;
-    reg        wrap_first;
 
     {behav_name} grid (
         .clk(clk), .rst(rst), .en(en),
@@ -70,21 +128,10 @@ module {module_name}(
             c_row <= {c_width}'d0;
             out_valid <= 1'b0;
             out_last <= 1'b0;
-            wrap_cyc <= 32'd0;
-            wrap_first <= 1'b1;
         end else if (en) begin
-            wrap_cyc <= wrap_cyc + 1;
             c_row <= behav_c_row;
             out_valid <= behav_out_valid;
             out_last <= behav_out_last;
-            if (preload_valid && wrap_first) begin
-                $display("WRAP_START wrap_cyc=%0d", wrap_cyc);
-                wrap_first <= 1'b0;
-            end
-            if (out_valid && out_last) begin
-                $display("WRAP_DONE wrap_cyc=%0d", wrap_cyc);
-                wrap_first <= 1'b1;
-            end
         end
     end
 
@@ -96,7 +143,7 @@ module {behav_name}(
     input  wire                   en,
     input  wire [{a_width-1}:0]   a_rows,
     input  wire [{b_width-1}:0]   b_cols,
-    input  wire [{b_width-1}:0]   bias_cols,
+    input  wire [{bias_width-1}:0]   bias_cols,
     input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
@@ -162,14 +209,14 @@ module {behav_name}(
     integer chunk_idx;
     integer beat_in_chunk;
     reg signed [31:0] sum;
-    reg [7:0] sat;
+    reg signed [15:0] sat;
 
-    function [7:0] sat_int8;
+    function signed [15:0] sat_int8;
         input signed [31:0] x;
         begin
-            if (x > 32'sd127) sat_int8 = 8'h7f;
-            else if (x < -32'sd128) sat_int8 = 8'h80;
-            else sat_int8 = x[7:0];
+            if (x > 32'sd127) sat_int8 = 16'sd127;
+            else if (x < -32'sd128) sat_int8 = -16'sd128;
+            else sat_int8 = x[15:0];
         end
     endfunction
 
@@ -253,30 +300,7 @@ module {behav_name}(
                             $display("BEH_START beh_cyc=%0d", beh_cyc);
                             beh_first_input <= 1'b0;
                         end
-                        chunk_idx = beat_count / INPUT_BEATS;
-                        beat_in_chunk = beat_count % INPUT_BEATS;
-                        if (beat_in_chunk < {m}) begin
-                            for (lane = 0; lane < 8; lane = lane + 1) begin
-                                kk = chunk_idx * 8 + lane;
-                                if (kk < {k}) begin
-                                    if (coll_buf == 0)
-                                        amat_0[beat_in_chunk][kk] = a_rows[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                    else
-                                        amat_1[beat_in_chunk][kk] = a_rows[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                end
-                            end
-                        end
-                        if (beat_in_chunk < {n}) begin
-                            for (lane = 0; lane < 8; lane = lane + 1) begin
-                                kk = chunk_idx * 8 + lane;
-                                if (kk < {k}) begin
-                                    if (coll_buf == 0)
-                                        bmat_0[kk][beat_in_chunk] = b_cols[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                    else
-                                        bmat_1[kk][beat_in_chunk] = b_cols[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                end
-                            end
-                        end
+{collect_unpack}
                         beat_count <= beat_count + 1;
                     end
                     if (beat_count + 1 >= TOTAL_INPUT_BEATS) begin
@@ -330,30 +354,7 @@ module {behav_name}(
                                 $display("BEH_START beh_cyc=%0d", beh_cyc);
                                 beh_first_input <= 1'b0;
                             end
-                            chunk_idx = shadow_beat / INPUT_BEATS;
-                            beat_in_chunk = shadow_beat % INPUT_BEATS;
-                            if (beat_in_chunk < {m}) begin
-                                for (lane = 0; lane < 8; lane = lane + 1) begin
-                                    kk = chunk_idx * 8 + lane;
-                                    if (kk < {k}) begin
-                                        if (pending_buf == 0)
-                                            amat_0[beat_in_chunk][kk] = a_rows[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                        else
-                                            amat_1[beat_in_chunk][kk] = a_rows[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                    end
-                                end
-                            end
-                            if (beat_in_chunk < {n}) begin
-                                for (lane = 0; lane < 8; lane = lane + 1) begin
-                                    kk = chunk_idx * 8 + lane;
-                                    if (kk < {k}) begin
-                                        if (pending_buf == 0)
-                                            bmat_0[kk][beat_in_chunk] = b_cols[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                        else
-                                            bmat_1[kk][beat_in_chunk] = b_cols[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                    end
-                                end
-                            end
+{shadow_unpack}
                             next_sb = shadow_beat + 1;
                         end
                         shadow_beat <= next_sb;
@@ -432,9 +433,9 @@ module {behav_name}(
                                 else
                                     sat = sat_int8(cmat_1[actual_row][actual_col]);
                             end else begin
-                                sat = 8'd0;
+                                sat = 16'sd0;
                             end
-                            c_row[tile * 128 + lane * 8 +: 8] <= sat;
+                            c_row[tile * 128 + lane * 16 +: 16] <= sat;
                         end
                     end
                     out_valid <= 1'b1;
@@ -1133,6 +1134,317 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper"):
     lines.append("")
     for l in synth_top.splitlines():
         lines.append(l)
+    lines.append("")
+    lines.append("`endif")
+    return "\n".join(lines) + "\n"
+
+
+def _k_spatial_partitions(k, k_spatial):
+    k_chunks = (k + 7) // 8
+    if k_spatial < 1:
+        raise ValueError("k_spatial must be >= 1")
+    if k_spatial > k_chunks:
+        raise ValueError(
+            f"k_spatial={k_spatial} exceeds K_CHUNKS={k_chunks}; "
+            "v1 requires at most one spatial grid per K chunk"
+        )
+    base = k_chunks // k_spatial
+    extra = k_chunks % k_spatial
+    out = []
+    start = 0
+    for p in range(k_spatial):
+        count = base + (1 if p < extra else 0)
+        out.append((start, start + count - 1))
+        start += count
+    return out
+
+
+def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1):
+    """Generate a structural K-spatial Catapult core.
+
+    The structural body instantiates multiple tensor-slice grids and exposes the
+    intended partition/control topology. Functional RTL simulation for this
+    experimental mode is provided by the combined core's behavioral branch.
+    """
+    if k_spatial == 1:
+        return generate_synth_verilog(m, k, n, module_name)
+
+    partitions = _k_spatial_partitions(k, k_spatial)
+    grid_rows = (m + 7) // 8
+    grid_cols = (n + 7) // 8
+    a_width = grid_rows * 64
+    b_width = grid_cols * 64
+    bias_width = b_width
+    a_chunk_width = a_width
+    b_chunk_width = b_width
+    c_width = grid_cols * 128
+    input_beats = max(m, n)
+    k_chunks = (k + 7) // 8
+    full_k_spatial = k_spatial == k_chunks
+    if full_k_spatial:
+        a_width *= k_chunks
+        b_width *= k_chunks
+    total_output_rows = grid_rows * 8
+
+    row_mask_vals = [tail_mask_hex(m, r) for r in range(grid_rows)]
+    col_mask_vals = [tail_mask_hex(n, c) for c in range(grid_cols)]
+    part_comments = "\n".join(
+        f"// K_SPATIAL_PARTITION {p}: chunks {lo}..{hi}" for p, (lo, hi) in enumerate(partitions)
+    )
+
+    decls = []
+    insts = []
+    for p, (lo, hi) in enumerate(partitions):
+        decls.append(f"    // Spatial grid {p}: contiguous K chunks {lo}..{hi}")
+        if full_k_spatial:
+            decls.append(f"    wire part{p}_active = 1'b1;")
+            decls.append(f"    wire part{p}_first_chunk = 1'b1;")
+            decls.append(f"    wire part{p}_last_chunk = 1'b1;")
+            part_k_size = k - lo * 8 if hi == k_chunks - 1 else 8
+            part_k_mask = tail_mask_hex(k, hi) if hi == k_chunks - 1 else 0xFF
+        else:
+            decls.append(f"    wire part{p}_active = (chunk_idx >= 16'd{lo}) && (chunk_idx <= 16'd{hi});")
+            decls.append(f"    wire part{p}_first_chunk = (chunk_idx == 16'd{lo});")
+            decls.append(f"    wire part{p}_last_chunk = (chunk_idx == 16'd{hi});")
+            part_k_size = (k - hi * 8) or 8
+            part_k_mask = tail_mask_hex(k, hi)
+        decls.append(
+            f"    wire [7:0] part{p}_k_size = part{p}_last_chunk ? "
+            f"((16'd{hi} == K_CHUNKS - 1) ? 8'd{part_k_size} : 8'd8) : 8'd8;"
+        )
+        decls.append(
+            f"    wire [7:0] part{p}_k_mask = part{p}_last_chunk ? "
+            f"((16'd{hi} == K_CHUNKS - 1) ? {vm(part_k_mask)} : 8'hFF) : 8'hFF;"
+        )
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                idx = p * grid_rows * grid_cols + r * grid_cols + c
+                if full_k_spatial:
+                    a_expr = f"a_rows[{p}*{a_chunk_width} + {(r + 1) * 64 - 1}:{p}*{a_chunk_width} + {r * 64}]"
+                    b_expr = f"b_cols[{p}*{b_chunk_width} + {(c + 1) * 64 - 1}:{p}*{b_chunk_width} + {c * 64}]"
+                else:
+                    a_expr = f"a_rows[{(r + 1) * 64 - 1}:{r * 64}]"
+                    b_expr = f"b_cols[{(c + 1) * 64 - 1}:{c * 64}]"
+                insts.append(f"""\
+        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_p{p}_r{r}_c{c} (
+            .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
+            .start_mat_mul(slice_start && part{p}_active),
+            .done_mat_mul(done_mat_mul[{idx}]),
+            .a_data((in_beat_active && part{p}_active && ({c} == 0)) ? {a_expr} : 64'b0),
+            .b_data((in_beat_active && part{p}_active && ({r} == 0)) ? {b_expr} : 64'b0),
+            .a_data_in(64'b0),
+            .b_data_in(64'b0),
+            .a_data_out(),
+            .b_data_out(),
+            .c_data_out(partial_c_p{p}_r{r}_c{c}),
+            .c_data_available(partial_avail_p{p}_r{r}_c{c}),
+            .validity_mask_a_rows({vm(row_mask_vals[r])}),
+            .validity_mask_a_cols_b_rows(part{p}_k_mask),
+            .validity_mask_b_cols({vm(col_mask_vals[c])}),
+            .slice_dtype(2'd0), .slice_mode(1'b0), .op(3'd0),
+            .preload(1'b0), .no_rounding(1'b0),
+            .final_mat_mul_size(part{p}_k_size),
+            .a_loc(5'd{r}),
+            .b_loc(5'd{c})
+        );""")
+
+    partial_wires = []
+    for p in range(k_spatial):
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                partial_wires.append(f"    wire [127:0] partial_c_p{p}_r{r}_c{c};")
+                partial_wires.append(f"    wire         partial_avail_p{p}_r{r}_c{c};")
+
+    row_avail = []
+    row_mux_cases = []
+    for r in range(grid_rows):
+        avail_terms = " & ".join(
+            f"partial_avail_p{p}_r{r}_c{c}" for p in range(k_spatial) for c in range(grid_cols)
+        )
+        row_avail.append(f"    wire row_avail_{r} = {avail_terms};")
+        row_mux_cases.append(f"        if (row_avail_{r}) begin")
+        for c in range(grid_cols):
+            for lane in range(8):
+                terms = " + ".join(
+                    f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*16 +: 16])" for p in range(k_spatial)
+                )
+                row_mux_cases.append(
+                    f"            accum32 = {terms} + $signed({{ {{24{{bias_cols[{c}*64 + {lane}*8 + 7]}}}}, bias_cols[{c}*64 + {lane}*8 +: 8] }});"
+                )
+                row_mux_cases.append(
+                    f"            row_mux[{c}*128 + {lane}*16 +: 16] = sat_int8_to_i16(accum32);"
+                )
+        row_mux_cases.append("        end")
+    any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
+
+    if full_k_spatial:
+        wait_body = """\
+                    if (any_avail) begin
+                        c_row <= row_mux;
+                        out_valid <= 1'b1;
+                        out_last <= (out_row_count + 16'd1 == TOTAL_OUT_ROWS);
+                        out_row_count <= out_row_count + 16'd1;
+                        if (out_row_count + 16'd1 == TOTAL_OUT_ROWS)
+                            state <= S_IDLE;
+                    end"""
+    else:
+        wait_body = f"""\
+                    if (all_slices_done) begin
+                        if (chunk_idx + 16'd1 == K_CHUNKS) begin
+                            state <= S_OUTPUT;
+                        end else begin
+                            chunk_idx <= chunk_idx + 16'd1;
+                            beat_count <= 16'd0;
+                            state <= S_RUN;
+                        end
+                    end"""
+
+    return f"""\
+// Auto-generated by generate_catapult_rtl.py
+// Experimental K-spatial structural tensor-slice synth wrapper
+// Dimensions: M={m}, K={k}, N={n}  |  Grid: {grid_rows}x{grid_cols} slices, K_SPATIAL={k_spatial}
+// WARNING: K-spatial partial outputs are INT16; correctness requires every partition partial sum to fit INT16.
+{part_comments}
+`timescale 1ns/1ps
+
+module {module_name}(
+    input  wire                   clk,
+    input  wire                   rst,
+    input  wire                   en,
+    input  wire [{a_width-1}:0]   a_rows,
+    input  wire [{b_width-1}:0]   b_cols,
+    input  wire [{bias_width-1}:0]   bias_cols,
+    input  wire                   preload_valid,
+    input  wire                   in_valid,
+    output reg  [{c_width-1}:0]   c_row,
+    output reg                    out_valid,
+    output reg                    out_last
+);
+
+    localparam integer INPUT_BEATS = {input_beats};
+    localparam integer K_CHUNKS = {k_chunks};
+    localparam integer K_SPATIAL = {k_spatial};
+    localparam integer TOTAL_OUT_ROWS = {total_output_rows};
+    localparam [1:0] S_IDLE=2'd0, S_RUN=2'd1, S_WAIT=2'd2, S_OUTPUT=2'd3;
+
+    reg [1:0] state;
+    reg [15:0] beat_count;
+    reg [15:0] chunk_idx;
+    reg [15:0] out_row_count;
+    reg signed [31:0] accum32;
+    reg [{c_width-1}:0] row_mux;
+
+    wire slice_reset = rst;
+    wire in_beat_active = (state == S_RUN) && in_valid && (beat_count < INPUT_BEATS);
+    wire slice_start = in_beat_active && (beat_count == 16'd0);
+    wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
+    wire all_slices_done = &done_mat_mul;
+
+{chr(10).join(decls)}
+
+{chr(10).join(partial_wires)}
+
+{chr(10).join(insts)}
+
+{chr(10).join(row_avail)}
+
+    wire any_avail = {any_avail_expr};
+
+    function [15:0] sat_int8_to_i16;
+        input signed [31:0] x;
+        begin
+            if (x > 32'sd127) sat_int8_to_i16 = 16'sd127;
+            else if (x < -32'sd128) sat_int8_to_i16 = -16'sd128;
+            else sat_int8_to_i16 = x[15:0];
+        end
+    endfunction
+
+    always @(*) begin
+        row_mux = {c_width}'d0;
+        accum32 = 32'sd0;
+{chr(10).join(row_mux_cases)}
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= S_IDLE;
+            beat_count <= 16'd0;
+            chunk_idx <= 16'd0;
+            out_row_count <= 16'd0;
+            c_row <= {c_width}'d0;
+            out_valid <= 1'b0;
+            out_last <= 1'b0;
+        end else if (en) begin
+            out_valid <= 1'b0;
+            out_last <= 1'b0;
+            case (state)
+                S_IDLE: begin
+                    beat_count <= 16'd0;
+                    chunk_idx <= 16'd0;
+                    out_row_count <= 16'd0;
+                    if (preload_valid) state <= S_RUN;
+                end
+                S_RUN: begin
+                    if (in_beat_active) begin
+                        beat_count <= beat_count + 16'd1;
+                        if (beat_count + 16'd1 == INPUT_BEATS)
+                            state <= S_WAIT;
+                    end
+                end
+                S_WAIT: begin
+{wait_body}
+                end
+                S_OUTPUT: begin
+                    if (any_avail) begin
+                        c_row <= row_mux;
+                        out_valid <= 1'b1;
+                        out_last <= (out_row_count + 16'd1 == TOTAL_OUT_ROWS);
+                        out_row_count <= out_row_count + 16'd1;
+                        if (out_row_count + 16'd1 == TOTAL_OUT_ROWS)
+                            state <= S_IDLE;
+                    end
+                end
+            endcase
+        end
+    end
+
+endmodule
+"""
+
+
+def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1):
+    k_chunks = (k + 7) // 8
+    sim = generate_sim_verilog(m, k, n, module_name, full_k_spatial=(k_spatial == k_chunks))
+    if k_spatial == 1:
+        return sim
+    banner = (
+        f"// Experimental K-spatial behavioral simulation model, K_SPATIAL={k_spatial}\n"
+        "// WARNING: structural K-spatial partial outputs are INT16; simulation uses exact INT32 reference math.\n"
+    )
+    return banner + sim
+
+
+def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1):
+    if k_spatial == 1:
+        return generate_combined_core_verilog(m, k, n, module_name)
+    _k_spatial_partitions(k, k_spatial)
+    sim_top = generate_k_spatial_sim_verilog(m, k, n, module_name, k_spatial)
+    synth_top = generate_k_spatial_synth_verilog(m, k, n, module_name, k_spatial)
+
+    lines = []
+    lines.append("// Auto-generated by generate_catapult_rtl.py")
+    lines.append(f"// Combined K-spatial core: M={m}, K={k}, N={n}, K_SPATIAL={k_spatial}")
+    lines.append("//   ifndef SYNTHESIS -> behavioral simulation model")
+    lines.append("//   else             -> experimental structural K-spatial wrapper")
+    lines.append("// WARNING: INT16 partial overflow is possible in K-spatial structural mode.")
+    lines.append("")
+    lines.append("`ifndef SYNTHESIS")
+    lines.append("")
+    lines.extend(sim_top.splitlines())
+    lines.append("")
+    lines.append("`else")
+    lines.append("")
+    lines.extend(synth_top.splitlines())
     lines.append("")
     lines.append("`endif")
     return "\n".join(lines) + "\n"

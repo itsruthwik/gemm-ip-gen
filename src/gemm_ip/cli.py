@@ -33,6 +33,8 @@ def main():
     parser.add_argument("--name", type=str, default="gemm_8x8x8", help="Package name")
     parser.add_argument("--interface", choices=("stream", "array"), default="stream",
                         help="Interface type (Catapult only, default: stream)")
+    parser.add_argument("--k-spatial", type=int, default=None,
+                        help="Catapult only: number of spatial K grid partitions (default: full K-chunk unroll)")
     parser.add_argument("--output_dir", type=str, default="./output",
                         help="Output directory (default: ./output)")
     args = parser.parse_args()
@@ -55,6 +57,7 @@ def _run_catapult(args):
                 args.output_dir,
                 interface=item.get("interface", "stream"),
                 output_precision=item.get("output_precision"),
+                gemm_k_spatial=item.get("gemm_k_spatial"),
             )
         output_dir = Path(args.output_dir)
         (output_dir / "gemm_ip_combined.h").write_text(gen_combined_header(items))
@@ -63,7 +66,7 @@ def _run_catapult(args):
     else:
         generate_catapult_pkg(
             args.m, args.k, args.n, args.name,
-            args.output_dir, interface=args.interface
+            args.output_dir, interface=args.interface, gemm_k_spatial=args.k_spatial
         )
 
 
