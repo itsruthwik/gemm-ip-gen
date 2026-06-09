@@ -278,7 +278,9 @@ def test_stream_const_weights_full_k_spatial_has_no_a_replay(tmp_path):
     assert "ROW_PACK_FULL_KC" in h
     assert "COL_PACK_FULL_KC" in h
     assert "FEED: for (int step = 0; step < 17; step++)" in h
-    assert "ac_int<1152, false>  a_rows" in h
+    # Narrow full-K word: 64*k_chunks bits (one tile, all K chunks), independent of
+    # grid_rows/grid_cols.  The wrapper RTL re-inserts the tile offset by beat index.
+    assert "ac_int<576, false>  a_rows" in h
     assert "ac_int<576, false>  b_cols" in h
 
 

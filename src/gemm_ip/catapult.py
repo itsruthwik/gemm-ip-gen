@@ -52,8 +52,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     mr = grid_rows * 8
     k_chunks = _ceil_div(k, LANE_WIDTH)
     full_k_spatial = gemm_k_spatial == k_chunks
-    a_bits = row_chunk_bits * k_chunks if full_k_spatial else row_chunk_bits
-    b_bits = col_chunk_bits * k_chunks if full_k_spatial else col_chunk_bits
+    # Full-K uses the NARROW per-beat word (one tile, 64 bits per K-chunk); the
+    # wrapper RTL re-inserts the grid row/col tile offset by beat index, so the
+    # deep input FIFO never stores the always-zero grid padding (area saving on
+    # tiled designs).  Chunked keeps the single-chunk grid-padded width.
+    a_bits = 64 * k_chunks if full_k_spatial else row_chunk_bits
+    b_bits = 64 * k_chunks if full_k_spatial else col_chunk_bits
     bias_bits = col_chunk_bits
     input_beats = max(m, n)
     total_beats = input_beats if full_k_spatial else k_chunks * input_beats
@@ -69,12 +73,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     # (rounding / saturation) by omitting ``.to_int()``.
     assign_expr = "value.to_int()" if _is_ac_integer_type(result_type) else "value"
     a_el_expr = (
-        f"a_buf[actual_row].slc<8>(k_chunk * {row_chunk_bits} + row_tile * 64 + k_lane * 8)"
+        f"a_buf[actual_row].slc<8>(k_chunk * 64 + k_lane * 8)"
         if full_k_spatial
         else f"a_buf[k_chunk * {input_beats} + actual_row].slc<8>(row_tile * 64 + k_lane * 8)"
     )
     b_el_expr = (
-        f"b_buf[actual_col].slc<8>(k_chunk * {col_chunk_bits} + ct * 64 + k_lane * 8)"
+        f"b_buf[actual_col].slc<8>(k_chunk * 64 + k_lane * 8)"
         if full_k_spatial
         else f"b_buf[k_chunk * {input_beats} + actual_col].slc<8>(ct * 64 + k_lane * 8)"
     )
@@ -95,13 +99,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 #pragma hls_unroll
                 ROW_PACK_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
                     int kk = kc * 8 + kl;
-                    int row_tile = t / 8;
-                    #pragma hls_unroll
-                    ROW_TILE_FULL: for (int rt = 0; rt < {grid_rows}; rt++) {{
-                        if (row_tile == rt && kk < {k}) {{
-                            a_rows.set_slc(kc * {row_chunk_bits} + rt * 64 + kl * 8,
-                                           {name}_to_gemm_int8(a_beat[kk]));
-                        }}
+                    if (kk < {k}) {{
+                        a_rows.set_slc(kc * 64 + kl * 8,
+                                       {name}_to_gemm_int8(a_beat[kk]));
                     }}
                 }}
             }}
@@ -113,13 +113,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 #pragma hls_unroll
                 COL_PACK_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
                     int kk = kc * 8 + kl;
-                    int col_tile = t / 8;
-                    #pragma hls_unroll
-                    COL_TILE_FULL: for (int ct = 0; ct < {grid_cols}; ct++) {{
-                        if (col_tile == ct && kk < {k}) {{
-                            b_cols.set_slc(kc * {col_chunk_bits} + ct * 64 + kl * 8,
-                                           {name}_to_gemm_int8(b_beat[kk]));
-                        }}
+                    if (kk < {k}) {{
+                        b_cols.set_slc(kc * 64 + kl * 8,
+                                       {name}_to_gemm_int8(b_beat[kk]));
                     }}
                 }}
             }}
@@ -232,13 +228,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 #pragma hls_unroll
                 ROW_PACK_ARRAY_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
                     int kk = kc * 8 + kl;
-                    int row_tile = t / 8;
-                    #pragma hls_unroll
-                    ROW_TILE_ARRAY_FULL: for (int rt = 0; rt < {grid_rows}; rt++) {{
-                        if (row_tile == rt && kk < {k}) {{
-                            a_rows_packed.set_slc(kc * {row_chunk_bits} + rt * 64 + kl * 8,
-                                                  {name}_to_gemm_int8(a_beat[kk]));
-                        }}
+                    if (kk < {k}) {{
+                        a_rows_packed.set_slc(kc * 64 + kl * 8,
+                                              {name}_to_gemm_int8(a_beat[kk]));
                     }}
                 }}
             }}
@@ -250,13 +242,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 #pragma hls_unroll
                 COL_PACK_ARRAY_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
                     int kk = kc * 8 + kl;
-                    int col_tile = t / 8;
-                    #pragma hls_unroll
-                    COL_TILE_ARRAY_FULL: for (int ct = 0; ct < {grid_cols}; ct++) {{
-                        if (col_tile == ct && kk < {k}) {{
-                            b_cols_packed.set_slc(kc * {col_chunk_bits} + ct * 64 + kl * 8,
-                                                  {name}_to_gemm_int8(b_beat[kk]));
-                        }}
+                    if (kk < {k}) {{
+                        b_cols_packed.set_slc(kc * 64 + kl * 8,
+                                              {name}_to_gemm_int8(b_beat[kk]));
                     }}
                 }}
             }}

@@ -260,8 +260,8 @@ def _gen_all_stimulus_catapult_full_k_spatial(m, k, n, num_vectors, base_seed):
 
         a_stim, b_stim = [], []
         for t in range(input_beats):
-            a_stim.append(pack_a_full_k_spatial(A, t, grid_rows, m, k))
-            b_stim.append(pack_b_full_k_spatial(B, t, grid_cols, n, k))
+            a_stim.append(pack_a_full_k_spatial_narrow(A, t, m, k))
+            b_stim.append(pack_b_full_k_spatial_narrow(B, t, n, k))
         all_a_stim.append(a_stim)
         all_b_stim.append(b_stim)
         all_bias.append(pack_bias(biases, grid_cols, n))
@@ -361,8 +361,10 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
     b_bytes = grid_cols * 8
     bias_bytes = b_bytes
     if full_k_spatial:
-        a_bytes *= k_chunks
-        b_bytes *= k_chunks
+        # Narrow word: 64*k_chunks bits = 8*k_chunks bytes (one tile, all K chunks);
+        # the wrapper RTL routes the tile by beat index.  Bias stays grid_cols*64.
+        a_bytes = 8 * k_chunks
+        b_bytes = 8 * k_chunks
     c_bytes = grid_cols * 16
     aw = a_bytes * 8
     bw = b_bytes * 8

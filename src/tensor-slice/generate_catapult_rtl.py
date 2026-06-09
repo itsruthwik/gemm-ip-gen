@@ -29,8 +29,9 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
     input_beats = max(m, n)
     k_chunks = (k + 7) // 8
     if full_k_spatial:
-        a_width *= k_chunks
-        b_width *= k_chunks
+        # Narrow per-beat word: one tile, 64 bits per K-chunk, no grid padding.
+        a_width = 64 * k_chunks
+        b_width = 64 * k_chunks
     bias_width = grid_cols * 64
     total_input_beats = input_beats if full_k_spatial else k_chunks * input_beats
     total_output_rows = m
@@ -75,9 +76,9 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
                                 chunk_idx = kk / 8;
                                 lane = kk % 8;
                                 if (coll_buf == 0)
-                                    amat_0[beat_in_chunk][kk] = a_rows[chunk_idx * {a_chunk_width} + (beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                    amat_0[beat_in_chunk][kk] = a_rows[chunk_idx * 64 + lane * 8 +: 8];
                                 else
-                                    amat_1[beat_in_chunk][kk] = a_rows[chunk_idx * {a_chunk_width} + (beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                    amat_1[beat_in_chunk][kk] = a_rows[chunk_idx * 64 + lane * 8 +: 8];
                             end
                         end
                         if (beat_in_chunk < {n}) begin
@@ -85,9 +86,9 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
                                 chunk_idx = kk / 8;
                                 lane = kk % 8;
                                 if (coll_buf == 0)
-                                    bmat_0[kk][beat_in_chunk] = b_cols[chunk_idx * {b_chunk_width} + (beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                    bmat_0[kk][beat_in_chunk] = b_cols[chunk_idx * 64 + lane * 8 +: 8];
                                 else
-                                    bmat_1[kk][beat_in_chunk] = b_cols[chunk_idx * {b_chunk_width} + (beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                    bmat_1[kk][beat_in_chunk] = b_cols[chunk_idx * 64 + lane * 8 +: 8];
                             end
                         end"""
         shadow_unpack = collect_unpack.replace("beat_count", "shadow_beat").replace("coll_buf", "pending_buf")
@@ -1182,8 +1183,12 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
     k_chunks = (k + 7) // 8
     full_k_spatial = k_spatial == k_chunks
     if full_k_spatial:
-        a_width *= k_chunks
-        b_width *= k_chunks
+        # Narrow per-beat word: partition p carries one 64-bit tile (its K-chunk);
+        # the wrapper routes it to the row/col tile by beat index, so no grid padding.
+        a_width = 64 * k_chunks
+        b_width = 64 * k_chunks
+        a_chunk_width = 64
+        b_chunk_width = 64
     total_output_rows = grid_rows * 8
 
     row_mask_vals = [tail_mask_hex(m, r) for r in range(grid_rows)]
@@ -1220,18 +1225,24 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
             for c in range(grid_cols):
                 idx = p * grid_rows * grid_cols + r * grid_cols + c
                 if full_k_spatial:
-                    a_expr = f"a_rows[{p}*{a_chunk_width} + {(r + 1) * 64 - 1}:{p}*{a_chunk_width} + {r * 64}]"
-                    b_expr = f"b_cols[{p}*{b_chunk_width} + {(c + 1) * 64 - 1}:{p}*{b_chunk_width} + {c * 64}]"
+                    # Narrow word: partition p carries one 64-bit tile at p*64; route
+                    # it to row-tile r / col-tile c by beat index (beat_count/8 == tile).
+                    a_expr = f"a_rows[{p}*{a_chunk_width} + 63:{p}*{a_chunk_width}]"
+                    b_expr = f"b_cols[{p}*{b_chunk_width} + 63:{p}*{b_chunk_width}]"
+                    a_route = f" && (beat_count >> 3 == {r})"
+                    b_route = f" && (beat_count >> 3 == {c})"
                 else:
                     a_expr = f"a_rows[{(r + 1) * 64 - 1}:{r * 64}]"
                     b_expr = f"b_cols[{(c + 1) * 64 - 1}:{c * 64}]"
+                    a_route = ""
+                    b_route = ""
                 insts.append(f"""\
         (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_p{p}_r{r}_c{c} (
             .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
             .start_mat_mul(slice_start && part{p}_active),
             .done_mat_mul(done_mat_mul[{idx}]),
-            .a_data((in_beat_active && part{p}_active && ({c} == 0)) ? {a_expr} : 64'b0),
-            .b_data((in_beat_active && part{p}_active && ({r} == 0)) ? {b_expr} : 64'b0),
+            .a_data((in_beat_active && part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
+            .b_data((in_beat_active && part{p}_active && ({r} == 0){b_route}) ? {b_expr} : 64'b0),
             .a_data_in(64'b0),
             .b_data_in(64'b0),
             .a_data_out(),
