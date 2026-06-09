@@ -120,6 +120,29 @@ def pack_b_full_k_spatial(B, col_idx, grid_cols, n, k):
     return val
 
 
+def pack_a_full_k_spatial_narrow(A, t, m, k):
+    """Narrow full-K spatial A beat (64*k_chunks bits): one row tile at position 0,
+    K chunk c at bits [c*64 : c*64+64], no tile-row offset.  Matches the Vitis
+    narrow full_k_spatial RTL, which routes the tile to amat[beat] by beat index."""
+    val = 0
+    if t < m:
+        for kk in range(k):
+            byte = int(A[t, kk]) & 0xFF
+            val |= byte << ((kk // 8) * 64 + (kk % 8) * 8)
+    return val
+
+
+def pack_b_full_k_spatial_narrow(B, col_idx, n, k):
+    """Narrow full-K spatial B beat (64*k_chunks bits): one col tile at position 0,
+    K chunk c at bits [c*64 : c*64+64], no tile-col offset."""
+    val = 0
+    if col_idx < n:
+        for kk in range(k):
+            byte = int(B[kk, col_idx]) & 0xFF
+            val |= byte << ((kk // 8) * 64 + (kk % 8) * 8)
+    return val
+
+
 def pack_bias(biases, grid_cols, n):
     """Pack bias array into a single integer (same layout as B)."""
     val = 0
@@ -270,6 +293,39 @@ def _gen_all_stimulus_vitis(m, k, n, num_vectors, base_seed):
             for t in range(input_beats):
                 a_stim.append(pack_a_chunk(A, t, chunk, grid_rows, m, k))
                 b_stim.append(pack_b_chunk(B, t, chunk, grid_cols, n, k))
+        all_a_stim.append(a_stim)
+        all_b_stim.append(b_stim)
+        all_bias.append(pack_bias(biases, grid_cols, n))
+
+        golden = []
+        for rt in range(grid_rows):
+            for row in range(8):
+                golden.append(pack_c_row(C_sat, rt, row, grid_cols, m, n, "vitis"))
+        all_golden.append(golden)
+
+    return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols
+
+
+def _gen_all_stimulus_vitis_full_k_narrow(m, k, n, num_vectors, base_seed):
+    """Vitis full-K-spatial stimulus with the NARROW packed word (64*k_chunks bits).
+
+    One A row and one B column per beat (input_beats beats), each carrying all K
+    chunks in a single 64*k_chunks-bit tile at position 0.  Golden uses Vitis int8
+    packing.  Matches generate_vitis_{sim,synth}_rtl in full_k_spatial mode."""
+    grid_rows = (m + 7) // 8
+    grid_cols = (n + 7) // 8
+    input_beats = max(m, n)
+
+    all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
+
+    for v in range(num_vectors):
+        seed = base_seed + v
+        A, B, biases, C_sat = _random_matrices(m, k, n, seed)
+
+        a_stim, b_stim = [], []
+        for t in range(input_beats):
+            a_stim.append(pack_a_full_k_spatial_narrow(A, t, m, k))
+            b_stim.append(pack_b_full_k_spatial_narrow(B, t, n, k))
         all_a_stim.append(a_stim)
         all_b_stim.append(b_stim)
         all_bias.append(pack_bias(biases, grid_cols, n))
@@ -575,7 +631,7 @@ endmodule
 # ── Vitis testbench ────────────────────────────────────────────────────────────
 
 
-def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False):
+def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, full_k_spatial=False):
     """Generate a multi-vector Vitis testbench.
 
     back2back=False (default): Drain each vector completely before feeding the next.
@@ -587,13 +643,21 @@ def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_b
     grid_cols = (n + 7) // 8
     input_beats = max(m, n)  # row/col: one A row + one B col per cycle
     k_chunks = (k + 7) // 8
-    total_input_beats = k_chunks * input_beats
-    a_bytes = grid_rows * 8
-    b_bytes = grid_cols * 8
+    if full_k_spatial:
+        # Narrow word: one row/col tile per beat carrying all K chunks (64*k_chunks).
+        total_input_beats = input_beats
+        a_bytes = 8 * k_chunks
+        b_bytes = 8 * k_chunks
+    else:
+        total_input_beats = k_chunks * input_beats
+        a_bytes = grid_rows * 8
+        b_bytes = grid_cols * 8
     c_bytes = grid_cols * 8
+    bias_bytes = grid_cols * 8   # bias is always grid_cols*64 bits (one byte per col tile-lane)
     aw = a_bytes * 8
     bw = b_bytes * 8
     cw = c_bytes * 8
+    biasw = bias_bytes * 8
 
     num_vectors = len(all_a_stim)
     total_out_rows = m
@@ -604,7 +668,7 @@ def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_b
         for t in range(total_input_beats):
             a_init.append(f"        a_stim[{v}][{t}] = {hex_literal(all_a_stim[v][t], a_bytes)};")
             b_init.append(f"        b_stim[{v}][{t}] = {hex_literal(all_b_stim[v][t], b_bytes)};")
-        bias_init.append(f"        bias_stim[{v}] = {hex_literal(all_bias[v], b_bytes)};")
+        bias_init.append(f"        bias_stim[{v}] = {hex_literal(all_bias[v], bias_bytes)};")
         for row in range(total_out_rows):
             golden_init.append(f"        golden[{v}][{row}] = {hex_literal(all_golden[v][row], c_bytes)};")
 
@@ -761,7 +825,7 @@ module tb_vitis_{m}x{k}x{n};
     reg        a_tvalid = 0;
     wire       a_tready;
 
-    reg  [{bw - 1}:0] bias_tdata = 0;
+    reg  [{biasw - 1}:0] bias_tdata = 0;
     reg        bias_tvalid = 0;
     wire       bias_tready;
 
@@ -786,7 +850,7 @@ module tb_vitis_{m}x{k}x{n};
     // Stimulus & golden memories
     reg [{aw - 1}:0] a_stim    [0:NV-1][0:TOTAL_INPUT_BEATS - 1];
     reg [{bw - 1}:0] b_stim    [0:NV-1][0:TOTAL_INPUT_BEATS - 1];
-    reg [{bw - 1}:0] bias_stim [0:NV-1];
+    reg [{biasw - 1}:0] bias_stim [0:NV-1];
     reg [{cw - 1}:0] golden    [0:NV-1][0:{total_out_rows - 1}];
 
     initial begin
@@ -828,9 +892,18 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
         Verilog source as a string.
     """
     if protocol == "vitis":
-        all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_vitis(
-            m, k, n, num_vectors, seed)
-        return _gen_vitis_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back)
+        k_chunks = (k + 7) // 8
+        # Mirror generate_vitis_sim_rtl's default: gemm_k_spatial defaults to 1, so
+        # full_k_spatial == (1 == k_chunks).  Callers may force it for k_chunks>1.
+        vfull = full_k_spatial or (k_chunks == 1)
+        if vfull:
+            all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_vitis_full_k_narrow(
+                m, k, n, num_vectors, seed)
+        else:
+            all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_vitis(
+                m, k, n, num_vectors, seed)
+        return _gen_vitis_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden,
+                             timing=timing, back2back=back2back, full_k_spatial=vfull)
     if full_k_spatial:
         all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_catapult_full_k_spatial(
             m, k, n, num_vectors, seed)
