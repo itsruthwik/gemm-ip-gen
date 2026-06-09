@@ -96,9 +96,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 ROW_PACK_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
                     int kk = kc * 8 + kl;
                     int row_tile = t / 8;
-                    if (kk < {k}) {{
-                        a_rows.set_slc(kc * {row_chunk_bits} + row_tile * 64 + kl * 8,
-                                       {name}_to_gemm_int8(a_beat[kk]));
+                    #pragma hls_unroll
+                    ROW_TILE_FULL: for (int rt = 0; rt < {grid_rows}; rt++) {{
+                        if (row_tile == rt && kk < {k}) {{
+                            a_rows.set_slc(kc * {row_chunk_bits} + rt * 64 + kl * 8,
+                                           {name}_to_gemm_int8(a_beat[kk]));
+                        }}
                     }}
                 }}
             }}
@@ -111,9 +114,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 COL_PACK_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
                     int kk = kc * 8 + kl;
                     int col_tile = t / 8;
-                    if (kk < {k}) {{
-                        b_cols.set_slc(kc * {col_chunk_bits} + col_tile * 64 + kl * 8,
-                                       {name}_to_gemm_int8(b_beat[kk]));
+                    #pragma hls_unroll
+                    COL_TILE_FULL: for (int ct = 0; ct < {grid_cols}; ct++) {{
+                        if (col_tile == ct && kk < {k}) {{
+                            b_cols.set_slc(kc * {col_chunk_bits} + ct * 64 + kl * 8,
+                                           {name}_to_gemm_int8(b_beat[kk]));
+                        }}
                     }}
                 }}
             }}
@@ -153,9 +159,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 ROW_PACK_DIRECT: for (int kl = 0; kl < 8; kl++) {{
                     int kk = kl;
                     int row_tile = t / 8;
-                    if (kk < {k}) {{
-                        a_rows.set_slc(row_tile * 64 + kl * 8,
-                                       {name}_to_gemm_int8(a_beat[kk]));
+                    #pragma hls_unroll
+                    ROW_TILE_DIRECT: for (int rt = 0; rt < {grid_rows}; rt++) {{
+                        if (row_tile == rt && kk < {k}) {{
+                            a_rows.set_slc(rt * 64 + kl * 8,
+                                           {name}_to_gemm_int8(a_beat[kk]));
+                        }}
                     }}
                 }}
                 #pragma hls_unroll
@@ -165,9 +174,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                     ROW_PACK_REPLAY: for (int kl = 0; kl < 8; kl++) {{
                         int kk = replay_kc * 8 + kl;
                         int row_tile = t / 8;
-                        if (kk < {k}) {{
-                            replay_rows.set_slc(row_tile * 64 + kl * 8,
-                                                {name}_to_gemm_int8(a_beat[kk]));
+                        #pragma hls_unroll
+                        ROW_TILE_REPLAY: for (int rt = 0; rt < {grid_rows}; rt++) {{
+                            if (row_tile == rt && kk < {k}) {{
+                                replay_rows.set_slc(rt * 64 + kl * 8,
+                                                    {name}_to_gemm_int8(a_beat[kk]));
+                            }}
                         }}
                     }}
                     a_replay[replay_kc][t] = replay_rows;
@@ -182,9 +194,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
             COL_PACK: for (int kl = 0; kl < 8; kl++) {{
                 int kk = kc * 8 + kl;
                 int col_tile = t / 8;
-                if (kk < {k}) {{
-                    b_cols.set_slc(col_tile * 64 + kl * 8,
-                                   {name}_to_gemm_int8(b_beat[kk]));
+                #pragma hls_unroll
+                COL_TILE_CHUNK: for (int ct = 0; ct < {grid_cols}; ct++) {{
+                    if (col_tile == ct && kk < {k}) {{
+                        b_cols.set_slc(ct * 64 + kl * 8,
+                                       {name}_to_gemm_int8(b_beat[kk]));
+                    }}
                 }}
             }}
         }}
@@ -218,9 +233,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 ROW_PACK_ARRAY_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
                     int kk = kc * 8 + kl;
                     int row_tile = t / 8;
-                    if (kk < {k}) {{
-                        a_rows_packed.set_slc(kc * {row_chunk_bits} + row_tile * 64 + kl * 8,
-                                              {name}_to_gemm_int8(a_beat[kk]));
+                    #pragma hls_unroll
+                    ROW_TILE_ARRAY_FULL: for (int rt = 0; rt < {grid_rows}; rt++) {{
+                        if (row_tile == rt && kk < {k}) {{
+                            a_rows_packed.set_slc(kc * {row_chunk_bits} + rt * 64 + kl * 8,
+                                                  {name}_to_gemm_int8(a_beat[kk]));
+                        }}
                     }}
                 }}
             }}
@@ -233,9 +251,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 COL_PACK_ARRAY_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
                     int kk = kc * 8 + kl;
                     int col_tile = t / 8;
-                    if (kk < {k}) {{
-                        b_cols_packed.set_slc(kc * {col_chunk_bits} + col_tile * 64 + kl * 8,
-                                              {name}_to_gemm_int8(b_beat[kk]));
+                    #pragma hls_unroll
+                    COL_TILE_ARRAY_FULL: for (int ct = 0; ct < {grid_cols}; ct++) {{
+                        if (col_tile == ct && kk < {k}) {{
+                            b_cols_packed.set_slc(kc * {col_chunk_bits} + ct * 64 + kl * 8,
+                                                  {name}_to_gemm_int8(b_beat[kk]));
+                        }}
                     }}
                 }}
             }}
@@ -269,9 +290,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
             for (int kl = 0; kl < 8; kl++) {{
                 int kk = kc * 8 + kl;
                 int row_tile = t / 8;
-                if (kk < {k}) {{
-                    a_rows_packed.set_slc(row_tile * 64 + kl * 8,
-                                          {name}_to_gemm_int8(a_beat[kk]));
+                #pragma hls_unroll
+                for (int rt = 0; rt < {grid_rows}; rt++) {{
+                    if (row_tile == rt && kk < {k}) {{
+                        a_rows_packed.set_slc(rt * 64 + kl * 8,
+                                              {name}_to_gemm_int8(a_beat[kk]));
+                    }}
                 }}
             }}
         }}
@@ -281,9 +305,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
             for (int kl = 0; kl < 8; kl++) {{
                 int kk = kc * 8 + kl;
                 int col_tile = t / 8;
-                if (kk < {k}) {{
-                    b_cols_packed.set_slc(col_tile * 64 + kl * 8,
-                                          {name}_to_gemm_int8(b_beat[kk]));
+                #pragma hls_unroll
+                for (int ct = 0; ct < {grid_cols}; ct++) {{
+                    if (col_tile == ct && kk < {k}) {{
+                        b_cols_packed.set_slc(ct * 64 + kl * 8,
+                                              {name}_to_gemm_int8(b_beat[kk]));
+                    }}
                 }}
             }}
         }}
