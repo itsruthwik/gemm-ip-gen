@@ -239,3 +239,12 @@ def load_vitis_rtl_generator():
         _sys.path.insert(0, ts_dir)
     from generate_vitis_rtl import generate_vitis_rtl  # noqa: F811
     return generate_vitis_rtl
+
+
+def load_vitis_combined_rtl_generator():
+    """Import generate_vitis_combined_rtl (sim+synth under `ifndef SYNTHESIS)."""
+    ts_dir = str(Path(__file__).resolve().parent.parent / "tensor-slice")
+    if ts_dir not in _sys.path:
+        _sys.path.insert(0, ts_dir)
+    from generate_vitis_rtl import generate_vitis_combined_rtl  # noqa: F811
+    return generate_vitis_combined_rtl

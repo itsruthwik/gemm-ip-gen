@@ -50,7 +50,7 @@ set for a layer. Each entry carries `gemm_m`, `gemm_k`, `gemm_n`,
 | C model | `{name}_gemm_ip.h` (templated) | `{name}_wrapper.cpp` (C API) |
 | RTL wrapper | `{name}_core.v` | `{name}_wrapper.v` + `{name}_core.v` |
 | Build script | `run_catapult.tcl` | `run_vitis.tcl` |
-| Interface support | `stream`, `array` | `stream` only |
+| Interface support | `stream`, `array` | `stream`, `array` |
 | Bias handling | Inside blackbox (preload phase) | Inside blackbox (preload phase) |
 | Result type | int8 (saturated from int32) | int8 (saturated from int32) |
 
@@ -88,7 +88,19 @@ For a package named `<name>`:
 | `gemm_ip_combined.h` | Shape/id dispatch header for hls4ml integration |
 | `integration_manifest.json` | Package metadata for multi-layer models |
 
-## Stream interface (Vitis)
+## Vitis interfaces
+
+The generated Vitis package always uses the same packed `ap_uint` stream blackbox
+internally, and emits typed hls4ml adapters for both integration styles:
+
+- `nnet::gemm_ip_stream(...)` for stream-fed layers
+- `nnet::gemm_ip_array(...)` for array-fed layers
+
+The selected `interface` value is preserved in `integration_manifest.json` and
+used by `gemm_ip_combined.h` to dispatch the matching adapter for each generated
+shape.
+
+### Stream blackbox contract
 
 The Vitis blackbox uses three input streams and one output stream, all
 `hls::stream<ap_uint<W>>`:

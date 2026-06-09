@@ -9,7 +9,6 @@ Per-package outputs (``<name>`` is the ``--name`` argument):
   ``<name>_wrapper.cpp``   C API model  (``hls::stream<ap_uint<W>>`` interface)
   ``<name>.v``             RTL wrapper module ``<name>_wrapper``
   ``<name>_wrapper.json``  Blackbox descriptor
-  ``tensor_slice_int8.v``  Copied tensor-slice RTL core
   ``run_vitis.tcl``        Standalone Vitis HLS project script (Tcl)
   ``run_vitis.py``         Standalone Vitis 2025.2 Python HLS runner
   ``hls_config.cfg``       Vitis 2025.2 HLS component config
@@ -53,6 +52,7 @@ Exact pack/unpack contract matches ``nnet_gemm_stream.h`` and
 """
 
 import json
+import sys
 from pathlib import Path
 
 from gemm_ip.metadata import (
@@ -70,6 +70,7 @@ from gemm_ip.metadata import (
     verilog_tile_comment,
     normalize_gemm_config,
     load_vitis_rtl_generator,
+    load_vitis_combined_rtl_generator,
 )
 
 
@@ -83,11 +84,59 @@ def _write_text(path, content):
     path.write_text(content, encoding="utf-8")
 
 
-def _copy_file(src, dst):
-    if not src.exists():
-        raise FileNotFoundError(f"Required RTL source not found: {src}")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+def _validate_gemm_k_spatial(k, gemm_k_spatial):
+    k_chunks = _ceil_div(k, LANE_WIDTH)
+    if gemm_k_spatial is None:
+        return k_chunks
+    k_spatial = int(gemm_k_spatial)
+    if k_spatial < 1:
+        raise ValueError("gemm_k_spatial must be >= 1")
+    if k_spatial > k_chunks:
+        raise ValueError(
+            f"gemm_k_spatial={k_spatial} exceeds K_CHUNKS={k_chunks}; "
+            "v1 requires at most one spatial grid per K chunk"
+        )
+    return k_spatial
+
+
+def normalize_vitis_items(cfg):
+    items = normalize_gemm_config(cfg)
+    for item in items:
+        item["backend"] = "vitis"
+        item["gemm_k_spatial"] = _validate_gemm_k_spatial(
+            item["k"], item.get("gemm_k_spatial")
+        )
+    return items
+
+
+def _k_chunks(item):
+    return _ceil_div(item["k"], LANE_WIDTH)
+
+
+def _full_k_spatial(item):
+    return item.get("gemm_k_spatial", _k_chunks(item)) == _k_chunks(item)
+
+
+def _a_bb_width(item):
+    # Full-K-spatial uses the NARROW per-beat word: each beat carries one row's
+    # K-data as 64*k_chunks bits (one 8-lane tile per K-chunk, at position 0).
+    # The wrapper RTL re-inserts the grid_rows row-tile offset internally (routed
+    # by beat index), so the deep input FIFO never stores the always-zero padding.
+    # Chunked mode keeps the single-chunk width (grid_rows*64).
+    if _full_k_spatial(item):
+        return 64 * _k_chunks(item)
+    return _a_width(item["m"])
+
+
+def _b_bb_width(item):
+    if _full_k_spatial(item):
+        return 64 * _k_chunks(item)
+    return _b_width(item["n"])
+
+
+def _total_input_beats(item):
+    input_beats = max(item["m"], item["n"])
+    return input_beats if _full_k_spatial(item) else _k_chunks(item) * input_beats
 
 
 # ── C API model (wrapper.cpp) ──────────────────────────────────────────────────
@@ -106,11 +155,72 @@ def _gen_wrapper_cpp(item):
     name = item["emit_name"]
     m, k_val, n = item["m"], item["k"], item["n"]
     gr, gc = item["grid_rows"], item["grid_cols"]
-    aw = _a_width(m)
-    bw = _b_width(n)
+    aw = _a_bb_width(item)
+    bw = _b_bb_width(item)
+    biasw = _bias_width(n)
     cw = _c_width(n)
-    k_chunks = _ceil_div(k_val, LANE_WIDTH)
+    k_chunks = _k_chunks(item)
+    full_k_spatial = _full_k_spatial(item)
     input_beats = max(m, n)
+    total_input_beats = _total_input_beats(item)
+    read_loop = f"""\
+    ReadFullK:
+    for (int t = 0; t < {input_beats}; t++) {{
+        #pragma HLS PIPELINE II=1
+        ap_uint<{aw}> a_pkt = a_stream.read();
+        ap_uint<{bw}> b_pkt = b_stream.read();
+        if (t < {m}) {{
+            // Narrow word: one row-tile, all K-chunks at position 0 (no row_tile offset).
+            for (int kc = 0; kc < {k_chunks}; kc++) {{
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        a_rows[t][kk] = a_pkt.range(kc * 64 + kl * 8 + 7,
+                                                    kc * 64 + kl * 8);
+                    }}
+                }}
+            }}
+        }}
+        if (t < {n}) {{
+            for (int kc = 0; kc < {k_chunks}; kc++) {{
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        b_cols[t][kk] = b_pkt.range(kc * 64 + kl * 8 + 7,
+                                                    kc * 64 + kl * 8);
+                    }}
+                }}
+            }}
+        }}
+    }}""" if full_k_spatial else f"""\
+    ReadChunks:
+    for (int kc = 0; kc < {k_chunks}; kc++) {{
+        for (int t = 0; t < {input_beats}; t++) {{
+            #pragma HLS PIPELINE II=1
+            ap_uint<{aw}> a_pkt = a_stream.read();
+            ap_uint<{bw}> b_pkt = b_stream.read();
+            if (t < {m}) {{
+                int row_tile = t / 8;
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        a_rows[t][kk] = a_pkt.range(row_tile * 64 + kl * 8 + 7,
+                                                    row_tile * 64 + kl * 8);
+                    }}
+                }}
+            }}
+            if (t < {n}) {{
+                int col_tile = t / 8;
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        b_cols[t][kk] = b_pkt.range(col_tile * 64 + kl * 8 + 7,
+                                                    col_tile * 64 + kl * 8);
+                    }}
+                }}
+            }}
+        }}
+    }}"""
 
     return f"""\
 #include <hls_stream.h>
@@ -118,8 +228,9 @@ def _gen_wrapper_cpp(item):
 
 // ── Behavioral C model for {name} ─────────────────────────────────────────────
 // Dimensions: M={m}, K={k_val}, N={n}
-// Grid: {gr}x{gc} tiles, {k_chunks} K chunks, {input_beats} row/col beats per chunk
-// Stream widths: A={aw}, B={bw}, C={cw}
+// Grid: {gr}x{gc} tiles, {k_chunks} K chunks, {total_input_beats} total row/col beats
+// K_SPATIAL={item.get("gemm_k_spatial", k_chunks)}
+// Stream widths: A={aw}, B={bw}, Bias={biasw}, C={cw}
 
 static ap_int<8> saturated_int8(ap_int<32> v) {{
     if (v > 127) return 127;
@@ -130,7 +241,7 @@ static ap_int<8> saturated_int8(ap_int<32> v) {{
 void {name}_wrapper(
     hls::stream<ap_uint<{aw}>> &a_stream,
     hls::stream<ap_uint<{bw}>> &b_stream,
-    hls::stream<ap_uint<{bw}>> &bias_stream,
+    hls::stream<ap_uint<{biasw}>> &bias_stream,
     hls::stream<ap_uint<{cw}>> &c_stream
 ) {{
     ap_int<8> a_rows[{m}][{k_val}];
@@ -146,7 +257,7 @@ void {name}_wrapper(
     // Phase 1: Read bias (1 beat)
     // ═══════════════════════════════════════════════════════════════════════
     {{
-        ap_uint<{bw}> bias_pkt = bias_stream.read();
+        ap_uint<{biasw}> bias_pkt = bias_stream.read();
     BiasUnpack:
         for (int col = 0; col < {gc}; col++) {{
             for (int lane = 0; lane < 8; lane++) {{
@@ -161,36 +272,7 @@ void {name}_wrapper(
     // ═══════════════════════════════════════════════════════════════════════
     // Phase 2: Read chunk-local row/column beats
     // ═══════════════════════════════════════════════════════════════════════
-    ReadChunks:
-    for (int kc = 0; kc < {k_chunks}; kc++) {{
-        for (int t = 0; t < {input_beats}; t++) {{
-            #pragma HLS PIPELINE II=1
-            ap_uint<{aw}> a_pkt = a_stream.read();
-            ap_uint<{bw}> b_pkt = b_stream.read();
-            if (t < {m}) {{
-                int row_tile = t / 8;
-                int row_local = t % 8;
-                for (int kl = 0; kl < 8; kl++) {{
-                    int kk = kc * 8 + kl;
-                    if (kk < {k_val}) {{
-                        a_rows[t][kk] = a_pkt.range(row_tile * 64 + kl * 8 + 7,
-                                                    row_tile * 64 + kl * 8);
-                    }}
-                }}
-            }}
-            if (t < {n}) {{
-                int col_tile = t / 8;
-                int col_local = t % 8;
-                for (int kl = 0; kl < 8; kl++) {{
-                    int kk = kc * 8 + kl;
-                    if (kk < {k_val}) {{
-                        b_cols[t][kk] = b_pkt.range(col_tile * 64 + kl * 8 + 7,
-                                                    col_tile * 64 + kl * 8);
-                    }}
-                }}
-            }}
-        }}
-    }}
+{read_loop}
 
     // ═══════════════════════════════════════════════════════════════════════
     // Phase 3: Compute GEMM, add bias, saturate, write results
@@ -230,9 +312,10 @@ def _gen_json(item):
     m, k_val, n = item["m"], item["k"], item["n"]
     gr, gc = item["grid_rows"], item["grid_cols"]
 
-    k_chunks_val = (k_val + 7) // 8
+    k_chunks_val = _k_chunks(item)
     input_beats_val = max(m, n)
-    beh_grid = k_chunks_val * input_beats_val + max(0, k_val + n - k_chunks_val * input_beats_val) + m
+    total_input_beats = _total_input_beats(item)
+    beh_grid = total_input_beats + max(0, k_val + n - total_input_beats) + m
     total_latency = beh_grid + 4  # Vitis wrapper overhead: bias + tvalid/tready handshake + negedge detect
 
     desc = {
@@ -243,8 +326,8 @@ def _gen_json(item):
         ],
         "rtl_files": [
             f"{name}/{name}.v",
-            f"{name}/tensor_slice_int8.v",
         ],
+        "gemm_k_spatial": item.get("gemm_k_spatial", k_chunks_val),
         "c_parameters": [
             {
                 "c_name": "a_stream",
@@ -299,7 +382,12 @@ def _gen_json(item):
         },
         "rtl_performance": {
             "latency": str(total_latency),
-            "II": str(total_latency)
+            "II": str(total_input_beats),
+            "II_contract": "behavioral_overlap_input_beats",
+            "II_note": (
+                "II is the blackbox scheduling contract used by the behavioral model; "
+                "the synthesizable RTL wrapper is not transaction-overlapped in this release."
+            )
         },
         "rtl_resource_usage": {
             "FF": "1",
@@ -456,18 +544,58 @@ def _gen_design_cpp(item):
     name = item["emit_name"]
     m, k_val, n = item["m"], item["k"], item["n"]
     gr, gc = item["grid_rows"], item["grid_cols"]
-    aw = _a_width(m)
-    bw = _b_width(n)
+    aw = _a_bb_width(item)
+    bw = _b_bb_width(item)
+    biasw = _bias_width(n)
     cw = _c_width(n)
-    k_chunks = _ceil_div(k_val, LANE_WIDTH)
+    k_chunks = _k_chunks(item)
+    full_k_spatial = _full_k_spatial(item)
     input_beats = max(m, n)
+    total_input_beats = _total_input_beats(item)
 
     a_beat_w = k_val * 8
     b_beat_w = k_val * 8
     c_row_w  = n * 8
 
     # Build the chunk-streaming section: direct for single-chunk, buffered for multi-chunk
-    if k_chunks == 1:
+    if full_k_spatial:
+        chunk_section = f"""\
+    // Full K-spatial: one widened blackbox beat per logical row/column
+    for (int t = 0; t < {input_beats}; t++) {{
+        #pragma HLS PIPELINE II=1
+        ap_uint<{aw}> a_pkt = 0;
+        ap_uint<{bw}> b_pkt = 0;
+        if (t < {m}) {{
+            ap_uint<{a_beat_w}> a_beat = a_beat_stream.read();
+            // Narrow word: one row-tile, all K-chunks at position 0.
+            for (int kc = 0; kc < {k_chunks}; kc++) {{
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        a_pkt.range(kc * 64 + kl * 8 + 7,
+                                    kc * 64 + kl * 8) =
+                            a_beat.range(kk * 8 + 7, kk * 8);
+                    }}
+                }}
+            }}
+        }}
+        if (t < {n}) {{
+            ap_uint<{b_beat_w}> b_beat = b_beat_stream.read();
+            for (int kc = 0; kc < {k_chunks}; kc++) {{
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        b_pkt.range(kc * 64 + kl * 8 + 7,
+                                    kc * 64 + kl * 8) =
+                            b_beat.range(kk * 8 + 7, kk * 8);
+                    }}
+                }}
+            }}
+        }}
+        a_chunk.write(a_pkt);
+        b_chunk.write(b_pkt);
+    }}"""
+    elif k_chunks == 1:
         chunk_section = f"""\
     // Single-chunk (K={k_val} <= 8): K-wide beats streamed directly into chunk beats
     for (int t = 0; t < {input_beats}; t++) {{
@@ -559,7 +687,7 @@ def _gen_design_cpp(item):
 extern void {name}_wrapper(
     hls::stream<ap_uint<{aw}>> &a_stream,
     hls::stream<ap_uint<{bw}>> &b_stream,
-    hls::stream<ap_uint<{bw}>> &bias_stream,
+    hls::stream<ap_uint<{biasw}>> &bias_stream,
     hls::stream<ap_uint<{cw}>> &c_stream
 );
 
@@ -575,18 +703,18 @@ void {name}_design(
     // Internal chunked streams for the blackbox wrapper
     hls::stream<ap_uint<{aw}>> a_chunk("a_chunk");
     hls::stream<ap_uint<{bw}>> b_chunk("b_chunk");
-    hls::stream<ap_uint<{bw}>> bias_chunk("bias_chunk");
+    hls::stream<ap_uint<{biasw}>> bias_chunk("bias_chunk");
     hls::stream<ap_uint<{cw}>> c_chunk("c_chunk");
 
-    #pragma HLS STREAM variable=a_chunk depth={k_chunks * input_beats}
-    #pragma HLS STREAM variable=b_chunk depth={k_chunks * input_beats}
+    #pragma HLS STREAM variable=a_chunk depth={total_input_beats}
+    #pragma HLS STREAM variable=b_chunk depth={total_input_beats}
     #pragma HLS STREAM variable=bias_chunk depth=2
     #pragma HLS STREAM variable=c_chunk depth={m}
     #pragma HLS DATAFLOW
 
     // -- Pack bias ----------------------------------------------------------
     {{
-        ap_uint<{bw}> bias_pkt = 0;
+        ap_uint<{biasw}> bias_pkt = 0;
         for (int c = 0; c < {gc}; c++) {{
             for (int lane = 0; lane < 8; lane++) {{
                 int actual_col = c * 8 + lane;
@@ -721,7 +849,6 @@ def write_resolved_blackbox_json(package_dir):
     desc["rtl_top_module_name"] = "{name}_wrapper"
     desc["rtl_files"] = [
         str(package_dir / "{name}.v"),
-        str(package_dir / "tensor_slice_int8.v"),
     ]
     resolved_json.write_text(json.dumps(desc, indent=2) + "\\n")
     return resolved_json
@@ -825,34 +952,39 @@ def gen_combined_header(items):
         for item in items
     )
 
-    branches = []
+    stream_branches = []
     for item in items:
+        target = item.get("interface", "stream")
+        if target == "array":
+            continue
         name = item["emit_name"]
         m_val, k_val, n_val = item["m"], item["k"], item["n"]
-        gr, gc = item["grid_rows"], item["grid_cols"]
-        aw = _a_width(m_val)
-        bw = _b_width(n_val)
-        cw = _c_width(n_val)
-
         shape_cond = f"CONFIG_T::gemm_m == {m_val} && CONFIG_T::gemm_k == {k_val} && CONFIG_T::gemm_n == {n_val}"
         if item.get("gemm_ip_index") is not None:
             shape_cond = f"CONFIG_T::gemm_ip_id == {item['gemm_ip_index']} && {shape_cond}"
 
-        branches.append(f"""\
+        stream_branches.append(f"""\
     if constexpr ({shape_cond}) {{
         {name}_gemm_ip_stream<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
             a_beat_stream, b_beat_stream, biases, res_stream);
     }}""")
 
-    branches_text = "\n else ".join(branches)
-    if branches:
-        branches_text += """ else {
+    stream_branches_text = "\n else ".join(stream_branches)
+    if not stream_branches_text:
+        stream_branches_text = """\
+    static_assert(CONFIG_T::gemm_m == 0,
+                  "No generated Vitis GEMM IP stream implementation is present.");"""
+    else:
+        stream_branches_text += """ else {
         static_assert(CONFIG_T::gemm_m == 0,
-                      "No generated Vitis GEMM IP implementation matches this CONFIG_T.");
+                      "No generated Vitis GEMM IP stream implementation matches this CONFIG_T.");
     }"""
 
     array_branches = []
     for item in items:
+        target = item.get("interface", "stream")
+        if target != "array":
+            continue
         name = item["emit_name"]
         m_val, k_val, n_val = item["m"], item["k"], item["n"]
         shape_cond = f"CONFIG_T::gemm_m == {m_val} && CONFIG_T::gemm_k == {k_val} && CONFIG_T::gemm_n == {n_val}"
@@ -869,6 +1001,11 @@ def gen_combined_header(items):
         array_branches_text = """\
     static_assert(CONFIG_T::gemm_m == 0,
                   "No generated Vitis GEMM IP array implementation is present.");"""
+    else:
+        array_branches_text += """ else {
+        static_assert(CONFIG_T::gemm_m == 0,
+                      "No generated Vitis GEMM IP array implementation matches this CONFIG_T.");
+    }"""
 
     return f"""\
 #ifndef GEMM_IP_COMBINED_H_
@@ -882,18 +1019,8 @@ def gen_combined_header(items):
 #include "ap_int.h"
 #include <cstddef>
 
-// nnet::array<> definition (needed for typed-beat dispatch)
-namespace nnet {{
-
-template <typename T, unsigned N> struct array {{
-    typedef T value_type;
-    static const unsigned size = N;
-    T data[N];
-    T &operator[](size_t pos) {{ return data[pos]; }}
-    const T &operator[](size_t pos) const {{ return data[pos]; }}
-}};
-
-}} // namespace nnet
+// nnet::array<> provided by firmware nnet_utils/nnet_types.h
+// (always included via nnet_gemm_behavioral.h -> nnet_gemm_ip.h)
 
 {includes}
 
@@ -908,7 +1035,7 @@ void gemm_ip_stream(
     bias_T biases[CONFIG_T::gemm_n],
     hls::stream<res_T> &res_stream
 ) {{
-{branches_text}
+{stream_branches_text}
 }}
 
 // ── Array interface ───────────────────────────────────────────────────────────
@@ -923,37 +1050,9 @@ void gemm_ip_array(
 {array_branches_text}
 }}
 
-// ── Simulation helper (hls4ml compat) ─────────────────────────────────────────
-
-template <class data_T, class weight_T, class bias_T, class res_T, typename CONFIG_T>
-void gemm_ip_stream_sim(
-    hls::stream<data_T> &data_stream,
-    weight_T weights[CONFIG_T::n_in * CONFIG_T::n_out],
-    bias_T biases[CONFIG_T::n_out],
-    hls::stream<res_T> &res_stream
-) {{
-    // Direct scalar computation avoids stream deadlocks in C simulation.
-    // Same reference logic as hls4ml's behavioral model.
-    data_T activations[CONFIG_T::gemm_m];
-
-    for (unsigned i = 0; i < CONFIG_T::gemm_m; i++) {{
-        activations[i] = data_stream.read();
-    }}
-
-    for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {{
-        res_T c_pack;
-        for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {{
-            typename CONFIG_T::accum_t accum = 0;
-            for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {{
-                accum += CONFIG_T::template product<typename data_T::value_type, weight_T>::product(
-                    activations[m][k], weights[n * CONFIG_T::gemm_k + k]);
-            }}
-            accum += biases[n];
-            c_pack[n] = static_cast<typename res_T::value_type>(accum);
-        }}
-        res_stream.write(c_pack);
-    }}
-}}
+// ── Simulation helpers are provided by nnet_gemm_behavioral.h,
+//     which is always included by nnet_gemm_ip.h.
+//     gemm_ip_stream_sim and gemm_ip_array_sim are defined there.
 
 }} // namespace nnet
 
@@ -978,84 +1077,100 @@ def _gen_layer_gemm_ip_h(item):
     name = item["emit_name"]
     m_val, k_val, n_val = item["m"], item["k"], item["n"]
     gr, gc = item["grid_rows"], item["grid_cols"]
-    aw = _a_width(m_val)
-    bw = _b_width(n_val)
+    aw = _a_bb_width(item)
+    bw = _b_bb_width(item)
+    biasw = _bias_width(n_val)
     cw = _c_width(n_val)
-    k_chunks = _ceil_div(k_val, LANE_WIDTH)
+    k_chunks = _k_chunks(item)
+    full_k_spatial = _full_k_spatial(item)
     input_beats = max(m_val, n_val)
+    total_input_beats = _total_input_beats(item)
 
-    return f"""\
-#ifndef {name.upper()}_GEMM_IP_H_
-#define {name.upper()}_GEMM_IP_H_
+    # ── Narrow packed word (RTL re-expands) ─────────────────────────────────────
+    # Full-K: each beat carries one row's K-data as 64*k_chunks bits (one 8-lane
+    # tile per K-chunk, position 0).  The wrapper RTL re-inserts the grid_rows /
+    # grid_cols tile offset internally, routed by beat index, so the deep input
+    # FIFO never stores the always-zero padding (BRAM saving on tiled designs).
+    # aw/bw already reflect this narrow width via _a_bb_width/_b_bb_width.
+    pingpong_depth = total_input_beats
 
-// Vitis blackbox adapter for {name} (M={m_val}, K={k_val}, N={n_val}).
-// Packs/unpacks typed nnet::array beats to/from ap_uint streams.
-// Included by gemm_ip_combined.h under GEMM_IP_HEADER.
+    if full_k_spatial:
+        pack_body = f"""\
+    // Single-pass narrow pack: write each row's / column's K-data at position 0
+    // (one 8-lane tile per K-chunk).  Constant bit offsets; the wrapper RTL routes
+    // the tile to the right grid row/col by beat index.
+    for (int t = 0; t < {input_beats}; t++) {{
+        #pragma HLS PIPELINE II=1
+        ap_uint<{aw}> a_pkt = 0;
+        ap_uint<{bw}> b_pkt = 0;
 
-#include "hls_stream.h"
-#include "ap_int.h"
-
-extern void {name}_wrapper(
-    hls::stream<ap_uint<{aw}>> &a_stream,
-    hls::stream<ap_uint<{bw}>> &b_stream,
-    hls::stream<ap_uint<{bw}>> &bias_stream,
-    hls::stream<ap_uint<{cw}>> &c_stream
-);
-
-namespace nnet {{
-
-template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void {name}_gemm_ip_stream(
-    hls::stream<a_beat_T> &a_beat_stream,
-    hls::stream<b_beat_T> &b_beat_stream,
-    bias_T biases[CONFIG_T::gemm_n],
-    hls::stream<res_T> &res_stream
-) {{
-    static_assert(CONFIG_T::gemm_m == {m_val}, "Adapter requires matching gemm_m");
-    static_assert(CONFIG_T::gemm_k == {k_val}, "Adapter requires matching gemm_k");
-    static_assert(CONFIG_T::gemm_n == {n_val}, "Adapter requires matching gemm_n");
-
-    #pragma HLS DATAFLOW
-
-    // Local packed streams
-    hls::stream<ap_uint<{aw}>> a_packed("a_packed");
-    hls::stream<ap_uint<{bw}>> b_packed("b_packed");
-    hls::stream<ap_uint<{bw}>> bias_packed("bias_packed");
-    hls::stream<ap_uint<{cw}>> c_packed("c_packed");
-
-    #pragma HLS STREAM variable=a_packed depth={k_chunks * input_beats}
-    #pragma HLS STREAM variable=b_packed depth={k_chunks * input_beats}
-    #pragma HLS STREAM variable=bias_packed depth=1
-    #pragma HLS STREAM variable=c_packed depth={m_val}
-
-    // ── Pack bias ─────────────────────────────────────────────────────────────
-    {{
-        ap_uint<{bw}> bias_pkt = 0;
-        for (int col = 0; col < {gc}; col++) {{
-            for (int lane = 0; lane < 8; lane++) {{
-                int actual_col = col * 8 + lane;
-                if (actual_col < {n_val}) {{
-                    bias_pkt.range(col * 64 + lane * 8 + 7, col * 64 + lane * 8) =
-                        static_cast<ap_int<8>>(biases[actual_col]);
+        if (t < {m_val}) {{
+            a_beat_T a_beat = a_beat_stream.read();
+            for (int kc = 0; kc < {k_chunks}; kc++) {{
+                #pragma HLS UNROLL
+                for (int kl = 0; kl < 8; kl++) {{
+                    #pragma HLS UNROLL
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        a_pkt.range(kc * 64 + kl * 8 + 7, kc * 64 + kl * 8) =
+                            static_cast<ap_int<8>>(a_beat[kk]);
+                    }}
                 }}
             }}
         }}
-        bias_packed.write(bias_pkt);
-    }}
 
-    a_beat_T a_rows[{m_val}];
-    b_beat_T b_cols[{n_val}];
+        if (t < {n_val}) {{
+            b_beat_T b_beat = b_beat_stream.read();
+            for (int kc = 0; kc < {k_chunks}; kc++) {{
+                #pragma HLS UNROLL
+                for (int kl = 0; kl < 8; kl++) {{
+                    #pragma HLS UNROLL
+                    int kk = kc * 8 + kl;
+                    if (kk < {k_val}) {{
+                        b_pkt.range(kc * 64 + kl * 8 + 7, kc * 64 + kl * 8) =
+                            static_cast<ap_int<8>>(b_beat[kk]);
+                    }}
+                }}
+            }}
+        }}
+
+        a_packed.write(a_pkt);
+        b_packed.write(b_pkt);
+    }}"""
+    else:
+        # Chunked mode replays each row/column across k_chunks output beats, so the
+        # input stream (consumed once) must be buffered first.  Kept as-is; this path
+        # is not used by the full-K micro-bench.  TODO(strategy-3): a narrow per-beat
+        # payload would let this drop the complete partition too.
+        pack_body = f"""\
+    // Buffer the typed row/column beats into flat ap_int<8> arrays.  We avoid an
+    // array-of-nnet::array (a_beat_T a_rows[M]) here: Vitis csynth cannot lower the
+    // pointer reinterpretation it implies (i9* -> [8 x i9]*) and trips the operator=
+    // pointer comparison in nnet::array.  A flat 2D ap_int<8> buffer synthesizes
+    // cleanly and matches the blackbox design-side packing.
+    ap_int<8> a_rows[{m_val}][{k_val}];
+    ap_int<8> b_cols[{n_val}][{k_val}];
+    #pragma HLS ARRAY_PARTITION variable=a_rows complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=b_cols complete dim=0
 
     for (int row = 0; row < {m_val}; row++) {{
         #pragma HLS PIPELINE II=1
-        a_rows[row] = a_beat_stream.read();
+        a_beat_T a_beat = a_beat_stream.read();
+        for (int kk = 0; kk < {k_val}; kk++) {{
+            #pragma HLS UNROLL
+            a_rows[row][kk] = static_cast<ap_int<8>>(a_beat[kk]);
+        }}
     }}
     for (int col = 0; col < {n_val}; col++) {{
         #pragma HLS PIPELINE II=1
-        b_cols[col] = b_beat_stream.read();
+        b_beat_T b_beat = b_beat_stream.read();
+        for (int kk = 0; kk < {k_val}; kk++) {{
+            #pragma HLS UNROLL
+            b_cols[col][kk] = static_cast<ap_int<8>>(b_beat[kk]);
+        }}
     }}
 
-    // ── Pack row/column beats as 8-lane K chunks ──────────────────────────────
+    // Pack row/column beats as 8-lane K chunks.
     for (int kc = 0; kc < {k_chunks}; kc++) {{
         for (int t = 0; t < {input_beats}; t++) {{
             #pragma HLS PIPELINE II=1
@@ -1087,12 +1202,85 @@ void {name}_gemm_ip_stream(
             a_packed.write(a_pkt);
             b_packed.write(b_pkt);
         }}
-    }}
+    }}"""
 
-    // ── Call blackbox ─────────────────────────────────────────────────────────
+    # Narrow-everywhere: pack writes the narrow word straight to a single FIFO and
+    # the blackbox re-expands internally.  No expand process, no second FIFO.
+    expand_defs = ""
+
+    stream_block = f"""\
+    hls::stream<ap_uint<{aw}>> a_packed("a_packed");
+    hls::stream<ap_uint<{bw}>> b_packed("b_packed");
+    hls::stream<ap_uint<{biasw}>> bias_packed("bias_packed");
+    hls::stream<ap_uint<{cw}>> c_packed("c_packed");
+    #pragma HLS STREAM variable=a_packed depth={pingpong_depth}
+    #pragma HLS STREAM variable=b_packed depth={pingpong_depth}
+    #pragma HLS STREAM variable=bias_packed depth=1
+    #pragma HLS STREAM variable=c_packed depth={m_val}
+
+    {name}_gemm_ip_pack<a_beat_T, b_beat_T, bias_T, CONFIG_T>(
+        a_beat_stream, b_beat_stream, biases, a_packed, b_packed, bias_packed);
+
     {name}_wrapper(a_packed, b_packed, bias_packed, c_packed);
 
-    // ── Unpack M result beats ─────────────────────────────────────────────────
+    {name}_gemm_ip_unpack<res_T, CONFIG_T>(c_packed, res_stream);"""
+
+    return f"""\
+#ifndef {name.upper()}_GEMM_IP_H_
+#define {name.upper()}_GEMM_IP_H_
+
+// Vitis blackbox adapter for {name} (M={m_val}, K={k_val}, N={n_val}).
+// Packs/unpacks typed nnet::array beats to/from ap_uint streams.
+// Included by gemm_ip_combined.h under GEMM_IP_HEADER.
+
+#include "hls_stream.h"
+#include "ap_int.h"
+
+extern void {name}_wrapper(
+    hls::stream<ap_uint<{aw}>> &a_stream,
+    hls::stream<ap_uint<{bw}>> &b_stream,
+    hls::stream<ap_uint<{biasw}>> &bias_stream,
+    hls::stream<ap_uint<{cw}>> &c_stream
+);
+
+namespace nnet {{
+
+// Pack stage: read typed row/column beats and the bias vector, emit ap_uint beats
+// for the blackbox. a_rows/b_cols are local to this process so the enclosing
+// DATAFLOW region stays canonical (only hls::stream FIFOs cross process boundaries).
+template <class a_beat_T, class b_beat_T, class bias_T, typename CONFIG_T>
+void {name}_gemm_ip_pack(
+    hls::stream<a_beat_T> &a_beat_stream,
+    hls::stream<b_beat_T> &b_beat_stream,
+    bias_T biases[CONFIG_T::gemm_n],
+    hls::stream<ap_uint<{aw}>> &a_packed,
+    hls::stream<ap_uint<{bw}>> &b_packed,
+    hls::stream<ap_uint<{biasw}>> &bias_packed
+) {{
+    // ── Pack bias ─────────────────────────────────────────────────────────────
+    {{
+        ap_uint<{biasw}> bias_pkt = 0;
+        for (int col = 0; col < {gc}; col++) {{
+            for (int lane = 0; lane < 8; lane++) {{
+                int actual_col = col * 8 + lane;
+                if (actual_col < {n_val}) {{
+                    bias_pkt.range(col * 64 + lane * 8 + 7, col * 64 + lane * 8) =
+                        static_cast<ap_int<8>>(biases[actual_col]);
+                }}
+            }}
+        }}
+        bias_packed.write(bias_pkt);
+    }}
+
+{pack_body}
+}}
+
+// Unpack stage: read the blackbox result beats and emit typed res beats.
+template <class res_T, typename CONFIG_T>
+void {name}_gemm_ip_unpack(
+    hls::stream<ap_uint<{cw}>> &c_packed,
+    hls::stream<res_T> &res_stream
+) {{
     for (int i = 0; i < {m_val}; i++) {{
         #pragma HLS PIPELINE II=1
         ap_uint<{cw}> out_pkt = c_packed.read();
@@ -1101,12 +1289,38 @@ void {name}_gemm_ip_stream(
             for (int lane = 0; lane < 8; lane++) {{
                 int actual_col = c * 8 + lane;
                 if (actual_col < {n_val}) {{
-                    out_beat[actual_col] = out_pkt.range(c * 64 + lane * 8 + 7, c * 64 + lane * 8);
+                    // Blackbox emits signed int8 results. Read as ap_int<8> so the
+                    // assignment value-converts (sign-extends for integer res_T,
+                    // value-casts for fixed-point) to whatever precision res_T uses.
+                    ap_int<8> raw_val = (ap_int<8>)out_pkt.range(c * 64 + lane * 8 + 7, c * 64 + lane * 8);
+                    out_beat[actual_col] = raw_val;
                 }}
             }}
         }}
         res_stream.write(out_beat);
     }}
+}}
+{expand_defs}
+template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
+void {name}_gemm_ip_stream(
+    hls::stream<a_beat_T> &a_beat_stream,
+    hls::stream<b_beat_T> &b_beat_stream,
+    bias_T biases[CONFIG_T::gemm_n],
+    hls::stream<res_T> &res_stream
+) {{
+    static_assert(CONFIG_T::gemm_m == {m_val}, "Adapter requires matching gemm_m");
+    static_assert(CONFIG_T::gemm_k == {k_val}, "Adapter requires matching gemm_k");
+    static_assert(CONFIG_T::gemm_n == {n_val}, "Adapter requires matching gemm_n");
+
+    // The blackbox gemm_fc_wrapper is an ap_ctrl_none module: it has no ap_start/
+    // ap_done and is driven purely by its FIFO handshakes, so it can only legally
+    // be instantiated inside a DATAFLOW region. We keep the pack/blackbox/unpack
+    // stages as separate processes connected only by hls::stream FIFOs; that is the
+    // canonical dataflow form and avoids the clang-3.9 DataflowCanonicalizer segfault
+    // that occurs when local arrays are shared across stages at this scope.
+    #pragma HLS DATAFLOW
+
+{stream_block}
 }}
 
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
@@ -1116,10 +1330,15 @@ void {name}_gemm_ip_array(
     bias_T biases[CONFIG_T::gemm_n],
     res_T results[CONFIG_T::gemm_m]
 ) {{
-    // Array variant — stream the arrays through the same blackbox
+    // Array variant — stream the arrays through the same blackbox. The local
+    // streams are fully written before the (dataflow) stream adapter is called,
+    // so they are depth-sized to the full beat counts.
     hls::stream<a_beat_T> a_str;
     hls::stream<b_beat_T> b_str;
     hls::stream<res_T> r_str;
+    #pragma HLS STREAM variable=a_str depth={m_val}
+    #pragma HLS STREAM variable=b_str depth={n_val}
+    #pragma HLS STREAM variable=r_str depth={m_val}
     for (unsigned row = 0; row < CONFIG_T::gemm_m; row++) {{
         a_str.write(a_beats[row]);
     }}
@@ -1128,8 +1347,15 @@ void {name}_gemm_ip_array(
     }}
     {name}_gemm_ip_stream<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
         a_str, b_str, biases, r_str);
+    // Copy element-wise into the output array. Assigning a whole nnet::array into an
+    // array element (results[i] = r_str.read()) invokes nnet::array::operator=, whose
+    // self-assignment pointer comparison Vitis csynth rejects on array elements.
     for (unsigned i = 0; i < CONFIG_T::gemm_m; i++) {{
-        results[i] = r_str.read();
+        res_T out_beat = r_str.read();
+        for (unsigned j = 0; j < res_T::size; j++) {{
+            #pragma HLS UNROLL
+            results[i][j] = out_beat[j];
+        }}
     }}
 }}
 
@@ -1149,7 +1375,7 @@ def gen_integration_manifest(items):
         name = item["emit_name"]
         cores.append({
             "name": name,
-            "interface": "stream",
+            "interface": item.get("interface", "stream"),
             "backend": "vitis",
             "wrapper_symbol": f"{name}_wrapper",
             "json": f"{name}/{name}_wrapper.json",
@@ -1160,6 +1386,7 @@ def gen_integration_manifest(items):
             "m": item["m"],
             "k": item["k"],
             "n": item["n"],
+            "gemm_k_spatial": item.get("gemm_k_spatial", _k_chunks(item)),
         })
 
     return json.dumps({
@@ -1175,16 +1402,27 @@ def gen_integration_manifest(items):
 
 def generate_vitis_pkg(item, output_dir):
     """Generate a single Vitis GEMM blackbox package."""
+    item = normalize_vitis_items(item)[0]
     pkg_dir = Path(output_dir) / item["emit_name"]
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate the Vitis RTL using the shared RTL generator
-    generate_grid_verilog = load_vitis_rtl_generator()
+    if item["gemm_k_spatial"] > 1 and item["gemm_k_spatial"] < _k_chunks(item):
+        print(
+            f"WARNING: {item['emit_name']}: gemm_k_spatial={item['gemm_k_spatial']} is experimental; "
+            "tensor-slice partial outputs are INT16 and partial overflow is possible. "
+            "Correctness depends on quantized operand ranges and partition size.",
+            file=sys.stderr,
+        )
+
+    # Generate the Vitis RTL using the combined emitter: behavioral sim model
+    # under `ifndef SYNTHESIS (used by cosim/XSIM) and the structural synth
+    # wrapper under `else (used by C synthesis). Both share the same port list,
+    # so the JSON blackbox binding is unchanged.
+    generate_grid_verilog = load_vitis_combined_rtl_generator()
     grid_v = generate_grid_verilog(item["m"], item["k"], item["n"],
-                                   module_name=f"{item['emit_name']}_wrapper")
+                                   module_name=f"{item['emit_name']}_wrapper",
+                                   gemm_k_spatial=item["gemm_k_spatial"])
     (pkg_dir / f"{item['emit_name']}.v").write_text(grid_v, encoding="utf-8")
-    tensor_slice_src = Path(__file__).resolve().parents[1] / "tensor-slice" / "tensor_slice_int8.v"
-    _copy_file(tensor_slice_src, pkg_dir / "tensor_slice_int8.v")
 
     _write_text(pkg_dir / f"{item['emit_name']}_wrapper.cpp", _gen_wrapper_cpp(item))
     _write_text(pkg_dir / f"{item['emit_name']}_wrapper.json", _gen_json(item))
@@ -1196,17 +1434,16 @@ def generate_vitis_pkg(item, output_dir):
     _write_text(pkg_dir / "run_vitis.py", _gen_python_runner(item))
 
     m, k_val, n = item["m"], item["k"], item["n"]
-    print(f"Generated Vitis package {pkg_dir}  (M={m}, K={k_val}, N={n})")
+    print(f"Generated Vitis package {pkg_dir}  (M={m}, K={k_val}, N={n}, k_spatial={item['gemm_k_spatial']})")
 
 
 def generate_from_config_file(config_file, output_dir):
     """Generate Vitis packages from a gemm_config.json file."""
     cfg = _read_json(config_file)
-    items = normalize_gemm_config(cfg)
+    items = normalize_vitis_items(cfg)
 
     output_dir = Path(output_dir)
     for item in items:
-        item["backend"] = "vitis"
         generate_vitis_pkg(item, output_dir)
 
     # Combined dispatch header

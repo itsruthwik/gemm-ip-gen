@@ -26,6 +26,7 @@ from gemm_ip.vitis import (
     generate_vitis_pkg,
     gen_combined_header,
     gen_integration_manifest,
+    normalize_vitis_items,
 )
 
 
@@ -72,12 +73,30 @@ class TestConfigNormalization:
         assert "_" in item["emit_name"]
         assert item["emit_name"] != "my.layer/1"
 
+    def test_vitis_defaults_gemm_k_spatial_to_full_k_chunks(self):
+        items = normalize_vitis_items({
+            "conv": {"m": 16, "k": 72, "n": 8, "backend": "vitis"},
+        })
+        assert items[0]["gemm_k_spatial"] == 9
+
+    def test_vitis_preserves_gemm_k_spatial(self):
+        items = normalize_vitis_items({
+            "conv": {"m": 16, "k": 72, "n": 8, "backend": "vitis", "gemm_k_spatial": 3},
+        })
+        assert items[0]["gemm_k_spatial"] == 3
+
+    def test_vitis_rejects_invalid_gemm_k_spatial(self):
+        with pytest.raises(ValueError, match="gemm_k_spatial must be >= 1"):
+            normalize_vitis_items({"name": "bad", "m": 8, "k": 16, "n": 8, "gemm_k_spatial": 0})
+        with pytest.raises(ValueError, match="exceeds K_CHUNKS"):
+            normalize_vitis_items({"name": "bad", "m": 8, "k": 16, "n": 8, "gemm_k_spatial": 3})
+
 
 # ─── 2. File presence ─────────────────────────────────────────────────────────
 
 
 PREFIXED_FILES = ["_wrapper.cpp", ".v", "_wrapper.json", "_gemm_ip.h", "_tb.cpp", "_design.cpp"]
-UNPREFIXED_FILES = ["run_vitis.tcl", "run_vitis.py", "hls_config.cfg", "tensor_slice_int8.v"]
+UNPREFIXED_FILES = ["run_vitis.tcl", "run_vitis.py", "hls_config.cfg"]
 
 
 class TestFilePresence:
@@ -197,6 +216,33 @@ class TestJsonDescriptor:
         with open(json_path) as f:
             desc = json.load(f)
         assert any(".v" in f for f in desc["rtl_files"])
+        assert f"{item['emit_name']}/tensor_slice_int8.v" not in desc["rtl_files"]
+
+    def test_json_ii_uses_input_beats_8x8x8(self, tmp_output):
+        item = _gen_item(m=8, k=8, n=8)
+        generate_vitis_pkg(item, tmp_output)
+        json_path = Path(tmp_output) / item["emit_name"] / f"{item['emit_name']}_wrapper.json"
+        desc = json.loads(json_path.read_text())
+        assert desc["rtl_performance"]["latency"] == "28"
+        assert desc["rtl_performance"]["II"] == "8"
+        assert desc["rtl_performance"]["II_contract"] == "behavioral_overlap_input_beats"
+        assert "not transaction-overlapped" in desc["rtl_performance"]["II_note"]
+
+    def test_json_ii_uses_full_k_input_beats_16x16x16(self, tmp_output):
+        item = _gen_item(m=16, k=16, n=16)
+        generate_vitis_pkg(item, tmp_output)
+        json_path = Path(tmp_output) / item["emit_name"] / f"{item['emit_name']}_wrapper.json"
+        desc = json.loads(json_path.read_text())
+        assert desc["rtl_performance"]["latency"] == "52"
+        assert desc["rtl_performance"]["II"] == "16"
+
+    def test_json_ii_uses_tail_input_beats(self, tmp_output):
+        item = _gen_item(m=14, k=6, n=6)
+        generate_vitis_pkg(item, tmp_output)
+        json_path = Path(tmp_output) / item["emit_name"] / f"{item['emit_name']}_wrapper.json"
+        desc = json.loads(json_path.read_text())
+        assert desc["rtl_performance"]["latency"] == "32"
+        assert desc["rtl_performance"]["II"] == "14"
 
 
 # ─── 4. Stream width derivation ────────────────────────────────────────────────
@@ -320,6 +366,13 @@ class TestIntegrationManifest:
         assert "combined_header" in manifest
         assert "gemm_ip_combined.h" in manifest["combined_header"]
 
+    def test_manifest_records_gemm_k_spatial(self):
+        items = normalize_vitis_items({
+            "gemm_a": {"m": 8, "k": 16, "n": 8, "backend": "vitis"},
+        })
+        manifest = json.loads(gen_integration_manifest(items))
+        assert manifest["cores"][0]["gemm_k_spatial"] == 2
+
 
 # ─── 8. C++ wrapper signature ─────────────────────────────────────────────────
 
@@ -376,6 +429,20 @@ class TestRtlPorts:
         content = v_path.read_text()
         assert "tensor_slice" in content
         assert "a_tdata" in content
+
+    def test_full_k_spatial_widens_blackbox_streams(self, tmp_output):
+        item = _gen_item(m=8, k=16, n=8)
+        generate_vitis_pkg(item, tmp_output)
+        pkg_dir = Path(tmp_output) / item["emit_name"]
+        cpp = (pkg_dir / f"{item['emit_name']}_wrapper.cpp").read_text()
+        header = (pkg_dir / f"{item['emit_name']}_gemm_ip.h").read_text()
+        rtl = (pkg_dir / f"{item['emit_name']}.v").read_text()
+
+        assert "hls::stream<ap_uint<128>> &a_stream" in cpp
+        assert "hls::stream<ap_uint<128>> &b_stream" in cpp
+        assert "#pragma HLS STREAM variable=a_packed depth=8" in header
+        assert "K_SPATIAL=2" in rtl
+        assert "input  wire [127:0]   a_tdata" in rtl
 
 
 # ─── 10. C++ model arithmetic validation ──────────────────────────────────────

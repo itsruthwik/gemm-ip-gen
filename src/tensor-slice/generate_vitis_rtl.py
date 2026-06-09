@@ -14,23 +14,89 @@ from pathlib import Path
 from _generate_rtl_common import tail_mask_hex, vm, total_cycles as _total_cycles
 
 
-def generate_vitis_sim_rtl(m, k, n, module_name="gemm_vitis"):
+def generate_vitis_sim_rtl(m, k, n, module_name="gemm_vitis", gemm_k_spatial=None):
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     a_width = grid_rows * 64
     b_width = grid_cols * 64
+    a_chunk_width = a_width
+    b_chunk_width = b_width
     c_stream_width = grid_cols * 64
     input_beats = max(m, n)
     k_chunks = (k + 7) // 8
-    total_input_beats = k_chunks * input_beats
+    k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
+    full_k_spatial = k_spatial == k_chunks
+    # Full K-spatial: every K chunk is packed into a single NARROW beat carrying one
+    # row/col tile (64 bits per K-chunk, position 0); only `input_beats` beats consumed.
+    # The wrapper routes the tile to amat[beat] directly (beat == row/col index).
+    # Chunked: one K chunk per beat, k_chunks * input_beats beats total.
+    if full_k_spatial:
+        a_width = 64 * k_chunks
+        b_width = 64 * k_chunks
+    total_input_beats = input_beats if full_k_spatial else k_chunks * input_beats
     total_output_rows = m
-    latency = max(0, k + n - k_chunks * input_beats)
+    latency = max(0, k + n - total_input_beats)
     behav_name = f"{module_name}_behav_grid"
+    mode_comment = (
+        "Full K-spatial behavioral MxKxN GEMM. Not intended for synthesis."
+        if full_k_spatial
+        else "Chunked behavioral MxKxN GEMM. Not intended for synthesis."
+    )
+
+    if full_k_spatial:
+        collect_unpack = f"""\
+                        beat_in_chunk = beat_count;
+                        if (beat_in_chunk < {m}) begin
+                            for (kk = 0; kk < {k}; kk = kk + 1) begin
+                                chunk_idx = kk / 8;
+                                lane = kk % 8;
+                                if (coll_buf == 0)
+                                    amat_0[beat_in_chunk][kk] = a_tdata[chunk_idx * 64 + lane * 8 +: 8];
+                                else
+                                    amat_1[beat_in_chunk][kk] = a_tdata[chunk_idx * 64 + lane * 8 +: 8];
+                            end
+                        end
+                        if (beat_in_chunk < {n}) begin
+                            for (kk = 0; kk < {k}; kk = kk + 1) begin
+                                chunk_idx = kk / 8;
+                                lane = kk % 8;
+                                if (coll_buf == 0)
+                                    bmat_0[kk][beat_in_chunk] = b_tdata[chunk_idx * 64 + lane * 8 +: 8];
+                                else
+                                    bmat_1[kk][beat_in_chunk] = b_tdata[chunk_idx * 64 + lane * 8 +: 8];
+                            end
+                        end"""
+    else:
+        collect_unpack = f"""\
+                        chunk_idx = beat_count / INPUT_BEATS;
+                        beat_in_chunk = beat_count % INPUT_BEATS;
+                        if (beat_in_chunk < {m}) begin
+                            for (lane = 0; lane < 8; lane = lane + 1) begin
+                                kk = chunk_idx * 8 + lane;
+                                if (kk < {k}) begin
+                                    if (coll_buf == 0)
+                                        amat_0[beat_in_chunk][kk] = a_tdata[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                    else
+                                        amat_1[beat_in_chunk][kk] = a_tdata[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                end
+                            end
+                        end
+                        if (beat_in_chunk < {n}) begin
+                            for (lane = 0; lane < 8; lane = lane + 1) begin
+                                kk = chunk_idx * 8 + lane;
+                                if (kk < {k}) begin
+                                    if (coll_buf == 0)
+                                        bmat_0[kk][beat_in_chunk] = b_tdata[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                    else
+                                        bmat_1[kk][beat_in_chunk] = b_tdata[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
+                                end
+                            end
+                        end"""
 
     return f"""\
 // Auto-generated simulation model by generate_vitis_rtl.py
-// Chunked behavioral MxKxN GEMM. Not intended for synthesis.
-// Dimensions: M={m}, K={k}, N={n}
+// {mode_comment}
+// Dimensions: M={m}, K={k}, N={n}  |  K_SPATIAL={k_spatial}
 `timescale 1ns/1ps
 
 module {module_name}(
@@ -98,6 +164,7 @@ module {behav_name}(
     localparam integer TOTAL_INPUT_BEATS = {total_input_beats};
     localparam integer TOTAL_ROWS = {total_output_rows};
     localparam integer LATENCY = {latency};
+    localparam integer LOWERED_II = TOTAL_INPUT_BEATS;
 
     localparam [2:0] C_IDLE=3'd0, C_COLLECT=3'd1, C_WAIT=3'd2, C_DONE=3'd3;
     localparam [1:0] O_IDLE=2'd0, O_OUTPUT=2'd1;
@@ -230,35 +297,12 @@ module {behav_name}(
                             if (prev_beh_start == 0)
                                 beh_ii_val <= 32'd0;
                             else
-                                beh_ii_val <= beh_cyc - prev_beh_start;
+                                beh_ii_val <= LOWERED_II;
                             prev_beh_start <= beh_cyc;
                             $display("BEH_START beh_cyc=%0d", beh_cyc);
                             beh_first_input <= 1'b0;
                         end
-                        chunk_idx = beat_count / INPUT_BEATS;
-                        beat_in_chunk = beat_count % INPUT_BEATS;
-                        if (beat_in_chunk < {m}) begin
-                            for (lane = 0; lane < 8; lane = lane + 1) begin
-                                kk = chunk_idx * 8 + lane;
-                                if (kk < {k}) begin
-                                    if (coll_buf == 0)
-                                        amat_0[beat_in_chunk][kk] = a_tdata[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                    else
-                                        amat_1[beat_in_chunk][kk] = a_tdata[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                end
-                            end
-                        end
-                        if (beat_in_chunk < {n}) begin
-                            for (lane = 0; lane < 8; lane = lane + 1) begin
-                                kk = chunk_idx * 8 + lane;
-                                if (kk < {k}) begin
-                                    if (coll_buf == 0)
-                                        bmat_0[kk][beat_in_chunk] = b_tdata[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                    else
-                                        bmat_1[kk][beat_in_chunk] = b_tdata[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                end
-                            end
-                        end
+{collect_unpack}
                         beat_count <= beat_count + 1;
                     end
                     if (beat_count + 1 >= TOTAL_INPUT_BEATS) begin
@@ -379,17 +423,298 @@ endmodule
 """
 
 
-def generate_vitis_synth_rtl(m, k, n, module_name="gemm_vitis", feed_mode="chained"):
+def _validate_gemm_k_spatial(k, gemm_k_spatial):
+    k_chunks = (k + 7) // 8
+    if gemm_k_spatial is None:
+        return 1
+    k_spatial = int(gemm_k_spatial)
+    if k_spatial < 1:
+        raise ValueError("gemm_k_spatial must be >= 1")
+    if k_spatial > k_chunks:
+        raise ValueError(f"gemm_k_spatial={k_spatial} exceeds K_CHUNKS={k_chunks}")
+    return k_spatial
+
+
+def _k_spatial_partitions(k, k_spatial):
+    k_chunks = (k + 7) // 8
+    base = k_chunks // k_spatial
+    rem = k_chunks % k_spatial
+    parts = []
+    lo = 0
+    for p in range(k_spatial):
+        size = base + (1 if p < rem else 0)
+        hi = lo + size - 1
+        parts.append((lo, hi))
+        lo = hi + 1
+    return parts
+
+
+def _generate_vitis_partial_k_spatial_synth_rtl(m, k, n, module_name, k_spatial):
+    """Structural K-spatial synth wrapper with AXI-Stream ports.
+
+    Mirrors generate_catapult_rtl.generate_k_spatial_synth_verilog (partitioned
+    tensor-slice grids, INT16 partial accumulation + bias, int8 saturation) but
+    wraps it in the AXI-Stream FSM + skid-buffer output used by the chunked Vitis
+    synth path. Like the Catapult counterpart this is an EXPERIMENTAL structural
+    model; functional RTL validation goes through the combined core's behavioral
+    (`ifndef SYNTHESIS) branch, which cosim elaborates.
+    """
+    grid_rows = (m + 7) // 8
+    grid_cols = (n + 7) // 8
+    k_chunks = (k + 7) // 8
+    a_width = grid_rows * 64
+    b_width = grid_cols * 64
+    c_width = grid_cols * 128          # INT16 partial-accumulation lanes
+    c_stream_width = grid_cols * 64    # packed int8 output
+    input_beats = max(m, n)
+    total_output_rows = grid_rows * 8
+    partitions = _k_spatial_partitions(k, k_spatial)
+    row_mask_vals = [tail_mask_hex(m, r) for r in range(grid_rows)]
+    col_mask_vals = [tail_mask_hex(n, c) for c in range(grid_cols)]
+    part_comments = "\n".join(
+        f"// K_SPATIAL_PARTITION {p}: chunks {lo}..{hi}" for p, (lo, hi) in enumerate(partitions)
+    )
+
+    decls = []
+    insts = []
+    partial_wires = []
+    for p, (lo, hi) in enumerate(partitions):
+        decls.append(f"    wire part{p}_active = (chunk_idx >= 16'd{lo}) && (chunk_idx <= 16'd{hi});")
+        decls.append(f"    wire part{p}_first_chunk = (chunk_idx == 16'd{lo});")
+        decls.append(f"    wire part{p}_last_chunk = (chunk_idx == 16'd{hi});")
+        decls.append(
+            f"    wire [7:0] part{p}_k_size = part{p}_last_chunk ? "
+            f"((16'd{hi} == K_CHUNKS - 1) ? 8'd{(k - hi * 8) or 8} : 8'd8) : 8'd8;"
+        )
+        decls.append(
+            f"    wire [7:0] part{p}_k_mask = part{p}_last_chunk ? "
+            f"((16'd{hi} == K_CHUNKS - 1) ? {vm(tail_mask_hex(k, hi))} : 8'hFF) : 8'hFF;"
+        )
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                idx = p * grid_rows * grid_cols + r * grid_cols + c
+                partial_wires.append(f"    wire [127:0] partial_c_p{p}_r{r}_c{c};")
+                partial_wires.append(f"    wire         partial_avail_p{p}_r{r}_c{c};")
+                insts.append(f"""\
+        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_p{p}_r{r}_c{c} (
+            .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
+            .start_mat_mul(slice_start && part{p}_active),
+            .done_mat_mul(done_mat_mul[{idx}]),
+            .a_data((in_beat_active && part{p}_active && ({c} == 0)) ? a_tdata[{r*64} +: 64] : 64'b0),
+            .b_data((in_beat_active && part{p}_active && ({r} == 0)) ? b_tdata[{c*64} +: 64] : 64'b0),
+            .a_data_in(64'b0), .b_data_in(64'b0),
+            .a_data_out(), .b_data_out(),
+            .c_data_out(partial_c_p{p}_r{r}_c{c}),
+            .c_data_available(partial_avail_p{p}_r{r}_c{c}),
+            .validity_mask_a_rows({vm(row_mask_vals[r])}),
+            .validity_mask_a_cols_b_rows(part{p}_k_mask),
+            .validity_mask_b_cols({vm(col_mask_vals[c])}),
+            .slice_dtype(2'd0), .slice_mode(1'b0), .op(3'd0),
+            .preload(1'b0), .no_rounding(1'b0),
+            .final_mat_mul_size(part{p}_k_size),
+            .a_loc(5'd{r}), .b_loc(5'd{c})
+        );""")
+
+    # ── Per-row availability + INT16 partial accumulation (mirror Catapult) ──
+    row_avail = []
+    row_mux_cases = []
+    for r in range(grid_rows):
+        avail_terms = " & ".join(
+            f"partial_avail_p{p}_r{r}_c{c}" for p in range(k_spatial) for c in range(grid_cols)
+        )
+        row_avail.append(f"    wire row_avail_{r} = {avail_terms};")
+        row_mux_cases.append(f"        if (row_avail_{r}) begin")
+        for c in range(grid_cols):
+            for lane in range(8):
+                terms = " + ".join(
+                    f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*16 +: 16])" for p in range(k_spatial)
+                )
+                row_mux_cases.append(
+                    f"            accum32 = {terms} + $signed({{ {{24{{bias_cols[{c}*64 + {lane}*8 + 7]}}}}, bias_cols[{c}*64 + {lane}*8 +: 8] }});"
+                )
+                row_mux_cases.append(
+                    f"            row_mux[{c}*128 + {lane}*16 +: 16] = sat_int8_to_i16(accum32);"
+                )
+        row_mux_cases.append("        end")
+    any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
+
+    return f"""\
+// Auto-generated by generate_vitis_rtl.py
+// Experimental K-spatial structural tensor-slice synth wrapper (AXI-Stream)
+// Dimensions: M={m}, K={k}, N={n}  |  Grid: {grid_rows}x{grid_cols} slices, K_SPATIAL={k_spatial}
+// WARNING: K-spatial partial outputs are INT16; correctness requires every partition partial sum to fit INT16.
+{part_comments}
+`timescale 1ns/1ps
+
+module {module_name}(
+    input  wire                   ap_clk,
+    input  wire                   ap_rst,
+    input  wire                   ap_ce,
+    input  wire [{a_width-1}:0]   a_tdata,
+    input  wire                   a_tvalid,
+    output wire                   a_tready,
+    input  wire [{b_width-1}:0]   bias_tdata,
+    input  wire                   bias_tvalid,
+    output wire                   bias_tready,
+    input  wire [{b_width-1}:0]   b_tdata,
+    input  wire                   b_tvalid,
+    output wire                   b_tready,
+    output wire [{c_stream_width-1}:0] c_tdata,
+    output wire                   c_tvalid,
+    input  wire                   c_tready
+);
+    wire clk = ap_clk;
+    wire rst = ap_rst;
+
+    localparam integer INPUT_BEATS = {input_beats};
+    localparam integer K_CHUNKS = {k_chunks};
+    localparam integer K_SPATIAL = {k_spatial};
+    localparam integer TOTAL_OUT_ROWS = {total_output_rows};
+    localparam [1:0] S_IDLE=2'd0, S_RUN=2'd1, S_WAIT=2'd2, S_OUTPUT=2'd3;
+
+    reg [1:0]  state;
+    reg [15:0] beat_count;
+    reg [15:0] chunk_idx;
+    reg [15:0] out_row_count;
+    reg [{b_width-1}:0] bias_cols;
+    reg signed [31:0] accum32;
+    reg [{c_width-1}:0] row_mux;
+
+    // Skid-buffered AXI-Stream output
+    reg [{c_stream_width-1}:0] skid_data;
+    reg skid_valid;
+    reg skid_last;
+
+    wire slice_reset = rst;
+    wire in_beat_active = (state == S_RUN) && a_tvalid && b_tvalid
+                          && (beat_count < INPUT_BEATS) && ap_ce && !skid_valid;
+    wire slice_start = in_beat_active && (beat_count == 16'd0);
+    wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
+    wire all_slices_done = &done_mat_mul;
+    wire output_fire = skid_valid && c_tready;
+
+    assign bias_tready = (state == S_IDLE) && ap_ce;
+    assign a_tready = in_beat_active && b_tvalid;
+    assign b_tready = in_beat_active && a_tvalid;
+    assign c_tdata = skid_data;
+    assign c_tvalid = skid_valid;
+
+{chr(10).join(decls)}
+
+{chr(10).join(partial_wires)}
+
+{chr(10).join(insts)}
+
+{chr(10).join(row_avail)}
+
+    wire any_avail = (state == S_OUTPUT) && ({any_avail_expr});
+
+    function [15:0] sat_int8_to_i16;
+        input signed [31:0] x;
+        begin
+            if (x > 32'sd127) sat_int8_to_i16 = 16'sd127;
+            else if (x < -32'sd128) sat_int8_to_i16 = -16'sd128;
+            else sat_int8_to_i16 = x[15:0];
+        end
+    endfunction
+
+    // Pack the saturated INT16 lanes down to int8 (low byte of each lane)
+    function [{c_stream_width-1}:0] pack_c_row;
+        input [{c_width-1}:0] row_in;
+        integer t;
+        integer ln;
+        begin
+            for (t = 0; t < {grid_cols}; t = t + 1)
+                for (ln = 0; ln < 8; ln = ln + 1)
+                    pack_c_row[t * 64 + ln * 8 +: 8] = row_in[t * 128 + ln * 16 +: 8];
+        end
+    endfunction
+
+    always @(*) begin
+        row_mux = {c_width}'d0;
+        accum32 = 32'sd0;
+{chr(10).join(row_mux_cases)}
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= S_IDLE;
+            beat_count <= 16'd0;
+            chunk_idx <= 16'd0;
+            out_row_count <= 16'd0;
+            bias_cols <= {b_width}'d0;
+            skid_data <= {c_stream_width}'d0;
+            skid_valid <= 1'b0;
+            skid_last <= 1'b0;
+        end else if (ap_ce) begin
+            if (output_fire) begin
+                skid_valid <= 1'b0;
+                skid_last <= 1'b0;
+            end
+            case (state)
+                S_IDLE: begin
+                    beat_count <= 16'd0;
+                    chunk_idx <= 16'd0;
+                    out_row_count <= 16'd0;
+                    if (bias_tvalid && bias_tready) begin
+                        bias_cols <= bias_tdata;
+                        state <= S_RUN;
+                    end
+                end
+                S_RUN: begin
+                    if (in_beat_active) begin
+                        beat_count <= beat_count + 16'd1;
+                        if (beat_count + 16'd1 == INPUT_BEATS)
+                            state <= S_WAIT;
+                    end
+                end
+                S_WAIT: begin
+                    if (all_slices_done) begin
+                        if (chunk_idx + 16'd1 == K_CHUNKS) begin
+                            state <= S_OUTPUT;
+                        end else begin
+                            chunk_idx <= chunk_idx + 16'd1;
+                            beat_count <= 16'd0;
+                            state <= S_RUN;
+                        end
+                    end
+                end
+                S_OUTPUT: begin
+                    if (any_avail && !skid_valid) begin
+                        skid_data <= pack_c_row(row_mux);
+                        skid_valid <= 1'b1;
+                        skid_last <= (out_row_count + 16'd1 == TOTAL_OUT_ROWS);
+                        out_row_count <= out_row_count + 16'd1;
+                        if (out_row_count + 16'd1 == TOTAL_OUT_ROWS)
+                            state <= S_IDLE;
+                    end
+                end
+            endcase
+        end
+    end
+endmodule
+"""
+
+
+def generate_vitis_synth_rtl(m, k, n, module_name="gemm_vitis", feed_mode="chained", gemm_k_spatial=None):
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
 
-    a_width = grid_rows * 64
-    b_width = grid_cols * 64
+    k_chunks = (k + 7) // 8
+    k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
+    full_k_spatial = k_spatial == k_chunks
+    if k_spatial > 1 and not full_k_spatial:
+        return _generate_vitis_partial_k_spatial_synth_rtl(m, k, n, module_name, k_spatial)
+    a_chunk_width = grid_rows * 64
+    b_chunk_width = grid_cols * 64
+    # Full-K uses the NARROW per-beat word (one tile, 64 bits per K-chunk); the
+    # wrapper routes it to the row/col tile selected by beat index (see data_wires).
+    a_width = 64 * k_chunks if full_k_spatial else a_chunk_width
+    b_width = 64 * k_chunks if full_k_spatial else b_chunk_width
     c_width = grid_cols * 128
     c_stream_width = grid_cols * 64
     input_beats = max(m, n)
     total_output_rows = grid_rows * 8
-    k_chunks = (k + 7) // 8
     last_k_size = k - (k_chunks - 1) * 8
     last_k_mask = tail_mask_hex(k, k_chunks - 1)
 
@@ -424,12 +749,25 @@ def generate_vitis_synth_rtl(m, k, n, module_name="gemm_vitis", feed_mode="chain
         for c in range(grid_cols):
             b_hi = (c + 1) * 64 - 1
             b_lo = c * 64
-            data_wires.append(
-                f"    wire [63:0] a_data_{r}_{c} = (in_beat_active && ({c} == 0)) ? a_tdata[{a_hi}:{a_lo}] : 64'b0;"
-            )
-            data_wires.append(
-                f"    wire [63:0] b_data_{r}_{c} = (in_beat_active && ({r} == 0)) ? b_tdata[{b_hi}:{b_lo}] : 64'b0;"
-            )
+            if full_k_spatial:
+                # Narrow word: one tile at position 0, all K-chunks (64 bits each).
+                # Route to row-tile r / col-tile c when the current beat's row/col
+                # index belongs to that tile (beat_count/8 == tile).
+                data_wires.append(
+                    f"    wire [63:0] a_data_{r}_{c} = (in_beat_active && ({c} == 0) && (beat_count >> 3 == {r})) ? "
+                    f"a_tdata[chunk_idx*64 +: 64] : 64'b0;"
+                )
+                data_wires.append(
+                    f"    wire [63:0] b_data_{r}_{c} = (in_beat_active && ({r} == 0) && (beat_count >> 3 == {c})) ? "
+                    f"b_tdata[chunk_idx*64 +: 64] : 64'b0;"
+                )
+            else:
+                data_wires.append(
+                    f"    wire [63:0] a_data_{r}_{c} = (in_beat_active && ({c} == 0)) ? a_tdata[{a_hi}:{a_lo}] : 64'b0;"
+                )
+                data_wires.append(
+                    f"    wire [63:0] b_data_{r}_{c} = (in_beat_active && ({r} == 0)) ? b_tdata[{b_hi}:{b_lo}] : 64'b0;"
+                )
 
     inst_lines = []
     for r in range(grid_rows):
@@ -501,7 +839,7 @@ def generate_vitis_synth_rtl(m, k, n, module_name="gemm_vitis", feed_mode="chain
     return f"""\
 // Auto-generated by generate_vitis_rtl.py
 // Chunked structural tensor-slice synth wrapper with AXI-Stream ports
-// Dimensions: M={m}, K={k}, N={n}  |  Grid: {grid_rows}x{grid_cols} slices
+// Dimensions: M={m}, K={k}, N={n}  |  Grid: {grid_rows}x{grid_cols} slices, K_SPATIAL={k_spatial}
 `timescale 1ns/1ps
 
 module {module_name}(
@@ -1156,8 +1494,45 @@ endmodule
     return verilog
 
 
-def generate_vitis_rtl(m, k, n, module_name="gemm_vitis", feed_mode="chained"):
-    return generate_vitis_synth_rtl(m, k, n, module_name, feed_mode)
+def generate_vitis_combined_rtl(m, k, n, module_name="gemm_vitis", gemm_k_spatial=None):
+    """Generate a single {module_name}.v with an ``ifndef SYNTHESIS`` guard.
+
+    ``ifndef SYNTHESIS`` — behavioral simulation model (wrapper + behav_grid).
+    Used by Vitis cosim (cosim_design), which does not define SYNTHESIS, so the
+    AXI-Stream behavioral model is elaborated by XSIM instead of the structural
+    wrapper.  This avoids the ``tensor_slice_int8`` black-box module-not-found
+    elaboration error that the synth-only RTL hits during cosim.
+
+    ``else`` — structural synth wrapper with tensor_slice_int8 black-box slices.
+    Used by Vitis C synthesis (which defines SYNTHESIS).
+
+    Both halves share the same AXI-Stream port list (verified identical), so the
+    JSON blackbox binding is the same regardless of which branch is active.
+    Mirrors generate_catapult_rtl.generate_combined_core_verilog.
+    """
+    sim_top = generate_vitis_sim_rtl(m, k, n, module_name, gemm_k_spatial=gemm_k_spatial)
+    synth_top = generate_vitis_synth_rtl(m, k, n, module_name, gemm_k_spatial=gemm_k_spatial)
+
+    lines = []
+    lines.append("// Auto-generated by generate_vitis_rtl.py")
+    lines.append(f"// Combined core: M={m}, K={k}, N={n}")
+    lines.append("//   ifndef SYNTHESIS -> behavioral simulation model (cosim/XSIM)")
+    lines.append("//   else             -> structural synth wrapper  (C synthesis)")
+    lines.append("")
+    lines.append("`ifndef SYNTHESIS")
+    lines.append("")
+    lines.extend(sim_top.splitlines())
+    lines.append("")
+    lines.append("`else")
+    lines.append("")
+    lines.extend(synth_top.splitlines())
+    lines.append("")
+    lines.append("`endif")
+    return "\n".join(lines) + "\n"
+
+
+def generate_vitis_rtl(m, k, n, module_name="gemm_vitis", feed_mode="chained", gemm_k_spatial=None):
+    return generate_vitis_synth_rtl(m, k, n, module_name, feed_mode, gemm_k_spatial)
 
 
 if __name__ == "__main__":

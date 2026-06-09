@@ -129,6 +129,13 @@ def _run_sim(rtl_src, tb_src, rtl_file, tb_file, extra_v=None, timeout=900):
         n = len(bh_lat)
         consistent = all(l == bh_lat[0] for l in bh_lat)
         print(f"\n    {rtl_file.stem}  {' '.join(parts)} cycles  ({n} vectors{', all consistent' if consistent else ''})")
+    steady_ii = [x for x in bh_iis[1:] if x > 0]
+    return {
+        "latencies": bh_lat,
+        "iis": bh_iis,
+        "steady_ii": steady_ii,
+        "stdout": r.stdout,
+    }
 
 
 # ── Catapult RTL simulation ──────────────────────────────────────────────────
@@ -230,6 +237,25 @@ class TestVitisRtlSim:
             timeout=1200,
         )
 
+    @pytest.mark.parametrize("m,k,n,expected_latency,expected_ii", [
+        pytest.param(8, 8, 8, 25, 8, id="8x8x8"),
+        pytest.param(14, 6, 6, 29, 14, id="14x6x6-tail"),
+        pytest.param(8, 16, 8, 33, 16, id="8x16x8-kgt8"),
+    ])
+    def test_vitis_behavioral_reports_lowered_ii(self, m, k, n, expected_latency, expected_ii, tmp_path):
+        mod = f"vit_lowered_ii_{m}x{k}x{n}"
+        result = _run_sim(
+            generate_vitis_sim_rtl(m, k, n, module_name=mod),
+            generate_tb(m, k, n, module_name=mod, protocol="vitis", num_vectors=3),
+            tmp_path / f"{mod}.v",
+            tmp_path / f"tb_{mod}.v",
+            timeout=1200,
+        )
+        assert result["latencies"]
+        assert result["latencies"][0] == expected_latency
+        assert result["steady_ii"]
+        assert all(ii == expected_ii for ii in result["steady_ii"])
+
 
 # ── Synth RTL structural smoke only ───────────────────────────────────────────
 
@@ -268,6 +294,18 @@ class TestSynthStructuralSmoke:
         rtl = generate_vitis_synth_rtl(m, k, n, module_name=mod)
         self._check_synth_rtl(rtl, m, k, n)
         self._compile_with_stub(rtl, mod, tmp_path)
+
+    def test_vitis_partial_k_spatial_synth_structure(self, tmp_path):
+        m, k, n, k_spatial = 16, 72, 8, 3
+        mod = "vit_ksp_synth_16x72x8_p3"
+        rtl = generate_vitis_synth_rtl(m, k, n, module_name=mod, gemm_k_spatial=k_spatial)
+        assert "K_SPATIAL=3" in rtl
+        assert "K_SPATIAL_PARTITION 0: chunks 0..2" in rtl
+        assert "K_SPATIAL_PARTITION 1: chunks 3..5" in rtl
+        assert "K_SPATIAL_PARTITION 2: chunks 6..8" in rtl
+        assert rtl.count('(* black_box = "true" *) (* keep = "true" *) tensor_slice_int8') == 6
+        assert "partial outputs are INT16" in rtl
+        assert "sat_int8_to_i16" in rtl
 
     @staticmethod
     def _check_synth_rtl(rtl, m, k, n):

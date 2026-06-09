@@ -32,9 +32,9 @@ def main():
     parser.add_argument("--n", type=int, default=8, help="GEMM N (output columns)")
     parser.add_argument("--name", type=str, default="gemm_8x8x8", help="Package name")
     parser.add_argument("--interface", choices=("stream", "array"), default="stream",
-                        help="Interface type (Catapult only, default: stream)")
+                        help="Interface type for generated package metadata/dispatch (default: stream)")
     parser.add_argument("--k-spatial", type=int, default=None,
-                        help="Catapult only: number of spatial K grid partitions (default: full K-chunk unroll)")
+                        help="Number of spatial K grid partitions (default: full K-chunk unroll)")
     parser.add_argument("--output_dir", type=str, default="./output",
                         help="Output directory (default: ./output)")
     args = parser.parse_args()
@@ -77,7 +77,8 @@ def _run_vitis(args):
         generate_from_config_file(args.config, args.output_dir)
     else:
         item = normalize_gemm_config({
-            "name": args.name, "m": args.m, "k": args.k, "n": args.n, "backend": "vitis"
+            "name": args.name, "m": args.m, "k": args.k, "n": args.n,
+            "backend": "vitis", "interface": args.interface, "gemm_k_spatial": args.k_spatial,
         })[0]
         generate_vitis_pkg(item, args.output_dir)
 
