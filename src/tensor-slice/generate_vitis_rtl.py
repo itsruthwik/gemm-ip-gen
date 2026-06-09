@@ -108,7 +108,7 @@ module {module_name}(
     input  wire                   a_tvalid,
     output wire                   a_tready,
 
-    input  wire [{b_width-1}:0]   bias_tdata,
+    input  wire [{b_chunk_width-1}:0]   bias_tdata,
     input  wire                   bias_tvalid,
     output wire                   bias_tready,
 
@@ -146,7 +146,7 @@ module {behav_name}(
     input  wire                   a_tvalid,
     output wire                   a_tready,
 
-    input  wire [{b_width-1}:0]   bias_tdata,
+    input  wire [{b_chunk_width-1}:0]   bias_tdata,
     input  wire                   bias_tvalid,
     output wire                   bias_tready,
 
@@ -464,6 +464,7 @@ def _generate_vitis_partial_k_spatial_synth_rtl(m, k, n, module_name, k_spatial)
     k_chunks = (k + 7) // 8
     a_width = grid_rows * 64
     b_width = grid_cols * 64
+    b_chunk_width = grid_cols * 64     # bias packet is always grid_cols*64 (per col-tile)
     c_width = grid_cols * 128          # INT16 partial-accumulation lanes
     c_stream_width = grid_cols * 64    # packed int8 output
     input_beats = max(m, n)
@@ -553,7 +554,7 @@ module {module_name}(
     input  wire [{a_width-1}:0]   a_tdata,
     input  wire                   a_tvalid,
     output wire                   a_tready,
-    input  wire [{b_width-1}:0]   bias_tdata,
+    input  wire [{b_chunk_width-1}:0]   bias_tdata,
     input  wire                   bias_tvalid,
     output wire                   bias_tready,
     input  wire [{b_width-1}:0]   b_tdata,
@@ -576,7 +577,7 @@ module {module_name}(
     reg [15:0] beat_count;
     reg [15:0] chunk_idx;
     reg [15:0] out_row_count;
-    reg [{b_width-1}:0] bias_cols;
+    reg [{b_chunk_width-1}:0] bias_cols;
     reg signed [31:0] accum32;
     reg [{c_width-1}:0] row_mux;
 
@@ -642,7 +643,7 @@ module {module_name}(
             beat_count <= 16'd0;
             chunk_idx <= 16'd0;
             out_row_count <= 16'd0;
-            bias_cols <= {b_width}'d0;
+            bias_cols <= {b_chunk_width}'d0;
             skid_data <= {c_stream_width}'d0;
             skid_valid <= 1'b0;
             skid_last <= 1'b0;
@@ -851,7 +852,7 @@ module {module_name}(
     input  wire                   a_tvalid,
     output wire                   a_tready,
 
-    input  wire [{b_width-1}:0]   bias_tdata,
+    input  wire [{b_chunk_width-1}:0]   bias_tdata,
     input  wire                   bias_tvalid,
     output wire                   bias_tready,
 
@@ -877,7 +878,7 @@ module {module_name}(
     reg [15:0] beat_count;
     reg [15:0] chunk_idx;
     reg [15:0] out_row_count;
-    reg [{b_width-1}:0] bias_cols;
+    reg [{b_chunk_width-1}:0] bias_cols;
     reg preload_d;
     reg transaction_active;
     reg [{c_width-1}:0] row_mux;
@@ -941,7 +942,7 @@ module {module_name}(
             beat_count <= 16'd0;
             chunk_idx <= 16'd0;
             out_row_count <= 16'd0;
-            bias_cols <= {b_width}'d0;
+            bias_cols <= {b_chunk_width}'d0;
             preload_d <= 1'b0;
             transaction_active <= 1'b0;
             skid_data <= {c_stream_width}'d0;
@@ -1027,6 +1028,7 @@ def _generate_buffered_vitis_synth_rtl(m, k, n, module_name="gemm_vitis", feed_m
 
     a_width = grid_rows * 64
     b_width = grid_cols * 64
+    b_chunk_width = grid_cols * 64   # bias packet is always grid_cols*64 (per col-tile)
     c_width = grid_cols * 128   # Catapult internal: 8 INT16 per column tile
 
     # ── Chained feed ─────────────────────────────────────────────────────────
@@ -1183,7 +1185,7 @@ module {module_name}(
     input  wire                   a_tvalid,
     output wire                   a_tready,
 
-    input  wire [{b_width-1}:0]   bias_tdata,
+    input  wire [{b_chunk_width-1}:0]   bias_tdata,
     input  wire                   bias_tvalid,
     output wire                   bias_tready,
 
