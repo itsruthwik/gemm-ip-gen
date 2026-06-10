@@ -392,7 +392,7 @@ class TestWrapperSignature:
         generate_vitis_pkg(item, tmp_output)
         cpp_path = Path(tmp_output) / item["emit_name"] / f"{item['emit_name']}_wrapper.cpp"
         content = cpp_path.read_text()
-        assert "saturated_int8" in content
+        assert "saturated_result" in content   # output saturator (out_bits-wide; renamed from saturated_int8)
         assert "M=14" in content
         assert "N=6" in content
 

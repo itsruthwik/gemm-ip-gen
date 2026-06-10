@@ -14,14 +14,20 @@ from pathlib import Path
 from _generate_rtl_common import tail_mask_hex, vm, total_cycles as _total_cycles
 
 
-def generate_vitis_sim_rtl(m, k, n, module_name="gemm_vitis", gemm_k_spatial=None):
+def generate_vitis_sim_rtl(m, k, n, module_name="gemm_vitis", gemm_k_spatial=None, out_bits=8):
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     a_width = grid_rows * 64
     b_width = grid_cols * 64
     a_chunk_width = a_width
     b_chunk_width = b_width
-    c_stream_width = grid_cols * 64
+    # Output lane width is driven by output_precision (out_bits); was hardcoded
+    # int8, which capped the GEMM result at ±127 regardless of output_precision.
+    c_lane = out_bits                 # result lane width
+    c_tile = 8 * out_bits             # column-tile stride (8 lanes per tile)
+    sat_pos = (1 << (out_bits - 1)) - 1
+    sat_neg = (1 << (out_bits - 1))
+    c_stream_width = grid_cols * c_tile
     input_beats = max(m, n)
     k_chunks = (k + 7) // 8
     k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
@@ -223,14 +229,14 @@ module {behav_name}(
     integer chunk_idx;
     integer beat_in_chunk;
     reg signed [31:0] sum;
-    reg [7:0] sat;
+    reg [{c_lane-1}:0] sat;
 
-    function [7:0] sat_int8;
+    function [{c_lane-1}:0] sat_int8;
         input signed [31:0] x;
         begin
-            if (x > 32'sd127) sat_int8 = 8'h7f;
-            else if (x < -32'sd128) sat_int8 = 8'h80;
-            else sat_int8 = x[7:0];
+            if (x > 32'sd{sat_pos}) sat_int8 = {c_lane}'h{sat_pos:x};
+            else if (x < -32'sd{sat_neg}) sat_int8 = {c_lane}'h{sat_neg:x};
+            else sat_int8 = x[{c_lane-1}:0];
         end
     endfunction
 
@@ -398,9 +404,9 @@ module {behav_name}(
                                     else
                                         sat = sat_int8(cmat_1[actual_row][actual_col]);
                                 end else begin
-                                    sat = 8'd0;
+                                    sat = {c_lane}'d0;
                                 end
-                                c_tdata[tile * 64 + lane * 8 +: 8] <= sat;
+                                c_tdata[tile * {c_tile} + lane * {c_lane} +: {c_lane}] <= sat;
                             end
                         end
                         c_tvalid <= 1'b1;
@@ -449,11 +455,11 @@ def _k_spatial_partitions(k, k_spatial):
     return parts
 
 
-def _generate_vitis_partial_k_spatial_synth_rtl(m, k, n, module_name, k_spatial):
+def _generate_vitis_partial_k_spatial_synth_rtl(m, k, n, module_name, k_spatial, out_bits=8):
     """Structural K-spatial synth wrapper with AXI-Stream ports.
 
     Mirrors generate_catapult_rtl.generate_k_spatial_synth_verilog (partitioned
-    tensor-slice grids, INT16 partial accumulation + bias, int8 saturation) but
+    tensor-slice grids, INT16 partial accumulation + bias, output saturation) but
     wraps it in the AXI-Stream FSM + skid-buffer output used by the chunked Vitis
     synth path. Like the Catapult counterpart this is an EXPERIMENTAL structural
     model; functional RTL validation goes through the combined core's behavioral
@@ -466,7 +472,12 @@ def _generate_vitis_partial_k_spatial_synth_rtl(m, k, n, module_name, k_spatial)
     b_width = grid_cols * 64
     b_chunk_width = grid_cols * 64     # bias packet is always grid_cols*64 (per col-tile)
     c_width = grid_cols * 128          # INT16 partial-accumulation lanes
-    c_stream_width = grid_cols * 64    # packed int8 output
+    # Output lane width driven by output_precision (out_bits); was hardcoded int8.
+    c_lane = out_bits
+    c_tile = 8 * out_bits
+    sat_pos = (1 << (out_bits - 1)) - 1
+    sat_neg = (1 << (out_bits - 1))
+    c_stream_width = grid_cols * c_tile  # packed output (out_bits/lane)
     input_beats = max(m, n)
     total_output_rows = grid_rows * 8
     partitions = _k_spatial_partitions(k, k_spatial)
@@ -613,13 +624,13 @@ module {module_name}(
     function [15:0] sat_int8_to_i16;
         input signed [31:0] x;
         begin
-            if (x > 32'sd127) sat_int8_to_i16 = 16'sd127;
-            else if (x < -32'sd128) sat_int8_to_i16 = -16'sd128;
+            if (x > 32'sd{sat_pos}) sat_int8_to_i16 = 16'sd{sat_pos};
+            else if (x < -32'sd{sat_neg}) sat_int8_to_i16 = -16'sd{sat_neg};
             else sat_int8_to_i16 = x[15:0];
         end
     endfunction
 
-    // Pack the saturated INT16 lanes down to int8 (low byte of each lane)
+    // Pack the saturated INT16 lanes down to the output width (low out_bits per lane)
     function [{c_stream_width-1}:0] pack_c_row;
         input [{c_width-1}:0] row_in;
         integer t;
@@ -627,7 +638,7 @@ module {module_name}(
         begin
             for (t = 0; t < {grid_cols}; t = t + 1)
                 for (ln = 0; ln < 8; ln = ln + 1)
-                    pack_c_row[t * 64 + ln * 8 +: 8] = row_in[t * 128 + ln * 16 +: 8];
+                    pack_c_row[t * {c_tile} + ln * {c_lane} +: {c_lane}] = row_in[t * 128 + ln * 16 +: {c_lane}];
         end
     endfunction
 
@@ -697,7 +708,7 @@ endmodule
 """
 
 
-def generate_vitis_synth_rtl(m, k, n, module_name="gemm_vitis", feed_mode="chained", gemm_k_spatial=None):
+def generate_vitis_synth_rtl(m, k, n, module_name="gemm_vitis", feed_mode="chained", gemm_k_spatial=None, out_bits=8):
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
 
@@ -705,7 +716,7 @@ def generate_vitis_synth_rtl(m, k, n, module_name="gemm_vitis", feed_mode="chain
     k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
     full_k_spatial = k_spatial == k_chunks
     if k_spatial > 1 and not full_k_spatial:
-        return _generate_vitis_partial_k_spatial_synth_rtl(m, k, n, module_name, k_spatial)
+        return _generate_vitis_partial_k_spatial_synth_rtl(m, k, n, module_name, k_spatial, out_bits=out_bits)
     a_chunk_width = grid_rows * 64
     b_chunk_width = grid_cols * 64
     # Full-K uses the NARROW per-beat word (one tile, 64 bits per K-chunk); the
@@ -713,7 +724,12 @@ def generate_vitis_synth_rtl(m, k, n, module_name="gemm_vitis", feed_mode="chain
     a_width = 64 * k_chunks if full_k_spatial else a_chunk_width
     b_width = 64 * k_chunks if full_k_spatial else b_chunk_width
     c_width = grid_cols * 128
-    c_stream_width = grid_cols * 64
+    # Output lane width driven by output_precision (out_bits); the internal row is
+    # always 16-bit/lane (c_width), so out_bits=16 keeps the full result and
+    # out_bits=8 takes the low byte (legacy int8 contract).
+    c_lane = out_bits
+    c_tile = 8 * out_bits
+    c_stream_width = grid_cols * c_tile
     input_beats = max(m, n)
     total_output_rows = grid_rows * 8
     last_k_size = k - (k_chunks - 1) * 8
@@ -932,7 +948,7 @@ module {module_name}(
         integer t;
         begin
             for (t = 0; t < {grid_cols}; t = t + 1)
-                pack_c_row[t * 64 +: 64] = row_in[t * 128 +: 64];
+                pack_c_row[t * {c_tile} +: {c_tile}] = row_in[t * 128 +: {c_tile}];
         end
     endfunction
 
@@ -1496,7 +1512,7 @@ endmodule
     return verilog
 
 
-def generate_vitis_combined_rtl(m, k, n, module_name="gemm_vitis", gemm_k_spatial=None):
+def generate_vitis_combined_rtl(m, k, n, module_name="gemm_vitis", gemm_k_spatial=None, out_bits=8):
     """Generate a single {module_name}.v with an ``ifndef SYNTHESIS`` guard.
 
     ``ifndef SYNTHESIS`` — behavioral simulation model (wrapper + behav_grid).
@@ -1512,8 +1528,8 @@ def generate_vitis_combined_rtl(m, k, n, module_name="gemm_vitis", gemm_k_spatia
     JSON blackbox binding is the same regardless of which branch is active.
     Mirrors generate_catapult_rtl.generate_combined_core_verilog.
     """
-    sim_top = generate_vitis_sim_rtl(m, k, n, module_name, gemm_k_spatial=gemm_k_spatial)
-    synth_top = generate_vitis_synth_rtl(m, k, n, module_name, gemm_k_spatial=gemm_k_spatial)
+    sim_top = generate_vitis_sim_rtl(m, k, n, module_name, gemm_k_spatial=gemm_k_spatial, out_bits=out_bits)
+    synth_top = generate_vitis_synth_rtl(m, k, n, module_name, gemm_k_spatial=gemm_k_spatial, out_bits=out_bits)
 
     lines = []
     lines.append("// Auto-generated by generate_vitis_rtl.py")

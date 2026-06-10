@@ -86,9 +86,13 @@ def b_stream_width(n):
     return grid_cols(n) * 64
 
 
-def c_stream_width(n):
-    """Bit-width of the result stream packet for *n* columns (int8)."""
-    return grid_cols(n) * 64
+def c_stream_width(n, out_bits=8):
+    """Bit-width of the result stream packet for *n* columns.
+
+    ``out_bits`` is the per-lane result width from ``output_precision`` (default
+    8 = legacy int8). 8 lanes per column tile, so width = grid_cols * 8 * out_bits.
+    """
+    return grid_cols(n) * 8 * out_bits
 
 
 def bias_stream_width(n):

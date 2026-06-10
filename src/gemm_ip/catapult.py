@@ -8,6 +8,7 @@ dispatch header for hls4ml integration.
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -1079,10 +1080,25 @@ def _validate_gemm_k_spatial(k, gemm_k_spatial):
     return k_spatial
 
 
+def _output_bits(output_precision):
+    """Result-lane width (bits) from an output_precision like 'fixed<16,6,…>'.
+
+    Drives the GEMM-IP output saturation/packing so the result honors the
+    configured precision instead of the legacy hardcoded int8 clamp. Returns 8
+    (legacy int8) when unset/unparseable so callers without a precision keep
+    the old behavior. The first ``fixed<>`` field is the total bit width.
+    """
+    if not output_precision:
+        return 8
+    m = re.search(r"u?fixed<\s*(\d+)", str(output_precision))
+    return int(m.group(1)) if m else 8
+
+
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None, gemm_k_spatial=None):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     gemm_k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
+    out_bits = _output_bits(output_precision)
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1095,7 +1111,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         sys.path.insert(0, ts_dir)
     from generate_catapult_rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
     if gemm_k_spatial == 1:
-        grid_v = generate_combined_core_verilog(m, k, n, module_name=f"{name}_core")
+        grid_v = generate_combined_core_verilog(m, k, n, module_name=f"{name}_core", out_bits=out_bits)
     else:
         print(
             f"WARNING: {name}: gemm_k_spatial={gemm_k_spatial} is experimental; "
@@ -1104,7 +1120,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             file=sys.stderr,
         )
         grid_v = generate_k_spatial_combined_core_verilog(
-            m, k, n, module_name=f"{name}_core", k_spatial=gemm_k_spatial
+            m, k, n, module_name=f"{name}_core", k_spatial=gemm_k_spatial, out_bits=out_bits
         )
     (pkg_dir / f"{name}_core.v").write_text(grid_v)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())

@@ -52,6 +52,7 @@ Exact pack/unpack contract matches ``nnet_gemm_stream.h`` and
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -97,6 +98,19 @@ def _validate_gemm_k_spatial(k, gemm_k_spatial):
             "v1 requires at most one spatial grid per K chunk"
         )
     return k_spatial
+
+
+def _output_bits(item):
+    """Result-lane width (bits) from the item's output_precision like
+    'fixed<16,6,…>'. Drives the GEMM-IP output saturation/packing so the result
+    honors output_precision instead of the legacy hardcoded int8 clamp. Returns 8
+    (legacy int8) when unset/unparseable. The first ``fixed<>`` field is the
+    total bit width."""
+    op = item.get("output_precision")
+    if not op:
+        return 8
+    m = re.search(r"u?fixed<\s*(\d+)", str(op))
+    return int(m.group(1)) if m else 8
 
 
 def normalize_vitis_items(cfg):
@@ -158,7 +172,12 @@ def _gen_wrapper_cpp(item):
     aw = _a_bb_width(item)
     bw = _b_bb_width(item)
     biasw = _bias_width(n)
-    cw = _c_width(n)
+    out_bits = _output_bits(item)
+    c_lane = out_bits
+    c_tile = 8 * out_bits
+    sat_pos = (1 << (out_bits - 1)) - 1
+    sat_neg = (1 << (out_bits - 1))
+    cw = _c_width(n, out_bits)
     k_chunks = _k_chunks(item)
     full_k_spatial = _full_k_spatial(item)
     input_beats = max(m, n)
@@ -232,9 +251,9 @@ def _gen_wrapper_cpp(item):
 // K_SPATIAL={item.get("gemm_k_spatial", k_chunks)}
 // Stream widths: A={aw}, B={bw}, Bias={biasw}, C={cw}
 
-static ap_int<8> saturated_int8(ap_int<32> v) {{
-    if (v > 127) return 127;
-    if (v < -128) return -128;
+static ap_int<{c_lane}> saturated_result(ap_int<32> v) {{
+    if (v > {sat_pos}) return {sat_pos};
+    if (v < -{sat_neg}) return -{sat_neg};
     return v;
 }}
 
@@ -293,8 +312,8 @@ void {name}_wrapper(
                         acc += (ap_int<32>)a_rows[actual_row][kk] * (ap_int<32>)b_cols[actual_col][kk];
                     }}
                 }}
-                ap_int<8> result = saturated_int8(acc);
-                out_pkt.range(c * 64 + cl * 8 + 7, c * 64 + cl * 8) = result;
+                ap_int<{c_lane}> result = saturated_result(acc);
+                out_pkt.range(c * {c_tile} + cl * {c_lane} + {c_lane - 1}, c * {c_tile} + cl * {c_lane}) = result;
             }}
         }}
         c_stream.write(out_pkt);
@@ -412,9 +431,13 @@ def _gen_tb_cpp(item, num_vectors=10):
     name = item["emit_name"]
     m, k_val, n = item["m"], item["k"], item["n"]
     nv = max(1, num_vectors)
+    out_bits = _output_bits(item)
+    c_lane = out_bits
+    sat_pos = (1 << (out_bits - 1)) - 1
+    sat_neg = (1 << (out_bits - 1))
     a_beat_w = k_val * 8
     b_beat_w = k_val * 8
-    c_row_w  = n * 8
+    c_row_w  = n * out_bits
     return f"""\
 #include <stdio.h>
 #include <stdlib.h>
@@ -423,9 +446,9 @@ def _gen_tb_cpp(item, num_vectors=10):
 
 #define NUM_VECTORS {nv}
 
-static ap_int<8> saturated_int8(ap_int<32> v) {{
-    if (v > 127) return 127;
-    if (v < -128) return -128;
+static ap_int<{c_lane}> saturated_int8(ap_int<32> v) {{
+    if (v > {sat_pos}) return {sat_pos};
+    if (v < -{sat_neg}) return -{sat_neg};
     return v;
 }}
 
@@ -467,7 +490,7 @@ int main() {{
         }}
 
         // ── Golden reference ───────────────────────────────────────────────
-        ap_int<8> expected[{m}][{n}];
+        ap_int<{c_lane}> expected[{m}][{n}];
         for (int i = 0; i < {m}; i++) {{
             for (int j = 0; j < {n}; j++) {{
                 ap_int<32> acc = biases[j];
@@ -502,7 +525,7 @@ int main() {{
         for (int i = 0; i < {m}; i++) {{
             ap_uint<{c_row_w}> res = res_beats.read();
             for (int j = 0; j < {n}; j++) {{
-                ap_int<8> got = res.range(j * 8 + 7, j * 8);
+                ap_int<{c_lane}> got = res.range(j * {c_lane} + {c_lane - 1}, j * {c_lane});
                 if (got != expected[i][j]) {{
                     printf("MISMATCH vec=%d [%d][%d]: got %d expected %d\\n",
                            vec, i, j, (int)got, (int)expected[i][j]);
@@ -547,7 +570,12 @@ def _gen_design_cpp(item):
     aw = _a_bb_width(item)
     bw = _b_bb_width(item)
     biasw = _bias_width(n)
-    cw = _c_width(n)
+    out_bits = _output_bits(item)
+    c_lane = out_bits
+    c_tile = 8 * out_bits
+    sat_pos = (1 << (out_bits - 1)) - 1
+    sat_neg = (1 << (out_bits - 1))
+    cw = _c_width(n, out_bits)
     k_chunks = _k_chunks(item)
     full_k_spatial = _full_k_spatial(item)
     input_beats = max(m, n)
@@ -555,7 +583,7 @@ def _gen_design_cpp(item):
 
     a_beat_w = k_val * 8
     b_beat_w = k_val * 8
-    c_row_w  = n * 8
+    c_row_w  = n * out_bits
 
     # Build the chunk-streaming section: direct for single-chunk, buffered for multi-chunk
     if full_k_spatial:
@@ -741,8 +769,8 @@ void {name}_design(
             for (int lane = 0; lane < 8; lane++) {{
                 int actual_col = c * 8 + lane;
                 if (actual_col < {n}) {{
-                    row.range(actual_col * 8 + 7, actual_col * 8) =
-                        out_pkt.range(c * 64 + lane * 8 + 7, c * 64 + lane * 8);
+                    row.range(actual_col * {c_lane} + {c_lane - 1}, actual_col * {c_lane}) =
+                        out_pkt.range(c * {c_tile} + lane * {c_lane} + {c_lane - 1}, c * {c_tile} + lane * {c_lane});
                 }}
             }}
         }}
@@ -1080,7 +1108,10 @@ def _gen_layer_gemm_ip_h(item):
     aw = _a_bb_width(item)
     bw = _b_bb_width(item)
     biasw = _bias_width(n_val)
-    cw = _c_width(n_val)
+    out_bits = _output_bits(item)
+    c_lane = out_bits
+    c_tile = 8 * out_bits
+    cw = _c_width(n_val, out_bits)
     k_chunks = _k_chunks(item)
     full_k_spatial = _full_k_spatial(item)
     input_beats = max(m_val, n_val)
@@ -1289,10 +1320,10 @@ void {name}_gemm_ip_unpack(
             for (int lane = 0; lane < 8; lane++) {{
                 int actual_col = c * 8 + lane;
                 if (actual_col < {n_val}) {{
-                    // Blackbox emits signed int8 results. Read as ap_int<8> so the
-                    // assignment value-converts (sign-extends for integer res_T,
-                    // value-casts for fixed-point) to whatever precision res_T uses.
-                    ap_int<8> raw_val = (ap_int<8>)out_pkt.range(c * 64 + lane * 8 + 7, c * 64 + lane * 8);
+                    // Blackbox emits signed out_bits-wide results. Read as the
+                    // matching ap_int so the assignment value-converts (sign-extends
+                    // for integer res_T, value-casts for fixed-point) to res_T.
+                    ap_int<{c_lane}> raw_val = (ap_int<{c_lane}>)out_pkt.range(c * {c_tile} + lane * {c_lane} + {c_lane - 1}, c * {c_tile} + lane * {c_lane});
                     out_beat[actual_col] = raw_val;
                 }}
             }}
@@ -1418,10 +1449,12 @@ def generate_vitis_pkg(item, output_dir):
     # under `ifndef SYNTHESIS (used by cosim/XSIM) and the structural synth
     # wrapper under `else (used by C synthesis). Both share the same port list,
     # so the JSON blackbox binding is unchanged.
+    out_bits = _output_bits(item)
     generate_grid_verilog = load_vitis_combined_rtl_generator()
     grid_v = generate_grid_verilog(item["m"], item["k"], item["n"],
                                    module_name=f"{item['emit_name']}_wrapper",
-                                   gemm_k_spatial=item["gemm_k_spatial"])
+                                   gemm_k_spatial=item["gemm_k_spatial"],
+                                   out_bits=out_bits)
     (pkg_dir / f"{item['emit_name']}.v").write_text(grid_v, encoding="utf-8")
 
     _write_text(pkg_dir / f"{item['emit_name']}_wrapper.cpp", _gen_wrapper_cpp(item))

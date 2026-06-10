@@ -1106,7 +1106,34 @@ def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="c
     return generate_synth_verilog(m, k, n, module_name, feed_mode, debug)
 
 
-def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper"):
+def _widen_output_saturation(text, out_bits):
+    """Rewrite the hardcoded int8 (±127) output-saturation bounds to an
+    ``out_bits``-wide signed range.
+
+    The Catapult core always packs 16-bit output lanes (``c_row[...+:16]``,
+    ``c_bits = grid_cols * 128``); only the clamp *value* was int8, which
+    silently capped the GEMM result at ±127 regardless of the configured
+    ``output_precision``. This rewrites the clamp to the output range
+    (e.g. ±32767 for a 16-bit ``output_precision``). The ``32'sd127`` /
+    ``16'sd127`` / ``-32'sd128`` / ``-16'sd128`` tokens appear ONLY inside the
+    ``sat_int8`` / ``sat_int8_to_i16`` functions, so the substitution is exact.
+    No-op for ``out_bits == 8`` (preserves the legacy int8 contract).
+    """
+    if out_bits is None or out_bits == 8:
+        return text
+    if out_bits > 16:
+        raise ValueError(f"out_bits={out_bits} exceeds the 16-bit tensor_slice "
+                         "partial width; output_precision must be <= 16 bits")
+    pos = (1 << (out_bits - 1)) - 1          # e.g. 32767
+    neg = (1 << (out_bits - 1))              # e.g. 32768
+    subs = [("32'sd127", f"32'sd{pos}"), ("16'sd127", f"16'sd{pos}"),
+            ("-32'sd128", f"-32'sd{neg}"), ("-16'sd128", f"-16'sd{neg}")]
+    for old, new in subs:
+        text = text.replace(old, new)
+    return text
+
+
+def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out_bits=8):
     """Generate a single {module_name}.v with ifndef SYNTHESIS guard.
 
     ``ifndef SYNTHESIS`` — behavioral simulation model (wrapper + behav_grid).
@@ -1116,6 +1143,9 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper"):
     Used by Catapult HLS → downstream synthesis (Design Compiler).
 
     Both share the same port list so the ac_blackbox() binding is identical.
+
+    ``out_bits`` is the result-lane width derived from ``output_precision``
+    (default 8 = legacy int8 clamp; 16 = honor a fixed<16,…> output_precision).
     """
     sim_top = generate_sim_verilog(m, k, n, module_name)
     synth_top = generate_synth_verilog(m, k, n, module_name)
@@ -1137,7 +1167,7 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper"):
         lines.append(l)
     lines.append("")
     lines.append("`endif")
-    return "\n".join(lines) + "\n"
+    return _widen_output_saturation("\n".join(lines) + "\n", out_bits)
 
 
 def _k_spatial_partitions(k, k_spatial):
@@ -1435,9 +1465,9 @@ def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_s
     return banner + sim
 
 
-def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1):
+def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, out_bits=8):
     if k_spatial == 1:
-        return generate_combined_core_verilog(m, k, n, module_name)
+        return generate_combined_core_verilog(m, k, n, module_name, out_bits=out_bits)
     _k_spatial_partitions(k, k_spatial)
     sim_top = generate_k_spatial_sim_verilog(m, k, n, module_name, k_spatial)
     synth_top = generate_k_spatial_synth_verilog(m, k, n, module_name, k_spatial)
@@ -1458,7 +1488,7 @@ def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wra
     lines.extend(synth_top.splitlines())
     lines.append("")
     lines.append("`endif")
-    return "\n".join(lines) + "\n"
+    return _widen_output_saturation("\n".join(lines) + "\n", out_bits)
 
 
 if __name__ == "__main__":
