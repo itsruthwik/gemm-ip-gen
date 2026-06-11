@@ -167,6 +167,11 @@ class TestCatapultRtlSim:
         pytest.param(8, 24, 8, 3, id="8x24x8-p3"),
         pytest.param(16, 72, 8, 3, id="16x72x8-p3"),
         pytest.param(25, 81, 10, 3, id="25x81x10-p3"),
+        # Full-K deep-K shapes where the feed-dominated FIRST_OUT drops below
+        # the chunked schedule (80 vs 144 / 91 vs 275) — proves the behavioral
+        # model still passes golden data through the earlier emit window.
+        pytest.param(16, 72, 8, 9, id="16x72x8-p9-fullk"),
+        pytest.param(25, 81, 10, 11, id="25x81x10-p11-fullk"),
     ])
     def test_catapult_k_spatial_core_sim(self, m, k, n, k_spatial, tmp_path):
         mod = f"ksp_{m}x{k}x{n}_p{k_spatial}"

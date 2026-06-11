@@ -367,3 +367,84 @@ def test_generate_k_spatial_package_warns_and_emits_partitions(tmp_path, capsys)
     assert rtl.count('(* black_box = "true" *) (* keep = "true" *) tensor_slice_int8') == 6
     assert "partial outputs are INT16" in rtl
     assert "sat_int8_to_i16" in rtl
+
+def test_full_k_first_out_drops_for_deep_k():
+    """Full-K-spatial feeds every K chunk in one max(M,N)-beat pass, so its
+    first_out must fall below the chunked schedule wherever the feed (not the
+    systolic K+N wave) dominates — the deep-K conv shapes. Wave-dominated
+    shapes stay equal, and full-K may never be later than chunked."""
+    from gemm_ip.catapult import latency_cycles
+
+    def pair(m, k, n):
+        gr, gc = (m + 7) // 8, (n + 7) // 8
+        return (latency_cycles(m, k, n, gr, gc, full_k_spatial=False),
+                latency_cycles(m, k, n, gr, gc, full_k_spatial=True))
+
+    # Deep-K: feed-dominated, full-K strictly earlier.
+    assert pair(16, 72, 8) == (144, 80)
+    assert pair(25, 81, 10) == (275, 91)
+    assert pair(10, 27, 10) == (40, 37)
+
+    # Wave-dominated: equal, never worse.
+    for shape in [(16, 16, 16), (10, 10, 10), (8, 24, 8)]:
+        chunked, fullk = pair(*shape)
+        assert fullk == chunked
+
+    # k_chunks == 1: the branches coincide (fc/attn/mlp3 packages unchanged).
+    for shape in [(8, 8, 8), (16, 8, 8), (8, 8, 16)]:
+        chunked, fullk = pair(*shape)
+        assert fullk == chunked
+
+
+def test_full_k_first_out_not_below_feed_beats():
+    """first_out >= total feed beats by construction: the first output row must
+    land inside the DRAIN window, never inside FEED (FEED ignores out_valid)."""
+    from gemm_ip.catapult import latency_cycles
+
+    for (m, k, n) in [(16, 16, 16), (10, 10, 10), (8, 24, 8), (10, 27, 10),
+                      (16, 72, 8), (25, 81, 10), (8, 8, 8), (64, 16, 8)]:
+        gr, gc = (m + 7) // 8, (n + 7) // 8
+        for fk in (False, True):
+            beats = max(m, n) if fk else ((k + 7) // 8) * max(m, n)
+            assert latency_cycles(m, k, n, gr, gc, full_k_spatial=fk) >= beats
+
+
+def test_full_k_package_uses_full_k_drain_timing(tmp_path):
+    """The generated full-K package must carry the full-K first_out coherently:
+    behavioral FIRST_OUT localparam, C++ clk_cnt emit gate, and the DRAIN trip
+    count all derive from the same value."""
+    import re as _re
+
+    # conv2d shape, full-K (k_chunks == 9): first_out = 16 + (72+8-16) = 80.
+    generate_catapult_pkg(16, 72, 8, "test_fullk_t", tmp_path, gemm_k_spatial=9)
+    h = (tmp_path / "test_fullk_t" / "test_fullk_t_gemm_ip.h").read_text()
+    v = (tmp_path / "test_fullk_t" / "test_fullk_t_core.v").read_text()
+    assert "localparam integer FIRST_OUT         = 80;" in v
+    assert "clk_cnt >= 81" in h                       # first_out + 1
+    assert "DRAIN: for (int i = 0; i < 98; i++)" in h  # blind(82) + m(16)
+
+    # Same shape, chunked: first_out = 144 (9 chunks x 16 beats, wave = 0).
+    generate_catapult_pkg(16, 72, 8, "test_chk_t", tmp_path, gemm_k_spatial=1)
+    h1 = (tmp_path / "test_chk_t" / "test_chk_t_gemm_ip.h").read_text()
+    v1 = (tmp_path / "test_chk_t" / "test_chk_t_core.v").read_text()
+    assert "localparam integer FIRST_OUT         = 144;" in v1
+    assert "clk_cnt >= 145" in h1
+    assert "DRAIN: for (int i = 0; i < 162; i++)" in h1  # blind(146) + m(16)
+
+    # k_chunks == 1 control keeps the legacy value on both paths.
+    generate_catapult_pkg(8, 8, 8, "test_k1_t", tmp_path)
+    v2 = (tmp_path / "test_k1_t" / "test_k1_t_core.v").read_text()
+    assert "localparam integer FIRST_OUT         = 16;" in v2
+
+
+def test_assert_core_first_out_rejects_mismatch():
+    """The generation-time cross-check must hard-fail if the behavioral grid's
+    FIRST_OUT drifts from latency_cycles (sim model vs wrapper drain window)."""
+    from gemm_ip.catapult import _assert_core_first_out
+
+    good = "localparam integer FIRST_OUT = 80;"
+    _assert_core_first_out("ok", 16, 72, 8, 9, good)
+
+    bad = "localparam integer FIRST_OUT = 144;"
+    with pytest.raises(RuntimeError, match="FIRST_OUT"):
+        _assert_core_first_out("bad", 16, 72, 8, 9, bad)

@@ -47,28 +47,34 @@ def _blackbox_delay_ns(clock_period_ns):
     return round(min(0.7 * period, period - 1.5), 2)
 
 
-def latency_cycles(m, k, n, grid_rows, grid_cols):
+def latency_cycles(m, k, n, grid_rows, grid_cols, full_k_spatial=False):
     """First-output cycle offset for the C++ simulation model.
 
-    Matches the double-buffer behavioral grid timing:
-      first_out = k_chunks × max(M,N) + max(0, K+N − k_chunks×max(M,N))
-    This is the cycle where out_valid fires in the simulation model,
-    offset from clk_cnt = 0 (first in_valid beat).
+    Matches the behavioral grid timing: feed beats + the systolic K+N wave
+    remainder.
+      chunked: first_out = k_chunks × max(M,N) + max(0, K+N − k_chunks×max(M,N))
+      full-K:  first_out =            max(M,N) + max(0, K+N −          max(M,N))
+    Full-K mode feeds every K chunk spatially in one max(M,N)-beat pass, so
+    its first output arrives correspondingly earlier. By construction
+    first_out >= total feed beats, so the first row always lands inside the
+    DRAIN window, never inside FEED. This is the cycle where out_valid fires
+    in the simulation model, offset from clk_cnt = 0 (first in_valid beat).
     """
     k_chunks = _ceil_div(k, LANE_WIDTH)
     input_beats = max(m, n)
-    wait = max(0, k + n - k_chunks * input_beats)
-    return k_chunks * input_beats + wait
+    total_beats = input_beats if full_k_spatial else k_chunks * input_beats
+    return total_beats + max(0, k + n - total_beats)
 
 
-def dead_cycles_raw(m, k, n, grid_cols):
+def dead_cycles_raw(m, k, n, grid_cols, full_k_spatial=False):
     """Drain dead cycles before the C++ wrapper starts capturing output."""
-    return latency_cycles(m, k, n, grid_rows=1, grid_cols=grid_cols) + 1
+    return latency_cycles(m, k, n, grid_rows=1, grid_cols=grid_cols,
+                          full_k_spatial=full_k_spatial) + 1
 
 
-def dead_cycles(m, k, n, grid_cols):
+def dead_cycles(m, k, n, grid_cols, full_k_spatial=False):
     """Drain dead cycles + 1-cycle padding."""
-    return dead_cycles_raw(m, k, n, grid_cols) + 1
+    return dead_cycles_raw(m, k, n, grid_cols, full_k_spatial=full_k_spatial) + 1
 
 
 def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gemm_k_spatial=1,
@@ -96,8 +102,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     bias_bits = col_chunk_bits
     input_beats = max(m, n)
     total_beats = input_beats if full_k_spatial else k_chunks * input_beats
-    first_out = latency_cycles(m, k, n, grid_rows, grid_cols)
-    blind = dead_cycles(m, k, n, grid_cols)
+    first_out = latency_cycles(m, k, n, grid_rows, grid_cols, full_k_spatial=full_k_spatial)
+    blind = dead_cycles(m, k, n, grid_cols, full_k_spatial=full_k_spatial)
     drain = blind + mr
 
     # The DRAIN loop polls out_valid, so it absorbs the core's port lag. The
@@ -1226,6 +1232,25 @@ def _assert_core_port_widths(name, header_text, grid_v):
             )
 
 
+def _assert_core_first_out(name, m, k, n, gemm_k_spatial, grid_v):
+    """Cross-check the behavioral grid's FIRST_OUT localparam against
+    latency_cycles. The C++ sim core, the wrapper's DRAIN capture window, and
+    the behavioral Verilog model must agree on the first-output cycle (chunked
+    vs full-K-spatial); silent drift would desynchronize cosim capture."""
+    k_chunks = _ceil_div(k, LANE_WIDTH)
+    full_k_spatial = k_chunks > 1 and gemm_k_spatial == k_chunks
+    expected = latency_cycles(m, k, n, grid_rows=(m + 7) // 8,
+                              grid_cols=(n + 7) // 8, full_k_spatial=full_k_spatial)
+    found = re.findall(r"localparam integer FIRST_OUT\s*=\s*(\d+);", grid_v)
+    if len(found) != 1 or int(found[0]) != expected:
+        raise RuntimeError(
+            f"{name}: behavioral grid FIRST_OUT {found} does not match "
+            f"latency_cycles()={expected} (m={m} k={k} n={n}, "
+            f"gemm_k_spatial={gemm_k_spatial}). The sim model and the wrapper "
+            "were generated with inconsistent drain timing."
+        )
+
+
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
                           gemm_k_spatial=None, input_precision=None, weight_precision=None,
                           clock_period_ns=None):
@@ -1268,6 +1293,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         clock_period_ns=clock_period_ns,
     )
     _assert_core_port_widths(name, header_text, grid_v)
+    _assert_core_first_out(name, m, k, n, gemm_k_spatial, grid_v)
     (pkg_dir / f"{name}_core.v").write_text(grid_v)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
     (pkg_dir / f"{name}_gemm_ip.h").write_text(header_text)

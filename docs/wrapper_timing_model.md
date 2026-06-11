@@ -38,37 +38,58 @@ for step in 0..(k_chunks * input_beats):
 
 ## Dead-Cycle Formula
 
-Matches the double-buffer behavioral grid timing:
+Matches the behavioral grid timing — feed beats plus the systolic K+N wave
+remainder. Full-K-spatial mode (`gemm_k_spatial == k_chunks > 1`) feeds every
+K chunk spatially in one `max(M,N)`-beat pass, so its first output arrives
+correspondingly earlier; chunked mode serializes the chunks:
 
 ```python
-def latency_cycles(m, k, n, grid_rows, grid_cols):
+def latency_cycles(m, k, n, grid_rows, grid_cols, full_k_spatial=False):
     k_chunks = ceil(k / 8)
     input_beats = max(m, n)
-    wait = max(0, k + n - k_chunks * input_beats)
-    return k_chunks * input_beats + wait
+    total_beats = input_beats if full_k_spatial else k_chunks * input_beats
+    return total_beats + max(0, k + n - total_beats)
 
-def dead_cycles_raw(m, k, n, grid_cols):
-    return latency_cycles(m, k, n, grid_rows=1, grid_cols=grid_cols) + 1
+def dead_cycles_raw(m, k, n, grid_cols, full_k_spatial=False):
+    return latency_cycles(m, k, n, grid_rows=1, grid_cols=grid_cols,
+                          full_k_spatial=full_k_spatial) + 1
 
-def dead_cycles(m, k, n, grid_cols):
-    return dead_cycles_raw(m, k, n, grid_cols) + 1
+def dead_cycles(m, k, n, grid_cols, full_k_spatial=False):
+    return dead_cycles_raw(m, k, n, grid_cols, full_k_spatial) + 1
 ```
+
+By construction `first_out >= total feed beats`, so the first output row
+always lands inside the DRAIN window. The same formula is emitted into three
+coordinated places — the C++ clk_cnt sim core, the behavioral Verilog grid's
+`FIRST_OUT` localparam, and the wrapper's DRAIN trip count — and package
+generation cross-asserts the behavioral localparam against `latency_cycles`
+(`_assert_core_first_out`). `k_chunks == 1` designs are unaffected (the two
+branches coincide).
+
+This is the behavioral model's systolic abstraction; the structural
+(`SYNTHESIS`) branch is synthesis-only and is not a cycle-accurate reference.
 
 Grid-level latency:
 ```
-beh  = k_chunks × max(M,N) + max(0, K+N − k_chunks×max(M,N)) + M  (+1 sync)
-wrap = beh + 3   (Catapult wrapper: bias + transition + register)
-II   = k_chunks × max(M,N) + 1   (back-to-back with shadow FIFO)
+beats = max(M,N)               (full-K)   |   k_chunks × max(M,N)   (chunked)
+beh   = beats + max(0, K+N − beats) + M  (+1 sync)
+wrap  = beh + 3   (Catapult wrapper: bias + transition + register)
+II    = beats + 1   (back-to-back with shadow FIFO)
 ```
 
 Examples:
 
-| Shape | k_chunks | first_out | blind | beh | wrap | b2b II |
-|---|---:|---:|---:|---:|---:|---:|
-| 8×8×8 | 1 | 16 | 18 | 25 | 28 | 9 |
-| 16×8×8 | 1 | 16 | 18 | 33 | 36 | 17 |
-| 16×16×16 | 2 | 32 | 34 | 49 | 52 | 33 |
-| 9×17×10 | 3 | 30 | 32 | 40 | 43 | 31 |
+| Shape | k_chunks | mode | first_out | blind | beh | wrap | b2b II |
+|---|---:|---|---:|---:|---:|---:|---:|
+| 8×8×8 | 1 | chunked | 16 | 18 | 25 | 28 | 9 |
+| 16×8×8 | 1 | chunked | 16 | 18 | 33 | 36 | 17 |
+| 16×16×16 | 2 | chunked | 32 | 34 | 49 | 52 | 33 |
+| 16×16×16 | 2 | full-K | 32 | 34 | 49 | 52 | 17 |
+| 9×17×10 | 3 | chunked | 30 | 32 | 40 | 43 | 31 |
+| 16×72×8 | 9 | chunked | 144 | 146 | 161 | 164 | 145 |
+| 16×72×8 | 9 | full-K | 80 | 82 | 97 | 100 | 17 |
+| 25×81×10 | 11 | chunked | 275 | 277 | 301 | 304 | 276 |
+| 25×81×10 | 11 | full-K | 91 | 93 | 117 | 120 | 26 |
 
 ## Active Wrapper Schedule
 

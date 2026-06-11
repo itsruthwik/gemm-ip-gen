@@ -36,10 +36,11 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
     total_input_beats = input_beats if full_k_spatial else k_chunks * input_beats
     total_output_rows = m
     latency = max(0, k + n - total_input_beats)
-    # First-output offset == catapult.latency_cycles (ALWAYS k_chunks-based, even in
-    # full_k_spatial mode), so the single-buffer sim model below stays aligned with
-    # the validated C++ core and the wrapper's DRAIN capture window.
-    first_out = k_chunks * input_beats + max(0, k + n - k_chunks * input_beats)
+    # First-output offset == catapult.latency_cycles(full_k_spatial=...): feed
+    # beats + the systolic K+N wave remainder. Full-K mode feeds every K chunk
+    # spatially in one max(M,N)-beat pass, so its first_out drops accordingly;
+    # the C++ core and the wrapper's DRAIN capture window use the same formula.
+    first_out = total_input_beats + latency
     behav_name = f"{module_name}_behav_grid"
     mode_comment = (
         "Full K-spatial behavioral MxKxN GEMM. Not intended for synthesis."
