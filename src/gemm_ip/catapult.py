@@ -21,6 +21,31 @@ from gemm_ip.metadata import (
     load_catapult_rtl_generator,
 )
 
+# Combinational delay (ns) Catapult must budget for any cycle that touches the
+# blackbox boundary. The structural grid registers its inputs and outputs, but
+# the residual paths (input-reg setup muxing on Catapult's side; registered
+# c_row through the wait_dp live mux into the drain logic) are real. The old
+# 0.5 claim let Catapult chain its own feed/drain logic into the same cycle as
+# the hard block's pin timing, and post-route Fmax collapsed (~179 MHz vs the
+# 306 MHz baseline on fc_large at a 5 ns target).
+_BLACKBOX_DELAY_FALLBACK_NS = 3.5
+
+
+def _blackbox_delay_ns(clock_period_ns):
+    """Blackbox delay budget derived from the project clock.
+
+    70% of the period, but always leaving Catapult >= 1.5 ns of glue headroom
+    (the scheduler rejects the component outright below that: 3.3/2.3 and
+    3.3/2.0 fail, 3.6/2.0 and 5.0/3.5 schedule). At the 5 ns project standard
+    this reproduces the validated .delay(3.5). NOTE: tighter clock targets do
+    NOT improve post-route Fmax on the tensor_slice arch — a 3.6 ns build
+    routed at 186 MHz vs 222.7 MHz for the 5 ns build (routing-dominated).
+    """
+    if not clock_period_ns:
+        return _BLACKBOX_DELAY_FALLBACK_NS
+    period = float(clock_period_ns)
+    return round(min(0.7 * period, period - 1.5), 2)
+
 
 def latency_cycles(m, k, n, grid_rows, grid_cols):
     """First-output cycle offset for the C++ simulation model.
@@ -47,7 +72,8 @@ def dead_cycles(m, k, n, grid_cols):
 
 
 def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gemm_k_spatial=1,
-                      input_precision=None, weight_precision=None):
+                      input_precision=None, weight_precision=None, clock_period_ns=None):
+    bb_delay_ns = _blackbox_delay_ns(clock_period_ns)
     row_chunk_bits = grid_rows * 64
     col_chunk_bits = grid_cols * 64
     c_bits = grid_cols * 128
@@ -73,6 +99,20 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     first_out = latency_cycles(m, k, n, grid_rows, grid_cols)
     blind = dead_cycles(m, k, n, grid_cols)
     drain = blind + mr
+
+    # The DRAIN loop polls out_valid, so it absorbs the core's port lag. The
+    # last emitted row sits at run()-call index first_out + mr + 2 (preload
+    # call + clk_cnt→call offset), and the worst port lag is 3 calls (sim
+    # branch: 2 registered stages; structural branch adds an input register).
+    # Guard that the lagged emission still lands inside the FEED+DRAIN call
+    # budget so a future shape cannot silently outgrow the slack.
+    spare_drain_calls = (total_beats + 1 + drain) - (first_out + mr + 2 + 3)
+    if spare_drain_calls < 0:
+        raise RuntimeError(
+            f"{name}: GEMM wrapper drain window too tight for the core port "
+            f"lag (short by {-spare_drain_calls} calls; m={m} k={k} n={n}). "
+            "Increase dead_cycles padding."
+        )
 
     # Choose the RHS expression for the final output assignment based on the
     # configured result type.  Integer types (ac_int / ac_uint) need an explicit
@@ -369,7 +409,7 @@ class {name}_ccore {{
             .verilog_files("{name}_core.v")
             .outputs("c_row out_valid out_last")
             .area(2048.0)
-            .delay(0.5)
+            .delay({bb_delay_ns})
             .latency(1)
             .init_delay(1)
             .clock_name("clk")
@@ -1180,7 +1220,8 @@ def _assert_core_port_widths(name, header_text, grid_v):
 
 
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
-                          gemm_k_spatial=None, input_precision=None, weight_precision=None):
+                          gemm_k_spatial=None, input_precision=None, weight_precision=None,
+                          clock_period_ns=None):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     gemm_k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
@@ -1217,6 +1258,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         gemm_k_spatial=gemm_k_spatial,
         input_precision=input_precision,
         weight_precision=weight_precision,
+        clock_period_ns=clock_period_ns,
     )
     _assert_core_port_widths(name, header_text, grid_v)
     (pkg_dir / f"{name}_core.v").write_text(grid_v)
@@ -1266,6 +1308,7 @@ def _normalize_config_items(cfg):
                 "output_precision": item.get("output_precision"),
                 "input_precision": item.get("input_precision"),
                 "weight_precision": item.get("weight_precision"),
+                "clock_period_ns": item.get("clock_period_ns"),
                 "gemm_k_spatial": _validate_gemm_k_spatial(
                     int(item.get("gemm_k", item.get("n_in", 8))),
                     item.get("gemm_k_spatial"),

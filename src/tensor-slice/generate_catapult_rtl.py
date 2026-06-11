@@ -302,10 +302,10 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
             b_hi = (c + 1) * 64 - 1
             b_lo = c * 64
             data_wires.append(
-                f"    wire [63:0] a_data_{r}_{c} = (in_beat_active && ({c} == 0)) ? a_rows[{a_hi}:{a_lo}] : 64'b0;"
+                f"    wire [63:0] a_data_{r}_{c} = (in_beat_active && ({c} == 0)) ? a_rows_q[{a_hi}:{a_lo}] : 64'b0;"
             )
             data_wires.append(
-                f"    wire [63:0] b_data_{r}_{c} = (in_beat_active && ({r} == 0)) ? b_cols[{b_hi}:{b_lo}] : 64'b0;"
+                f"    wire [63:0] b_data_{r}_{c} = (in_beat_active && ({r} == 0)) ? b_cols_q[{b_hi}:{b_lo}] : 64'b0;"
             )
 
     inst_lines = []
@@ -317,7 +317,7 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
             .start_mat_mul(slice_start),
             .done_mat_mul(done_mat_mul[{r*grid_cols+c}]),
             .a_data(a_data_{r}_{c}),
-            .b_data(preload_d ? bias_cols[{c}*64 +: 64] : b_data_{r}_{c}),
+            .b_data(preload_d ? bias_cols_q[{c}*64 +: 64] : b_data_{r}_{c}),
             .a_data_in(a_chain_{r}_{c}),
             .b_data_in(b_chain_{r}_{c}),
             .a_data_out(a_chain_{r}_{c+1}),
@@ -423,8 +423,38 @@ module {module_name}(
     reg transaction_active;
     reg [{c_width-1}:0] row_mux;
 
+    // ── Input pipeline stage ────────────────────────────────────────────────
+    // Register the whole input bundle (en-gated, so the +1 is one run()-call
+    // and the core stays self-timed). Without this the beat decode + data
+    // gating muxes chain combinationally from the Catapult wrapper's logic
+    // into the tensor_slice hard-block input pins — the post-route critical
+    // path. The wrapper's poll-based DRAIN absorbs the uniform +1; the sim
+    // branch intentionally does NOT model it (sim is the latency/parity
+    // reference; the structural branch is timing-only).
+    reg [{a_width-1}:0] a_rows_q;
+    reg [{b_width-1}:0] b_cols_q;
+    reg [{b_width-1}:0] bias_cols_q;
+    reg preload_valid_q;
+    reg in_valid_q;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            a_rows_q        <= {a_width}'d0;
+            b_cols_q        <= {b_width}'d0;
+            bias_cols_q     <= {b_width}'d0;
+            preload_valid_q <= 1'b0;
+            in_valid_q      <= 1'b0;
+        end else if (en) begin
+            a_rows_q        <= a_rows;
+            b_cols_q        <= b_cols;
+            bias_cols_q     <= bias_cols;
+            preload_valid_q <= preload_valid;
+            in_valid_q      <= in_valid;
+        end
+    end
+
     wire slice_reset = rst;
-    wire in_beat_active = (state == S_RUN) && in_valid && (beat_count < INPUT_BEATS);
+    wire in_beat_active = (state == S_RUN) && in_valid_q && (beat_count < INPUT_BEATS);
     wire slice_start = in_beat_active && (beat_count == 16'd0);
     wire slice_pe_reset = slice_start && (chunk_idx == 16'd0);
     wire final_chunk = (chunk_idx == K_CHUNKS - 1);
@@ -479,7 +509,7 @@ module {module_name}(
                     chunk_idx <= 16'd0;
                     out_row_count <= 16'd0;
                     transaction_active <= 1'b0;
-                    if (preload_valid) begin
+                    if (preload_valid_q) begin
                         preload_d <= 1'b1;
                         transaction_active <= 1'b1;
                         state <= S_PRELOAD;
