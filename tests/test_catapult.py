@@ -10,6 +10,7 @@ if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
 from gemm_ip.catapult import (
+    _assert_core_port_widths,
     _is_ac_integer_type,
     _normalize_config_items,
     gen_combined_header,
@@ -303,6 +304,46 @@ def test_array_partial_k_spatial_keeps_time_tiled_feed(tmp_path):
     assert "FEED_ARRAY: for (int step = 0; step < 73; step++)" in h
     assert "int kc = eff_step / 24" in h
     assert "ROW_PACK_ARRAY_FULL_KC" not in h
+
+
+def test_single_k_chunk_wide_designs_use_chunked_layout(tmp_path):
+    """k<=8 (k_chunks==1) must generate the CHUNKED layout end-to-end. The old
+    full-mode selection emitted 64-bit wrapper words against the chunked grid's
+    grid_{rows,cols}*64-bit ports; the simulator X-padded the gap and every
+    row/col tile beyond the first was corrupted (multi-tile chained cosim bug)."""
+    import re as _re
+
+    # B-side multi-tile: the mlp3/cnn5 dense1 shape (8, 8, 16).
+    generate_catapult_pkg(8, 8, 16, "test_n16k8", tmp_path)
+    h = (tmp_path / "test_n16k8" / "test_n16k8_gemm_ip.h").read_text()
+    v = (tmp_path / "test_n16k8" / "test_n16k8_core.v").read_text()
+    assert _re.search(r"ac_int<128, false>\s*b_cols", h)   # grid_cols*64, not 64
+    assert "ROW_PACK_FULL_KC" not in h                     # chunked feed loops
+    assert _re.search(r"\[127:0\]\s*b_cols", v)
+
+    # A-side multi-tile: (16, 8, 8) has the same hazard on a_rows.
+    generate_catapult_pkg(16, 8, 8, "test_m16k8", tmp_path)
+    h2 = (tmp_path / "test_m16k8" / "test_m16k8_gemm_ip.h").read_text()
+    v2 = (tmp_path / "test_m16k8" / "test_m16k8_core.v").read_text()
+    assert _re.search(r"ac_int<128, false>\s*a_rows", h2)  # grid_rows*64, not 64
+    assert _re.search(r"\[127:0\]\s*a_rows", v2)
+
+
+def test_assert_core_port_widths_rejects_layout_mismatch():
+    """The generation-time cross-check must hard-fail on header/grid width drift
+    instead of leaving a silent X-padded port for the simulator to find."""
+    hdr = (
+        "void run(ac_int<64, false>  a_rows, ac_int<64, false>  b_cols,\n"
+        "         ac_int<128, false>  bias_cols, ac_int<256, false>& c_row);"
+    )
+    rtl = (
+        "input  wire [63:0]   a_rows,\n"
+        "input  wire [127:0]   b_cols,\n"
+        "input  wire [127:0]   bias_cols,\n"
+        "output reg  [255:0]   c_row"
+    )
+    with pytest.raises(RuntimeError, match="b_cols"):
+        _assert_core_port_widths("bad", hdr, rtl)
 
 
 def test_catapult_header_reads_int16_result_lanes(tmp_path):

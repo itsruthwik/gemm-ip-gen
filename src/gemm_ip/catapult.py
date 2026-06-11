@@ -53,7 +53,14 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     c_bits = grid_cols * 128
     mr = grid_rows * 8
     k_chunks = _ceil_div(k, LANE_WIDTH)
-    full_k_spatial = gemm_k_spatial == k_chunks
+    # Full-K-spatial layout applies ONLY to the dedicated k-spatial grid
+    # (gemm_k_spatial == k_chunks > 1). For k_chunks == 1 the package always
+    # generates the CHUNKED grid (generate_combined_core_verilog), so the
+    # wrapper must pack chunked words too: matching k_chunks==1 here used to
+    # emit 64-bit full-mode words against the grid's grid_cols*64-bit ports,
+    # X-poisoning every row/col tile beyond the first (cosim-only corruption
+    # for max(m,n) > 8).
+    full_k_spatial = k_chunks > 1 and gemm_k_spatial == k_chunks
     # Full-K uses the NARROW per-beat word (one tile, 64 bits per K-chunk); the
     # wrapper RTL re-inserts the grid row/col tile offset by beat index, so the
     # deep input FIFO never stores the always-zero grid padding (area saving on
@@ -1145,6 +1152,33 @@ def _output_bits(output_precision):
     return int(m.group(1)) if m else 8
 
 
+_CORE_PORTS = ("a_rows", "b_cols", "bias_cols", "c_row")
+
+
+def _assert_core_port_widths(name, header_text, grid_v):
+    """Cross-check the blackbox word widths between the generated C++ header and
+    the generated grid RTL. Catapult wires a width-mismatched blackbox port
+    without erroring and the simulator X-pads the missing bits (silent cosim
+    corruption), so any disagreement must fail generation instead."""
+    hdr = {}
+    for w, port in re.findall(
+            r"ac_int<(\d+), false>\s*&?\s*(%s)\b" % "|".join(_CORE_PORTS), header_text):
+        hdr.setdefault(port, set()).add(int(w))
+    rtl = {}
+    for w, port in re.findall(
+            r"\[(\d+):0\]\s*(%s)\b" % "|".join(_CORE_PORTS), grid_v):
+        rtl.setdefault(port, set()).add(int(w) + 1)
+    for port in _CORE_PORTS:
+        hw, rw = hdr.get(port, set()), rtl.get(port, set())
+        if len(hw) != 1 or len(rw) != 1 or hw != rw:
+            raise RuntimeError(
+                f"{name}: blackbox port width mismatch for '{port}': C++ header "
+                f"declares {sorted(hw)} bits, grid RTL declares {sorted(rw)} bits. "
+                "The wrapper and the core were generated with inconsistent word "
+                "layouts (full-K-spatial vs chunked)."
+            )
+
+
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
                           gemm_k_spatial=None, input_precision=None, weight_precision=None):
     if interface not in ("stream", "array"):
@@ -1177,17 +1211,17 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         grid_v = generate_k_spatial_combined_core_verilog(
             m, k, n, module_name=f"{name}_core", k_spatial=gemm_k_spatial, out_bits=out_bits
         )
+    header_text = gen_public_header(
+        name, m, k, n, grid_rows, grid_cols,
+        result_type=output_precision,
+        gemm_k_spatial=gemm_k_spatial,
+        input_precision=input_precision,
+        weight_precision=weight_precision,
+    )
+    _assert_core_port_widths(name, header_text, grid_v)
     (pkg_dir / f"{name}_core.v").write_text(grid_v)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
-    (pkg_dir / f"{name}_gemm_ip.h").write_text(
-        gen_public_header(
-            name, m, k, n, grid_rows, grid_cols,
-            result_type=output_precision,
-            gemm_k_spatial=gemm_k_spatial,
-            input_precision=input_precision,
-            weight_precision=weight_precision,
-        )
-    )
+    (pkg_dir / f"{name}_gemm_ip.h").write_text(header_text)
     (pkg_dir / f"{name}_inst.cpp").write_text(gen_inst_cpp(name, m, k, n, interface))
     (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(name, m, k, n, interface))
     (pkg_dir / "run_catapult.tcl").write_text(gen_tcl(name, m, k, n, interface))
