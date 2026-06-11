@@ -36,62 +36,53 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
     total_input_beats = input_beats if full_k_spatial else k_chunks * input_beats
     total_output_rows = m
     latency = max(0, k + n - total_input_beats)
+    # First-output offset == catapult.latency_cycles (ALWAYS k_chunks-based, even in
+    # full_k_spatial mode), so the single-buffer sim model below stays aligned with
+    # the validated C++ core and the wrapper's DRAIN capture window.
+    first_out = k_chunks * input_beats + max(0, k + n - k_chunks * input_beats)
     behav_name = f"{module_name}_behav_grid"
     mode_comment = (
         "Full K-spatial behavioral MxKxN GEMM. Not intended for synthesis."
         if full_k_spatial
         else "Chunked behavioral MxKxN GEMM. Not intended for synthesis."
     )
-    collect_unpack = f"""\
-                        chunk_idx = beat_count / INPUT_BEATS;
-                        beat_in_chunk = beat_count % INPUT_BEATS;
-                        if (beat_in_chunk < {m}) begin
-                            for (lane = 0; lane < 8; lane = lane + 1) begin
-                                kk = chunk_idx * 8 + lane;
-                                if (kk < {k}) begin
-                                    if (coll_buf == 0)
-                                        amat_0[beat_in_chunk][kk] = a_rows[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                    else
-                                        amat_1[beat_in_chunk][kk] = a_rows[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                end
-                            end
+    # Single-buffer unpack: capture a_rows/b_cols into amat/bmat at beat index `cc`
+    # (== the C++ core's clk_cnt while collecting). Mirrors the original double-buffer
+    # unpack with the _0/_1 buffers collapsed to one.
+    single_unpack = f"""\
+                    cc_chunk = cc / INPUT_BEATS;
+                    cc_beat  = cc % INPUT_BEATS;
+                    if (cc_beat < {m}) begin
+                        for (lane = 0; lane < 8; lane = lane + 1) begin
+                            kk = cc_chunk * 8 + lane;
+                            if (kk < {k})
+                                amat[cc_beat][kk] = a_rows[(cc_beat / 8) * 64 + lane * 8 +: 8];
                         end
-                        if (beat_in_chunk < {n}) begin
-                            for (lane = 0; lane < 8; lane = lane + 1) begin
-                                kk = chunk_idx * 8 + lane;
-                                if (kk < {k}) begin
-                                    if (coll_buf == 0)
-                                        bmat_0[kk][beat_in_chunk] = b_cols[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                    else
-                                        bmat_1[kk][beat_in_chunk] = b_cols[(beat_in_chunk / 8) * 64 + lane * 8 +: 8];
-                                end
-                            end
-                        end"""
-    shadow_unpack = collect_unpack.replace("beat_count", "shadow_beat").replace("coll_buf", "pending_buf")
+                    end
+                    if (cc_beat < {n}) begin
+                        for (lane = 0; lane < 8; lane = lane + 1) begin
+                            kk = cc_chunk * 8 + lane;
+                            if (kk < {k})
+                                bmat[kk][cc_beat] = b_cols[(cc_beat / 8) * 64 + lane * 8 +: 8];
+                        end
+                    end"""
     if full_k_spatial:
-        collect_unpack = f"""\
-                        beat_in_chunk = beat_count;
-                        if (beat_in_chunk < {m}) begin
-                            for (kk = 0; kk < {k}; kk = kk + 1) begin
-                                chunk_idx = kk / 8;
-                                lane = kk % 8;
-                                if (coll_buf == 0)
-                                    amat_0[beat_in_chunk][kk] = a_rows[chunk_idx * 64 + lane * 8 +: 8];
-                                else
-                                    amat_1[beat_in_chunk][kk] = a_rows[chunk_idx * 64 + lane * 8 +: 8];
-                            end
+        single_unpack = f"""\
+                    cc_beat = cc;
+                    if (cc_beat < {m}) begin
+                        for (kk = 0; kk < {k}; kk = kk + 1) begin
+                            cc_chunk = kk / 8;
+                            lane = kk % 8;
+                            amat[cc_beat][kk] = a_rows[cc_chunk * 64 + lane * 8 +: 8];
                         end
-                        if (beat_in_chunk < {n}) begin
-                            for (kk = 0; kk < {k}; kk = kk + 1) begin
-                                chunk_idx = kk / 8;
-                                lane = kk % 8;
-                                if (coll_buf == 0)
-                                    bmat_0[kk][beat_in_chunk] = b_cols[chunk_idx * 64 + lane * 8 +: 8];
-                                else
-                                    bmat_1[kk][beat_in_chunk] = b_cols[chunk_idx * 64 + lane * 8 +: 8];
-                            end
-                        end"""
-        shadow_unpack = collect_unpack.replace("beat_count", "shadow_beat").replace("coll_buf", "pending_buf")
+                    end
+                    if (cc_beat < {n}) begin
+                        for (kk = 0; kk < {k}; kk = kk + 1) begin
+                            cc_chunk = kk / 8;
+                            lane = kk % 8;
+                            bmat[kk][cc_beat] = b_cols[cc_chunk * 64 + lane * 8 +: 8];
+                        end
+                    end"""
 
     return f"""\
 // Auto-generated simulation model by generate_catapult_rtl.py
@@ -152,64 +143,27 @@ module {behav_name}(
     output reg                    out_last
 );
 
-    localparam integer INPUT_BEATS = {input_beats};
-    localparam integer K_CHUNKS = {k_chunks};
+    localparam integer INPUT_BEATS       = {input_beats};
+    localparam integer K_CHUNKS          = {k_chunks};
     localparam integer TOTAL_INPUT_BEATS = {total_input_beats};
-    localparam integer TOTAL_ROWS = {total_output_rows};
-    localparam integer LATENCY = {latency};
+    localparam integer FIRST_OUT         = {first_out};
+    localparam integer TOTAL_ROWS        = {total_output_rows};
 
-    localparam [2:0] C_IDLE=3'd0, C_COLLECT=3'd1, C_WAIT=3'd2, C_DONE=3'd3;
-    localparam [1:0] O_IDLE=2'd0, O_OUTPUT=2'd1;
+    // ── Single-buffer storage (faithful to the validated C++ ccore) ────────
+    reg signed [7:0]  amat [0:{m-1}][0:{k-1}];
+    reg signed [7:0]  bmat [0:{k-1}][0:{n-1}];
+    reg signed [7:0]  bias_buf [0:{n-1}];
+    reg [31:0] clk_cnt;
+    reg        running;
 
-    // ── Collection pipeline registers ──────────────────────────────────────
-    reg [2:0]  coll_state;
-    reg [15:0] beat_count;
-    reg [15:0] wait_count;
-
-    // ── Output pipeline registers ──────────────────────────────────────────
-    reg [1:0]  out_state;
-    reg [15:0] out_row_idx;
-
-    // ── Double-buffered storage ────────────────────────────────────────────
-    reg signed [7:0] amat_0 [0:{m-1}][0:{k-1}];
-    reg signed [7:0] amat_1 [0:{m-1}][0:{k-1}];
-    reg signed [7:0] bmat_0 [0:{k-1}][0:{n-1}];
-    reg signed [7:0] bmat_1 [0:{k-1}][0:{n-1}];
-    reg signed [7:0] bias_0 [0:{n-1}];
-    reg signed [7:0] bias_1 [0:{n-1}];
-    reg signed [31:0] cmat_0 [0:{m-1}][0:{n-1}];
-    reg signed [31:0] cmat_1 [0:{m-1}][0:{n-1}];
-
-    // ── Buffer control ─────────────────────────────────────────────────────
-    reg        coll_buf;   // which buffer collection pipeline writes
-    reg        out_buf;    // which buffer output pipeline reads
-    reg        buf_ready_0;
-    reg        buf_ready_1;
-    wire       buf_ready_cur = (out_buf == 0) ? buf_ready_0 : buf_ready_1;
-    reg        next_use;
-
-    // ── Pending start (for back-to-back pipelining) ────────────────────────
-    reg        pending_start;
-    reg        pending_buf;
-    reg [15:0] shadow_beat;
-    reg        _pnd;   // combinatorial pending: visible this cycle
-
-    // ── BEH timing ─────────────────────────────────────────────────────────
+    // ── Diagnostics (parsed by the testbench; not load-bearing) ────────────
     reg [31:0] beh_cyc;
-    reg        beh_first_input;
     reg [31:0] prev_beh_start;
     reg [31:0] beh_ii_val;
 
-    integer i;
-    integer j;
-    integer kk;
-    integer tile;
-    integer lane;
-    integer actual_row;
-    integer actual_col;
-    integer chunk_idx;
-    integer beat_in_chunk;
-    reg signed [31:0] sum;
+    integer i, j, kk, lane, tile;
+    integer cc, cc_chunk, cc_beat, out_idx, actual_row, actual_col;
+    reg signed [31:0] acc;
     reg signed [15:0] sat;
 
     function signed [15:0] sat_int8;
@@ -222,240 +176,80 @@ module {behav_name}(
     endfunction
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Collection pipeline: C_IDLE → C_COLLECT → C_WAIT → C_DONE → C_IDLE
-    // With pending-start mechanism for back-to-back pipelining.
+    // Single-buffer clk_cnt schedule — a faithful translation of the validated
+    // C++ ccore::run() (#else branch). One frame at a time: capture a_rows/b_cols
+    // while cc < TOTAL_INPUT_BEATS, then emit one row per cycle for cc in
+    // [FIRST_OUT+1, FIRST_OUT+1+TOTAL_ROWS), then reset. `cc` is the effective
+    // clk_cnt this cycle (forced to 0 on the first in_valid, matching the C++
+    // `if (!running) clk_cnt = 0`). This replaces the old double-buffered FSM,
+    // which mis-handled chained en-stalls and diverged from the C++ reference.
     // ═══════════════════════════════════════════════════════════════════════
     always @(posedge clk) begin
         if (rst) begin
-            coll_state <= C_IDLE;
-            beat_count <= 16'd0;
-            wait_count <= 16'd0;
-            coll_buf <= 1'b0;
-            buf_ready_0 <= 1'b0;
-            buf_ready_1 <= 1'b0;
-            pending_start <= 1'b0;
-            pending_buf <= 1'b0;
-            shadow_beat <= 16'd0;
-            beh_cyc <= 32'd0;
-            beh_first_input <= 1'b1;
+            clk_cnt        <= 32'd0;
+            running        <= 1'b0;
+            c_row          <= {c_width}'d0;
+            out_valid      <= 1'b0;
+            out_last       <= 1'b0;
+            beh_cyc        <= 32'd0;
             prev_beh_start <= 32'd0;
-            beh_ii_val <= 32'd0;
+            beh_ii_val     <= 32'd0;
         end else if (en) begin
-            beh_cyc <= beh_cyc + 1;
+            beh_cyc   <= beh_cyc + 1;
+            c_row     <= {c_width}'d0;
+            out_valid <= 1'b0;
+            out_last  <= 1'b0;
 
-            // Bias acceptance: use the OTHER buffer unless output is draining from it.
-            // If coll_state is not C_IDLE, defer the start via pending flags.
-            if (preload_valid && ((coll_buf ^ 1'b1) != out_buf || !buf_ready_cur)) begin
-                next_use = coll_buf ^ 1'b1;
-                if (next_use == 0) begin
+            cc = (in_valid && !running) ? 0 : clk_cnt;
+
+            // ── capture ──────────────────────────────────────────────────
+            if (in_valid) begin
+                if (!running) begin
+                    running <= 1'b1;
                     for (j = 0; j < {n}; j = j + 1)
-                        bias_0[j] <= bias_cols[(j / 8) * 64 + (j % 8) * 8 +: 8];
-                end else begin
-                    for (j = 0; j < {n}; j = j + 1)
-                        bias_1[j] <= bias_cols[(j / 8) * 64 + (j % 8) * 8 +: 8];
+                        bias_buf[j] <= bias_cols[(j / 8) * 64 + (j % 8) * 8 +: 8];
+                    if (prev_beh_start == 0) beh_ii_val <= 32'd0;
+                    else                     beh_ii_val <= beh_cyc - prev_beh_start;
+                    prev_beh_start <= beh_cyc;
+                    $display("BEH_START beh_cyc=%0d", beh_cyc);
                 end
-                if (coll_state == C_IDLE) begin
-                    // Start immediately
-                    coll_buf <= next_use;
-                    beh_first_input <= 1'b1;
-                    beat_count <= 16'd0;
-                    wait_count <= 16'd0;
-                    coll_state <= C_COLLECT;
-                end else begin
-                    // Defer start until C_IDLE
-                    pending_start <= 1'b1;
-                    pending_buf <= next_use;
-                    beh_first_input <= 1'b1;
+                if (cc < TOTAL_INPUT_BEATS) begin
+{single_unpack}
                 end
             end
 
-            // Combinatorial pending: sees both persisted and just-scheduled.
-            // Needed because C_WAIT may complete on the same cycle as bias acceptance.
-            _pnd = pending_start;
-            if (preload_valid && ((coll_buf ^ 1'b1) != out_buf || !buf_ready_cur)) begin
-                if (coll_state != C_IDLE) _pnd = 1'b1;
+            // ── emit (compute-at-emit, like the C++ ccore) ───────────────
+            if ((running || (in_valid && !running)) &&
+                cc >= FIRST_OUT + 1 && cc < FIRST_OUT + 1 + TOTAL_ROWS) begin
+                out_idx    = cc - (FIRST_OUT + 1);
+                actual_row = out_idx;
+                for (tile = 0; tile < {grid_cols}; tile = tile + 1) begin
+                    for (lane = 0; lane < 8; lane = lane + 1) begin
+                        actual_col = tile * 8 + lane;
+                        if (actual_row < {m} && actual_col < {n}) begin
+                            acc = bias_buf[actual_col];
+                            for (kk = 0; kk < {k}; kk = kk + 1)
+                                acc = acc + (amat[actual_row][kk] * bmat[kk][actual_col]);
+                            sat = sat_int8(acc);
+                        end else begin
+                            sat = 16'sd0;
+                        end
+                        c_row[tile * 128 + lane * 16 +: 16] <= sat;
+                    end
+                end
+                out_valid <= 1'b1;
+                out_last  <= (out_idx + 1 == TOTAL_ROWS) ? 1'b1 : 1'b0;
             end
 
-            case (coll_state)
-                C_IDLE: begin
-                    // Service pending start (deferred from C_WAIT interrupt)
-                    if (pending_start) begin
-                        coll_buf <= pending_buf;
-                        beh_first_input <= 1'b1;
-                        beat_count <= 16'd0;
-                        wait_count <= 16'd0;
-                        pending_start <= 1'b0;
-                        coll_state <= C_COLLECT;
-                    end
-                end
-
-                C_COLLECT: begin
-                    if (in_valid) begin
-                        if (beh_first_input) begin
-                            // II measurement: delta from previous start
-                            if (prev_beh_start == 0)
-                                beh_ii_val <= 32'd0;
-                            else
-                                beh_ii_val <= beh_cyc - prev_beh_start;
-                            prev_beh_start <= beh_cyc;
-                            $display("BEH_START beh_cyc=%0d", beh_cyc);
-                            beh_first_input <= 1'b0;
-                        end
-{collect_unpack}
-                        beat_count <= beat_count + 1;
-                    end
-                    if (beat_count + 1 >= TOTAL_INPUT_BEATS) begin
-                        // Compute matmul using coll_buf's data
-                        if (coll_buf == 0) begin
-                            for (i = 0; i < {m}; i = i + 1) begin
-                                for (j = 0; j < {n}; j = j + 1) begin
-                                    sum = bias_0[j];
-                                    for (kk = 0; kk < {k}; kk = kk + 1)
-                                        sum = sum + (amat_0[i][kk] * bmat_0[kk][j]);
-                                    cmat_0[i][j] <= sum;
-                                end
-                            end
-                        end else begin
-                            for (i = 0; i < {m}; i = i + 1) begin
-                                for (j = 0; j < {n}; j = j + 1) begin
-                                    sum = bias_1[j];
-                                    for (kk = 0; kk < {k}; kk = kk + 1)
-                                        sum = sum + (amat_1[i][kk] * bmat_1[kk][j]);
-                                    cmat_1[i][j] <= sum;
-                                end
-                            end
-                        end
-                        if (LATENCY == 0) begin
-                            if (coll_buf == 0)
-                                buf_ready_0 <= 1'b1;
-                            else
-                                buf_ready_1 <= 1'b1;
-                            beat_count <= 16'd0;
-                            coll_state <= C_IDLE;
-                        end else begin
-                            wait_count <= 16'd0;
-                            coll_state <= C_WAIT;
-                        end
-                    end
-                end
-
-                C_WAIT: begin
-                    // Shadow collection: capture pending-vector data during pipeline wait.
-                    // Uses _pnd (combinatorial) so bias accepted this same cycle is visible.
-                    if (_pnd) begin : shadow_collect
-                        integer next_sb;
-                        next_sb = shadow_beat;
-                        if (in_valid && shadow_beat < TOTAL_INPUT_BEATS) begin
-                            if (beh_first_input) begin
-                                if (prev_beh_start == 0)
-                                    beh_ii_val <= 32'd0;
-                                else
-                                    beh_ii_val <= beh_cyc - prev_beh_start;
-                                prev_beh_start <= beh_cyc;
-                                $display("BEH_START beh_cyc=%0d", beh_cyc);
-                                beh_first_input <= 1'b0;
-                            end
-{shadow_unpack}
-                            next_sb = shadow_beat + 1;
-                        end
-                        shadow_beat <= next_sb;
-
-                        wait_count <= wait_count + 1;
-                        if (wait_count + 1 >= LATENCY) begin
-                            if (coll_buf == 0)
-                                buf_ready_0 <= 1'b1;
-                            else
-                                buf_ready_1 <= 1'b1;
-                            coll_buf <= pending_buf;
-                            beh_first_input <= (next_sb == 0) ? 1'b1 : beh_first_input;
-                            beat_count <= next_sb;
-                            wait_count <= 16'd0;
-                            shadow_beat <= 16'd0;
-                            pending_start <= 1'b0;
-                            coll_state <= C_COLLECT;
-                        end
-                    end else begin
-                        wait_count <= wait_count + 1;
-                        if (wait_count + 1 >= LATENCY) begin
-                            if (coll_buf == 0)
-                                buf_ready_0 <= 1'b1;
-                            else
-                                buf_ready_1 <= 1'b1;
-                            beat_count <= 16'd0;
-                            coll_state <= C_IDLE;
-                        end
-                    end
-                end
-
-                default: coll_state <= C_IDLE;
-            endcase
-        end
-    end
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Output pipeline: O_IDLE → O_OUTPUT → O_IDLE
-    // Checks both buffers and picks whichever is ready.
-    // ═══════════════════════════════════════════════════════════════════════
-    always @(posedge clk) begin
-        if (rst) begin
-            out_state <= O_IDLE;
-            out_row_idx <= 16'd0;
-            c_row <= {c_width}'d0;
-            out_valid <= 1'b0;
-            out_last <= 1'b0;
-            out_buf <= 1'b1;
-        end else if (en) begin
-            out_valid <= 1'b0;
-            out_last <= 1'b0;
-
-            case (out_state)
-                O_IDLE: begin
-                    c_row <= {c_width}'d0;
-                    out_row_idx <= 16'd0;
-                    // Pick whichever buffer has data ready
-                    if (buf_ready_0) begin
-                        out_buf <= 1'b0;
-                        out_state <= O_OUTPUT;
-                    end else if (buf_ready_1) begin
-                        out_buf <= 1'b1;
-                        out_state <= O_OUTPUT;
-                    end
-                end
-
-                O_OUTPUT: begin
-                    c_row <= {c_width}'d0;
-                    actual_row = out_row_idx;
-                    for (tile = 0; tile < {grid_cols}; tile = tile + 1) begin
-                        for (lane = 0; lane < 8; lane = lane + 1) begin
-                            actual_col = tile * 8 + lane;
-                            if (actual_row < {m} && actual_col < {n}) begin
-                                if (out_buf == 0)
-                                    sat = sat_int8(cmat_0[actual_row][actual_col]);
-                                else
-                                    sat = sat_int8(cmat_1[actual_row][actual_col]);
-                            end else begin
-                                sat = 16'sd0;
-                            end
-                            c_row[tile * 128 + lane * 16 +: 16] <= sat;
-                        end
-                    end
-                    out_valid <= 1'b1;
-                    out_last <= (out_row_idx + 1 == TOTAL_ROWS);
-                    out_row_idx <= out_row_idx + 1;
-                    if (out_row_idx + 1 >= TOTAL_ROWS) begin
-                        $display("BEH_II=%0d", beh_ii_val);
-                        $display("BEH_DONE beh_cyc=%0d", beh_cyc);
-                        // Clear buffer that was just output
-                        if (out_buf == 0)
-                            buf_ready_0 <= 1'b0;
-                        else
-                            buf_ready_1 <= 1'b0;
-                        out_state <= O_IDLE;
-                    end
-                end
-
-                default: out_state <= O_IDLE;
-            endcase
+            // ── advance / reset ──────────────────────────────────────────
+            clk_cnt <= cc + 1;
+            if ((running || (in_valid && !running)) &&
+                (cc + 1) >= FIRST_OUT + 1 + TOTAL_ROWS) begin
+                running <= 1'b0;
+                clk_cnt <= 32'd0;
+                $display("BEH_II=%0d", beh_ii_val);
+                $display("BEH_DONE beh_cyc=%0d", beh_cyc);
+            end
         end
     end
 

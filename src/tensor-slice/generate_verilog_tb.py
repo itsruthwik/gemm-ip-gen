@@ -432,6 +432,17 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
             in_valid <= 0;
             a_rows <= 0;
             b_cols <= 0;
+
+            // Sequential drain-gap cadence: the grid sim model is single-buffer
+            // (it processes one frame at a time, matching the validated C++ core
+            // and the real wrapper's per-frame drive), so wait for this frame to
+            // fully drain (its out_last) before feeding the next. Still exercises
+            // consecutive frames through the core with reset only on the first.
+            cycle_ctr = 0;
+            while (out_last_count < vec_idx + 1 && cycle_ctr < 2000) begin
+                @(posedge clk);
+                cycle_ctr = cycle_ctr + 1;
+            end
         end
 
         // Wait for all out_last events
