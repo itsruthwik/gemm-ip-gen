@@ -46,7 +46,8 @@ def dead_cycles(m, k, n, grid_cols):
     return dead_cycles_raw(m, k, n, grid_cols) + 1
 
 
-def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gemm_k_spatial=1):
+def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gemm_k_spatial=1,
+                      input_precision=None, weight_precision=None):
     row_chunk_bits = grid_rows * 64
     col_chunk_bits = grid_cols * 64
     c_bits = grid_cols * 128
@@ -73,6 +74,13 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     # Fixed-point types should preserve the normal AC-datatype conversion
     # (rounding / saturation) by omitting ``.to_int()``.
     assign_expr = "value.to_int()" if _is_ac_integer_type(result_type) else "value"
+
+    # The core is a pure INTEGER matmul: it multiplies operand int8 *codes*
+    # (the fixed-point mantissa = value · 2^frac). The raw integer dot-product
+    # therefore carries 2^(frac_a + frac_b); the wrapper drain shifts it back to
+    # the real value, then adds the (full-precision) bias and quantizes to the
+    # result type. gemm_shift == 0 collapses to the legacy integer-coded path.
+    gemm_shift = _frac_bits(input_precision) + _frac_bits(weight_precision)
     a_el_expr = (
         f"a_buf[actual_row].slc<8>(k_chunk * 64 + k_lane * 8)"
         if full_k_spatial
@@ -413,9 +421,13 @@ class {name}_ccore {{
                             acc += a_el * b_el;
                         }}
                     }}
+                    // Saturate the raw integer dot-product to the physical
+                    // 16-bit output lane (NOT int8): the core emits the integer
+                    // accumulator; the wrapper drain rescales + quantizes to the
+                    // result type. Matches the RTL core (out_bits=16).
                     ac_int<16, true> sat_val;
-                    if (acc > 127) sat_val = 127;
-                    else if (acc < -128) sat_val = -128;
+                    if (acc > 32767) sat_val = 32767;
+                    else if (acc < -32768) sat_val = -32768;
                     else sat_val = acc;
                     row_out.set_slc(ct * 128 + cl * 16, sat_val);
                 }}
@@ -436,7 +448,11 @@ class {name}_ccore {{
 
 template <class src_T>
 ac_int<8, true> {name}_to_gemm_int8(const src_T &value) {{
-    return static_cast<ac_int<8, true> >(value.to_int());
+    // The int8 code is the fixed-point MANTISSA (value · 2^frac), i.e. the raw
+    // stored bits — NOT value.to_int(), which would truncate the fractional part
+    // of an ac_fixed operand and destroy it. slc<8>(0) reinterprets the low 8
+    // mantissa bits as a signed int8 code; the drain rescales by 2^-(fa+fb).
+    return static_cast<ac_int<8, true> >(value.template slc<8>(0));
 }}
 
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
@@ -469,8 +485,10 @@ void {name}_gemm_ip_stream_const_weights(
     BIAS_PACK: for (int col = 0; col < {n}; col++) {{
         int col_tile = col / 8;
         int col_local = col % 8;
-        bias_packed.set_slc(col_tile * 64 + col_local * 8,
-                            {name}_to_gemm_int8(biases[col]));
+        // Bias is added in the drain (post-rescale, full precision), so the
+        // pure-matmul core is fed zero bias. Keeps the core a clean integer GEMM.
+        (void) col_tile; (void) col_local;
+        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
     }}
 
 {stream_feed_loop}
@@ -490,8 +508,13 @@ void {name}_gemm_ip_stream_const_weights(
                     int col_tile = col / 8;
                     int col_local = col % 8;
                     ac_int<16, true> raw_val = c_row.template slc<16>(col_tile * 128 + col_local * 16);
+                    // Rescale the raw integer dot-product by 2^-(fa+fb) to the
+                    // real value, then add the full-precision bias (Keras order:
+                    // matmul + bias, then quantize on the result-type cast below).
                     typename CONFIG_T::accum_t value =
-                        static_cast<typename CONFIG_T::accum_t>(raw_val.to_int());
+                        static_cast<typename CONFIG_T::accum_t>(
+                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {gemm_shift})
+                        + static_cast<typename CONFIG_T::accum_t>(biases[col]);
                     out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
                 }}
                 res_stream.write(out_pack);
@@ -549,8 +572,10 @@ void {name}_gemm_ip_array(
     BIAS_PACK_ARRAY: for (int col = 0; col < {n}; col++) {{
         int col_tile = col / 8;
         int col_local = col % 8;
-        bias_packed.set_slc(col_tile * 64 + col_local * 8,
-                            {name}_to_gemm_int8(biases[col]));
+        // Bias is added in the drain (post-rescale, full precision), so the
+        // pure-matmul core is fed zero bias. Keeps the core a clean integer GEMM.
+        (void) col_tile; (void) col_local;
+        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
     }}
 
 {array_feed_loop}
@@ -571,8 +596,13 @@ void {name}_gemm_ip_array(
                     int col_tile = col / 8;
                     int col_local = col % 8;
                     ac_int<16, true> raw_val = c_row.template slc<16>(col_tile * 128 + col_local * 16);
+                    // Rescale the raw integer dot-product by 2^-(fa+fb) to the
+                    // real value, then add the full-precision bias (Keras order:
+                    // matmul + bias, then quantize on the result-type cast below).
                     typename CONFIG_T::accum_t value =
-                        static_cast<typename CONFIG_T::accum_t>(raw_val.to_int());
+                        static_cast<typename CONFIG_T::accum_t>(
+                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {gemm_shift})
+                        + static_cast<typename CONFIG_T::accum_t>(biases[col]);
                     out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
                 }}
                 results[captured] = out_pack;
@@ -742,12 +772,15 @@ int main() {{
     for (int i = 0; i < {m}; i++) {{
 {read_result}
         for (int j = 0; j < {n}; j++) {{
-            int gemm_acc = biases[j];
+            int gemm_acc = 0;
             for (int kk = 0; kk < {k}; kk++) {{
                 gemm_acc += activations[i][kk].to_int() * weights[j][kk].to_int();
             }}
-            if (gemm_acc > 127) gemm_acc = 127;
-            else if (gemm_acc < -128) gemm_acc = -128;
+            // Core saturates the raw integer dot-product to the 16-bit output
+            // lane; bias is added afterwards (post-rescale) in the wrapper drain.
+            if (gemm_acc > 32767) gemm_acc = 32767;
+            else if (gemm_acc < -32768) gemm_acc = -32768;
+            gemm_acc += biases[j];
             if (out[j].to_int() != gemm_acc) {{
                 printf("Mismatch row %d col %d: got %d expected %d\\n",
                        i, j, out[j].to_int(), gemm_acc);
@@ -1080,6 +1113,24 @@ def _validate_gemm_k_spatial(k, gemm_k_spatial):
     return k_spatial
 
 
+def _frac_bits(precision):
+    """Fractional-bit count (W - I) of a precision like 'fixed<9,5,…>'.
+
+    The GEMM IP feeds operands as int8 *codes* = the fixed-point mantissa
+    (value · 2^frac). The product of two operands therefore carries
+    2^(frac_a + frac_b), which the wrapper drain divides back out. Returns 0 for
+    an unset/unparseable precision (integer-coded operand ⇒ no rescale), so the
+    rescale collapses to the identity for the legacy integer-input case.
+    """
+    if not precision:
+        return 0
+    m = re.search(r"u?fixed<\s*(\d+)\s*,\s*(-?\d+)", str(precision))
+    if not m:
+        return 0
+    width, integer_bits = int(m.group(1)), int(m.group(2))
+    return width - integer_bits
+
+
 def _output_bits(output_precision):
     """Result-lane width (bits) from an output_precision like 'fixed<16,6,…>'.
 
@@ -1094,11 +1145,15 @@ def _output_bits(output_precision):
     return int(m.group(1)) if m else 8
 
 
-def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None, gemm_k_spatial=None):
+def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
+                          gemm_k_spatial=None, input_precision=None, weight_precision=None):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     gemm_k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
-    out_bits = _output_bits(output_precision)
+    # The core saturates the raw integer dot-product to the physical 16-bit
+    # output lane; result-precision quantization happens in the wrapper drain
+    # (rescale + bias + result-type cast), not in the core.
+    out_bits = 16
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1129,6 +1184,8 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             name, m, k, n, grid_rows, grid_cols,
             result_type=output_precision,
             gemm_k_spatial=gemm_k_spatial,
+            input_precision=input_precision,
+            weight_precision=weight_precision,
         )
     )
     (pkg_dir / f"{name}_inst.cpp").write_text(gen_inst_cpp(name, m, k, n, interface))
@@ -1173,6 +1230,8 @@ def _normalize_config_items(cfg):
                 "gemm_ip_id": item.get("gemm_ip_id", name),
                 "gemm_ip_index": item.get("gemm_ip_index"),
                 "output_precision": item.get("output_precision"),
+                "input_precision": item.get("input_precision"),
+                "weight_precision": item.get("weight_precision"),
                 "gemm_k_spatial": _validate_gemm_k_spatial(
                     int(item.get("gemm_k", item.get("n_in", 8))),
                     item.get("gemm_k_spatial"),

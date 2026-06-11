@@ -1122,8 +1122,17 @@ def _widen_output_saturation(text, out_bits):
     if out_bits is None or out_bits == 8:
         return text
     if out_bits > 16:
-        raise ValueError(f"out_bits={out_bits} exceeds the 16-bit tensor_slice "
-                         "partial width; output_precision must be <= 16 bits")
+        # The tensor_slice output lane is physically 16 bits, so the saturation
+        # clamp can be at most ±2^15. Cap here rather than rejecting the design:
+        # the GEMM result is lossless as long as its raw integer magnitude fits
+        # 16 bits, which the Keras-vs-C-sim gate certifies per design (a design
+        # that genuinely overflows would saturate and fail that bit-exact check).
+        import sys as _sys
+        print(f"  [gemm-ip-gen] WARNING: output_precision is {out_bits} bits but the "
+              f"Catapult tensor_slice lane is 16 bits; clamping saturation to 16 bits. "
+              f"Correctness depends on the raw GEMM result fitting 16 bits "
+              f"(verify via Keras-vs-C-sim).", file=_sys.stderr)
+        out_bits = 16
     pos = (1 << (out_bits - 1)) - 1          # e.g. 32767
     neg = (1 << (out_bits - 1))              # e.g. 32768
     subs = [("32'sd127", f"32'sd{pos}"), ("16'sd127", f"16'sd{pos}"),

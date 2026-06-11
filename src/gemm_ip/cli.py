@@ -58,6 +58,8 @@ def _run_catapult(args):
                 interface=item.get("interface", "stream"),
                 output_precision=item.get("output_precision"),
                 gemm_k_spatial=item.get("gemm_k_spatial"),
+                input_precision=item.get("input_precision"),
+                weight_precision=item.get("weight_precision"),
             )
         output_dir = Path(args.output_dir)
         (output_dir / "gemm_ip_combined.h").write_text(gen_combined_header(items))
