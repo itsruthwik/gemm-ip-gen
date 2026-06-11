@@ -273,9 +273,6 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
     row_mask_vals = [tail_mask_hex(m, r) for r in range(grid_rows)]
     col_mask_vals = [tail_mask_hex(n, c) for c in range(grid_cols)]
 
-    def align_delay(r, c):
-        return (grid_cols - 1 - c) * 8 + r * grid_cols * 8
-
     chain_wires = []
     for r in range(grid_rows):
         for c in range(grid_cols + 1):
@@ -327,64 +324,52 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
             .validity_mask_a_rows({vm(row_mask_vals[r])}),
             .validity_mask_a_cols_b_rows(current_k_mask),
             .validity_mask_b_cols({vm(col_mask_vals[c])}),
-            .slice_dtype(2'd0), .slice_mode(1'b0), .op(3'd0),
+            .slice_dtype(2'd0), .slice_mode(1'b0), .op({{2'b00, op0_{r}}}),
             .preload(preload_d), .no_rounding(1'b0),
             .final_mat_mul_size(current_k_size),
             .a_loc(5'd{r}),
             .b_loc(5'd{c})
         );""")
 
-    align_decl = []
-    align_assign = []
-    align_always = []
+    # ── Zero-storage output collector (op[0] readout gate) ──────────────────
+    # tensor_slice_int8 contract: op[0] == out_ctrl. With op[0]=1 the tile
+    # HOLDS its completed result internally (no burst, including after
+    # intermediate K-chunks); with op[0]=0 it shifts one result row per cycle
+    # on c_data_out once ready (c_data_available qualifies each row). The
+    # legacy free-run behaviour is op[0] tied 0. All tiles finish together,
+    # so column tiles of one tile-row concatenate as pure wiring; the wrapper
+    # holds every tile-row and releases them one at a time, in row-major
+    # order, for their 8-row bursts. No parking storage and no delay pyramid
+    # (the old alignment shift-lines cost sum-of-delays x 129 FFs — ~6.2k on
+    # a 2x2 grid, ~29k on 4x2).
+    op0_decl = []
     for r in range(grid_rows):
-        for c in range(grid_cols):
-            d = align_delay(r, c)
-            acd = f"acd_{r}_{c}"
-            aca = f"aca_{r}_{c}"
-            if d == 0:
-                align_decl.append(f"    wire [127:0] {acd} = c_data_{r}_{c};")
-                align_decl.append(f"    wire         {aca} = c_avail_{r}_{c};")
-            else:
-                align_decl.append(f"    reg [127:0] {acd}_pipe [0:{d-1}];")
-                align_decl.append(f"    reg         {aca}_pipe [0:{d-1}];")
-                align_decl.append(f"    wire [127:0] {acd};")
-                align_decl.append(f"    wire         {aca};")
-                align_assign.append(f"    assign {acd} = {acd}_pipe[{d-1}];")
-                align_assign.append(f"    assign {aca} = {aca}_pipe[{d-1}];")
-                blk = [
-                    "    always @(posedge clk) begin",
-                    "        if (slice_reset) begin",
-                ]
-                for dd in range(d):
-                    blk.append(f"            {acd}_pipe[{dd}] <= 128'd0;")
-                    blk.append(f"            {aca}_pipe[{dd}] <= 1'b0;")
-                blk.append("        end else if (transaction_active) begin")
-                blk.append(f"            {acd}_pipe[0] <= c_data_{r}_{c};")
-                blk.append(f"            {aca}_pipe[0] <= c_avail_{r}_{c};")
-                for dd in range(1, d):
-                    blk.append(f"            {acd}_pipe[{dd}] <= {acd}_pipe[{dd-1}];")
-                    blk.append(f"            {aca}_pipe[{dd}] <= {aca}_pipe[{dd-1}];")
-                blk.append("        end")
-                blk.append("    end")
-                align_always.extend(blk)
-
-    row_avail_decl = [f"    wire row_avail_{r} = aca_{r}_{grid_cols-1};" for r in range(grid_rows)]
-    any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
+        release = (f"emit_phase && (cur_row_tile == 16'd{r})"
+                   if grid_rows > 1 else "emit_phase")
+        op0_decl.append(f"    wire op0_{r} = !({release});")
+    row_avail_decl = []
+    row_data_decl = []
+    for r in range(grid_rows):
+        avail_terms = " & ".join(f"c_avail_{r}_{c}" for c in range(grid_cols))
+        concat = "{" + ", ".join(f"c_data_{r}_{c}" for c in range(grid_cols - 1, -1, -1)) + "}"
+        row_avail_decl.append(f"    wire row_avail_{r} = {avail_terms};")
+        row_data_decl.append(f"    wire [{c_width-1}:0] row_data_{r} = {concat};")
     mux_lines = []
     for r in range(grid_rows):
-        mux_lines.append(f"        if (row_avail_{r}) begin")
-        for c in range(grid_cols):
-            mux_lines.append(f"            row_mux[{c}*128 +: 128] = acd_{r}_{c};")
+        cond = (f"(cur_row_tile == 16'd{r}) && row_avail_{r}"
+                if grid_rows > 1 else f"row_avail_{r}")
+        mux_lines.append(f"        if ({cond}) begin")
+        mux_lines.append(f"            row_mux = row_data_{r};")
+        mux_lines.append("            row_take = 1'b1;")
         mux_lines.append("        end")
 
     debug_block = ""
     if debug:
         debug_block = """
     always @(posedge clk) begin
-        if (!slice_reset && (transaction_active || any_avail || |done_mat_mul)) begin
-            $display("DBG t=%0t st=%0d beat=%0d done=%b any=%0b out_rows=%0d",
-                     $time, state, beat_count, done_mat_mul, any_avail, out_row_count);
+        if (!slice_reset && (transaction_active || row_take || |done_mat_mul)) begin
+            $display("DBG t=%0t st=%0d beat=%0d done=%b take=%0b out_rows=%0d",
+                     $time, state, beat_count, done_mat_mul, row_take, out_row_count);
         end
     end
 """
@@ -422,6 +407,7 @@ module {module_name}(
     reg preload_d;
     reg transaction_active;
     reg [{c_width-1}:0] row_mux;
+    reg row_take;
 
     // ── Input pipeline stage ────────────────────────────────────────────────
     // Register the whole input bundle (en-gated, so the +1 is one run()-call
@@ -464,6 +450,14 @@ module {module_name}(
     wire [{grid_rows*grid_cols-1}:0] done_mat_mul;
     wire all_slices_done = &done_mat_mul;
 
+    // Output collector control: hold every tile-row (out_ctrl=1) until all
+    // tiles have finished the final chunk, then release one tile-row at a
+    // time for its 8-row burst, in row-major order.
+    wire emit_phase = transaction_active && final_chunk && all_slices_done;
+    wire [15:0] cur_row_tile = out_row_count >> 3;
+
+{chr(10).join(op0_decl)}
+
 {chr(10).join(chain_wires)}
 
 {chr(10).join(data_wires)}
@@ -472,18 +466,14 @@ module {module_name}(
 
 {chr(10).join(inst_lines)}
 
-{chr(10).join(align_decl)}
-{chr(10).join(align_assign)}
-{chr(10).join(align_always)}
-
 {chr(10).join(row_avail_decl)}
-
-    wire any_avail = transaction_active && final_chunk && ({any_avail_expr});
+{chr(10).join(row_data_decl)}
 
 {debug_block}
 
     always @(*) begin
-        row_mux = {c_width}'d0;
+        row_mux  = {c_width}'d0;
+        row_take = 1'b0;
 {chr(10).join(mux_lines)}
     end
 
@@ -527,7 +517,7 @@ module {module_name}(
                             state <= S_WAIT;
                     end
 
-                    if (any_avail) begin
+                    if (emit_phase && row_take) begin
                         c_row <= row_mux;
                         out_valid <= 1'b1;
                         out_last <= (out_row_count + 16'd1 == TOTAL_OUT_ROWS);
@@ -540,7 +530,7 @@ module {module_name}(
                 end
 
                 S_WAIT: begin
-                    if (any_avail) begin
+                    if (emit_phase && row_take) begin
                         c_row <= row_mux;
                         out_valid <= 1'b1;
                         out_last <= (out_row_count + 16'd1 == TOTAL_OUT_ROWS);
@@ -1090,13 +1080,13 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
                 if full_k_spatial:
                     # Narrow word: partition p carries one 64-bit tile at p*64; route
                     # it to row-tile r / col-tile c by beat index (beat_count/8 == tile).
-                    a_expr = f"a_rows[{p}*{a_chunk_width} + 63:{p}*{a_chunk_width}]"
-                    b_expr = f"b_cols[{p}*{b_chunk_width} + 63:{p}*{b_chunk_width}]"
+                    a_expr = f"a_rows_q[{p}*{a_chunk_width} + 63:{p}*{a_chunk_width}]"
+                    b_expr = f"b_cols_q[{p}*{b_chunk_width} + 63:{p}*{b_chunk_width}]"
                     a_route = f" && (beat_count >> 3 == {r})"
                     b_route = f" && (beat_count >> 3 == {c})"
                 else:
-                    a_expr = f"a_rows[{(r + 1) * 64 - 1}:{r * 64}]"
-                    b_expr = f"b_cols[{(c + 1) * 64 - 1}:{c * 64}]"
+                    a_expr = f"a_rows_q[{(r + 1) * 64 - 1}:{r * 64}]"
+                    b_expr = f"b_cols_q[{(c + 1) * 64 - 1}:{c * 64}]"
                     a_route = ""
                     b_route = ""
                 insts.append(f"""\
@@ -1115,7 +1105,7 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
             .validity_mask_a_rows({vm(row_mask_vals[r])}),
             .validity_mask_a_cols_b_rows(part{p}_k_mask),
             .validity_mask_b_cols({vm(col_mask_vals[c])}),
-            .slice_dtype(2'd0), .slice_mode(1'b0), .op(3'd0),
+            .slice_dtype(2'd0), .slice_mode(1'b0), .op({{2'b00, op0_{r}}}),
             .preload(1'b0), .no_rounding(1'b0),
             .final_mat_mul_size(part{p}_k_size),
             .a_loc(5'd{r}),
@@ -1143,23 +1133,22 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
                     f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*16 +: 16])" for p in range(k_spatial)
                 )
                 row_mux_cases.append(
-                    f"            accum32 = {terms} + $signed({{ {{24{{bias_cols[{c}*64 + {lane}*8 + 7]}}}}, bias_cols[{c}*64 + {lane}*8 +: 8] }});"
+                    f"            accum32 = {terms} + $signed({{ {{24{{bias_cols_q[{c}*64 + {lane}*8 + 7]}}}}, bias_cols_q[{c}*64 + {lane}*8 +: 8] }});"
                 )
                 row_mux_cases.append(
                     f"            row_mux[{c}*128 + {lane}*16 +: 16] = sat_int8_to_i16(accum32);"
                 )
         row_mux_cases.append("        end")
     any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
+    op0_lines = "\n".join(
+        f"    wire op0_{r} = !((state == S_OUTPUT) && (cur_row_tile == 16'd{r}));"
+        for r in range(grid_rows)
+    )
 
     if full_k_spatial:
         wait_body = """\
-                    if (any_avail) begin
-                        c_row <= row_mux;
-                        out_valid <= 1'b1;
-                        out_last <= (out_row_count + 16'd1 == TOTAL_OUT_ROWS);
-                        out_row_count <= out_row_count + 16'd1;
-                        if (out_row_count + 16'd1 == TOTAL_OUT_ROWS)
-                            state <= S_IDLE;
+                    if (all_slices_done) begin
+                        state <= S_OUTPUT;
                     end"""
     else:
         wait_body = f"""\
@@ -1208,11 +1197,45 @@ module {module_name}(
     reg signed [31:0] accum32;
     reg [{c_width-1}:0] row_mux;
 
+    // Input pipeline stage (same rationale as the chunked emitter): register
+    // the whole bundle en-gated so the beat decode + partition gating muxes
+    // start from local registers instead of chaining from the Catapult
+    // wrapper into the tensor_slice input pins.
+    reg [{a_width-1}:0] a_rows_q;
+    reg [{b_width-1}:0] b_cols_q;
+    reg [{bias_width-1}:0] bias_cols_q;
+    reg preload_valid_q;
+    reg in_valid_q;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            a_rows_q        <= {a_width}'d0;
+            b_cols_q        <= {b_width}'d0;
+            bias_cols_q     <= {bias_width}'d0;
+            preload_valid_q <= 1'b0;
+            in_valid_q      <= 1'b0;
+        end else if (en) begin
+            a_rows_q        <= a_rows;
+            b_cols_q        <= b_cols;
+            bias_cols_q     <= bias_cols;
+            preload_valid_q <= preload_valid;
+            in_valid_q      <= in_valid;
+        end
+    end
+
     wire slice_reset = rst;
-    wire in_beat_active = (state == S_RUN) && in_valid && (beat_count < INPUT_BEATS);
+    wire in_beat_active = (state == S_RUN) && in_valid_q && (beat_count < INPUT_BEATS);
     wire slice_start = in_beat_active && (beat_count == 16'd0);
     wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
     wire all_slices_done = &done_mat_mul;
+
+    // op[0] readout gate (op[0] == out_ctrl on the tensor slice): hold every
+    // tile-row's completed result inside the tiles until S_OUTPUT, then
+    // release one tile-row at a time, in row-major order. The released row's
+    // partition partials are summed combinationally below; no parking
+    // storage is needed and intermediate-chunk bursts never occur.
+    wire [15:0] cur_row_tile = out_row_count >> 3;
+{op0_lines}
 
 {chr(10).join(decls)}
 
@@ -1256,7 +1279,7 @@ module {module_name}(
                     beat_count <= 16'd0;
                     chunk_idx <= 16'd0;
                     out_row_count <= 16'd0;
-                    if (preload_valid) state <= S_RUN;
+                    if (preload_valid_q) state <= S_RUN;
                 end
                 S_RUN: begin
                     if (in_beat_active) begin
