@@ -69,6 +69,26 @@ branches coincide).
 This is the behavioral model's systolic abstraction; the structural
 (`SYNTHESIS`) branch is synthesis-only and is not a cycle-accurate reference.
 
+## Frame Pipelining (sim core)
+
+The sim core (C++ ccore `#else` branch and the behavioral Verilog grid) is a
+frame-slot scheduler: each frame gets a private operand buffer and cycle
+counter, so the feed of frame t+1 may overlap the compute/drain of frame t.
+A frame starts at the first `in_valid` call after a non-`in_valid` call (the
+FEED protocol always inserts the preload step between frames), and emits its
+M result rows at `[first_out+1, first_out+1+M)` of its own clock.
+
+- Minimum frame period: `total_beats + 1` calls (preload + data beats) —
+  back-to-back frames sustain ~one result row per cycle for square 8-row
+  frames. Emission windows of consecutive frames cannot overlap because
+  `M <= total_beats < total_beats + 1`.
+- Slot count: `ceil((first_out + 1 + M) / (total_beats + 1)) + 1` frames in
+  flight (one spare so an allocating frame never lands on a draining slot).
+- The generated wrapper still issues frames sequentially (FEED then DRAIN
+  within one call), so per-frame latencies are unchanged; the pipelining is
+  exploitable by callers that issue back-to-back frames (multi-frame conv
+  tiling, einsum head loops, back-to-back samples).
+
 Grid-level latency:
 ```
 beats = max(M,N)               (full-K)   |   k_chunks × max(M,N)   (chunked)

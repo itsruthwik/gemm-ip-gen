@@ -141,26 +141,58 @@ def _run_sim(rtl_src, tb_src, rtl_file, tb_file, extra_v=None, timeout=900):
 # ── Catapult RTL simulation ──────────────────────────────────────────────────
 
 
+def _expected_first_out(m, k, n, k_spatial=1):
+    from gemm_ip.catapult import latency_cycles
+    k_chunks = (k + 7) // 8
+    full_k = k_chunks > 1 and k_spatial == k_chunks
+    return latency_cycles(m, k, n, (m + 7) // 8, (n + 7) // 8, full_k_spatial=full_k)
+
+
+def _assert_frame_latency(res, m, k, n, k_spatial=1):
+    """Every simulated frame's behavioral latency (alloc cycle .. retire
+    cycle, inclusive) must equal first_out + M + 1 — exact, in both the
+    sequential and back-to-back cadences (pipelining never stretches a
+    frame)."""
+    expected = _expected_first_out(m, k, n, k_spatial) + m + 1
+    assert res["latencies"], "no BEH_START/BEH_DONE diagnostics captured"
+    assert all(l == expected for l in res["latencies"]), (res["latencies"], expected)
+
+
+def _assert_row_cadence(res, m):
+    """Within every frame the M result rows stream on consecutive cycles
+    (II=1 per row): last_output - first_output == (M-1) cycles, exact."""
+    import re as _re
+    t_first = [int(x) for x in _re.findall(r"T:first_output=(\d+)", res["stdout"])]
+    t_last = [int(x) for x in _re.findall(r"T:last_output=(\d+)", res["stdout"])]
+    assert t_first and len(t_first) == len(t_last), (t_first, t_last)
+    deltas = [(b - a) // 10 for a, b in zip(t_first, t_last)]
+    assert all(d == m - 1 for d in deltas), (deltas, m - 1)
+
+
 @pytest.mark.skipif(not HAVE_SIM, reason="iverilog/vvp not available")
 class TestCatapultRtlSim:
     @pytest.mark.parametrize("m,k,n", DEFAULT_CASES)
     def test_catapult_core_sim(self, m, k, n, tmp_path):
         mod = f"gemm_{m}x{k}x{n}_core"
-        _run_sim(
+        res = _run_sim(
             generate_combined_core_verilog(m, k, n, module_name=mod),
-            generate_tb(m, k, n, module_name=mod, protocol="catapult", num_vectors=10),
+            generate_tb(m, k, n, module_name=mod, protocol="catapult", num_vectors=10, timing=True),
             tmp_path / f"{mod}.v",
             tmp_path / f"tb_{mod}.v",
         )
+        _assert_frame_latency(res, m, k, n)
+        _assert_row_cadence(res, m)
 
     @pytest.mark.parametrize("m,k,n", DEFAULT_CASES)
     def test_catapult_back2back(self, m, k, n, tmp_path):
         mod = f"cat_b2b_{m}x{k}x{n}"
-        _run_sim(
+        res = _run_sim(
             generate_combined_core_verilog(m, k, n, module_name=mod),
-            generate_tb(m, k, n, module_name=mod, protocol="catapult", num_vectors=2, back2back=True),
+            generate_tb(m, k, n, module_name=mod, protocol="catapult", num_vectors=2, back2back=True, timing=True),
             tmp_path / f"{mod}.v", tmp_path / f"tb_{mod}.v",
         )
+        _assert_frame_latency(res, m, k, n)
+        _assert_row_cadence(res, m)
 
     @pytest.mark.parametrize("m,k,n,k_spatial", [
         pytest.param(8, 16, 8, 2, id="8x16x8-p2"),
@@ -176,12 +208,14 @@ class TestCatapultRtlSim:
     def test_catapult_k_spatial_core_sim(self, m, k, n, k_spatial, tmp_path):
         mod = f"ksp_{m}x{k}x{n}_p{k_spatial}"
         full_k_spatial = k_spatial == (k + 7) // 8
-        _run_sim(
+        res = _run_sim(
             generate_k_spatial_combined_core_verilog(m, k, n, module_name=mod, k_spatial=k_spatial),
-            generate_tb(m, k, n, module_name=mod, protocol="catapult", num_vectors=4, full_k_spatial=full_k_spatial),
+            generate_tb(m, k, n, module_name=mod, protocol="catapult", num_vectors=4, full_k_spatial=full_k_spatial, timing=True),
             tmp_path / f"{mod}.v",
             tmp_path / f"tb_{mod}.v",
         )
+        _assert_frame_latency(res, m, k, n, k_spatial)
+        _assert_row_cadence(res, m)
 
 
 TENSOR_SLICE_STUB = r"""
@@ -342,3 +376,51 @@ class TestSynthStructuralSmoke:
             timeout=60,
         )
         assert r.returncode == 0, r.stdout + r.stderr
+
+@pytest.mark.skipif(not HAVE_SIM, reason="iverilog/vvp not available")
+class TestCatapultFramePipelining:
+    @pytest.mark.parametrize("m,k,n,k_spatial", [
+        pytest.param(8, 8, 8, 1, id="8x8x8"),
+        pytest.param(10, 10, 10, 2, id="10x10x10-fullk"),
+        pytest.param(16, 16, 16, 2, id="16x16x16-fullk"),
+        pytest.param(16, 72, 8, 9, id="16x72x8-fullk"),
+        pytest.param(16, 72, 8, 1, id="16x72x8-chunked"),
+    ])
+    def test_catapult_back_to_back_frame_ii(self, m, k, n, k_spatial, tmp_path):
+        """Back-to-back frames must pipeline through the frame-slot sim core:
+        data stays correct under overlap, and the sustained frame II equals
+        the feed length plus the preload step (TOTAL_INPUT_BEATS + 1) — i.e.
+        ~one result row per cycle for square 8-row frames. A couple of cycles
+        of modeling slack are tolerated, never less than the feed length."""
+        import re
+
+        k_chunks = (k + 7) // 8
+        full_flag = (k_spatial == k_chunks) and k_chunks > 1
+        mod = f"b2b_{m}x{k}x{n}_p{k_spatial}"
+        res = _run_sim(
+            generate_k_spatial_combined_core_verilog(m, k, n, module_name=mod, k_spatial=k_spatial),
+            generate_tb(m, k, n, module_name=mod, protocol="catapult",
+                        num_vectors=6, back2back=True, timing=True,
+                        full_k_spatial=full_flag),
+            tmp_path / f"{mod}.v",
+            tmp_path / f"tb_{mod}.v",
+        )
+        total_beats = max(m, n) if (full_flag or k_chunks == 1) else k_chunks * max(m, n)
+        period = total_beats + 1
+
+        # Feed-side II: frame-start spacing from the model diagnostics.
+        steady = res["steady_ii"]
+        assert steady, "no BEH_II diagnostics captured"
+        assert all(period <= ii <= period + 2 for ii in steady), (steady, period)
+
+        # Output-side II: spacing between consecutive frames' first rows
+        # (10 ns TB clock).
+        t_first = [int(x) for x in re.findall(r"T:first_output=(\d+)", res["stdout"])]
+        assert len(t_first) == 6, t_first
+        deltas = [(b - a) // 10 for a, b in zip(t_first, t_first[1:])]
+        assert all(period <= d <= period + 2 for d in deltas), (deltas, period)
+
+        # Per-frame latency is never stretched by pipelining, and the M rows
+        # of each frame stream on consecutive cycles (II=1 per row).
+        _assert_frame_latency(res, m, k, n, k_spatial)
+        _assert_row_cadence(res, m)

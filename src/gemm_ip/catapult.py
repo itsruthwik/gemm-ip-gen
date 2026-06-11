@@ -105,6 +105,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     first_out = latency_cycles(m, k, n, grid_rows, grid_cols, full_k_spatial=full_k_spatial)
     blind = dead_cycles(m, k, n, grid_cols, full_k_spatial=full_k_spatial)
     drain = blind + mr
+    # Frame slots for the pipelined sim core: feed of frame t+1 may overlap
+    # compute/drain of frame t (min frame period = total_beats + 1 calls).
+    slots = -(-(first_out + 1 + m) // (total_beats + 1)) + 1
 
     # The DRAIN loop polls out_valid, so it absorbs the core's port lag. The
     # last emitted row sits at run()-call index first_out + mr + 2 (preload
@@ -135,14 +138,14 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     # result type. gemm_shift == 0 collapses to the legacy integer-coded path.
     gemm_shift = _frac_bits(input_precision) + _frac_bits(weight_precision)
     a_el_expr = (
-        f"a_buf[actual_row].slc<8>(k_chunk * 64 + k_lane * 8)"
+        f"a_buf[s][actual_row].slc<8>(k_chunk * 64 + k_lane * 8)"
         if full_k_spatial
-        else f"a_buf[k_chunk * {input_beats} + actual_row].slc<8>(row_tile * 64 + k_lane * 8)"
+        else f"a_buf[s][k_chunk * {input_beats} + actual_row].slc<8>(row_tile * 64 + k_lane * 8)"
     )
     b_el_expr = (
-        f"b_buf[actual_col].slc<8>(k_chunk * 64 + k_lane * 8)"
+        f"b_buf[s][actual_col].slc<8>(k_chunk * 64 + k_lane * 8)"
         if full_k_spatial
-        else f"b_buf[k_chunk * {input_beats} + actual_col].slc<8>(ct * 64 + k_lane * 8)"
+        else f"b_buf[s][k_chunk * {input_beats} + actual_col].slc<8>(ct * 64 + k_lane * 8)"
     )
     if full_k_spatial:
         stream_feed_loop = f"""
@@ -430,70 +433,86 @@ class {name}_ccore {{
         out_valid = in_valid;
         out_last = in_valid;
 #else
-        static ac_int<{a_bits}, false> a_buf[{total_beats}];
-        static ac_int<{b_bits}, false> b_buf[{total_beats}];
-        static int clk_cnt = 0;
-        static bool running = false;
-        static ac_int<{bias_bits}, false> bias_buf = 0;
+        // Frame-slot behavioral scheduler (mirrors the RTL sim model): up to
+        // {slots} frames in flight. A frame starts at the first in_valid call
+        // after a non-in_valid call (the FEED protocol always inserts the
+        // preload step between frames); each frame keeps a private operand
+        // buffer and cycle counter and emits its {m} rows at
+        // [first_out+1, first_out+1+{m}) of its own clock. Back-to-back
+        // frames sustain a frame II of {total_beats + 1} calls.
+        static ac_int<{a_bits}, false> a_buf[{slots}][{total_beats}];
+        static ac_int<{b_bits}, false> b_buf[{slots}][{total_beats}];
+        static ac_int<{bias_bits}, false> bias_buf[{slots}];
+        static int cc_slot[{slots}] = {{0}};
+        static bool slot_run[{slots}] = {{false}};
+        static int wr_slot = {slots - 1};
+        static bool feeding = false;
 
         c_row = 0;
         out_valid = 0;
         out_last = 0;
 
         if (in_valid) {{
-            if (!running) {{
-                clk_cnt = 0;
-                running = true;
-                bias_buf = bias_cols;
+            if (!feeding) {{
+                wr_slot = (wr_slot + 1) % {slots};
+                feeding = true;
+                slot_run[wr_slot] = true;
+                cc_slot[wr_slot] = 0;
+                bias_buf[wr_slot] = bias_cols;
             }}
-            if (clk_cnt < {total_beats}) {{
-                a_buf[clk_cnt] = a_rows;
-                b_buf[clk_cnt] = b_cols;
+            if (cc_slot[wr_slot] < {total_beats}) {{
+                a_buf[wr_slot][cc_slot[wr_slot]] = a_rows;
+                b_buf[wr_slot][cc_slot[wr_slot]] = b_cols;
             }}
+        }} else {{
+            feeding = false;
         }}
 
-        if (running && clk_cnt >= {first_out + 1} && clk_cnt < {first_out + 1} + {mr}) {{
-            int out_idx = clk_cnt - ({first_out + 1});
-            int row_tile = out_idx / 8;
-            int row_local = out_idx % 8;
-            int actual_row = row_tile * 8 + row_local;
-            ac_int<{c_bits}, false> row_out = 0;
-            for (int ct = 0; ct < {grid_cols}; ct++) {{
-                for (int cl = 0; cl < 8; cl++) {{
-                    int actual_col = ct * 8 + cl;
-                    ac_int<32, true> acc = 0;
-                    // Apply bias from bias_buf
-                    ac_int<8, true> bias_el = bias_buf.slc<8>(ct * 64 + cl * 8);
-                    if (actual_row < {m} && actual_col < {n}) {{
-                        acc = bias_el;
-                        for (int kk = 0; kk < {k}; kk++) {{
-                            int k_chunk = kk / 8;
-                            int k_lane = kk % 8;
-                            ac_int<8, true> a_el = {a_el_expr};
-                            ac_int<8, true> b_el = {b_el_expr};
-                            acc += a_el * b_el;
+        for (int s = 0; s < {slots}; s++) {{
+            if (!slot_run[s]) continue;
+            int scc = cc_slot[s];
+            if (scc >= {first_out + 1} && scc < {first_out + 1} + {m}) {{
+                int out_idx = scc - ({first_out + 1});
+                int actual_row = out_idx;
+                int row_tile = actual_row / 8;
+                (void) row_tile;
+                ac_int<{c_bits}, false> row_out = 0;
+                for (int ct = 0; ct < {grid_cols}; ct++) {{
+                    for (int cl = 0; cl < 8; cl++) {{
+                        int actual_col = ct * 8 + cl;
+                        ac_int<32, true> acc = 0;
+                        // Apply bias from this frame's bias buffer
+                        ac_int<8, true> bias_el = bias_buf[s].slc<8>(ct * 64 + cl * 8);
+                        if (actual_row < {m} && actual_col < {n}) {{
+                            acc = bias_el;
+                            for (int kk = 0; kk < {k}; kk++) {{
+                                int k_chunk = kk / 8;
+                                int k_lane = kk % 8;
+                                ac_int<8, true> a_el = {a_el_expr};
+                                ac_int<8, true> b_el = {b_el_expr};
+                                acc += a_el * b_el;
+                            }}
                         }}
+                        // Saturate the raw integer dot-product to the physical
+                        // 16-bit output lane (NOT int8): the core emits the integer
+                        // accumulator; the wrapper drain rescales + quantizes to the
+                        // result type. Matches the RTL core (out_bits=16).
+                        ac_int<16, true> sat_val;
+                        if (acc > 32767) sat_val = 32767;
+                        else if (acc < -32768) sat_val = -32768;
+                        else sat_val = acc;
+                        row_out.set_slc(ct * 128 + cl * 16, sat_val);
                     }}
-                    // Saturate the raw integer dot-product to the physical
-                    // 16-bit output lane (NOT int8): the core emits the integer
-                    // accumulator; the wrapper drain rescales + quantizes to the
-                    // result type. Matches the RTL core (out_bits=16).
-                    ac_int<16, true> sat_val;
-                    if (acc > 32767) sat_val = 32767;
-                    else if (acc < -32768) sat_val = -32768;
-                    else sat_val = acc;
-                    row_out.set_slc(ct * 128 + cl * 16, sat_val);
                 }}
+                c_row = row_out;
+                out_valid = 1;
+                out_last = (out_idx == {m} - 1) ? 1 : 0;
             }}
-            c_row = row_out;
-            out_valid = 1;
-            out_last = (out_idx == {mr} - 1) ? 1 : 0;
-        }}
-
-        clk_cnt++;
-        if (running && clk_cnt >= {first_out + 1} + {mr}) {{
-            running = false;
-            clk_cnt = 0;
+            cc_slot[s] = scc + 1;
+            if (scc + 1 >= {first_out + 1} + {m}) {{
+                slot_run[s] = false;
+                cc_slot[s] = 0;
+            }}
         }}
 #endif
     }}

@@ -47,9 +47,16 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
         if full_k_spatial
         else "Chunked behavioral MxKxN GEMM. Not intended for synthesis."
     )
-    # Single-buffer unpack: capture a_rows/b_cols into amat/bmat at beat index `cc`
-    # (== the C++ core's clk_cnt while collecting). Mirrors the original double-buffer
-    # unpack with the _0/_1 buffers collapsed to one.
+    # Frames in flight: the feed of frame t+1 overlaps the compute/drain of
+    # frame t, so back-to-back frames sustain a frame II of total_beats+1
+    # (the preload step plus the data beats). Slot count covers the deepest
+    # overlap plus one spare so an allocating frame never lands on a slot
+    # that is still draining.
+    frame_period = total_input_beats + 1
+    slots = -(-(first_out + 1 + total_output_rows) // frame_period) + 1
+    # Per-slot unpack: capture a_rows/b_cols into the allocating slot's amat/
+    # bmat partition at beat index `cc` (== that frame's clk_cnt while
+    # collecting). `ws` is the slot index resolved this cycle.
     single_unpack = f"""\
                     cc_chunk = cc / INPUT_BEATS;
                     cc_beat  = cc % INPUT_BEATS;
@@ -57,14 +64,14 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
                         for (lane = 0; lane < 8; lane = lane + 1) begin
                             kk = cc_chunk * 8 + lane;
                             if (kk < {k})
-                                amat[cc_beat][kk] = a_rows[(cc_beat / 8) * 64 + lane * 8 +: 8];
+                                amat[ws * {m} + cc_beat][kk] = a_rows[(cc_beat / 8) * 64 + lane * 8 +: 8];
                         end
                     end
                     if (cc_beat < {n}) begin
                         for (lane = 0; lane < 8; lane = lane + 1) begin
                             kk = cc_chunk * 8 + lane;
                             if (kk < {k})
-                                bmat[kk][cc_beat] = b_cols[(cc_beat / 8) * 64 + lane * 8 +: 8];
+                                bmat[ws * {k} + kk][cc_beat] = b_cols[(cc_beat / 8) * 64 + lane * 8 +: 8];
                         end
                     end"""
     if full_k_spatial:
@@ -74,14 +81,14 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
                         for (kk = 0; kk < {k}; kk = kk + 1) begin
                             cc_chunk = kk / 8;
                             lane = kk % 8;
-                            amat[cc_beat][kk] = a_rows[cc_chunk * 64 + lane * 8 +: 8];
+                            amat[ws * {m} + cc_beat][kk] = a_rows[cc_chunk * 64 + lane * 8 +: 8];
                         end
                     end
                     if (cc_beat < {n}) begin
                         for (kk = 0; kk < {k}; kk = kk + 1) begin
                             cc_chunk = kk / 8;
                             lane = kk % 8;
-                            bmat[kk][cc_beat] = b_cols[cc_chunk * 64 + lane * 8 +: 8];
+                            bmat[ws * {k} + kk][cc_beat] = b_cols[cc_chunk * 64 + lane * 8 +: 8];
                         end
                     end"""
 
@@ -149,21 +156,29 @@ module {behav_name}(
     localparam integer TOTAL_INPUT_BEATS = {total_input_beats};
     localparam integer FIRST_OUT         = {first_out};
     localparam integer TOTAL_ROWS        = {total_output_rows};
+    localparam integer FRAME_SLOTS       = {slots};
 
-    // ── Single-buffer storage (faithful to the validated C++ ccore) ────────
-    reg signed [7:0]  amat [0:{m-1}][0:{k-1}];
-    reg signed [7:0]  bmat [0:{k-1}][0:{n-1}];
-    reg signed [7:0]  bias_buf [0:{n-1}];
-    reg [31:0] clk_cnt;
-    reg        running;
+    // ── Frame-slot storage: up to FRAME_SLOTS frames in flight ─────────────
+    // Pure behavioral scheduler (no tensor-slice structure): each frame gets
+    // a private operand partition and cycle counter; results are computed at
+    // emit time in full precision. Feed of frame t+1 overlaps compute/drain
+    // of frame t, so back-to-back frames sustain frame II = TOTAL_INPUT_BEATS+1
+    // (~one result row per cycle) while each frame keeps its own FIRST_OUT.
+    reg signed [7:0]  amat [0:{slots * m - 1}][0:{k - 1}];
+    reg signed [7:0]  bmat [0:{slots * k - 1}][0:{n - 1}];
+    reg signed [7:0]  bias_buf [0:{slots * n - 1}];
+    reg [31:0] cc_slot [0:{slots - 1}];
+    reg        slot_run [0:{slots - 1}];
+    reg [31:0] wr_slot;
+    reg        feeding;
 
     // ── Diagnostics (parsed by the testbench; not load-bearing) ────────────
     reg [31:0] beh_cyc;
     reg [31:0] prev_beh_start;
     reg [31:0] beh_ii_val;
 
-    integer i, j, kk, lane, tile;
-    integer cc, cc_chunk, cc_beat, out_idx, actual_row, actual_col;
+    integer i, j, kk, lane, tile, s;
+    integer ws, cc, scc, cc_chunk, cc_beat, out_idx, actual_row, actual_col;
     reg signed [31:0] acc;
     reg signed [15:0] sat;
 
@@ -177,18 +192,23 @@ module {behav_name}(
     endfunction
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Single-buffer clk_cnt schedule — a faithful translation of the validated
-    // C++ ccore::run() (#else branch). One frame at a time: capture a_rows/b_cols
-    // while cc < TOTAL_INPUT_BEATS, then emit one row per cycle for cc in
-    // [FIRST_OUT+1, FIRST_OUT+1+TOTAL_ROWS), then reset. `cc` is the effective
-    // clk_cnt this cycle (forced to 0 on the first in_valid, matching the C++
-    // `if (!running) clk_cnt = 0`). This replaces the old double-buffered FSM,
-    // which mis-handled chained en-stalls and diverged from the C++ reference.
+    // Frame-slot clk_cnt schedule. A frame starts at the first in_valid call
+    // after a non-in_valid call (the wrapper protocol always inserts at least
+    // the preload step between frames): allocate the next slot, capture its
+    // TOTAL_INPUT_BEATS beats, then emit one row per cycle for that slot's
+    // cc in [FIRST_OUT+1, FIRST_OUT+1+TOTAL_ROWS) and retire it. Emission
+    // windows of consecutive frames cannot overlap (TOTAL_ROWS <= the minimum
+    // frame period TOTAL_INPUT_BEATS+1). Everything advances on en only, so
+    // wrapper stalls keep the model aligned with the run()-call schedule.
     // ═══════════════════════════════════════════════════════════════════════
     always @(posedge clk) begin
         if (rst) begin
-            clk_cnt        <= 32'd0;
-            running        <= 1'b0;
+            for (s = 0; s < FRAME_SLOTS; s = s + 1) begin
+                cc_slot[s]  <= 32'd0;
+                slot_run[s] <= 1'b0;
+            end
+            wr_slot        <= FRAME_SLOTS - 1;
+            feeding        <= 1'b0;
             c_row          <= {c_width}'d0;
             out_valid      <= 1'b0;
             out_last       <= 1'b0;
@@ -201,55 +221,68 @@ module {behav_name}(
             out_valid <= 1'b0;
             out_last  <= 1'b0;
 
-            cc = (in_valid && !running) ? 0 : clk_cnt;
-
-            // ── capture ──────────────────────────────────────────────────
+            // ── capture into the feeding frame's slot ────────────────────
+            ws = wr_slot;
+            cc = 0;
             if (in_valid) begin
-                if (!running) begin
-                    running <= 1'b1;
+                if (!feeding) begin
+                    ws = (wr_slot + 1) % FRAME_SLOTS;
+                    if (slot_run[ws]) $display("BEH_SLOT_OVERFLOW beh_cyc=%0d", beh_cyc);
+                    wr_slot      <= ws;
+                    feeding      <= 1'b1;
+                    slot_run[ws] <= 1'b1;
+                    cc_slot[ws]  <= 32'd1;   // cc = 0 is consumed this cycle
                     for (j = 0; j < {n}; j = j + 1)
-                        bias_buf[j] <= bias_cols[(j / 8) * 64 + (j % 8) * 8 +: 8];
+                        bias_buf[ws * {n} + j] <= bias_cols[(j / 8) * 64 + (j % 8) * 8 +: 8];
                     if (prev_beh_start == 0) beh_ii_val <= 32'd0;
                     else                     beh_ii_val <= beh_cyc - prev_beh_start;
                     prev_beh_start <= beh_cyc;
                     $display("BEH_START beh_cyc=%0d", beh_cyc);
+                    cc = 0;
+                end else begin
+                    cc = cc_slot[ws];
                 end
                 if (cc < TOTAL_INPUT_BEATS) begin
 {single_unpack}
                 end
+            end else begin
+                feeding <= 1'b0;
             end
 
-            // ── emit (compute-at-emit, like the C++ ccore) ───────────────
-            if ((running || (in_valid && !running)) &&
-                cc >= FIRST_OUT + 1 && cc < FIRST_OUT + 1 + TOTAL_ROWS) begin
-                out_idx    = cc - (FIRST_OUT + 1);
-                actual_row = out_idx;
-                for (tile = 0; tile < {grid_cols}; tile = tile + 1) begin
-                    for (lane = 0; lane < 8; lane = lane + 1) begin
-                        actual_col = tile * 8 + lane;
-                        if (actual_row < {m} && actual_col < {n}) begin
-                            acc = bias_buf[actual_col];
-                            for (kk = 0; kk < {k}; kk = kk + 1)
-                                acc = acc + (amat[actual_row][kk] * bmat[kk][actual_col]);
-                            sat = sat_int8(acc);
-                        end else begin
-                            sat = 16'sd0;
+            // ── per-slot emit (compute-at-emit) + advance / retire ───────
+            // slot_run[] reads pre-edge values, so the slot allocated THIS
+            // cycle (cc already set to 1 above) is naturally skipped.
+            for (s = 0; s < FRAME_SLOTS; s = s + 1) begin
+                if (slot_run[s]) begin
+                    scc = cc_slot[s];
+                    if (scc >= FIRST_OUT + 1 && scc < FIRST_OUT + 1 + TOTAL_ROWS) begin
+                        out_idx    = scc - (FIRST_OUT + 1);
+                        actual_row = out_idx;
+                        for (tile = 0; tile < {grid_cols}; tile = tile + 1) begin
+                            for (lane = 0; lane < 8; lane = lane + 1) begin
+                                actual_col = tile * 8 + lane;
+                                if (actual_row < {m} && actual_col < {n}) begin
+                                    acc = bias_buf[s * {n} + actual_col];
+                                    for (kk = 0; kk < {k}; kk = kk + 1)
+                                        acc = acc + (amat[s * {m} + actual_row][kk] * bmat[s * {k} + kk][actual_col]);
+                                    sat = sat_int8(acc);
+                                end else begin
+                                    sat = 16'sd0;
+                                end
+                                c_row[tile * 128 + lane * 16 +: 16] <= sat;
+                            end
                         end
-                        c_row[tile * 128 + lane * 16 +: 16] <= sat;
+                        out_valid <= 1'b1;
+                        out_last  <= (out_idx + 1 == TOTAL_ROWS) ? 1'b1 : 1'b0;
+                    end
+                    cc_slot[s] <= scc + 1;
+                    if (scc + 1 >= FIRST_OUT + 1 + TOTAL_ROWS) begin
+                        slot_run[s] <= 1'b0;
+                        cc_slot[s]  <= 32'd0;
+                        $display("BEH_II=%0d", beh_ii_val);
+                        $display("BEH_DONE beh_cyc=%0d", beh_cyc);
                     end
                 end
-                out_valid <= 1'b1;
-                out_last  <= (out_idx + 1 == TOTAL_ROWS) ? 1'b1 : 1'b0;
-            end
-
-            // ── advance / reset ──────────────────────────────────────────
-            clk_cnt <= cc + 1;
-            if ((running || (in_valid && !running)) &&
-                (cc + 1) >= FIRST_OUT + 1 + TOTAL_ROWS) begin
-                running <= 1'b0;
-                clk_cnt <= 32'd0;
-                $display("BEH_II=%0d", beh_ii_val);
-                $display("BEH_DONE beh_cyc=%0d", beh_cyc);
             end
         end
     end

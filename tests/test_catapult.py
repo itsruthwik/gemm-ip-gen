@@ -420,7 +420,7 @@ def test_full_k_package_uses_full_k_drain_timing(tmp_path):
     h = (tmp_path / "test_fullk_t" / "test_fullk_t_gemm_ip.h").read_text()
     v = (tmp_path / "test_fullk_t" / "test_fullk_t_core.v").read_text()
     assert "localparam integer FIRST_OUT         = 80;" in v
-    assert "clk_cnt >= 81" in h                       # first_out + 1
+    assert "scc >= 81" in h                           # first_out + 1
     assert "DRAIN: for (int i = 0; i < 98; i++)" in h  # blind(82) + m(16)
 
     # Same shape, chunked: first_out = 144 (9 chunks x 16 beats, wave = 0).
@@ -428,7 +428,7 @@ def test_full_k_package_uses_full_k_drain_timing(tmp_path):
     h1 = (tmp_path / "test_chk_t" / "test_chk_t_gemm_ip.h").read_text()
     v1 = (tmp_path / "test_chk_t" / "test_chk_t_core.v").read_text()
     assert "localparam integer FIRST_OUT         = 144;" in v1
-    assert "clk_cnt >= 145" in h1
+    assert "scc >= 145" in h1
     assert "DRAIN: for (int i = 0; i < 162; i++)" in h1  # blind(146) + m(16)
 
     # k_chunks == 1 control keeps the legacy value on both paths.
