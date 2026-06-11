@@ -693,8 +693,15 @@ template <typename T, unsigned N> struct array {
     const T &operator[](size_t pos) const { return data[pos]; }
 
     array &operator=(const array &other) {
+#ifndef __SYNTHESIS__
+        // Software-only self-assignment guard. Under HLS the pointer compare
+        // becomes a SELECT; with a dynamic destination index (the einsum GEMM
+        // drain's results[captured]) Catapult cannot prove non-aliasing and
+        // schedules a dynamic conditional whole-array copy, which is an
+        // unschedulable recurrence. Value-semantics arrays never need it.
         if (&other == this)
             return *this;
+#endif
         #pragma hls_unroll
         for (unsigned i = 0; i < N; i++) {
             data[i] = other[i];
