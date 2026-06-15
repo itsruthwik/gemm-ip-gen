@@ -78,7 +78,8 @@ def dead_cycles(m, k, n, grid_cols, full_k_spatial=False):
 
 
 def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gemm_k_spatial=1,
-                      input_precision=None, weight_precision=None, clock_period_ns=None):
+                      input_precision=None, weight_precision=None, clock_period_ns=None,
+                      n_frames=1):
     bb_delay_ns = _blackbox_delay_ns(clock_period_ns)
     row_chunk_bits = grid_rows * 64
     col_chunk_bits = grid_cols * 64
@@ -103,25 +104,40 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     input_beats = max(m, n)
     total_beats = input_beats if full_k_spatial else k_chunks * input_beats
     first_out = latency_cycles(m, k, n, grid_rows, grid_cols, full_k_spatial=full_k_spatial)
-    blind = dead_cycles(m, k, n, grid_cols, full_k_spatial=full_k_spatial)
-    drain = blind + mr
     # Frame slots for the pipelined sim core: feed of frame t+1 may overlap
     # compute/drain of frame t (min frame period = total_beats + 1 calls).
     slots = -(-(first_out + 1 + m) // (total_beats + 1)) + 1
 
-    # The DRAIN loop polls out_valid, so it absorbs the core's port lag. The
-    # last emitted row sits at run()-call index first_out + mr + 2 (preload
-    # call + clk_cnt→call offset), and the worst port lag is 3 calls (sim
-    # branch: 2 registered stages; structural branch adds an input register).
-    # Guard that the lagged emission still lands inside the FEED+DRAIN call
-    # budget so a future shape cannot silently outgrow the slack.
-    spare_drain_calls = (total_beats + 1 + drain) - (first_out + mr + 2 + 3)
-    if spare_drain_calls < 0:
+    # Merged feed+drain call budget. The RUN loop polls out_valid on every
+    # call, so it absorbs the core's port lag. The frame's last row sits at
+    # run()-call index first_out + (m-1) + 2 (preload call + clk_cnt->call
+    # offset), and the worst port lag is 3 calls (sim branch: 2 registered
+    # stages; structural branch adds an input register) — plus 2 calls spare.
+    run_calls = first_out + m + 6
+    if run_calls < total_beats + 2:
         raise RuntimeError(
-            f"{name}: GEMM wrapper drain window too tight for the core port "
-            f"lag (short by {-spare_drain_calls} calls; m={m} k={k} n={n}). "
-            "Increase dead_cycles padding."
+            f"{name}: GEMM wrapper RUN budget shorter than the feed itself "
+            f"(run_calls={run_calls}, total_beats={total_beats}; m={m} k={k} n={n})."
         )
+
+    # Back-to-back multi-frame schedule. The wrapper feeds n_frames frames with NO
+    # preload step (preload_valid is tied off; bias lives in the drain capture).
+    # Each frame is total_beats in_valid beats + exactly ONE in_valid=0 separator
+    # so the core's `feeding` flag drops and the next frame allocates a fresh slot.
+    # Steady-state frame period = total_beats + 1; the last frame's outputs drain
+    # in the trailing first_out + m + slack tail. With n_frames == 1 this reduces
+    # to a single preload-free frame (real hls4ml flow: one frame per wrapper call).
+    period = total_beats + 1
+    # in_valid is asserted only inside the feed region; feed_total covers every
+    # frame's total_beats feed cycles plus its trailing 1-cycle separator.
+    feed_total = n_frames * period
+    # Loop length: the LAST frame starts feeding at (n_frames-1)*period and its
+    # final output lands first_out + m later (the behavioral core emits m rows per
+    # frame). Use mr (>= m) + slack for the port-lag tail. Sizing on feed_total
+    # here would over-run by a full period per frame (a serialized-latency
+    # regression for n_frames == 1).
+    total_steps = (n_frames - 1) * period + first_out + mr + 6
+    total_rows = n_frames * m
 
     # Choose the RHS expression for the final output assignment based on the
     # configured result type.  Integer types (ac_int / ac_uint) need an explicit
@@ -147,17 +163,79 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         if full_k_spatial
         else f"b_buf[s][k_chunk * {input_beats} + actual_col].slc<8>(ct * 64 + k_lane * 8)"
     )
+
+    # Per-call output capture, embedded in the merged RUN loop so rows are
+    # collected as they emerge while the frame is still feeding/computing.
+    _capture_body = f"""\
+        if (v) {{
+            if (captured < {m}) {{
+                res_T out_pack;
+                #pragma hls_unroll
+                for (int col = 0; col < {n}; col++) {{
+                    int col_tile = col / 8;
+                    int col_local = col % 8;
+                    ac_int<16, true> raw_val = c_row.template slc<16>(col_tile * 128 + col_local * 16);
+                    // Rescale the raw integer dot-product by 2^-(fa+fb) to the
+                    // real value, then add the full-precision bias (Keras order:
+                    // matmul + bias, then quantize on the result-type cast below).
+                    typename CONFIG_T::accum_t value =
+                        static_cast<typename CONFIG_T::accum_t>(
+                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {gemm_shift})
+                        + static_cast<typename CONFIG_T::accum_t>(biases[col]);
+                    out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
+                }}
+                %SINK%
+            }}
+            captured++;
+        }}"""
+    stream_capture = _capture_body.replace("%SINK%", "res_stream.write(out_pack);")
+    array_capture = _capture_body.replace("%SINK%", "results[captured] = out_pack;")
+
+    # Back-to-back capture: identical body but the row budget spans all frames
+    # (n_frames * m rows emerge across the run, retiring in frame order).
+    _capture_body_b2b = f"""\
+        if (v) {{
+            // The behavioral core emits exactly {m} out_valid pulses per frame
+            // (TOTAL_ROWS = m, no padding pulses), retiring in frame order, so
+            // every pulse is a real result row: write the first {total_rows}.
+            if (written < {total_rows}) {{
+                res_T out_pack;
+                #pragma hls_unroll
+                for (int col = 0; col < {n}; col++) {{
+                    int col_tile = col / 8;
+                    int col_local = col % 8;
+                    ac_int<16, true> raw_val = c_row.template slc<16>(col_tile * 128 + col_local * 16);
+                    typename CONFIG_T::accum_t value =
+                        static_cast<typename CONFIG_T::accum_t>(
+                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {gemm_shift})
+                        + static_cast<typename CONFIG_T::accum_t>(biases[col]);
+                    out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
+                }}
+                res_stream.write(out_pack);
+                written++;
+            }}
+            captured++;
+        }}"""
+    stream_capture_b2b = _capture_body_b2b
+
     if full_k_spatial:
         stream_feed_loop = f"""
-    // Full K-spatial mode: feed each logical A row once. The blackbox A/B
-    // words are widened to carry every 8-wide K chunk for the current row/col.
+    // Back-to-back, preload-free feed of {n_frames} frame(s) (full K-spatial:
+    // each logical A row once, A/B words widened to carry every 8-wide K chunk).
+    // Each frame is {total_beats} in_valid beats + ONE in_valid=0 separator
+    // (period {period}); preload_valid is tied off (bias added in the drain
+    // capture). Every step polls out_valid, so rows are captured as they emerge
+    // — frame t+1 feeds while frame t drains in the core's FRAME_SLOTS.
     #pragma hls_pipeline_init_interval 1
-    FEED: for (int step = 0; step < {input_beats + 1}; step++) {{
-        int t = (step == 0) ? 0 : step - 1;
+    RUN: for (int step = 0; step < {total_steps}; step++) {{
+        bool in_feed = (step < {feed_total});
+        int p = in_feed ? (step % {period}) : {period};
+        bool feeding_now = in_feed && (p < {total_beats});
+        int t = p;
         ac_int<{a_bits}, false> a_rows = 0;
         ac_int<{b_bits}, false> b_cols = 0;
 
-        if (step > 0 && t < {m}) {{
+        if (feeding_now && t < {m}) {{
             a_beat_T a_beat = a_stream.read();
             #pragma hls_unroll
             ROW_PACK_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
@@ -171,7 +249,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 }}
             }}
         }}
-        if (step > 0 && t < {n}) {{
+        if (feeding_now && t < {n}) {{
             b_beat_T b_beat = weight_cols[t];
             #pragma hls_unroll
             COL_PACK_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
@@ -186,34 +264,38 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
             }}
         }}
 
-        last_a_rows = a_rows;
-        last_b_cols = b_cols;
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
-        ac_int<1, false> feed_valid = (step == 0) ? 0 : 1;
-        ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
-        gemm.run(last_a_rows, last_b_cols, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
-        feed_dependency |= v;
+        ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
+        gemm.run(a_rows, b_cols, bias_packed, 0, feed_valid, c_row, v, l);
+{stream_capture_b2b}
     }}
 """
     else:
         stream_feed_loop = f"""
     // Replay storage is packed to the blackbox protocol. HLS4ML still emits
     // each logical K-wide A row once; later K chunks replay packed slices.
+    // Reused per frame (written at each frame's kc==0 beats, read within the
+    // same frame's later chunks — the feed is sequential in step order).
     ac_int<{a_bits}, false> a_replay[{k_chunks}][{input_beats}];
 
-    // Feed M A rows and N B columns to the grid core as 8-lane K chunks.
-    // Step 0 preloads bias, steps 1+ feed data beats. During K chunk 0,
-    // read the logical A rows and prepack remaining chunks for replay.
+    // Back-to-back, preload-free feed of {n_frames} frame(s): M A rows + N B
+    // columns as 8-lane K chunks. Each frame is {total_beats} in_valid beats +
+    // ONE in_valid=0 separator (period {period}); preload_valid tied off (bias
+    // added in the drain capture). Every step polls out_valid, so rows are
+    // captured as they emerge — frame t+1 feeds while frame t drains in the
+    // core's FRAME_SLOTS.
     #pragma hls_pipeline_init_interval 1
-    FEED: for (int step = 0; step < {k_chunks * input_beats + 1}; step++) {{
-        int eff_step = (step == 0) ? 0 : step - 1;
-        int kc = eff_step / {input_beats};
-        int t = eff_step % {input_beats};
+    RUN: for (int step = 0; step < {total_steps}; step++) {{
+        bool in_feed = (step < {feed_total});
+        int p = in_feed ? (step % {period}) : {period};
+        bool feeding_now = in_feed && (p < {total_beats});
+        int kc = p / {input_beats};
+        int t = p % {input_beats};
         ac_int<{a_bits}, false> a_rows = 0;
         ac_int<{b_bits}, false> b_cols = 0;
 
-        if (step > 0 && t < {m}) {{
+        if (feeding_now && t < {m}) {{
             if (kc == 0) {{
                 a_beat_T a_beat = a_stream.read();
                 #pragma hls_unroll
@@ -249,7 +331,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 a_rows = a_replay[kc][t];
             }}
         }}
-        if (step > 0 && t < {n}) {{
+        if (feeding_now && t < {n}) {{
             b_beat_T b_beat = weight_cols[t];
             #pragma hls_unroll
             COL_PACK: for (int kl = 0; kl < 8; kl++) {{
@@ -265,28 +347,28 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
             }}
         }}
 
-        last_a_rows = a_rows;
-        last_b_cols = b_cols;
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
-        ac_int<1, false> feed_valid = (step == 0) ? 0 : 1;
-        ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
-        gemm.run(last_a_rows, last_b_cols, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
-        feed_dependency |= v;
+        ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
+        gemm.run(a_rows, b_cols, bias_packed, 0, feed_valid, c_row, v, l);
+{stream_capture_b2b}
     }}
 """
 
     if full_k_spatial:
         array_feed_loop = f"""
-    // Full K-spatial mode: feed each logical A row and B column once. The
-    // blackbox A/B words are widened to carry every 8-wide K chunk.
+    // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats}
+    // preload then feed each logical A row and B column once (full K-spatial
+    // mode: A/B words widened to carry every 8-wide K chunk); every step
+    // polls out_valid, so the frame's rows are captured as they emerge
+    // instead of in a separate drain loop after the feed.
     #pragma hls_pipeline_init_interval 1
-    FEED_ARRAY: for (int step = 0; step < {input_beats + 1}; step++) {{
+    RUN_ARRAY: for (int step = 0; step < {run_calls}; step++) {{
         int t = (step == 0) ? 0 : step - 1;
         ac_int<{a_bits}, false> a_rows_packed = 0;
         ac_int<{b_bits}, false> b_cols_packed = 0;
 
-        if (step > 0 && t < {m}) {{
+        if (step > 0 && step <= {total_beats} && t < {m}) {{
             a_beat_T a_beat = a_rows[t];
             #pragma hls_unroll
             ROW_PACK_ARRAY_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
@@ -300,7 +382,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 }}
             }}
         }}
-        if (step > 0 && t < {n}) {{
+        if (step > 0 && step <= {total_beats} && t < {n}) {{
             b_beat_T b_beat = weight_cols[t];
             #pragma hls_unroll
             COL_PACK_ARRAY_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
@@ -315,29 +397,29 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
             }}
         }}
 
-        last_a_rows = a_rows_packed;
-        last_b_cols = b_cols_packed;
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
-        ac_int<1, false> feed_valid = (step == 0) ? 0 : 1;
+        ac_int<1, false> feed_valid = (step >= 1 && step <= {total_beats}) ? 1 : 0;
         ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
-        gemm.run(last_a_rows, last_b_cols, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
-        feed_dependency |= v;
+        gemm.run(a_rows_packed, b_cols_packed, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
+{array_capture}
     }}
 """
     else:
         array_feed_loop = f"""
-    // Feed M A rows and N B columns as 8-lane K chunks.
-    // Step 0 preloads bias, steps 1+ feed data beats.
+    // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats}
+    // preload then feed M A rows and N B columns as 8-lane K chunks; every
+    // step polls out_valid, so the frame's rows are captured as they emerge
+    // instead of in a separate drain loop after the feed.
     #pragma hls_pipeline_init_interval 1
-    FEED_ARRAY: for (int step = 0; step < {k_chunks * input_beats + 1}; step++) {{
-        int eff_step = (step == 0) ? 0 : step - 1;
+    RUN_ARRAY: for (int step = 0; step < {run_calls}; step++) {{
+        int eff_step = (step == 0 || step > {total_beats}) ? 0 : step - 1;
         int kc = eff_step / {input_beats};
         int t = eff_step % {input_beats};
         ac_int<{a_bits}, false> a_rows_packed = 0;
         ac_int<{b_bits}, false> b_cols_packed = 0;
 
-        if (step > 0 && t < {m}) {{
+        if (step > 0 && step <= {total_beats} && t < {m}) {{
             a_beat_T a_beat = a_rows[t];
             #pragma hls_unroll
             for (int kl = 0; kl < 8; kl++) {{
@@ -352,7 +434,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 }}
             }}
         }}
-        if (step > 0 && t < {n}) {{
+        if (step > 0 && step <= {total_beats} && t < {n}) {{
             b_beat_T b_beat = weight_cols[t];
             #pragma hls_unroll
             for (int kl = 0; kl < 8; kl++) {{
@@ -368,14 +450,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
             }}
         }}
 
-        last_a_rows = a_rows_packed;
-        last_b_cols = b_cols_packed;
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
-        ac_int<1, false> feed_valid = (step == 0) ? 0 : 1;
+        ac_int<1, false> feed_valid = (step >= 1 && step <= {total_beats}) ? 1 : 0;
         ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
-        gemm.run(last_a_rows, last_b_cols, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
-        feed_dependency |= v;
+        gemm.run(a_rows_packed, b_cols_packed, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
+{array_capture}
     }}
 """
 
@@ -384,6 +464,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
 #define {name.upper()}_GEMM_IP_H
 
 #include "ac_int.h"
+#include "ac_fixed.h"
 #include "ac_channel.h"
 
 #if defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW)
@@ -547,10 +628,8 @@ void {name}_gemm_ip_stream_const_weights(
 
 
     static {name}_ccore gemm;
-    int captured = 0;
-    ac_int<1, false> feed_dependency = 0;
-    ac_int<{a_bits}, false> last_a_rows = 0;
-    ac_int<{b_bits}, false> last_b_cols = 0;
+    int captured = 0;   // total out_valid pulses seen (incl. padding rows)
+    int written = 0;    // real result rows written to res_stream
     ac_int<{bias_bits}, false> bias_packed = 0;
 
     #pragma hls_unroll
@@ -564,45 +643,6 @@ void {name}_gemm_ip_stream_const_weights(
     }}
 
 {stream_feed_loop}
-    #pragma hls_pipeline_init_interval 1
-    DRAIN: for (int i = 0; i < {blind + m}; i++) {{
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        ac_int<1, false> drain_valid = 0;
-        ac_int<1, false> drain_preload_valid = 0;
-        gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
-        ac_int<1, false> output_valid = v | feed_dependency;
-        if (output_valid) {{
-            if (v && captured < {m}) {{
-                res_T out_pack;
-                #pragma hls_unroll
-                for (int col = 0; col < {n}; col++) {{
-                    int col_tile = col / 8;
-                    int col_local = col % 8;
-                    ac_int<16, true> raw_val = c_row.template slc<16>(col_tile * 128 + col_local * 16);
-                    // Rescale the raw integer dot-product by 2^-(fa+fb) to the
-                    // real value, then add the full-precision bias (Keras order:
-                    // matmul + bias, then quantize on the result-type cast below).
-                    typename CONFIG_T::accum_t value =
-                        static_cast<typename CONFIG_T::accum_t>(
-                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {gemm_shift})
-                        + static_cast<typename CONFIG_T::accum_t>(biases[col]);
-                    out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
-                }}
-                res_stream.write(out_pack);
-            }}
-            captured++;
-        }}
-    }}
-
-    #pragma hls_pipeline_init_interval 1
-    DRAIN_PADDED_ROWS: for (int i = 0; i < {mr - m}; i++) {{
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        ac_int<1, false> drain_valid = 0;
-        ac_int<1, false> drain_preload_valid = 0;
-        gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
-    }}
 }}
 
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
@@ -633,12 +673,9 @@ void {name}_gemm_ip_array(
 
     static {name}_ccore gemm;
     int captured = 0;
-    ac_int<1, false> feed_dependency = 0;
     ac_int<{a_bits}, false> last_a_rows = 0;
     ac_int<{b_bits}, false> last_b_cols = 0;
     ac_int<{bias_bits}, false> bias_packed = 0;
-    ac_int<{a_bits}, false> preload_a_rows = 0;
-    ac_int<{b_bits}, false> preload_b_cols = 0;
 
     #pragma hls_unroll
     BIAS_PACK_ARRAY: for (int col = 0; col < {n}; col++) {{
@@ -651,37 +688,6 @@ void {name}_gemm_ip_array(
     }}
 
 {array_feed_loop}
-
-    #pragma hls_pipeline_init_interval 1
-    DRAIN_ARRAY: for (int i = 0; i < {blind + m}; i++) {{
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        ac_int<1, false> drain_valid = 0;
-        ac_int<1, false> drain_preload_valid = 0;
-        gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
-        ac_int<1, false> output_valid = v | feed_dependency;
-        if (output_valid) {{
-            if (v && captured < {m}) {{
-                res_T out_pack;
-                #pragma hls_unroll
-                for (int col = 0; col < {n}; col++) {{
-                    int col_tile = col / 8;
-                    int col_local = col % 8;
-                    ac_int<16, true> raw_val = c_row.template slc<16>(col_tile * 128 + col_local * 16);
-                    // Rescale the raw integer dot-product by 2^-(fa+fb) to the
-                    // real value, then add the full-precision bias (Keras order:
-                    // matmul + bias, then quantize on the result-type cast below).
-                    typename CONFIG_T::accum_t value =
-                        static_cast<typename CONFIG_T::accum_t>(
-                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {gemm_shift})
-                        + static_cast<typename CONFIG_T::accum_t>(biases[col]);
-                    out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
-                }}
-                results[captured] = out_pack;
-            }}
-            captured++;
-        }}
-    }}
 
     #pragma hls_pipeline_init_interval 1
     DRAIN_ARRAY_PADDED_ROWS: for (int i = 0; i < {mr - m}; i++) {{
@@ -741,8 +747,9 @@ template <typename T, unsigned N> struct array {
 """
 
 
-def gen_tb(name, m, k, n, interface="stream"):
+def gen_tb(name, m, k, n, interface="stream", n_frames=1):
     if interface == "array":
+        # Array interface is a single-frame smoke test (n_frames ignored).
         call_setup = f"""\
     a_beat_t a_rows[{m}];
     b_beat_t weight_cols[{n}];
@@ -750,7 +757,7 @@ def gen_tb(name, m, k, n, interface="stream"):
 
     for (int i = 0; i < {m}; i++) {{
         for (int kk = 0; kk < {k}; kk++) {{
-            a_rows[i][kk] = activations[i][kk];
+            a_rows[i][kk] = activations[0][i][kk];
         }}
     }}
     for (int j = 0; j < {n}; j++) {{
@@ -765,27 +772,37 @@ def gen_tb(name, m, k, n, interface="stream"):
     nnet::{name}_gemm_ip_array<a_beat_t, b_beat_t, int, res_t, {name}_config>(
         a_rows, weight_cols, biases, results);
 #endif
+
+    for (int i = 0; i < {m}; i++) {{
+        res_t out = results[i];
+        check_row(out, activations[0][i], weights, biases, 0, i, failed);
+    }}
 """
-        read_result = "        res_t out = results[i];"
     else:
+        # Stream interface: feed NFRAMES distinct activation frames back-to-back
+        # (weights are constant across frames), then read and verify every frame's
+        # rows. Cycle/II timing is observed from the core's BEH_START/BEH_II/BEH_DONE
+        # $display lines in the QuestaSim transcript, not from the testbench.
         call_setup = f"""\
     ac_channel<a_beat_t> a_stream;
     ac_channel<b_beat_t> b_stream;
     ac_channel<res_t> res_stream;
 
-    for (int i = 0; i < {m}; i++) {{
-        a_beat_t a_beat;
-        for (int kk = 0; kk < {k}; kk++) {{
-            a_beat[kk] = activations[i][kk];
-        }}
-        a_stream.write(a_beat);
-    }}
     for (int j = 0; j < {n}; j++) {{
         b_beat_t b_beat;
         for (int kk = 0; kk < {k}; kk++) {{
             b_beat[kk] = weights[j][kk];
         }}
         b_stream.write(b_beat);
+    }}
+    for (int f = 0; f < NFRAMES; f++) {{
+        for (int i = 0; i < {m}; i++) {{
+            a_beat_t a_beat;
+            for (int kk = 0; kk < {k}; kk++) {{
+                a_beat[kk] = activations[f][i][kk];
+            }}
+            a_stream.write(a_beat);
+        }}
     }}
 
 #ifdef CCS_SCVERIFY
@@ -794,8 +811,14 @@ def gen_tb(name, m, k, n, interface="stream"):
     nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, int, res_t, {name}_config>(
         a_stream, b_stream, biases, res_stream);
 #endif
+
+    for (int f = 0; f < NFRAMES; f++) {{
+        for (int i = 0; i < {m}; i++) {{
+            res_t out = res_stream.read();
+            check_row(out, activations[f][i], weights, biases, f, i, failed);
+        }}
+    }}
 """
-        read_result = "        res_t out = res_stream.read();"
 
     return f"""\
 #ifdef CCS_SCVERIFY
@@ -808,6 +831,8 @@ def gen_tb(name, m, k, n, interface="stream"):
 #include "nnet_types.h"
 #include "{name}_gemm_ip.h"
 
+#define NFRAMES {n_frames}
+
 struct {name}_config {{
     static const unsigned gemm_m = {m};
     static const unsigned gemm_k = {k};
@@ -816,26 +841,50 @@ struct {name}_config {{
     static const unsigned n_out = {n};
     static const bool transpose_weights = true;
     typedef int bias_t;
-    typedef int accum_t;
+    typedef ac_fixed<48, 24, true> accum_t;
 }};
 
-typedef nnet::array<ac_int<8, true>, {m}> a_beat_t;
-typedef nnet::array<ac_int<8, true>, {n}> b_beat_t;
+typedef nnet::array<ac_int<8, true>, {k}> a_beat_t;
+typedef nnet::array<ac_int<8, true>, {k}> b_beat_t;
 typedef nnet::array<ac_int<16, true>, {n}> res_t;
+
+// Per-row golden check: raw integer dot-product saturated to the 16-bit output
+// lane, then bias added (matches the core + wrapper-drain order).
+static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
+                      ac_int<8, true> weights[{n}][{k}], int biases[{n}],
+                      int f, int i, int &failed) {{
+    for (int j = 0; j < {n}; j++) {{
+        int gemm_acc = 0;
+        for (int kk = 0; kk < {k}; kk++) {{
+            gemm_acc += a_row[kk].to_int() * weights[j][kk].to_int();
+        }}
+        if (gemm_acc > 32767) gemm_acc = 32767;
+        else if (gemm_acc < -32768) gemm_acc = -32768;
+        gemm_acc += biases[j];
+        if (out[j].to_int() != gemm_acc) {{
+            printf("Mismatch frame %d row %d col %d: got %d expected %d\\n",
+                   f, i, j, out[j].to_int(), gemm_acc);
+            failed = 1;
+        }}
+    }}
+}}
 
 #ifdef CCS_SCVERIFY
 CCS_MAIN(int argc, char *argv[]) {{
 #else
 int main() {{
 #endif
-    ac_int<8, true> activations[{m}][{k}];
+    ac_int<8, true> activations[NFRAMES][{m}][{k}];
     ac_int<8, true> weights[{n}][{k}];
     int biases[{n}];
     int failed = 0;
 
-    for (int i = 0; i < {m}; i++) {{
-        for (int kk = 0; kk < {k}; kk++) {{
-            activations[i][kk] = ((i * 3 + kk - 4) & 0x7) - 4;
+    for (int f = 0; f < NFRAMES; f++) {{
+        for (int i = 0; i < {m}; i++) {{
+            for (int kk = 0; kk < {k}; kk++) {{
+                // Frame-dependent stimulus so consecutive frames differ.
+                activations[f][i][kk] = ((i * 3 + kk - 4 + f * 2) & 0x7) - 4;
+            }}
         }}
     }}
 
@@ -847,26 +896,6 @@ int main() {{
     }}
 
 {call_setup}
-
-    for (int i = 0; i < {m}; i++) {{
-{read_result}
-        for (int j = 0; j < {n}; j++) {{
-            int gemm_acc = 0;
-            for (int kk = 0; kk < {k}; kk++) {{
-                gemm_acc += activations[i][kk].to_int() * weights[j][kk].to_int();
-            }}
-            // Core saturates the raw integer dot-product to the 16-bit output
-            // lane; bias is added afterwards (post-rescale) in the wrapper drain.
-            if (gemm_acc > 32767) gemm_acc = 32767;
-            else if (gemm_acc < -32768) gemm_acc = -32768;
-            gemm_acc += biases[j];
-            if (out[j].to_int() != gemm_acc) {{
-                printf("Mismatch row %d col %d: got %d expected %d\\n",
-                       i, j, out[j].to_int(), gemm_acc);
-                failed = 1;
-            }}
-        }}
-    }}
 
 #ifdef CCS_SCVERIFY
     CCS_RETURN(failed);
@@ -918,7 +947,7 @@ struct {name}_config {{
     static const unsigned n_out = {n};
     static const bool transpose_weights = true;
     typedef int bias_t;
-    typedef int accum_t;
+    typedef ac_fixed<48, 24, true> accum_t;
 }};
 
 typedef nnet::array<ac_int<8, true>, {k}> a_beat_t;
@@ -961,12 +990,17 @@ options set Input/CompilerFlags {{-DBLACKBOX_FLOW}}
 
 solution file add ./{name}_inst.cpp -type C++
 solution file add ./{name}_tb.cpp -type C++
+# Behavioral blackbox core RTL (ifndef SYNTHESIS branch) for SCVerify RTL cosim.
+solution file add ./{name}_core.v -type Verilog -exclude true
 
 directive set -DESIGN_GOAL area
 directive set -SPECULATE true
 directive set -MERGEABLE true
-directive set -REGISTER_THRESHOLD 256
-directive set -MEM_MAP_THRESHOLD 32
+# Sim-only unit package (back-to-back demonstration): map the small internal
+# operand/replay arrays to registers so the back-to-back modulo feed indexing
+# never contends for limited RAM read ports (not an area-optimised build).
+directive set -REGISTER_THRESHOLD 4096
+directive set -MEM_MAP_THRESHOLD 4096
 directive set -LOGIC_OPT false
 directive set -FSM_ENCODING none
 directive set -UNROLL no
@@ -993,6 +1027,12 @@ go architect
 go allocate
 go schedule
 go extract
+
+# RTL co-simulation (QuestaSim/msim) on the generated Verilog. Compiled WITHOUT
+# -DSYNTHESIS, so the core's ifndef SYNTHESIS behavioral (frame-slot) branch is
+# exercised — the same path large-bench cosim uses. Parse BEH_START/BEH_II/
+# BEH_DONE from the transcript for back-to-back frame timing.
+flow run /SCVerify/launch_make ./scverify/Verify_rtl_v_msim.mk {{}} SIMTOOL=msim sim
 
 project save
 puts "{name} Catapult run complete."
@@ -1272,7 +1312,7 @@ def _assert_core_first_out(name, m, k, n, gemm_k_spatial, grid_v):
 
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
                           gemm_k_spatial=None, input_precision=None, weight_precision=None,
-                          clock_period_ns=None):
+                          clock_period_ns=None, n_frames=1):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     gemm_k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
@@ -1310,6 +1350,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         input_precision=input_precision,
         weight_precision=weight_precision,
         clock_period_ns=clock_period_ns,
+        n_frames=n_frames,
     )
     _assert_core_port_widths(name, header_text, grid_v)
     _assert_core_first_out(name, m, k, n, gemm_k_spatial, grid_v)
@@ -1317,7 +1358,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
     (pkg_dir / f"{name}_gemm_ip.h").write_text(header_text)
     (pkg_dir / f"{name}_inst.cpp").write_text(gen_inst_cpp(name, m, k, n, interface))
-    (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(name, m, k, n, interface))
+    (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(name, m, k, n, interface, n_frames=n_frames))
     (pkg_dir / "run_catapult.tcl").write_text(gen_tcl(name, m, k, n, interface))
     print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface}, k_spatial={gemm_k_spatial})")
 

@@ -59,11 +59,11 @@ def dead_cycles(m, k, n, grid_cols, full_k_spatial=False):
 ```
 
 By construction `first_out >= total feed beats`, so the first output row
-always lands inside the DRAIN window. The same formula is emitted into three
-coordinated places — the C++ clk_cnt sim core, the behavioral Verilog grid's
-`FIRST_OUT` localparam, and the wrapper's DRAIN trip count — and package
-generation cross-asserts the behavioral localparam against `latency_cycles`
-(`_assert_core_first_out`). `k_chunks == 1` designs are unaffected (the two
+always lands inside the RUN loop's capture window. The same formula is emitted
+into three coordinated places — the C++ clk_cnt sim core, the behavioral
+Verilog grid's `FIRST_OUT` localparam, and the wrapper's RUN call budget — and
+package generation cross-asserts the behavioral localparam against
+`latency_cycles` (`_assert_core_first_out`). `k_chunks == 1` designs are unaffected (the two
 branches coincide).
 
 This is the behavioral model's systolic abstraction; the structural
@@ -84,10 +84,10 @@ M result rows at `[first_out+1, first_out+1+M)` of its own clock.
   `M <= total_beats < total_beats + 1`.
 - Slot count: `ceil((first_out + 1 + M) / (total_beats + 1)) + 1` frames in
   flight (one spare so an allocating frame never lands on a draining slot).
-- The generated wrapper still issues frames sequentially (FEED then DRAIN
-  within one call), so per-frame latencies are unchanged; the pipelining is
-  exploitable by callers that issue back-to-back frames (multi-frame conv
-  tiling, einsum head loops, back-to-back samples).
+- The generated wrapper's merged RUN loop overlaps a frame's feed with its
+  own compute/drain window (see Active Wrapper Schedule); cross-frame overlap
+  is exploitable by callers that issue back-to-back frames through one core
+  (multi-frame conv tiling, einsum head loops).
 
 Grid-level latency:
 ```
@@ -113,32 +113,33 @@ Examples:
 
 ## Active Wrapper Schedule
 
-The generated wrapper uses a single merged FEED loop (bias preload folded into step 0):
+See `wrapper_run_loop.md` for the full anatomy and cycle-by-cycle timing
+diagrams of this loop.
+
+The generated wrapper uses a single merged RUN loop per frame: steps
+`0..total_beats` preload + feed the frame's beats, and EVERY step polls
+`out_valid`, so rows are captured as they emerge instead of in a separate
+drain loop after the feed (the feed of the frame overlaps its own
+compute/drain window):
 
 - `BIAS_PACK`: N iterations (unrolled)
-- `READ_A_ROWS`: M iterations, II=1 pipelined
-- `READ_B_COLS`: N iterations, II=1 pipelined
-- `FEED`: `k_chunks × max(M,N) + 1` iterations (step 0 = preload, steps 1+ = data), II=1 pipelined
-- `DRAIN`: `dead_cycles + M` iterations, II=1 pipelined
+- `RUN` / `RUN_ARRAY`: `first_out + M + 6` iterations, II=1 pipelined
+  (step 0 = preload, steps 1..total_beats = data beats, all steps poll)
 - `DRAIN_PADDED_ROWS`: `MR - M` iterations, II=1 pipelined
 
 For `8x8x8`:
 
 ```text
 BIAS_PACK          8 iterations (unrolled)
-READ_A_ROWS        8 iterations (II=1)
-READ_B_COLS        8 iterations (II=1)
-FEED               9 iterations (II=1, step 0 = bias preload)
-DRAIN             26 iterations (II=1)
+RUN               30 iterations (II=1; 9 feed steps + capture window)
 DRAIN_PADDED       0 iterations
 ```
 
-Catapult 2026.1 synthesis (nangate-45nm):
-
-- `/core` latency: `38` cycles
-- `/core` throughput: `40` cycles
-- `FEED + READ_A_ROWS + READ_B_COLS` merged: 17 iterations, II=1
-- `DRAIN`: 28 iterations, II=1
+versus the previous serialized schedule (`FEED` 9 + `DRAIN` 26 = 35 calls):
+the merged loop saves ~`total_beats` calls of per-frame function latency.
+The first output row is unchanged (still run-call index `first_out + 2`), so
+measured first-output latency is identical; function latency / call II is
+what shrinks.
 
 ## Blackbox Binding
 
@@ -165,9 +166,81 @@ RTL latency makes Catapult schedule excessive pipeline depth around the blackbox
 
 ## Latency Regression Signals
 
-- `FEED` has more than `k_chunks × max(M,N) + 1` iterations.
-- Catapult reports large local array load loops before `FEED`.
+- `RUN` has more than `first_out + M + 6` iterations.
+- Catapult reports large local array load loops before `RUN`.
 - `preload_valid` is hardwired to `1'b0` in the Catapult-generated RTL (means `feed_preload_valid` is compile-time constant).
 - `READ_A_ROWS`/`READ_B_COLS` use `hls_unroll` instead of `hls_pipeline_init_interval 1` — causes RAM port scheduling failures.
-- Separate `PRELOAD_BIAS` loop exists instead of being folded into FEED step 0.
+- Separate `PRELOAD_BIAS` or `DRAIN` loop exists instead of being folded into the RUN loop.
 - SCVerify reports non-zero comparison errors when C++ sim model uses old per-KK data indexing.
+
+## Back-to-Back Multi-Frame Feed (preload-free)
+
+The wrapper feeds `n_frames` frames back-to-back to exploit the behavioral core's
+frame-slot scheduler (`FRAME_SLOTS`), so the feed of frame *t+1* overlaps the
+compute/drain of frame *t*. This is controlled by the generated `n_frames` constant
+(`generate_catapult_pkg(..., n_frames=N)` / `python -m gemm_ip --n-frames N`):
+
+- `n_frames == 1` (default, the real hls4ml flow): one frame per wrapper call.
+- `n_frames > 1`: a standalone **simulation** package that feeds N frames in one
+  call, used to demonstrate/measure back-to-back throughput via Catapult scverify.
+
+### No preload step
+
+`preload_valid` is tied to `0` for every `gemm.run()` call. The behavioral
+(`ifndef SYNTHESIS`) core never reads `preload_valid` — it allocates a slot on the
+first `in_valid` after idle and captures (zero) bias there — and bias is added in
+the wrapper's drain capture (`bias_packed = 0`, real bias applied post-rescale).
+So the RTL core never sees bias and the loop spends no cycle on preload.
+
+### Frame schedule
+
+```text
+period      = total_beats + 1          # total_beats in_valid beats + ONE in_valid=0 separator
+feed_total  = n_frames * period
+total_steps = feed_total + first_out + MR + 5   # tail drains the last frame
+```
+
+Each frame is `total_beats` of `in_valid=1` followed by exactly ONE `in_valid=0`
+separator (no separator before the first frame). The separator drops the core's
+`feeding` flag so the next frame allocates a fresh slot — continuous `in_valid`
+would merge two frames. Steady-state **frame II = total_beats + 1**, while each
+frame's first-in→last-out latency stays `first_out + M` (II < latency = pipelined).
+
+### Output capture
+
+The behavioral core emits exactly **M** `out_valid` pulses per frame
+(`TOTAL_ROWS = M` in the `ifndef SYNTHESIS` branch — note this differs from the
+structural branch's `MR`), retiring in frame order. The wrapper writes the first
+`n_frames * M` pulses to `res_stream`.
+
+### Measured (Catapult synth + scverify RTL cosim, msim, 5 frames)
+
+Run through the real Catapult flow (`run_catapult.tcl` now ends with
+`flow run /SCVerify/launch_make ./scverify/Verify_rtl_v_msim.mk {} SIMTOOL=msim sim`,
+exercising the `ifndef SYNTHESIS` core — no `-DSYNTHESIS`). Frame II is read from
+the core's `BEH_II` `$display` lines; all cells bit-exact (`error count = 0`).
+
+| shape (MxKxN) | path | total_beats | per-frame latency (first_out+M) | steady frame II |
+|---|---|---:|---:|---:|
+| 8x8x16   | chunked (kc=1)       | 16 | 32 | **17** |
+| 16x16x16 | full-K-spatial (kc=2) | 16 | 48 | **17** |
+| 15x8x16  | chunked, non-square M | 16 | 39 | **17** |
+
+II = `total_beats + 1` in every case, versus the serialized wrapper whose II equals
+the full per-frame latency. This isolates the large-bench GEMM-vs-baseline latency
+gap as a wrapper-feed (serialization) artifact, not a core limitation — demonstrated
+on the actual `ifndef SYNTHESIS` RTL path.
+
+### Reproduce
+
+```bash
+PYTHONPATH=src python3 -m gemm_ip --m 8 --k 8 --n 16 --name gemm_8x8x16 \
+    --output_dir b2b_work --n-frames 5
+cd b2b_work/gemm_8x8x16 && catapult -product ultra -shell -f run_catapult.tcl
+# grep the transcript for: "error count", "BEH_II", "Simulation PASSED"
+```
+
+Note: the `n_frames > 1` package raises `MEM_MAP_THRESHOLD`/`REGISTER_THRESHOLD`
+so the small operand/replay arrays map to registers (the back-to-back modulo feed
+indexing otherwise contends for limited RAM read ports). This is a sim-only
+relaxation, not an area-optimised build.

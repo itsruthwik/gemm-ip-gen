@@ -231,13 +231,11 @@ def test_stream_and_array_pass_bias_cols(tmp_path):
     # Check that bias_packed is passed to all gemm.run() calls
     assert "void test_s_gemm_ip_stream_const_weights" in h, "Stream wrapper must contain const-weight entry point"
     assert "bias_packed" in h, "Stream wrapper must contain bias_packed"
-    # Preload is now folded into FEED step 0 (feed_preload_valid = (step==0)?1:0)
-    assert "feed_preload_valid = (step == 0) ? 1 : 0" in h, \
-        "Stream wrapper feed call must use conditional preload on step 0"
-    assert "gemm.run(last_a_rows, last_b_cols, bias_packed, feed_preload_valid, feed_valid, c_row, v, l)" in h, \
-        "Stream wrapper feed call must pass bias_packed"
-    assert "gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l)" in h, \
-        "Stream wrapper drain call must pass bias_packed"
+    # Back-to-back wrapper: NO preload step (preload_valid tied to 0; bias is added
+    # in the drain capture, never loaded into the core). The single feed call passes
+    # bias_packed with the preload argument tied off.
+    assert "gemm.run(a_rows, b_cols, bias_packed, 0, feed_valid, c_row, v, l)" in h, \
+        "Stream wrapper feed call must pass bias_packed with preload tied off"
 
     # Array wrapper
     generate_catapult_pkg(4, 8, 4, "test_a", tmp_path, interface="array")
@@ -245,7 +243,7 @@ def test_stream_and_array_pass_bias_cols(tmp_path):
     assert "bias_packed" in h, "Array wrapper must contain bias_packed"
     assert "feed_preload_valid = (step == 0) ? 1 : 0" in h, \
         "Array wrapper feed call must use conditional preload on step 0"
-    assert "gemm.run(last_a_rows, last_b_cols, bias_packed, feed_preload_valid, feed_valid, c_row, v, l)" in h, \
+    assert "gemm.run(a_rows_packed, b_cols_packed, bias_packed, feed_preload_valid, feed_valid, c_row, v, l)" in h, \
         "Array wrapper feed call must pass bias_packed"
     assert "gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l)" in h, \
         "Array wrapper drain call must pass bias_packed"
@@ -278,7 +276,8 @@ def test_stream_const_weights_full_k_spatial_has_no_a_replay(tmp_path):
     assert "a_replay" not in h
     assert "ROW_PACK_FULL_KC" in h
     assert "COL_PACK_FULL_KC" in h
-    assert "FEED: for (int step = 0; step < 17; step++)" in h
+    # Back-to-back loop bound (n_frames=1): first_out + mr + 6 = 80 + 16 + 6 = 102.
+    assert "RUN: for (int step = 0; step < 102; step++)" in h
     # Narrow full-K word: 64*k_chunks bits (one tile, all K chunks), independent of
     # grid_rows/grid_cols.  The wrapper RTL re-inserts the tile offset by beat index.
     assert "ac_int<576, false>  a_rows" in h
@@ -290,7 +289,7 @@ def test_array_full_k_spatial_feeds_logical_rows_once(tmp_path):
     h = (tmp_path / "test_array_fullk" / "test_array_fullk_gemm_ip.h").read_text()
 
     assert "void test_array_fullk_gemm_ip_array" in h
-    assert "FEED_ARRAY: for (int step = 0; step < 25; step++)" in h
+    assert "RUN_ARRAY: for (int step = 0; step < 78; step++)" in h  # first_out(48) + m(24) + 6
     assert "ROW_PACK_ARRAY_FULL_KC" in h
     assert "COL_PACK_ARRAY_FULL_KC" in h
     assert "k_chunks * input_beats" not in h
@@ -301,7 +300,7 @@ def test_array_partial_k_spatial_keeps_time_tiled_feed(tmp_path):
     h = (tmp_path / "test_array_partialk" / "test_array_partialk_gemm_ip.h").read_text()
 
     assert "void test_array_partialk_gemm_ip_array" in h
-    assert "FEED_ARRAY: for (int step = 0; step < 73; step++)" in h
+    assert "RUN_ARRAY: for (int step = 0; step < 102; step++)" in h  # first_out(72) + m(24) + 6
     assert "int kc = eff_step / 24" in h
     assert "ROW_PACK_ARRAY_FULL_KC" not in h
 
@@ -421,7 +420,8 @@ def test_full_k_package_uses_full_k_drain_timing(tmp_path):
     v = (tmp_path / "test_fullk_t" / "test_fullk_t_core.v").read_text()
     assert "localparam integer FIRST_OUT         = 80;" in v
     assert "scc >= 81" in h                           # first_out + 1
-    assert "DRAIN: for (int i = 0; i < 98; i++)" in h  # blind(82) + m(16)
+    # Back-to-back loop bound (n_frames=1): first_out + mr + 6 = 80 + 16 + 6 = 102.
+    assert "RUN: for (int step = 0; step < 102; step++)" in h
 
     # Same shape, chunked: first_out = 144 (9 chunks x 16 beats, wave = 0).
     generate_catapult_pkg(16, 72, 8, "test_chk_t", tmp_path, gemm_k_spatial=1)
@@ -429,7 +429,8 @@ def test_full_k_package_uses_full_k_drain_timing(tmp_path):
     v1 = (tmp_path / "test_chk_t" / "test_chk_t_core.v").read_text()
     assert "localparam integer FIRST_OUT         = 144;" in v1
     assert "scc >= 145" in h1
-    assert "DRAIN: for (int i = 0; i < 162; i++)" in h1  # blind(146) + m(16)
+    # Back-to-back loop bound (n_frames=1): first_out(144) + mr(16) + 6 = 166.
+    assert "RUN: for (int step = 0; step < 166; step++)" in h1
 
     # k_chunks == 1 control keeps the legacy value on both paths.
     generate_catapult_pkg(8, 8, 8, "test_k1_t", tmp_path)

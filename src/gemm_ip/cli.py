@@ -35,6 +35,9 @@ def main():
                         help="Interface type for generated package metadata/dispatch (default: stream)")
     parser.add_argument("--k-spatial", type=int, default=None,
                         help="Number of spatial K grid partitions (default: full K-chunk unroll)")
+    parser.add_argument("--n-frames", type=int, default=1,
+                        help="Number of frames the wrapper feeds back-to-back (default: 1). "
+                             ">1 builds a multi-frame back-to-back unit package for cosim.")
     parser.add_argument("--output_dir", type=str, default="./output",
                         help="Output directory (default: ./output)")
     args = parser.parse_args()
@@ -69,7 +72,13 @@ def _run_catapult(args):
     else:
         generate_catapult_pkg(
             args.m, args.k, args.n, args.name,
-            args.output_dir, interface=args.interface, gemm_k_spatial=args.k_spatial
+            args.output_dir, interface=args.interface, gemm_k_spatial=args.k_spatial,
+            # Standalone unit packages use integer operand codes / int16 result
+            # lanes; an integer result type makes the wrapper drain emit
+            # value.to_int() so the ac_fixed rescale accumulator converts cleanly
+            # to the int16 output lane (the real hls4ml flow passes ac_fixed here).
+            output_precision="ac_int<16, true>",
+            n_frames=args.n_frames,
         )
 
 
