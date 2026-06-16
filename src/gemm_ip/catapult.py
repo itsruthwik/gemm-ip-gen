@@ -230,8 +230,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     RUN: for (int step = 0; step < {total_steps}; step++) {{
         bool in_feed = (step < {feed_total});
         int p = in_feed ? (step % {period}) : {period};
-        bool feeding_now = in_feed && (p < {total_beats});
-        int t = p;
+        bool feeding_now = in_feed && (p >= 1) && (p <= {total_beats});
+        int t = p - 1;
         ac_int<{a_bits}, false> a_rows = 0;
         ac_int<{b_bits}, false> b_cols = 0;
 
@@ -267,7 +267,14 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
-        gemm.run(a_rows, b_cols, bias_packed, 0, feed_valid, c_row, v, l);
+        // preload_valid pulses on each frame's leading beat (p==0) so the
+        // structural core's S_IDLE->S_PRELOAD->S_RUN arm is a live, non-constant
+        // signal. Without it (literal 0) VTR synthesis proves transaction_active,
+        // hence the tensor_slice result path, dead and prunes every slice. This
+        // reuses the per-frame idle beat (formerly a trailing separator -> now a
+        // leading preload, same period); bias stays 0 here (added in the drain).
+        ac_int<1, false> frame_preload = (in_feed && p == 0) ? 1 : 0;
+        gemm.run(a_rows, b_cols, bias_packed, frame_preload, feed_valid, c_row, v, l);
 {stream_capture_b2b}
     }}
 """
@@ -289,9 +296,10 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     RUN: for (int step = 0; step < {total_steps}; step++) {{
         bool in_feed = (step < {feed_total});
         int p = in_feed ? (step % {period}) : {period};
-        bool feeding_now = in_feed && (p < {total_beats});
-        int kc = p / {input_beats};
-        int t = p % {input_beats};
+        bool feeding_now = in_feed && (p >= 1) && (p <= {total_beats});
+        int pf = p - 1;
+        int kc = pf / {input_beats};
+        int t = pf % {input_beats};
         ac_int<{a_bits}, false> a_rows = 0;
         ac_int<{b_bits}, false> b_cols = 0;
 
@@ -350,7 +358,14 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
-        gemm.run(a_rows, b_cols, bias_packed, 0, feed_valid, c_row, v, l);
+        // preload_valid pulses on each frame's leading beat (p==0) so the
+        // structural core's S_IDLE->S_PRELOAD->S_RUN arm is a live, non-constant
+        // signal. Without it (literal 0) VTR synthesis proves transaction_active,
+        // hence the tensor_slice result path, dead and prunes every slice. This
+        // reuses the per-frame idle beat (formerly a trailing separator -> now a
+        // leading preload, same period); bias stays 0 here (added in the drain).
+        ac_int<1, false> frame_preload = (in_feed && p == 0) ? 1 : 0;
+        gemm.run(a_rows, b_cols, bias_packed, frame_preload, feed_valid, c_row, v, l);
 {stream_capture_b2b}
     }}
 """

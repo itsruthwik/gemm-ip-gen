@@ -231,11 +231,16 @@ def test_stream_and_array_pass_bias_cols(tmp_path):
     # Check that bias_packed is passed to all gemm.run() calls
     assert "void test_s_gemm_ip_stream_const_weights" in h, "Stream wrapper must contain const-weight entry point"
     assert "bias_packed" in h, "Stream wrapper must contain bias_packed"
-    # Back-to-back wrapper: NO preload step (preload_valid tied to 0; bias is added
-    # in the drain capture, never loaded into the core). The single feed call passes
-    # bias_packed with the preload argument tied off.
-    assert "gemm.run(a_rows, b_cols, bias_packed, 0, feed_valid, c_row, v, l)" in h, \
-        "Stream wrapper feed call must pass bias_packed with preload tied off"
+    # Back-to-back wrapper: bias is still added in the drain capture (never loaded
+    # into the core), but preload_valid must NOT be a compile-time constant 0 — that
+    # lets VTR/parmys prove the core's transaction_active (hence the tensor_slice
+    # result path) dead and prune every slice. It pulses on each frame's leading beat
+    # (p==0), a live per-frame signal that arms the core; this rides the per-frame
+    # idle beat so it costs no extra cycle and keeps bias in the drain (bias_packed=0).
+    assert "frame_preload = (in_feed && p == 0) ? 1 : 0" in h, \
+        "Stream wrapper must derive a live per-frame preload pulse (not a constant)"
+    assert "gemm.run(a_rows, b_cols, bias_packed, frame_preload, feed_valid, c_row, v, l)" in h, \
+        "Stream wrapper feed call must pass bias_packed with the live frame_preload"
 
     # Array wrapper
     generate_catapult_pkg(4, 8, 4, "test_a", tmp_path, interface="array")
