@@ -675,7 +675,6 @@ void {name}_gemm_ip_stream(
     {name}_gemm_ip_stream_const_weights<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
         a_stream, weight_cols, biases, res_stream);
 }}
-
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
 void {name}_gemm_ip_array(
     a_beat_T a_rows[CONFIG_T::gemm_m],
@@ -1080,15 +1079,25 @@ def gen_combined_header(items):
         {item["name"]}_gemm_ip_{target}<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
             TARGET_ARGS);
     }}"""
-        if target == "array":
-            array_branches.append(branch.replace("TARGET_ARGS", "a_rows, weight_cols, biases, results"))
-        else:
+        # The const-weight stream wrapper is emitted by EVERY generated package
+        # (regardless of its declared interface), so route every item's shape to it —
+        # the einsum GEMM uses the const-weight stream path for QKt/A.V even though its
+        # package item is registered with interface="array".
+        const_weight_stream_branches.append(f"""\
+    if constexpr ({_dispatch_condition(item)}) {{
+        {item["name"]}_gemm_ip_stream_const_weights<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
+            a_stream, weight_cols, biases, res_stream);
+    }}""")
+        # Every package also emits _gemm_ip_array; the io_stream einsum's buffered
+        # fallback (gemm_ip_array_wrapper) is always compiled, so route every item's
+        # shape to the array dispatcher too (regardless of declared interface).
+        array_branches.append(f"""\
+    if constexpr ({_dispatch_condition(item)}) {{
+        {item["name"]}_gemm_ip_array<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
+            a_rows, weight_cols, biases, results);
+    }}""")
+        if target != "array":
             stream_branches.append(branch.replace("TARGET_ARGS", "a_stream, b_stream, biases, res_stream"))
-            const_weight_stream_branches.append(
-                branch.replace("gemm_ip_stream", "gemm_ip_stream_const_weights").replace(
-                    "TARGET_ARGS", "a_stream, weight_cols, biases, res_stream"
-                )
-            )
     stream_branches_text = " else ".join(stream_branches)
     const_weight_stream_branches_text = " else ".join(const_weight_stream_branches)
     array_branches_text = " else ".join(array_branches)
