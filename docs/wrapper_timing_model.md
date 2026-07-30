@@ -21,20 +21,36 @@ drains the remaining padded rows.
 
 ## Input Feed Contract
 
-The feed path is row/col streaming with K-chunks:
+The feed path is row/col streaming with K-chunks, organised as `n_frames`
+back-to-back frames of period `total_beats + 1`. Each frame is one leading
+idle/preload beat followed by its `total_beats` data beats:
 
 ```text
-k_chunks = ceil(K / 8)
+k_chunks    = ceil(K / 8)
 input_beats = max(M, N)
+total_beats = input_beats                 (full-K-spatial)
+            | k_chunks * input_beats      (chunked)
+period      = total_beats + 1
+feed_total  = n_frames * period
 
-for step in 0..(k_chunks * input_beats):
-    if step == 0:  preload_valid = 1, in_valid = 0  (bias preload)
-    if step > 0:   preload_valid = 0, in_valid = 1  (data feed)
-    beat t = (step-1) % input_beats, chunk kc = (step-1) / input_beats
-    pack a_beat[t] into a_rows (K lanes kc*8..kc*8+7)
-    pack b_beat[t] into b_cols (K lanes kc*8..kc*8+7)
-    gemm.run(a_rows, b_cols, bias_cols, preload_valid, in_valid, ...)
+for step in 0..total_steps:
+    in_feed     = step < feed_total
+    p           = in_feed ? step % period : period
+    feeding_now = in_feed and 1 <= p <= total_beats
+    beat t = (p-1) % input_beats, chunk kc = (p-1) / input_beats
+
+    frame_preload = (in_feed and p == 0)   # leading beat of each frame
+    feed_valid    = feeding_now
+
+    pack a_beat[t] into a_rows (K lanes kc*8..kc*8+7; all chunks if full-K)
+    pack b_beat[t] into b_cols (K lanes kc*8..kc*8+7; all chunks if full-K)
+    gemm.run(a_rows, b_cols, bias_packed, frame_preload, feed_valid, ...)
 ```
+
+`bias_packed` is always **zero** — the core is a pure integer matmul and the
+real bias is added in the wrapper's capture path (see *Output capture*). The
+`p == 0` beat carries `preload_valid` rather than data; it costs no extra
+cycle because it is the same idle beat that separates consecutive frames.
 
 ## Dead-Cycle Formula
 
@@ -75,10 +91,11 @@ The sim core (C++ ccore `#else` branch and the behavioral Verilog grid) is a
 frame-slot scheduler: each frame gets a private operand buffer and cycle
 counter, so the feed of frame t+1 may overlap the compute/drain of frame t.
 A frame starts at the first `in_valid` call after a non-`in_valid` call (the
-FEED protocol always inserts the preload step between frames), and emits its
-M result rows at `[first_out+1, first_out+1+M)` of its own clock.
+FEED protocol always inserts one idle beat — the `p == 0` preload beat —
+between frames), and emits its M result rows at `[first_out+1, first_out+1+M)`
+of its own clock.
 
-- Minimum frame period: `total_beats + 1` calls (preload + data beats) —
+- Minimum frame period: `total_beats + 1` calls (idle/preload + data beats) —
   back-to-back frames sustain ~one result row per cycle for square 8-row
   frames. Emission windows of consecutive frames cannot overlap because
   `M <= total_beats < total_beats + 1`.
@@ -116,18 +133,29 @@ Examples:
 See `wrapper_run_loop.md` for the full anatomy and cycle-by-cycle timing
 diagrams of this loop.
 
-The generated wrapper uses a single merged RUN loop per frame: steps
-`0..total_beats` preload + feed the frame's beats, and EVERY step polls
-`out_valid`, so rows are captured as they emerge instead of in a separate
-drain loop after the feed (the feed of the frame overlaps its own
-compute/drain window):
+The generated wrapper uses a single merged RUN loop covering every frame:
+within a frame, `p == 0` is the preload beat and `p == 1..total_beats` are the
+data beats, and EVERY step polls `out_valid`, so rows are captured as they
+emerge instead of in a separate drain loop after the feed (the feed of a frame
+overlaps its own compute/drain window, and with `n_frames > 1` it also overlaps
+the previous frame's):
 
-- `BIAS_PACK`: N iterations (unrolled)
-- `RUN` / `RUN_ARRAY`: `first_out + M + 6` iterations, II=1 pipelined
-  (step 0 = preload, steps 1..total_beats = data beats, all steps poll)
+- `BIAS_PACK`: N iterations (unrolled), packing **zero** bias
+- `RUN` / `RUN_ARRAY`: `total_steps` iterations, II=1 pipelined, where
+
+  ```text
+  total_steps = (n_frames - 1) * period + first_out + MR + 6
+  ```
+
+  The `+6` is the port-lag tail: the last row sits at call index
+  `first_out + (M-1) + 2`, worst-case RTL port lag is 3 calls, plus 2 spare.
+  Note the tail is sized on `MR` (padded rows), not `M`.
 - `DRAIN_PADDED_ROWS`: `MR - M` iterations, II=1 pipelined
 
-For `8x8x8`:
+Generation fails hard (`RuntimeError`) if the single-frame budget
+`run_calls = first_out + M + 6` cannot even cover `total_beats + 2`.
+
+For `8x8x8` (`total_beats = 8`, `first_out = 16`, `MR = M = 8`, `n_frames = 1`):
 
 ```text
 BIAS_PACK          8 iterations (unrolled)
@@ -166,14 +194,19 @@ RTL latency makes Catapult schedule excessive pipeline depth around the blackbox
 
 ## Latency Regression Signals
 
-- `RUN` has more than `first_out + M + 6` iterations.
+- `RUN` has more than `(n_frames - 1) * period + first_out + MR + 6` iterations.
 - Catapult reports large local array load loops before `RUN`.
-- `preload_valid` is hardwired to `1'b0` in the Catapult-generated RTL (means `feed_preload_valid` is compile-time constant).
-- `READ_A_ROWS`/`READ_B_COLS` use `hls_unroll` instead of `hls_pipeline_init_interval 1` — causes RAM port scheduling failures.
+- `preload_valid` is a compile-time constant in the Catapult-generated RTL.
+  It must stay a live signal (`frame_preload`, pulsed at `p == 0`): if it folds
+  to a constant, VTR proves `transaction_active` — and with it the whole
+  tensor_slice result path — dead and prunes every slice. See *Per-frame
+  preload pulse* below.
+- `READ_B_COLS` uses `hls_unroll` instead of `hls_pipeline_init_interval 1` —
+  causes RAM port scheduling failures.
 - Separate `PRELOAD_BIAS` or `DRAIN` loop exists instead of being folded into the RUN loop.
 - SCVerify reports non-zero comparison errors when C++ sim model uses old per-KK data indexing.
 
-## Back-to-Back Multi-Frame Feed (preload-free)
+## Back-to-Back Multi-Frame Feed
 
 The wrapper feeds `n_frames` frames back-to-back to exploit the behavioral core's
 frame-slot scheduler (`FRAME_SLOTS`), so the feed of frame *t+1* overlaps the
@@ -184,27 +217,40 @@ compute/drain of frame *t*. This is controlled by the generated `n_frames` const
 - `n_frames > 1`: a standalone **simulation** package that feeds N frames in one
   call, used to demonstrate/measure back-to-back throughput via Catapult scverify.
 
-### No preload step
+### No bias step; per-frame preload pulse
 
-`preload_valid` is tied to `0` for every `gemm.run()` call. The behavioral
-(`ifndef SYNTHESIS`) core never reads `preload_valid` — it allocates a slot on the
-first `in_valid` after idle and captures (zero) bias there — and bias is added in
-the wrapper's drain capture (`bias_packed = 0`, real bias applied post-rescale).
-So the RTL core never sees bias and the loop spends no cycle on preload.
+The core never receives bias: `bias_packed` is hardwired to zero and the real
+bias is added in the wrapper's capture path, post-rescale, in full precision.
+The behavioral (`ifndef SYNTHESIS`) core does not depend on `preload_valid` —
+it allocates a slot on the first `in_valid` after idle. So no cycle is spent on
+a *bias* preload.
+
+`preload_valid` is nevertheless **driven live**, pulsed on each frame's leading
+beat (`frame_preload = in_feed && p == 0`). This is a synthesis requirement, not
+a timing one: the structural (`SYNTHESIS`) core's `S_IDLE -> S_PRELOAD -> S_RUN`
+arm must be reachable, otherwise VTR proves `transaction_active` — and hence the
+tensor_slice result path — dead and prunes every slice. The pulse is free: it
+reuses the frame's mandatory idle beat, which moved from a *trailing separator*
+to a *leading preload* without changing the period.
 
 ### Frame schedule
 
 ```text
-period      = total_beats + 1          # total_beats in_valid beats + ONE in_valid=0 separator
+period      = total_beats + 1          # 1 preload/idle beat + total_beats in_valid beats
 feed_total  = n_frames * period
-total_steps = feed_total + first_out + MR + 5   # tail drains the last frame
+total_steps = (n_frames - 1) * period + first_out + MR + 6
 ```
 
-Each frame is `total_beats` of `in_valid=1` followed by exactly ONE `in_valid=0`
-separator (no separator before the first frame). The separator drops the core's
+Each frame is ONE `in_valid=0` beat (`p == 0`, carrying `preload_valid=1`)
+followed by `total_beats` of `in_valid=1`. The idle beat drops the core's
 `feeding` flag so the next frame allocates a fresh slot — continuous `in_valid`
 would merge two frames. Steady-state **frame II = total_beats + 1**, while each
 frame's first-in→last-out latency stays `first_out + M` (II < latency = pipelined).
+
+`total_steps` is sized from the *last* frame's start (`(n_frames-1) * period`)
+plus one full drain tail, not from `feed_total` — sizing on `feed_total` would
+over-run by a whole period per frame and reintroduce serialized latency at
+`n_frames == 1`.
 
 ### Output capture
 

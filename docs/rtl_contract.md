@@ -73,18 +73,75 @@ The generated synth RTL wrapper consumes chunk-local 64-bit tile lanes:
 
 Invalid tail M/N/K lanes are masked to zero.
 
+## K-Spatial (full-K) Layout
+
+`gemm_k_spatial` selects how the K chunks are consumed. Two modes exist:
+
+| | chunked (`gemm_k_spatial == 1`) | full-K-spatial (`gemm_k_spatial == K_CHUNKS > 1`) |
+|---|---|---|
+| grid | one tensor-slice grid | `K_CHUNKS` grid partitions |
+| feed beats | `K_CHUNKS * max(M,N)` | `max(M,N)` (single pass) |
+| A word width | `GRID_ROWS * 64` | `64 * K_CHUNKS` |
+| B word width | `GRID_COLS * 64` | `64 * K_CHUNKS` |
+| per-beat content | one K chunk of row/col `t` | **all** K chunks of row/col `t` |
+| wrapper storage | `a_replay[K_CHUNKS][max(M,N)]` | none |
+
+Full-K mode uses the NARROW per-beat word: partition `p` carries one 64-bit
+tile (its K chunk) and the RTL re-inserts the grid row/column tile offset from
+the beat index, so the deep input FIFO never stores the always-zero grid
+padding. Chunked mode keeps the single-chunk grid-padded width.
+
+Only `K_CHUNKS > 1` can be full-K. For `K_CHUNKS == 1` the package always
+generates the chunked grid, so the wrapper must pack chunked words too —
+emitting 64-bit full-mode words against the grid's `GRID_COLS * 64`-bit ports
+X-poisons every tile beyond the first (a cosim-only corruption for
+`max(M,N) > 8`).
+
+Intermediate K-spatial partial sums are INT16, so partition-level overflow is
+possible; correctness depends on quantized operand ranges and partition size.
+The generator prints a warning for every `gemm_k_spatial > 1` package.
+
 ## Synth Protocol
 
-1. Bias arrives first.
-2. The wrapper pulses `preload` for one cycle.
-3. For each K chunk:
+1. The wrapper pulses `preload_valid` for one cycle at the head of each frame.
+   The bias word is zero — see *Bias* below — so this pulse exists to keep the
+   `S_IDLE -> S_PRELOAD -> S_RUN` arm live, not to load coefficients.
+2. For each K chunk:
    - pulse `start_mat_mul` on the first A/B beat of that chunk
    - assert `pe_reset` only on chunk 0
    - drive `validity_mask_a_cols_b_rows` and `final_mat_mul_size` for that chunk
    - feed `max(M,N)` row/column beats
-4. Intermediate outputs from non-final K chunks are ignored.
-5. After the final K chunk, the wrapper aligns slice outputs, concatenates all
-   column tiles, and emits full output rows.
+3. Intermediate outputs from non-final K chunks are ignored.
+4. After the final K chunk, the output collector releases one tile-row at a
+   time and concatenates its column tiles into full output rows.
+
+## Bias
+
+The core is a **pure integer matmul**. `bias_cols` is driven with zero by every
+generated wrapper; the real bias is added in the C++ wrapper's capture path,
+after the `2^-(frac_a + frac_b)` rescale, in full `accum_t` precision, and
+before the result-type quantization (Keras order: matmul + bias, then quantize).
+The `bias_cols` port and the preload phase are retained in the RTL contract, but
+no generated flow uses them to carry coefficients.
+
+## Output Collector
+
+Output readout is gated by the tensor-slice `op[0]` (`out_ctrl`) input, with
+**zero parking storage**:
+
+- `op[0] = 1` — the tile HOLDS its completed result internally (including after
+  intermediate K chunks) and emits nothing.
+- `op[0] = 0` — the tile shifts one result row per cycle onto `c_data_out`,
+  qualified by `c_data_available`.
+
+All tiles in the grid finish together, so the column tiles of one tile-row
+concatenate as pure wiring. The wrapper holds every tile-row (`op[0] = 1`) and
+releases them one at a time in row-major order for their 8-row bursts.
+
+This replaced an earlier per-tile delay-line alignment pyramid, whose shift
+registers cost sum-of-delays x 129 FFs (~6.2k on a 2x2 grid, ~29k on 4x2). That
+pyramid survives only in the unused `_generate_buffered_synth_verilog` path and
+is not reachable from any generator entry point.
 
 ## Tensor-Slice Assumption
 

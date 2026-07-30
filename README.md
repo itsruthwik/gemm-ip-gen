@@ -51,8 +51,9 @@ set for a layer. Each entry carries `gemm_m`, `gemm_k`, `gemm_n`,
 | RTL wrapper | `{name}_core.v` | `{name}_wrapper.v` + `{name}_core.v` |
 | Build script | `run_catapult.tcl` | `run_vitis.tcl` |
 | Interface support | `stream`, `array` | `stream`, `array` |
-| Bias handling | Inside blackbox (preload phase) | Inside blackbox (preload phase) |
-| Result type | int8 (saturated from int32) | int8 (saturated from int32) |
+| Bias handling | In the wrapper capture path, post-rescale, full precision (the core is fed zero bias) | Inside blackbox (preload phase) |
+| Core output lane | int16 | `output_precision`-driven |
+| Result type | `output_precision` (rescale + bias + round/saturate in wrapper) | `output_precision` (saturated in wrapper) |
 
 ## Generated outputs
 

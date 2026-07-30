@@ -120,13 +120,14 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
             f"(run_calls={run_calls}, total_beats={total_beats}; m={m} k={k} n={n})."
         )
 
-    # Back-to-back multi-frame schedule. The wrapper feeds n_frames frames with NO
-    # preload step (preload_valid is tied off; bias lives in the drain capture).
-    # Each frame is total_beats in_valid beats + exactly ONE in_valid=0 separator
-    # so the core's `feeding` flag drops and the next frame allocates a fresh slot.
+    # Back-to-back multi-frame schedule. No BIAS preload step: bias_packed is zero
+    # and the real bias lives in the drain capture. Each frame is ONE in_valid=0
+    # beat (p == 0, carrying a live preload_valid pulse - see the RUN loop comment)
+    # followed by total_beats in_valid beats; the idle beat drops the core's
+    # `feeding` flag so the next frame allocates a fresh slot.
     # Steady-state frame period = total_beats + 1; the last frame's outputs drain
-    # in the trailing first_out + m + slack tail. With n_frames == 1 this reduces
-    # to a single preload-free frame (real hls4ml flow: one frame per wrapper call).
+    # in the trailing first_out + mr + slack tail. With n_frames == 1 this reduces
+    # to a single frame (real hls4ml flow: one frame per wrapper call).
     period = total_beats + 1
     # in_valid is asserted only inside the feed region; feed_total covers every
     # frame's total_beats feed cycles plus its trailing 1-cycle separator.
@@ -220,12 +221,13 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
 
     if full_k_spatial:
         stream_feed_loop = f"""
-    // Back-to-back, preload-free feed of {n_frames} frame(s) (full K-spatial:
-    // each logical A row once, A/B words widened to carry every 8-wide K chunk).
-    // Each frame is {total_beats} in_valid beats + ONE in_valid=0 separator
-    // (period {period}); preload_valid is tied off (bias added in the drain
-    // capture). Every step polls out_valid, so rows are captured as they emerge
-    // — frame t+1 feeds while frame t drains in the core's FRAME_SLOTS.
+    // Back-to-back feed of {n_frames} frame(s) (full K-spatial: each logical A
+    // row once, A/B words widened to carry every 8-wide K chunk). Each frame is
+    // ONE in_valid=0 beat (p == 0, carrying the preload pulse) + {total_beats}
+    // in_valid beats (period {period}); the core is fed ZERO bias (the real bias
+    // is added in the drain capture). Every step polls out_valid, so rows are
+    // captured as they emerge — frame t+1 feeds while frame t drains in the
+    // core's FRAME_SLOTS.
     #pragma hls_pipeline_init_interval 1
     RUN: for (int step = 0; step < {total_steps}; step++) {{
         bool in_feed = (step < {feed_total});
@@ -286,12 +288,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     // same frame's later chunks — the feed is sequential in step order).
     ac_int<{a_bits}, false> a_replay[{k_chunks}][{input_beats}];
 
-    // Back-to-back, preload-free feed of {n_frames} frame(s): M A rows + N B
-    // columns as 8-lane K chunks. Each frame is {total_beats} in_valid beats +
-    // ONE in_valid=0 separator (period {period}); preload_valid tied off (bias
-    // added in the drain capture). Every step polls out_valid, so rows are
-    // captured as they emerge — frame t+1 feeds while frame t drains in the
-    // core's FRAME_SLOTS.
+    // Back-to-back feed of {n_frames} frame(s): M A rows + N B columns as 8-lane
+    // K chunks. Each frame is ONE in_valid=0 beat (p == 0, carrying the preload
+    // pulse) + {total_beats} in_valid beats (period {period}); the core is fed
+    // ZERO bias (the real bias is added in the drain capture). Every step polls
+    // out_valid, so rows are captured as they emerge — frame t+1 feeds while
+    // frame t drains in the core's FRAME_SLOTS.
     #pragma hls_pipeline_init_interval 1
     RUN: for (int step = 0; step < {total_steps}; step++) {{
         bool in_feed = (step < {feed_total});
