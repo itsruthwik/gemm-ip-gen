@@ -1,0 +1,5 @@
+# Runtime + test dependencies for gemm-ip-gen (Python >= 3.10)
+# Fresh machine:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -e .
+numpy>=1.24
+pytest>=7.0

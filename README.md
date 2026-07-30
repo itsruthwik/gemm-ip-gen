@@ -9,7 +9,12 @@ generated together.
 ## Quick start
 
 ```bash
-# Install (editable)
+# Fresh machine: create a venv and install everything (Python >= 3.10)
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt -e .
+source .venv/bin/activate
+
+# Already have an environment? Editable install only
 pip install -e .
 
 # Catapult (default)
