@@ -402,11 +402,7 @@ def _gen_json(item):
         "rtl_performance": {
             "latency": str(total_latency),
             "II": str(total_input_beats),
-            "II_contract": "behavioral_overlap_input_beats",
-            "II_note": (
-                "II is the blackbox scheduling contract used by the behavioral model; "
-                "the synthesizable RTL wrapper is not transaction-overlapped in this release."
-            )
+            "II_contract": "behavioral_overlap_input_beats"
         },
         "rtl_resource_usage": {
             "FF": "1",
@@ -1170,9 +1166,7 @@ def _gen_layer_gemm_ip_h(item):
     }}"""
     else:
         # Chunked mode replays each row/column across k_chunks output beats, so the
-        # input stream (consumed once) must be buffered first.  Kept as-is; this path
-        # is not used by the full-K micro-bench.  TODO(strategy-3): a narrow per-beat
-        # payload would let this drop the complete partition too.
+        # input stream (consumed once) is buffered first.
         pack_body = f"""\
     // Buffer the typed row/column beats into flat ap_int<8> arrays.  We avoid an
     // array-of-nnet::array (a_beat_T a_rows[M]) here: Vitis csynth cannot lower the

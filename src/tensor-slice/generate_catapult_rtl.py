@@ -444,13 +444,9 @@ module {module_name}(
     reg row_take;
 
     // ── Input pipeline stage ────────────────────────────────────────────────
-    // Register the whole input bundle (en-gated, so the +1 is one run()-call
-    // and the core stays self-timed). Without this the beat decode + data
-    // gating muxes chain combinationally from the Catapult wrapper's logic
-    // into the tensor_slice hard-block input pins — the post-route critical
-    // path. The wrapper's poll-based DRAIN absorbs the uniform +1; the sim
-    // branch intentionally does NOT model it (sim is the latency/parity
-    // reference; the structural branch is timing-only).
+    // Register the whole input bundle (en-gated, so the core stays self-timed),
+    // keeping the beat decode and data gating muxes off the path into the
+    // tensor_slice input pins.
     reg [{a_width-1}:0] a_rows_q;
     reg [{b_width-1}:0] b_cols_q;
     reg [{b_width-1}:0] bias_cols_q;

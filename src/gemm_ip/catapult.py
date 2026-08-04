@@ -87,12 +87,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     mr = grid_rows * 8
     k_chunks = _ceil_div(k, LANE_WIDTH)
     # Full-K-spatial layout applies ONLY to the dedicated k-spatial grid
-    # (gemm_k_spatial == k_chunks > 1). For k_chunks == 1 the package always
-    # generates the CHUNKED grid (generate_combined_core_verilog), so the
-    # wrapper must pack chunked words too: matching k_chunks==1 here used to
-    # emit 64-bit full-mode words against the grid's grid_cols*64-bit ports,
-    # X-poisoning every row/col tile beyond the first (cosim-only corruption
-    # for max(m,n) > 8).
+    # (gemm_k_spatial == k_chunks > 1); k_chunks == 1 always uses the chunked
+    # grid and its matching word width.
     full_k_spatial = k_chunks > 1 and gemm_k_spatial == k_chunks
     # Full-K uses the NARROW per-beat word (one tile, 64 bits per K-chunk); the
     # wrapper RTL re-inserts the grid row/col tile offset by beat index, so the

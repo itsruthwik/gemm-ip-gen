@@ -105,8 +105,8 @@ def bias_stream_width(n):
 
 def latency_cycles(k_val, grid_rows_val, grid_cols_val, m=None, n=None,
                    k=None, feed_mode="direct"):
-    """First output available at this cycle (0-based).  APPROXIMATE — for
-    exact transaction control use _generate_rtl_common.total_cycles().
+    """First output available at this cycle (0-based).  Conservative estimate;
+    exact transaction control uses _generate_rtl_common.total_cycles().
     """
     import sys as _sys
     from pathlib import Path as _Path

@@ -91,11 +91,9 @@ tile (its K chunk) and the RTL re-inserts the grid row/column tile offset from
 the beat index, so the deep input FIFO never stores the always-zero grid
 padding. Chunked mode keeps the single-chunk grid-padded width.
 
-Only `K_CHUNKS > 1` can be full-K. For `K_CHUNKS == 1` the package always
-generates the chunked grid, so the wrapper must pack chunked words too —
-emitting 64-bit full-mode words against the grid's `GRID_COLS * 64`-bit ports
-X-poisons every tile beyond the first (a cosim-only corruption for
-`max(M,N) > 8`).
+Only `K_CHUNKS > 1` can be full-K. For `K_CHUNKS == 1` the package generates the
+chunked grid and the wrapper packs chunked words to match its
+`GRID_COLS * 64`-bit ports.
 
 Intermediate K-spatial partial sums are INT16, so partition-level overflow is
 possible; correctness depends on quantized operand ranges and partition size.

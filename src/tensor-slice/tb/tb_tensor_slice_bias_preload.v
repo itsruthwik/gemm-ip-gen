@@ -59,24 +59,6 @@ module tb_tensor_slice_bias_preload;
         else sat8 = v;
     endfunction
 
-    // Compute expected row: for each col c (0..7), acc = sum_k(A[row][k] * B[k][c]) + bias[c]
-    function [63:0] pack_exp(
-        input [7:0] k_len,              // K dimension
-        input integer row_val,           // A value for this row (all K positions)
-        input integer b0, input integer b1, // bias bytes 0,1
-        input [7:0] ma, input [7:0] mb   // row/col masks
-    );
-        reg [63:0] rv;
-        integer c;
-        begin
-            rv = 64'd0;
-            for (c = 0; c < 8; c = c + 1) begin
-                if ((ma[0] ^ ma[0] == 0) ? 1 : 0) begin  // always true hack
-                end
-            end
-        end
-    endfunction
-
     // Row/col protocol: drive num_rows A beats and num_cols B beats.
     // Each beat: 64 bits = 8 bytes = 8 K-values for one row/col.
     // Block-diagonal: A[row_val] replicated across all K bytes.

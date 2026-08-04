@@ -226,7 +226,6 @@ class TestJsonDescriptor:
         assert desc["rtl_performance"]["latency"] == "28"
         assert desc["rtl_performance"]["II"] == "8"
         assert desc["rtl_performance"]["II_contract"] == "behavioral_overlap_input_beats"
-        assert "not transaction-overlapped" in desc["rtl_performance"]["II_note"]
 
     def test_json_ii_uses_full_k_input_beats_16x16x16(self, tmp_output):
         item = _gen_item(m=16, k=16, n=16)
