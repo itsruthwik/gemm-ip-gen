@@ -18,7 +18,34 @@ from pathlib import Path
 from _generate_rtl_common import tail_mask_hex, vm, total_cycles as _total_cycles
 
 
-def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatial=False):
+def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatial=False,
+                         requant_shift=0, requant_bits=None):
+    # Body of requant_acc(): applied ONCE to the fully-accumulated dot product.
+    # Emit requant_acc() ONLY when it is used. A declared-but-unused function is
+    # dead Verilog, but it still perturbs synthesis (measured -1.2% Fmax on a
+    # requant_shift==0 design), so requant_shift==0 must reproduce the original
+    # output byte-for-byte.
+    _use_requant = bool(requant_shift and requant_shift > 0)
+    if _use_requant:
+        _w = requant_bits or 8
+        _half = 1 << (requant_shift - 1)
+        requant_fn = f"""
+    // Requantise the FULL contraction once, after everything has been summed
+    // (in-slice and cross-chunk alike are folded into `acc` here, which is the
+    // whole point of the behavioural model). Round-half-up, shift, then reduce
+    // to the output width.
+    function signed [15:0] requant_acc;
+        input signed [31:0] x;
+        reg signed [31:0] r;
+        begin
+            r = (x + 32'sd{_half}) >>> {requant_shift};
+            requant_acc = $signed(r[{_w-1}:0]);
+        end
+    endfunction
+"""
+    else:
+        requant_fn = ""
+    _sat_call = "requant_acc(acc)" if _use_requant else "sat_int8(acc)"
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     a_width = grid_rows * 64
@@ -190,7 +217,7 @@ module {behav_name}(
             else sat_int8 = x[15:0];
         end
     endfunction
-
+{requant_fn}
     // ═══════════════════════════════════════════════════════════════════════
     // Frame-slot clk_cnt schedule. A frame starts at the first in_valid call
     // after a non-in_valid call (the wrapper protocol always inserts at least
@@ -265,7 +292,7 @@ module {behav_name}(
                                     acc = bias_buf[s * {n} + actual_col];
                                     for (kk = 0; kk < {k}; kk = kk + 1)
                                         acc = acc + (amat[s * {m} + actual_row][kk] * bmat[s * {k} + kk][actual_col]);
-                                    sat = sat_int8(acc);
+                                    sat = {_sat_call};
                                 end else begin
                                     sat = 16'sd0;
                                 end
@@ -986,7 +1013,8 @@ def _widen_output_saturation(text, out_bits):
     return text
 
 
-def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out_bits=8):
+def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out_bits=8,
+                                   requant_shift=0, requant_bits=None):
     """Generate a single {module_name}.v with ifndef SYNTHESIS guard.
 
     ``ifndef SYNTHESIS`` — behavioral simulation model (wrapper + behav_grid).
@@ -1000,7 +1028,8 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
     ``out_bits`` is the result-lane width derived from ``output_precision``
     (default 8 = legacy int8 clamp; 16 = honor a fixed<16,…> output_precision).
     """
-    sim_top = generate_sim_verilog(m, k, n, module_name)
+    sim_top = generate_sim_verilog(m, k, n, module_name,
+                                   requant_shift=requant_shift, requant_bits=requant_bits)
     synth_top = generate_synth_verilog(m, k, n, module_name)
 
     lines = []
@@ -1043,13 +1072,36 @@ def _k_spatial_partitions(k, k_spatial):
     return out
 
 
-def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1):
-    """Generate a structural K-spatial Catapult core.
+def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
+                                     requant_shift=0, requant_bits=None):
+    """Structural K-spatial core.
+
+    Tensor-slice outputs (and therefore the K-chunk partials) are 16-bit, as in
+    the current architecture. Only the post-accum32 step changes: the summed
+    partials are requantised rather than clamped.
 
     The structural body instantiates multiple tensor-slice grids and exposes the
     intended partition/control topology. Functional RTL simulation for this
     experimental mode is provided by the combined core's behavioral branch.
     """
+    # As in the sim branch: emit the function only when used, so a
+    # requant_shift==0 core is byte-identical to the pre-requant generator.
+    if requant_shift and requant_shift > 0:
+        _w = requant_bits or 8
+        _half = 1 << (requant_shift - 1)
+        requant_fn = f"""
+    // Requantise the summed cross-chunk result once, replacing the old clamp.
+    function signed [15:0] requant_acc;
+        input signed [31:0] x;
+        reg signed [31:0] r;
+        begin
+            r = (x + 32'sd{_half}) >>> {requant_shift};
+            requant_acc = $signed(r[{_w-1}:0]);
+        end
+    endfunction
+"""
+    else:
+        requant_fn = ""
     if k_spatial == 1:
         return generate_synth_verilog(m, k, n, module_name)
 
@@ -1165,8 +1217,14 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
                 row_mux_cases.append(
                     f"            accum32 = {terms} + $signed({{ {{24{{bias_cols_q[{c}*64 + {lane}*8 + 7]}}}}, bias_cols_q[{c}*64 + {lane}*8 +: 8] }});"
                 )
+                # Slice outputs (and hence the partials) remain 16-bit -- unchanged.
+                # The ONLY change is what happens after accum32: requantise the
+                # cross-chunk sum instead of clamping it, matching requant_acc()
+                # in the behavioural branch.
+                _drain = ("requant_acc(accum32)" if requant_shift
+                          else "sat_int8_to_i16(accum32)")
                 row_mux_cases.append(
-                    f"            row_mux[{c}*128 + {lane}*16 +: 16] = sat_int8_to_i16(accum32);"
+                    f"            row_mux[{c}*128 + {lane}*16 +: 16] = {_drain};"
                 )
         row_mux_cases.append("        end")
     any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
@@ -1285,7 +1343,7 @@ module {module_name}(
             else sat_int8_to_i16 = x[15:0];
         end
     endfunction
-
+{requant_fn}
     always @(*) begin
         row_mux = {c_width}'d0;
         accum32 = 32'sd0;
@@ -1339,9 +1397,11 @@ endmodule
 """
 
 
-def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1):
+def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
+                                   requant_shift=0, requant_bits=None):
     k_chunks = (k + 7) // 8
-    sim = generate_sim_verilog(m, k, n, module_name, full_k_spatial=(k_spatial == k_chunks))
+    sim = generate_sim_verilog(m, k, n, module_name, full_k_spatial=(k_spatial == k_chunks),
+                               requant_shift=requant_shift, requant_bits=requant_bits)
     if k_spatial == 1:
         return sim
     banner = (
@@ -1351,12 +1411,16 @@ def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_s
     return banner + sim
 
 
-def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, out_bits=8):
+def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, out_bits=8,
+                                            requant_shift=0, requant_bits=None):
     if k_spatial == 1:
-        return generate_combined_core_verilog(m, k, n, module_name, out_bits=out_bits)
+        return generate_combined_core_verilog(m, k, n, module_name, out_bits=out_bits,
+                                              requant_shift=requant_shift, requant_bits=requant_bits)
     _k_spatial_partitions(k, k_spatial)
-    sim_top = generate_k_spatial_sim_verilog(m, k, n, module_name, k_spatial)
-    synth_top = generate_k_spatial_synth_verilog(m, k, n, module_name, k_spatial)
+    sim_top = generate_k_spatial_sim_verilog(m, k, n, module_name, k_spatial,
+                                            requant_shift=requant_shift, requant_bits=requant_bits)
+    synth_top = generate_k_spatial_synth_verilog(m, k, n, module_name, k_spatial,
+                                                requant_shift=requant_shift, requant_bits=requant_bits)
 
     lines = []
     lines.append("// Auto-generated by generate_catapult_rtl.py")

@@ -150,6 +150,35 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     # the real value, then adds the (full-precision) bias and quantizes to the
     # result type. gemm_shift == 0 collapses to the legacy integer-coded path.
     gemm_shift = _frac_bits(input_precision) + _frac_bits(weight_precision)
+    # Requantise ONCE, after the whole contraction is accumulated (in-slice and
+    # cross-chunk folded together in the behavioural model). The accumulator
+    # carries frac = frac_a + frac_b; the result lane carries frac(out), so the
+    # single shift is their difference. requant_shift == 0 -> legacy path (core
+    # emits the raw accumulator and the drain does the whole rescale).
+    _out_frac = _frac_bits(result_type)
+    requant_shift = max(0, gemm_shift - _out_frac) if _out_frac else 0
+    requant_bits = _output_bits(result_type) if requant_shift else None
+    drain_shift = _out_frac if requant_shift else gemm_shift
+    if requant_shift:
+        core_requant_emit = (
+            "                        // Requantise the FULLY accumulated dot product once:\n"
+            "                        // round-half-up, shift, wrap to the result width. Mirrors\n"
+            "                        // requant_acc() in the Verilog sim branch.\n"
+            "                        ac_int<16, true> sat_val;\n"
+            "                        {\n"
+            f"                            ac_int<32, true> _r = (acc + {1 << (requant_shift - 1)}) >> {requant_shift};\n"
+            f"                            sat_val = (ac_int<{requant_bits}, true>) _r;\n"
+            "                        }"
+        )
+    else:
+        core_requant_emit = (
+            "                        // Legacy: emit the raw accumulator saturated to the\n"
+            "                        // physical 16-bit lane; the drain does the full rescale.\n"
+            "                        ac_int<16, true> sat_val;\n"
+            "                        if (acc > 32767) sat_val = 32767;\n"
+            "                        else if (acc < -32768) sat_val = -32768;\n"
+            "                        else sat_val = acc;"
+        )
     a_el_expr = (
         f"a_buf[s][actual_row].slc<8>(k_chunk * 64 + k_lane * 8)"
         if full_k_spatial
@@ -177,7 +206,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                     // matmul + bias, then quantize on the result-type cast below).
                     typename CONFIG_T::accum_t value =
                         static_cast<typename CONFIG_T::accum_t>(
-                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {gemm_shift})
+                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {drain_shift})
                         + static_cast<typename CONFIG_T::accum_t>(biases[col]);
                     out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
                 }}
@@ -204,7 +233,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                     ac_int<16, true> raw_val = c_row.template slc<16>(col_tile * 128 + col_local * 16);
                     typename CONFIG_T::accum_t value =
                         static_cast<typename CONFIG_T::accum_t>(
-                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {gemm_shift})
+                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {drain_shift})
                         + static_cast<typename CONFIG_T::accum_t>(biases[col]);
                     out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
                 }}
@@ -587,14 +616,7 @@ class {name}_ccore {{
                                 acc += a_el * b_el;
                             }}
                         }}
-                        // Saturate the raw integer dot-product to the physical
-                        // 16-bit output lane (NOT int8): the core emits the integer
-                        // accumulator; the wrapper drain rescales + quantizes to the
-                        // result type. Matches the RTL core (out_bits=16).
-                        ac_int<16, true> sat_val;
-                        if (acc > 32767) sat_val = 32767;
-                        else if (acc < -32768) sat_val = -32768;
-                        else sat_val = acc;
+{core_requant_emit}
                         row_out.set_slc(ct * 128 + cl * 16, sat_val);
                     }}
                 }}
@@ -759,7 +781,8 @@ template <typename T, unsigned N> struct array {
 """
 
 
-def gen_tb(name, m, k, n, interface="stream", n_frames=1):
+def gen_tb(name, m, k, n, interface="stream", n_frames=1,
+           requant_shift=0, requant_bits=None, drain_shift=None):
     if interface == "array":
         # Array interface is a single-frame smoke test (n_frames ignored).
         call_setup = f"""\
@@ -832,6 +855,65 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1):
     }}
 """
 
+    if requant_shift:
+        # Requant path: the core emits an already-requantised code of
+        # `requant_bits` carrying `drain_shift` fractional bits, so the wrapper
+        # hands back the result type itself rather than a raw integer lane.
+        _int_bits = requant_bits - drain_shift
+        res_typedef = (
+            f"typedef nnet::array<ac_fixed<{requant_bits}, {_int_bits}, true>, {n}> res_t;"
+        )
+        check_row = f"""\
+// Per-row golden check for the requantised core: accumulate the whole dot
+// product exactly, requantise ONCE (round-half-up, shift, wrap to the result
+// width), then add the bias in the result's fixed-point domain. Mirrors
+// requant_acc() in the Verilog core plus the wrapper drain.
+static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
+                      ac_int<8, true> weights[{n}][{k}], int biases[{n}],
+                      int f, int i, int &failed) {{
+    for (int j = 0; j < {n}; j++) {{
+        int gemm_acc = 0;
+        for (int kk = 0; kk < {k}; kk++) {{
+            gemm_acc += a_row[kk].to_int() * weights[j][kk].to_int();
+        }}
+        // Single requantisation of the fully accumulated product.
+        ac_int<32, true> rounded = (ac_int<32, true>)(gemm_acc + {1 << (requant_shift - 1)}) >> {requant_shift};
+        ac_int<{requant_bits}, true> code = (ac_int<{requant_bits}, true>) rounded;
+        // Bias enters after the drain shift, i.e. scaled by 2^drain_shift.
+        ac_int<{requant_bits}, true> expect_code = code + (ac_int<{requant_bits}, true>)(biases[j] << {drain_shift});
+        ac_fixed<{requant_bits}, {_int_bits}, true> expect;
+        expect.set_slc(0, expect_code);
+        if (out[j] != expect) {{
+            printf("Mismatch frame %d row %d col %d: got %f expected %f\\n",
+                   f, i, j, out[j].to_double(), expect.to_double());
+            failed = 1;
+        }}
+    }}
+}}"""
+    else:
+        res_typedef = f"typedef nnet::array<ac_int<16, true>, {n}> res_t;"
+        check_row = f"""\
+// Per-row golden check: raw integer dot-product saturated to the 16-bit output
+// lane, then bias added (matches the core + wrapper-drain order).
+static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
+                      ac_int<8, true> weights[{n}][{k}], int biases[{n}],
+                      int f, int i, int &failed) {{
+    for (int j = 0; j < {n}; j++) {{
+        int gemm_acc = 0;
+        for (int kk = 0; kk < {k}; kk++) {{
+            gemm_acc += a_row[kk].to_int() * weights[j][kk].to_int();
+        }}
+        if (gemm_acc > 32767) gemm_acc = 32767;
+        else if (gemm_acc < -32768) gemm_acc = -32768;
+        gemm_acc += biases[j];
+        if (out[j].to_int() != gemm_acc) {{
+            printf("Mismatch frame %d row %d col %d: got %d expected %d\\n",
+                   f, i, j, out[j].to_int(), gemm_acc);
+            failed = 1;
+        }}
+    }}
+}}"""
+
     return f"""\
 #ifdef CCS_SCVERIFY
 #include "mc_testbench.h"
@@ -858,28 +940,9 @@ struct {name}_config {{
 
 typedef nnet::array<ac_int<8, true>, {k}> a_beat_t;
 typedef nnet::array<ac_int<8, true>, {k}> b_beat_t;
-typedef nnet::array<ac_int<16, true>, {n}> res_t;
+{res_typedef}
 
-// Per-row golden check: raw integer dot-product saturated to the 16-bit output
-// lane, then bias added (matches the core + wrapper-drain order).
-static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
-                      ac_int<8, true> weights[{n}][{k}], int biases[{n}],
-                      int f, int i, int &failed) {{
-    for (int j = 0; j < {n}; j++) {{
-        int gemm_acc = 0;
-        for (int kk = 0; kk < {k}; kk++) {{
-            gemm_acc += a_row[kk].to_int() * weights[j][kk].to_int();
-        }}
-        if (gemm_acc > 32767) gemm_acc = 32767;
-        else if (gemm_acc < -32768) gemm_acc = -32768;
-        gemm_acc += biases[j];
-        if (out[j].to_int() != gemm_acc) {{
-            printf("Mismatch frame %d row %d col %d: got %d expected %d\\n",
-                   f, i, j, out[j].to_int(), gemm_acc);
-            failed = 1;
-        }}
-    }}
-}}
+{check_row}
 
 #ifdef CCS_SCVERIFY
 CCS_MAIN(int argc, char *argv[]) {{
@@ -923,7 +986,8 @@ int main() {{
 """
 
 
-def gen_inst_cpp(name, m, k, n, interface="stream"):
+def gen_inst_cpp(name, m, k, n, interface="stream",
+                 requant_shift=0, requant_bits=None, drain_shift=None):
     from gemm_ip.metadata import grid_rows, grid_cols
     if interface == "array":
         top_signature = f"""\
@@ -947,6 +1011,13 @@ def gen_inst_cpp(name, m, k, n, interface="stream"):
 }}"""
     a_w = grid_rows(m) * 8
     b_w = grid_cols(n) * 8
+    # With a requantising core the wrapper hands back the result type itself
+    # (already rescaled), not the raw integer output lane.
+    res_typedef = (
+        f"typedef nnet::array<ac_fixed<{requant_bits}, {requant_bits - drain_shift}, true>, {n}> res_t;"
+        if requant_shift else
+        f"typedef nnet::array<ac_int<16, true>, {n}> res_t;"
+    )
     return f"""\
 #include "nnet_types.h"
 #include "{name}_gemm_ip.h"
@@ -964,7 +1035,7 @@ struct {name}_config {{
 
 typedef nnet::array<ac_int<8, true>, {k}> a_beat_t;
 typedef nnet::array<ac_int<8, true>, {k}> b_beat_t;
-typedef nnet::array<ac_int<16, true>, {n}> res_t;
+{res_typedef}
 
 #pragma hls_design top
 void {name}_inst(
@@ -1342,6 +1413,12 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     # output lane; result-precision quantization happens in the wrapper drain
     # (rescale + bias + result-type cast), not in the core.
     out_bits = 16
+    # Same derivation as the wrapper emitter: requantise once after the full
+    # accumulation instead of clamping the raw accumulator to the lane.
+    _gemm_shift = _frac_bits(input_precision) + _frac_bits(weight_precision)
+    _out_frac = _frac_bits(output_precision)
+    requant_shift = max(0, _gemm_shift - _out_frac) if _out_frac else 0
+    requant_bits = _output_bits(output_precision) if requant_shift else None
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1354,7 +1431,8 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         sys.path.insert(0, ts_dir)
     from generate_catapult_rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
     if gemm_k_spatial == 1:
-        grid_v = generate_combined_core_verilog(m, k, n, module_name=f"{name}_core", out_bits=out_bits)
+        grid_v = generate_combined_core_verilog(m, k, n, module_name=f"{name}_core", out_bits=out_bits,
+                                                requant_shift=requant_shift, requant_bits=requant_bits)
     else:
         print(
             f"WARNING: {name}: gemm_k_spatial={gemm_k_spatial} is experimental; "
@@ -1363,7 +1441,8 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             file=sys.stderr,
         )
         grid_v = generate_k_spatial_combined_core_verilog(
-            m, k, n, module_name=f"{name}_core", k_spatial=gemm_k_spatial, out_bits=out_bits
+            m, k, n, module_name=f"{name}_core", k_spatial=gemm_k_spatial, out_bits=out_bits,
+            requant_shift=requant_shift, requant_bits=requant_bits
         )
     header_text = gen_public_header(
         name, m, k, n, grid_rows, grid_cols,
@@ -1379,8 +1458,16 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     (pkg_dir / f"{name}_core.v").write_text(grid_v)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
     (pkg_dir / f"{name}_gemm_ip.h").write_text(header_text)
-    (pkg_dir / f"{name}_inst.cpp").write_text(gen_inst_cpp(name, m, k, n, interface))
-    (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(name, m, k, n, interface, n_frames=n_frames))
+    (pkg_dir / f"{name}_inst.cpp").write_text(gen_inst_cpp(
+        name, m, k, n, interface,
+        requant_shift=requant_shift, requant_bits=requant_bits,
+        drain_shift=(_out_frac if requant_shift else _gemm_shift),
+    ))
+    (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(
+        name, m, k, n, interface, n_frames=n_frames,
+        requant_shift=requant_shift, requant_bits=requant_bits,
+        drain_shift=(_out_frac if requant_shift else _gemm_shift),
+    ))
     (pkg_dir / "run_catapult.tcl").write_text(gen_tcl(name, m, k, n, interface))
     print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface}, k_spatial={gemm_k_spatial})")
 
