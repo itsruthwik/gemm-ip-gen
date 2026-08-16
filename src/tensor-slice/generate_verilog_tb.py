@@ -194,18 +194,22 @@ def hex_literal(val, width_bytes):
     return f"{bits}'h{val:0{width_bytes*2}x}"
 
 
-def _random_matrices(m, k, n, seed):
+def _random_matrices(m, k, n, seed, fixed_B=None):
     rng = np.random.default_rng(seed)
     max_val = max(1, int((127 / max(k, 1)) ** 0.5))
     A = rng.integers(-max_val, max_val + 1, size=(m, k), dtype=np.int8)
-    B = rng.integers(-max_val, max_val + 1, size=(k, n), dtype=np.int8)
+    # Weight-stationary: B is the baked const weight (same every vector), not random.
+    if fixed_B is not None:
+        B = np.asarray(fixed_B, dtype=np.int8)
+    else:
+        B = rng.integers(-max_val, max_val + 1, size=(k, n), dtype=np.int8)
     biases = rng.integers(-8, 8, size=(n,), dtype=np.int8)
     C_ref = A.astype(np.int32) @ B.astype(np.int32) + biases.astype(np.int32)
     C_sat = np.clip(C_ref, -128, 127).astype(np.int8)
     return A, B, biases, C_sat
 
 
-def _gen_all_stimulus(m, k, n, num_vectors, base_seed):
+def _gen_all_stimulus(m, k, n, num_vectors, base_seed, fixed_B=None):
     """Generate stimulus and golden data for *num_vectors* random tests.
 
     Row/col contract: one A row + one B column per beat.
@@ -222,7 +226,7 @@ def _gen_all_stimulus(m, k, n, num_vectors, base_seed):
 
     for v in range(num_vectors):
         seed = base_seed + v
-        A, B, biases, C_sat = _random_matrices(m, k, n, seed)
+        A, B, biases, C_sat = _random_matrices(m, k, n, seed, fixed_B=fixed_B)
 
         a_stim, b_stim = [], []
         for chunk in range(k_chunks):
@@ -342,7 +346,7 @@ def _gen_all_stimulus_vitis_full_k_narrow(m, k, n, num_vectors, base_seed):
 # ── Catapult testbench ─────────────────────────────────────────────────────────
 
 
-def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, full_k_spatial=False):
+def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, full_k_spatial=False, weights_in_core=False):
     """Generate a multi-vector Catapult testbench.
 
     back2back=False (default): Reset between every vector; check each vector
@@ -374,6 +378,8 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
     num_vectors = len(all_a_stim)
     total_out_rows = m
     b2b_flag = 1 if back2back else 0
+    # Weight-stationary DUT has no external b_cols port (weights baked in ROM).
+    dut_b_cols = "" if weights_in_core else ".b_cols(b_cols), "
 
     # Build memory initialization blocks
     a_init, b_init, bias_init, golden_init = [], [], [], []
@@ -604,7 +610,7 @@ module tb_catapult_{m}x{k}x{n};
 
     {module_name} dut (
         .clk(clk), .rst(rst), .en(en),
-        .a_rows(a_rows), .b_cols(b_cols), .bias_cols(bias_cols),
+        .a_rows(a_rows), {dut_b_cols}.bias_cols(bias_cols),
         .preload_valid(preload_valid), .in_valid(in_valid),
         .c_row(c_row), .out_valid(out_valid), .out_last(out_last)
     );
@@ -882,7 +888,8 @@ endmodule
 
 
 def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="catapult",
-                num_vectors=10, timing=False, back2back=False, full_k_spatial=False):
+                num_vectors=10, timing=False, back2back=False, full_k_spatial=False,
+                weights_in_core=False, fixed_B=None):
     """Generate a self-checking multi-vector Verilog testbench.
 
     Args:
@@ -917,8 +924,8 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
             m, k, n, num_vectors, seed)
     else:
         all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus(
-            m, k, n, num_vectors, seed)
-    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back, full_k_spatial=full_k_spatial)
+            m, k, n, num_vectors, seed, fixed_B=fixed_B)
+    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back, full_k_spatial=full_k_spatial, weights_in_core=weights_in_core)
 
 
 def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_sat, timing=False):

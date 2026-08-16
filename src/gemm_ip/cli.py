@@ -52,9 +52,18 @@ def _run_catapult(args):
     from gemm_ip.catapult import generate_catapult_pkg, gen_combined_header, gen_integration_manifest, gen_blackbox_tcl, _normalize_config_items
 
     if args.config:
-        cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        from gemm_ip import weights as _weights
+        cfg_path = Path(args.config)
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         items = _normalize_config_items(cfg)
         for item in items:
+            # Weight-stationary (const-weight): bake weights into the core ROM + csim
+            # header. The .dat is column-major [n][k] raw ints emitted by hls4ml, path
+            # relative to the config file; load_weight_dat returns B as [K, N].
+            weight_matrix = None
+            if item.get("weights_in_core") and item.get("weight_file"):
+                dat = (cfg_path.parent / item["weight_file"]).resolve()
+                weight_matrix = _weights.load_weight_dat(str(dat), item["n"], item["k"])
             generate_catapult_pkg(
                 item["m"], item["k"], item["n"], item["name"],
                 args.output_dir,
@@ -64,6 +73,7 @@ def _run_catapult(args):
                 input_precision=item.get("input_precision"),
                 weight_precision=item.get("weight_precision"),
                 clock_period_ns=item.get("clock_period_ns"),
+                weight_matrix=weight_matrix,
             )
         output_dir = Path(args.output_dir)
         (output_dir / "gemm_ip_combined.h").write_text(gen_combined_header(items))

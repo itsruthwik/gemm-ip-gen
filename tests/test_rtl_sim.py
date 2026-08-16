@@ -218,6 +218,43 @@ class TestCatapultRtlSim:
         _assert_row_cadence(res, m)
 
 
+@pytest.mark.skipif(not HAVE_SIM, reason="iverilog/vvp not available")
+class TestCatapultWeightStationary:
+    """Weight-stationary (const-weight) variant: weights baked into an internal ROM
+    (shared above the `ifndef), no external b_cols port. The ROM feed reproduces the
+    exact pack_b_chunk beat order, so the behavioral core must match golden computed
+    from A x W_baked, feeding A only."""
+
+    @pytest.mark.parametrize("m,k,n", DEFAULT_CASES)
+    def test_weight_stationary_core_sim(self, m, k, n, tmp_path):
+        import numpy as np
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "gemm_ip"))
+        import weights as _weights
+
+        rng = np.random.default_rng(1)
+        max_val = max(1, int((127 / max(k, 1)) ** 0.5))
+        B = rng.integers(-max_val, max_val + 1, size=(k, n)).astype(np.int8)  # baked [K,N]
+        rom = _weights.build_weight_rom(B, m, n, k)
+        mod = f"ws_{m}x{k}x{n}"
+        core = generate_combined_core_verilog(m, k, n, module_name=mod, weight_rom=rom)
+
+        # Shared-ROM structural invariants: one ROM decl, above the `ifndef, one top module.
+        assert core.count(f"module {mod}(") == 1
+        assert core.count("reg [") and "w_rom [0:" in core
+        assert core.index("w_rom [0:") < core.index("`ifndef SYNTHESIS")
+        assert "b_cols," not in core.split("`ifndef")[0]  # no b_cols in the shared top ports
+
+        res = _run_sim(
+            core,
+            generate_tb(m, k, n, module_name=mod, protocol="catapult", num_vectors=8,
+                        timing=True, weights_in_core=True, fixed_B=B),
+            tmp_path / f"{mod}.v",
+            tmp_path / f"tb_{mod}.v",
+        )
+        _assert_frame_latency(res, m, k, n)
+        _assert_row_cadence(res, m)
+
+
 TENSOR_SLICE_STUB = r"""
 module tensor_slice_int8(
     input clk, input reset, input pe_reset,

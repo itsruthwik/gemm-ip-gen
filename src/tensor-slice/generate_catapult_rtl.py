@@ -19,7 +19,7 @@ from _generate_rtl_common import tail_mask_hex, vm, total_cycles as _total_cycle
 
 
 def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatial=False,
-                         requant_shift=0, requant_bits=None):
+                         requant_shift=0, requant_bits=None, weight_rom=None, emit_rom=True):
     # Body of requant_acc(): applied ONCE to the fully-accumulated dot product.
     # Emit requant_acc() ONLY when it is used. A declared-but-unused function is
     # dead Verilog, but it still perturbs synthesis (measured -1.2% Fmax on a
@@ -119,6 +119,21 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
                         end
                     end"""
 
+    # Weight-stationary (const-weight): the top sim wrapper drops its external b_cols
+    # port and feeds the inner behav_grid from the shared ROM (w_rom_out). The behav_grid
+    # keeps its internal b_cols input, now driven by the ROM. Bias stays external.
+    _sim_ws = weight_rom is not None
+    if _sim_ws and full_k_spatial:
+        raise NotImplementedError("weight-stationary + full_k_spatial not supported yet")
+    if _sim_ws:
+        sim_b_cols_port = ""
+        sim_b_src = "w_rom_out"
+        sim_rom_block = _weight_rom_block(b_width, weight_rom) if emit_rom else ""
+    else:
+        sim_b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
+        sim_b_src = "b_cols"
+        sim_rom_block = ""
+
     return f"""\
 // Auto-generated simulation model by generate_catapult_rtl.py
 // {mode_comment}
@@ -130,22 +145,21 @@ module {module_name}(
     input  wire                   rst,
     input  wire                   en,
     input  wire [{a_width-1}:0]   a_rows,
-    input  wire [{b_width-1}:0]   b_cols,
-    input  wire [{bias_width-1}:0]   bias_cols,
+{sim_b_cols_port}    input  wire [{bias_width-1}:0]   bias_cols,
     input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
     output reg                    out_valid,
     output reg                    out_last
 );
-
+{sim_rom_block}
     wire [{c_width-1}:0] behav_c_row;
     wire                 behav_out_valid;
     wire                 behav_out_last;
 
     {behav_name} grid (
         .clk(clk), .rst(rst), .en(en),
-        .a_rows(a_rows), .b_cols(b_cols), .bias_cols(bias_cols),
+        .a_rows(a_rows), .b_cols({sim_b_src}), .bias_cols(bias_cols),
         .preload_valid(preload_valid), .in_valid(in_valid),
         .c_row(behav_c_row), .out_valid(behav_out_valid), .out_last(behav_out_last)
     );
@@ -318,7 +332,42 @@ endmodule
 """
 
 
-def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="chained", debug=False):
+def _weight_rom_block(b_width, weight_rom):
+    """Shared const-weight ROM: declaration + inline init + feed_ptr + w_rom_out wire.
+
+    Emitted once (above the `ifndef SYNTHESIS` split in the combined core) so a single
+    ROM feeds both the behavioral-sim and structural-synth branches. `feed_ptr` advances
+    one entry per presented input beat (mirrors the free-running `in_valid`), reproducing
+    the exact order the external `b_cols` port received (pack_b_chunk feed order).
+    """
+    hexw = (b_width + 3) // 4
+    mask = (1 << b_width) - 1
+    nbeats = len(weight_rom)
+    rom_init = "\n".join(
+        f"        w_rom[{i}] = {b_width}'h{(int(v) & mask):0{hexw}x};"
+        for i, v in enumerate(weight_rom)
+    )
+    return f"""
+    // Weight-stationary const-weight ROM (baked; no external b_cols port). One beat
+    // per presented input cycle; feeds both the sim and synth branches below.
+    reg [{b_width - 1}:0] w_rom [0:{nbeats - 1}];
+    initial begin
+{rom_init}
+    end
+    reg [15:0] feed_ptr;
+    always @(posedge clk) begin
+        if (rst) feed_ptr <= 16'd0;
+        else if (en) begin
+            if (!in_valid) feed_ptr <= 16'd0;
+            else if (feed_ptr < 16'd{nbeats - 1}) feed_ptr <= feed_ptr + 16'd1;
+        end
+    end
+    wire [{b_width - 1}:0] w_rom_out = w_rom[feed_ptr];
+"""
+
+
+def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="chained", debug=False,
+                           weight_rom=None, emit_rom=True):
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
 
@@ -435,6 +484,24 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
     end
 """
 
+    # ── Weight-stationary (const-weight) variant ────────────────────────────
+    # weight_rom = per-beat b_cols values (grid_cols*64 bits each), already in the
+    # pack_b_chunk feed order (see gemm_ip/weights.py). When present, drop the
+    # external b_cols port and source B from an internal ROM: one beat per presented
+    # input cycle. feed_ptr mirrors in_valid exactly as the external b_cols port did
+    # (the TB free-runs one beat/clock while in_valid is high), so timing/systolic
+    # feed are byte-identical to the streamed path. Bias stays external.
+    ws = weight_rom is not None
+    if ws:
+        b_cols_port = ""
+        b_cols_q_src = "w_rom_out"
+        # emit_rom=False when the combined core provides the shared ROM above `ifndef.
+        w_rom_block = _weight_rom_block(b_width, weight_rom) if emit_rom else ""
+    else:
+        b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
+        b_cols_q_src = "b_cols"
+        w_rom_block = ""
+
     return f"""\
 // Auto-generated by generate_catapult_rtl.py
 // Chunked structural tensor-slice synth wrapper
@@ -446,14 +513,14 @@ module {module_name}(
     input  wire                   rst,
     input  wire                   en,
     input  wire [{a_width-1}:0]   a_rows,
-    input  wire [{b_width-1}:0]   b_cols,
-    input  wire [{b_width-1}:0]   bias_cols,
+{b_cols_port}    input  wire [{b_width-1}:0]   bias_cols,
     input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
     output reg                    out_valid,
     output reg                    out_last
 );
+{w_rom_block}
 
     localparam integer INPUT_BEATS = {input_beats};
     localparam integer K_CHUNKS = {k_chunks};
@@ -489,7 +556,7 @@ module {module_name}(
             in_valid_q      <= 1'b0;
         end else if (en) begin
             a_rows_q        <= a_rows;
-            b_cols_q        <= b_cols;
+            b_cols_q        <= {b_cols_q_src};
             bias_cols_q     <= bias_cols;
             preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;
@@ -1013,8 +1080,29 @@ def _widen_output_saturation(text, out_bits):
     return text
 
 
+def _split_module(text, name):
+    """Split a single-module Verilog string into (header, body).
+
+    header = 'module {name}(' … '\\n);'  (port list, inclusive).
+    body   = everything after the port-list close up to (excluding) the final endmodule.
+    """
+    start = text.index(f"module {name}(")
+    pclose = text.index("\n);", start) + len("\n);")
+    end = text.rindex("endmodule")
+    return text[start:pclose], text[pclose:end]
+
+
+def _split_after_first_endmodule(text):
+    """Split at the first endmodule → (first_module_incl_endmodule, remainder)."""
+    idx = text.index("endmodule") + len("endmodule")
+    rest = text[idx:].lstrip("\n")
+    if rest and not rest.endswith("\n"):
+        rest += "\n"
+    return text[:idx], rest
+
+
 def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out_bits=8,
-                                   requant_shift=0, requant_bits=None):
+                                   requant_shift=0, requant_bits=None, weight_rom=None):
     """Generate a single {module_name}.v with ifndef SYNTHESIS guard.
 
     ``ifndef SYNTHESIS`` — behavioral simulation model (wrapper + behav_grid).
@@ -1028,6 +1116,30 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
     ``out_bits`` is the result-lane width derived from ``output_precision``
     (default 8 = legacy int8 clamp; 16 = honor a fixed<16,…> output_precision).
     """
+    # Weight-stationary: hoist a SINGLE weight ROM above the `ifndef so both the sim
+    # and synth branches read the same w_rom_out (one source of truth; sim ≡ synth
+    # weights by construction). The combined core becomes ONE module with the `ifndef
+    # INSIDE it; the sim's behav_grid helper stays a trailing module.
+    if weight_rom is not None:
+        sim_top = generate_sim_verilog(m, k, n, module_name, requant_shift=requant_shift,
+                                       requant_bits=requant_bits, weight_rom=weight_rom, emit_rom=False)
+        synth_top = generate_synth_verilog(m, k, n, module_name, weight_rom=weight_rom, emit_rom=False)
+        b_width = ((n + 7) // 8) * 64
+        header, syn_body = _split_module(synth_top, module_name)   # header incl. 'module..);'
+        sim_wrapper, sim_behav = _split_after_first_endmodule(sim_top)
+        _, sim_body = _split_module(sim_wrapper, module_name)
+        rom_block = _weight_rom_block(b_width, weight_rom)
+        out = (
+            f"// Auto-generated by generate_catapult_rtl.py\n"
+            f"// Combined core (weight-stationary): M={m}, K={k}, N={n}\n"
+            f"//   shared const-weight ROM above `ifndef feeds both branches\n"
+            f"{header}\n{rom_block}\n"
+            f"`ifndef SYNTHESIS\n{sim_body}`else\n{syn_body}`endif\n"
+            f"endmodule\n\n"
+            f"`ifndef SYNTHESIS\n{sim_behav}`endif\n"
+        )
+        return _widen_output_saturation(out, out_bits)
+
     sim_top = generate_sim_verilog(m, k, n, module_name,
                                    requant_shift=requant_shift, requant_bits=requant_bits)
     synth_top = generate_synth_verilog(m, k, n, module_name)

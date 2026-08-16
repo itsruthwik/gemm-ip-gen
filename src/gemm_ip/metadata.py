@@ -209,6 +209,13 @@ def _normalize_item(item):
 
     item.setdefault("interface", "stream")
     item.setdefault("backend", "catapult")
+
+    # Weight-stationary (const-weight) variant: the wrapper bakes the weights into
+    # an internal ROM (from weight_file) and takes no external weight port; the csim
+    # header takes A only (no weight argument). Selected solely by weights_in_core;
+    # weight_file is the column-major [n][k] raw-int .dat hls4ml emits.
+    item["weights_in_core"] = bool(item.get("weights_in_core", False))
+    item.setdefault("weight_file", item.get("weight_file"))
     return item
 
 

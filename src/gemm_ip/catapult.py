@@ -79,7 +79,12 @@ def dead_cycles(m, k, n, grid_cols, full_k_spatial=False):
 
 def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gemm_k_spatial=1,
                       input_precision=None, weight_precision=None, clock_period_ns=None,
-                      n_frames=1):
+                      n_frames=1, weight_rom=None):
+    # Weight-stationary (const-weight) mode: weights live in the RTL wrapper ROM,
+    # so the ccore run() drops the b_cols port (matching the ROM wrapper), and the
+    # csim-only behavioral branch bakes the same per-beat words into an internal
+    # B_ROM. Single source of truth = weight_rom (built once from the .dat).
+    weights_in_core = weight_rom is not None
     bb_delay_ns = _blackbox_delay_ns(clock_period_ns)
     row_chunk_bits = grid_rows * 64
     col_chunk_bits = grid_cols * 64
@@ -189,6 +194,43 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         if full_k_spatial
         else f"b_buf[s][k_chunk * {input_beats} + actual_col].slc<8>(ct * 64 + k_lane * 8)"
     )
+
+    # ---- Weight-stationary vs. two-stream: b_cols plumbing inserts -------------
+    # Weight-stationary drops b_cols everywhere (run() port, blackbox stub xor,
+    # feed-loop decl/pack/arg) and sources the csim b_buf from an internal B_ROM.
+    # Two-stream keeps today's external b_cols beat.  full_k_spatial is never
+    # weight-stationary (gemm_k_spatial is forced to 1), so only the chunked
+    # stream feed loop needs the conditional inserts.
+    if weights_in_core:
+        bcols_run_param = ""
+        bcols_bb_xor = ""
+        bcols_run_arg = ""
+        bbuf_src = "B_ROM[cc_slot[wr_slot]]"
+        brom_decl = _weightless_brom_cpp(b_bits, grid_cols, total_beats, weight_rom)
+        stream_bcols_decl = ""
+        stream_bcols_pack = ""
+    else:
+        bcols_run_param = f"        ac_int<{b_bits}, false>  b_cols,\n"
+        bcols_bb_xor = " ^ b_cols[0]"
+        bcols_run_arg = "b_cols, "
+        bbuf_src = "b_cols"
+        brom_decl = ""
+        stream_bcols_decl = f"ac_int<{b_bits}, false> b_cols = 0;"
+        stream_bcols_pack = f"""if (feeding_now && t < {n}) {{
+            b_beat_T b_beat = weight_cols[t];
+            #pragma hls_unroll
+            COL_PACK: for (int kl = 0; kl < 8; kl++) {{
+                int kk = kc * 8 + kl;
+                int col_tile = t / 8;
+                #pragma hls_unroll
+                COL_TILE_CHUNK: for (int ct = 0; ct < {grid_cols}; ct++) {{
+                    if (col_tile == ct && kk < {k}) {{
+                        b_cols.set_slc(ct * 64 + kl * 8,
+                                       {name}_to_gemm_int8(b_beat[kk]));
+                    }}
+                }}
+            }}
+        }}"""
 
     # Per-call output capture, embedded in the merged RUN loop so rows are
     # collected as they emerge while the frame is still feeding/computing.
@@ -328,7 +370,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         int kc = pf / {input_beats};
         int t = pf % {input_beats};
         ac_int<{a_bits}, false> a_rows = 0;
-        ac_int<{b_bits}, false> b_cols = 0;
+        {stream_bcols_decl}
 
         if (feeding_now && t < {m}) {{
             if (kc == 0) {{
@@ -366,21 +408,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 a_rows = a_replay[kc][t];
             }}
         }}
-        if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[t];
-            #pragma hls_unroll
-            COL_PACK: for (int kl = 0; kl < 8; kl++) {{
-                int kk = kc * 8 + kl;
-                int col_tile = t / 8;
-                #pragma hls_unroll
-                COL_TILE_CHUNK: for (int ct = 0; ct < {grid_cols}; ct++) {{
-                    if (col_tile == ct && kk < {k}) {{
-                        b_cols.set_slc(ct * 64 + kl * 8,
-                                       {name}_to_gemm_int8(b_beat[kk]));
-                    }}
-                }}
-            }}
-        }}
+        {stream_bcols_pack}
 
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
@@ -392,7 +420,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         // reuses the per-frame idle beat (formerly a trailing separator -> now a
         // leading preload, same period); bias stays 0 here (added in the drain).
         ac_int<1, false> frame_preload = (in_feed && p == 0) ? 1 : 0;
-        gemm.run(a_rows, b_cols, bias_packed, frame_preload, feed_valid, c_row, v, l);
+        gemm.run(a_rows, {bcols_run_arg}bias_packed, frame_preload, feed_valid, c_row, v, l);
 {stream_capture_b2b}
     }}
 """
@@ -501,6 +529,143 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     }}
 """
 
+    if weights_in_core:
+        # Weight-stationary: ONLY the self-contained weightless entry. No
+        # const_weights / two-stream / array functions (they reference an external
+        # b_cols the weightless ccore run() no longer has). Weights live in the
+        # csim B_ROM (baked above) and the RTL wrapper ROM.
+        entries_block = f"""\
+// Weight-stationary (const-weight) entry: A only, no weight argument. Synthesis
+// binds gemm.run to the weightless RTL core (weights in the wrapper ROM); csim
+// uses the ccore's internal B_ROM (same .dat-sourced beats). No frontend weight
+// accessor is involved.
+template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
+void {name}_gemm_ip_stream_weightless(
+    ac_channel<a_beat_T> &a_stream,
+    bias_T biases[CONFIG_T::gemm_n],
+    ac_channel<res_T> &res_stream
+) {{
+    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
+    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
+    static_assert(a_beat_T::size == CONFIG_T::gemm_k,
+                  "a_beat_T must carry one A-row K-width beat.");
+    static_assert(res_T::size == CONFIG_T::gemm_n,
+                  "res_T must carry one full GEMM result row.");
+
+    static {name}_ccore gemm;
+    int captured = 0;   // total out_valid pulses seen (incl. padding rows)
+    int written = 0;    // real result rows written to res_stream
+    ac_int<{bias_bits}, false> bias_packed = 0;
+
+    #pragma hls_unroll
+    BIAS_PACK: for (int col = 0; col < {n}; col++) {{
+        int col_tile = col / 8;
+        int col_local = col % 8;
+        // Bias is added in the drain (post-rescale, full precision), so the
+        // pure-matmul core is fed zero bias. Keeps the core a clean integer GEMM.
+        (void) col_tile; (void) col_local;
+        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
+    }}
+
+{stream_feed_loop}
+}}
+"""
+    else:
+        # Two-stream: const_weights worker + external-weight stream/array entries
+        # (today's behavior). The ccore run() keeps its b_cols port.
+        entries_block = f"""\
+template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
+void {name}_gemm_ip_stream_const_weights(
+    ac_channel<a_beat_T> &a_stream,
+    b_beat_T weight_cols[CONFIG_T::gemm_n],
+    bias_T biases[CONFIG_T::gemm_n],
+    ac_channel<res_T> &res_stream
+) {{
+    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
+    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
+    static_assert(a_beat_T::size == CONFIG_T::gemm_k,
+                  "a_beat_T must carry one A-row K-width beat.");
+    static_assert(CONFIG_T::transpose_weights,
+                  "Generated GEMM IP wrapper expects transposed weights.");
+    static_assert(b_beat_T::size == CONFIG_T::gemm_k,
+                  "b_beat_T must carry one B-col K-width beat.");
+    static_assert(res_T::size == CONFIG_T::gemm_n,
+                  "res_T must carry one full GEMM result row.");
+
+
+    static {name}_ccore gemm;
+    int captured = 0;   // total out_valid pulses seen (incl. padding rows)
+    int written = 0;    // real result rows written to res_stream
+    ac_int<{bias_bits}, false> bias_packed = 0;
+
+    #pragma hls_unroll
+    BIAS_PACK: for (int col = 0; col < {n}; col++) {{
+        int col_tile = col / 8;
+        int col_local = col % 8;
+        // Bias is added in the drain (post-rescale, full precision), so the
+        // pure-matmul core is fed zero bias. Keeps the core a clean integer GEMM.
+        (void) col_tile; (void) col_local;
+        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
+    }}
+
+{stream_feed_loop}
+}}
+
+template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
+void {name}_gemm_ip_stream(
+    ac_channel<a_beat_T> &a_stream,
+    ac_channel<b_beat_T> &b_stream,
+    bias_T biases[CONFIG_T::gemm_n],
+    ac_channel<res_T> &res_stream
+) {{
+    b_beat_T weight_cols[{n}];
+    #pragma hls_pipeline_init_interval 1
+    READ_B_COLS: for (int col = 0; col < {n}; col++) {{
+        weight_cols[col] = b_stream.read();
+    }}
+    {name}_gemm_ip_stream_const_weights<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
+        a_stream, weight_cols, biases, res_stream);
+}}
+
+template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
+void {name}_gemm_ip_array(
+    a_beat_T a_rows[CONFIG_T::gemm_m],
+    b_beat_T weight_cols[CONFIG_T::gemm_n],
+    bias_T biases[CONFIG_T::gemm_n],
+    res_T results[CONFIG_T::gemm_m]
+) {{
+    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
+    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
+
+    static {name}_ccore gemm;
+    int captured = 0;
+    ac_int<{a_bits}, false> last_a_rows = 0;
+    ac_int<{b_bits}, false> last_b_cols = 0;
+    ac_int<{bias_bits}, false> bias_packed = 0;
+
+    #pragma hls_unroll
+    BIAS_PACK_ARRAY: for (int col = 0; col < {n}; col++) {{
+        int col_tile = col / 8;
+        int col_local = col % 8;
+        // Bias is added in the drain (post-rescale, full precision), so the
+        // pure-matmul core is fed zero bias. Keeps the core a clean integer GEMM.
+        (void) col_tile; (void) col_local;
+        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
+    }}
+
+{array_feed_loop}
+
+    #pragma hls_pipeline_init_interval 1
+    DRAIN_ARRAY_PADDED_ROWS: for (int i = 0; i < {mr - m}; i++) {{
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        ac_int<1, false> drain_valid = 0;
+        ac_int<1, false> drain_preload_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
+    }}
+}}
+"""
+
     return f"""\
 #ifndef {name.upper()}_GEMM_IP_H
 #define {name.upper()}_GEMM_IP_H
@@ -527,8 +692,7 @@ class {name}_ccore {{
     #pragma hls_design interface ccore blackbox
     void run(
         ac_int<{a_bits}, false>  a_rows,
-        ac_int<{b_bits}, false>  b_cols,
-        ac_int<{bias_bits}, false>  bias_cols,
+{bcols_run_param}        ac_int<{bias_bits}, false>  bias_cols,
         ac_int<1, false>         preload_valid,
         ac_int<1, false>         in_valid,
         ac_int<{c_bits}, false>& c_row,
@@ -552,10 +716,10 @@ class {name}_ccore {{
             .has_state(true)
             .end();
         c_row = 0;
-        c_row[0] = a_rows[0] ^ b_cols[0] ^ bias_cols[0] ^ preload_valid[0] ^ in_valid[0];
+        c_row[0] = a_rows[0]{bcols_bb_xor} ^ bias_cols[0] ^ preload_valid[0] ^ in_valid[0];
         out_valid = in_valid;
         out_last = in_valid;
-#else
+#else{brom_decl}
         // Frame-slot behavioral scheduler (mirrors the RTL sim model): up to
         // {slots} frames in flight. A frame starts at the first in_valid call
         // after a non-in_valid call (the FEED protocol always inserts the
@@ -585,7 +749,7 @@ class {name}_ccore {{
             }}
             if (cc_slot[wr_slot] < {total_beats}) {{
                 a_buf[wr_slot][cc_slot[wr_slot]] = a_rows;
-                b_buf[wr_slot][cc_slot[wr_slot]] = b_cols;
+                b_buf[wr_slot][cc_slot[wr_slot]] = {bbuf_src};
             }}
         }} else {{
             feeding = false;
@@ -643,96 +807,7 @@ ac_int<8, true> {name}_to_gemm_int8(const src_T &value) {{
     return static_cast<ac_int<8, true> >(value.template slc<8>(0));
 }}
 
-template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void {name}_gemm_ip_stream_const_weights(
-    ac_channel<a_beat_T> &a_stream,
-    b_beat_T weight_cols[CONFIG_T::gemm_n],
-    bias_T biases[CONFIG_T::gemm_n],
-    ac_channel<res_T> &res_stream
-) {{
-    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
-    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
-    static_assert(a_beat_T::size == CONFIG_T::gemm_k,
-                  "a_beat_T must carry one A-row K-width beat.");
-    static_assert(CONFIG_T::transpose_weights,
-                  "Generated GEMM IP wrapper expects transposed weights.");
-    static_assert(b_beat_T::size == CONFIG_T::gemm_k,
-                  "b_beat_T must carry one B-col K-width beat.");
-    static_assert(res_T::size == CONFIG_T::gemm_n,
-                  "res_T must carry one full GEMM result row.");
-
-
-    static {name}_ccore gemm;
-    int captured = 0;   // total out_valid pulses seen (incl. padding rows)
-    int written = 0;    // real result rows written to res_stream
-    ac_int<{bias_bits}, false> bias_packed = 0;
-
-    #pragma hls_unroll
-    BIAS_PACK: for (int col = 0; col < {n}; col++) {{
-        int col_tile = col / 8;
-        int col_local = col % 8;
-        // Bias is added in the drain (post-rescale, full precision), so the
-        // pure-matmul core is fed zero bias. Keeps the core a clean integer GEMM.
-        (void) col_tile; (void) col_local;
-        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
-    }}
-
-{stream_feed_loop}
-}}
-
-template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void {name}_gemm_ip_stream(
-    ac_channel<a_beat_T> &a_stream,
-    ac_channel<b_beat_T> &b_stream,
-    bias_T biases[CONFIG_T::gemm_n],
-    ac_channel<res_T> &res_stream
-) {{
-    b_beat_T weight_cols[{n}];
-    #pragma hls_pipeline_init_interval 1
-    READ_B_COLS: for (int col = 0; col < {n}; col++) {{
-        weight_cols[col] = b_stream.read();
-    }}
-    {name}_gemm_ip_stream_const_weights<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
-        a_stream, weight_cols, biases, res_stream);
-}}
-template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void {name}_gemm_ip_array(
-    a_beat_T a_rows[CONFIG_T::gemm_m],
-    b_beat_T weight_cols[CONFIG_T::gemm_n],
-    bias_T biases[CONFIG_T::gemm_n],
-    res_T results[CONFIG_T::gemm_m]
-) {{
-    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
-    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
-
-    static {name}_ccore gemm;
-    int captured = 0;
-    ac_int<{a_bits}, false> last_a_rows = 0;
-    ac_int<{b_bits}, false> last_b_cols = 0;
-    ac_int<{bias_bits}, false> bias_packed = 0;
-
-    #pragma hls_unroll
-    BIAS_PACK_ARRAY: for (int col = 0; col < {n}; col++) {{
-        int col_tile = col / 8;
-        int col_local = col % 8;
-        // Bias is added in the drain (post-rescale, full precision), so the
-        // pure-matmul core is fed zero bias. Keeps the core a clean integer GEMM.
-        (void) col_tile; (void) col_local;
-        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
-    }}
-
-{array_feed_loop}
-
-    #pragma hls_pipeline_init_interval 1
-    DRAIN_ARRAY_PADDED_ROWS: for (int i = 0; i < {mr - m}; i++) {{
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        ac_int<1, false> drain_valid = 0;
-        ac_int<1, false> drain_preload_valid = 0;
-        gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
-    }}
-}}
-
+{entries_block}
 }} // namespace nnet
 
 #endif // {name.upper()}_GEMM_IP_H
@@ -782,8 +857,55 @@ template <typename T, unsigned N> struct array {
 
 
 def gen_tb(name, m, k, n, interface="stream", n_frames=1,
-           requant_shift=0, requant_bits=None, drain_shift=None):
-    if interface == "array":
+           requant_shift=0, requant_bits=None, drain_shift=None, weight_matrix=None):
+    weights_in_core = weight_matrix is not None
+    if weights_in_core:
+        # Golden uses the SAME baked weights as the core ROM.
+        import numpy as _np
+        _B = _np.asarray(weight_matrix)
+        weights_init = "\n".join(
+            f"    weights[{j}][{kk}] = {int(_B[kk, j])};" for j in range(n) for kk in range(k)
+        )
+    else:
+        weights_init = (
+            f"    for (int j = 0; j < {n}; j++) {{\n"
+            f"        for (int kk = 0; kk < {k}; kk++) {{\n"
+            f"            weights[j][kk] = ((j * 5 - kk + 1) & 0x7) - 3;\n"
+            f"        }}\n"
+            f"    }}"
+        )
+    if weights_in_core:
+        # Weight-stationary stream tb: no b_stream (weights baked in core); call the
+        # weightless entry. Golden uses the same baked weights (see weights init below).
+        call_setup = f"""\
+    ac_channel<a_beat_t> a_stream;
+    ac_channel<res_t> res_stream;
+
+    for (int f = 0; f < NFRAMES; f++) {{
+        for (int i = 0; i < {m}; i++) {{
+            a_beat_t a_beat;
+            for (int kk = 0; kk < {k}; kk++) {{
+                a_beat[kk] = activations[f][i][kk];
+            }}
+            a_stream.write(a_beat);
+        }}
+    }}
+
+#ifdef CCS_SCVERIFY
+    CCS_DESIGN({name}_inst)(a_stream, biases, res_stream);
+#else
+    nnet::{name}_gemm_ip_stream_weightless<a_beat_t, int, res_t, {name}_config>(
+        a_stream, biases, res_stream);
+#endif
+
+    for (int f = 0; f < NFRAMES; f++) {{
+        for (int i = 0; i < {m}; i++) {{
+            res_t out = res_stream.read();
+            check_row(out, activations[f][i], weights, biases, f, i, failed);
+        }}
+    }}
+"""
+    elif interface == "array":
         # Array interface is a single-frame smoke test (n_frames ignored).
         call_setup = f"""\
     a_beat_t a_rows[{m}];
@@ -965,10 +1087,8 @@ int main() {{
 
     for (int j = 0; j < {n}; j++) {{
         biases[j] = (j % 5) - 2;
-        for (int kk = 0; kk < {k}; kk++) {{
-            weights[j][kk] = ((j * 5 - kk + 1) & 0x7) - 3;
-        }}
     }}
+{weights_init}
 
 {call_setup}
 
@@ -986,10 +1106,62 @@ int main() {{
 """
 
 
+def _weightless_brom_cpp(b_bits, grid_cols, total_beats, weight_rom):
+    """csim-only internal weight ROM for the weightless ccore #else branch.
+
+    ``weight_rom`` is the list of per-beat b_cols words (each ``b_bits`` wide) from
+    ``build_weight_rom`` — the SAME beats the RTL wrapper ROM holds. Big words don't
+    fit a single C++ integer literal, so each word is split into ``grid_cols`` 64-bit
+    chunks stored as ``unsigned long long`` and reassembled into an ``ac_int`` via
+    ``set_slc`` in a one-time init. Emitted inside the ``#else`` (behavioral) branch,
+    so the synth/cosim translation unit never contains the table.
+    """
+    if len(weight_rom) != total_beats:
+        raise ValueError(
+            f"weight_rom has {len(weight_rom)} beats, expected total_beats={total_beats}"
+        )
+    chunks = b_bits // 64
+    mask64 = (1 << 64) - 1
+    rows = []
+    for w in weight_rom:
+        w = int(w) & ((1 << b_bits) - 1)
+        rows.append("{" + ", ".join(f"{(w >> (g * 64)) & mask64}ULL" for g in range(chunks)) + "}")
+    init = ",\n            ".join(rows)
+    return f"""
+        // csim-only weight ROM: per-beat b_cols words baked from the same
+        // weight_matrix that fills the RTL wrapper ROM (single .dat source). Split
+        // into 64-bit chunks (a full word may exceed a C++ literal) and reassembled.
+        static const unsigned long long _brom_w[{total_beats}][{chunks}] = {{
+            {init}
+        }};
+        static ac_int<{b_bits}, false> B_ROM[{total_beats}];
+        {{
+            static bool _brom_init = false;
+            if (!_brom_init) {{
+                for (int _i = 0; _i < {total_beats}; _i++)
+                    for (int _g = 0; _g < {chunks}; _g++)
+                        B_ROM[_i].set_slc(_g * 64, ac_int<64, false>(_brom_w[_i][_g]));
+                _brom_init = true;
+            }}
+        }}"""
+
+
 def gen_inst_cpp(name, m, k, n, interface="stream",
-                 requant_shift=0, requant_bits=None, drain_shift=None):
+                 requant_shift=0, requant_bits=None, drain_shift=None, weight_matrix=None):
     from gemm_ip.metadata import grid_rows, grid_cols
-    if interface == "array":
+    weights_in_core = weight_matrix is not None
+    if weights_in_core and interface == "array":
+        raise NotImplementedError(f"{name}: weight-stationary array interface not supported")
+    if weights_in_core:
+        top_signature = f"""\
+    ac_channel<a_beat_t> &a_stream,
+    int biases[{n}],
+    ac_channel<res_t> &res_stream
+) {{
+    nnet::{name}_gemm_ip_stream_weightless<a_beat_t, int, res_t, {name}_config>(
+        a_stream, biases, res_stream);
+}}"""
+    elif interface == "array":
         top_signature = f"""\
     a_beat_t a_rows[{m}],
     b_beat_t weight_cols[{n}],
@@ -1141,25 +1313,39 @@ def gen_combined_header(items):
     stream_branches = []
     const_weight_stream_branches = []
     array_branches = []
+    weightless_branches = []
     for item in items:
         target = item.get("interface", "stream")
+        # Weight-stationary items emit ONLY the weightless entry (A-only; weights in
+        # the core ROM). Their package has no _gemm_ip_stream / _const_weights /
+        # _array functions, so referencing those in the other dispatchers would be an
+        # undeclared-identifier error (non-dependent name, checked even in a discarded
+        # `if constexpr` branch). Route each item to exactly the dispatchers whose
+        # per-core function its package actually emits.
+        if item.get("weights_in_core"):
+            weightless_branches.append(f"""\
+    if constexpr ({_dispatch_condition(item)}) {{
+        {item["name"]}_gemm_ip_stream_weightless<a_beat_T, bias_T, res_T, CONFIG_T>(
+            a_stream, biases, res_stream);
+    }}""")
+            continue
         branch = f"""\
     if constexpr ({_dispatch_condition(item)}) {{
         {item["name"]}_gemm_ip_{target}<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
             TARGET_ARGS);
     }}"""
-        # The const-weight stream wrapper is emitted by EVERY generated package
-        # (regardless of its declared interface), so route every item's shape to it —
-        # the einsum GEMM uses the const-weight stream path for QKt/A.V even though its
-        # package item is registered with interface="array".
+        # The const-weight stream wrapper is emitted by every two-stream package
+        # (regardless of its declared interface), so route every such item's shape to
+        # it — the einsum GEMM uses the const-weight stream path for QKt/A.V even
+        # though its package item is registered with interface="array".
         const_weight_stream_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
         {item["name"]}_gemm_ip_stream_const_weights<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
             a_stream, weight_cols, biases, res_stream);
     }}""")
-        # Every package also emits _gemm_ip_array; the io_stream einsum's buffered
-        # fallback (gemm_ip_array_wrapper) is always compiled, so route every item's
-        # shape to the array dispatcher too (regardless of declared interface).
+        # Every two-stream package also emits _gemm_ip_array; the io_stream einsum's
+        # buffered fallback (gemm_ip_array_wrapper) is always compiled, so route every
+        # such item's shape to the array dispatcher too (regardless of interface).
         array_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
         {item["name"]}_gemm_ip_array<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
@@ -1197,6 +1383,16 @@ def gen_combined_header(items):
         static_assert(CONFIG_T::gemm_m == 0,
                       "No generated array GEMM IP implementation matches this CONFIG_T.");
     }"""
+    weightless_branches_text = " else ".join(weightless_branches)
+    if not weightless_branches_text:
+        weightless_branches_text = """\
+    static_assert(CONFIG_T::gemm_m == 0,
+                  "No generated weight-stationary GEMM IP implementation is present in this package.");"""
+    else:
+        weightless_branches_text += """ else {
+        static_assert(CONFIG_T::gemm_m == 0,
+                      "No generated weight-stationary GEMM IP implementation matches this CONFIG_T.");
+    }"""
     return f"""\
 #ifndef GEMM_IP_COMBINED_H_
 #define GEMM_IP_COMBINED_H_
@@ -1232,6 +1428,15 @@ void gemm_ip_array(
     res_T results[CONFIG_T::gemm_m]
 ) {{
 {array_branches_text}
+}}
+
+template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
+void gemm_ip_stream_weightless(
+    ac_channel<a_beat_T> &a_stream,
+    bias_T biases[CONFIG_T::gemm_n],
+    ac_channel<res_T> &res_stream
+) {{
+{weightless_branches_text}
 }}
 
 template <class data_T, class weight_T, class bias_T, class res_T, typename CONFIG_T>
@@ -1360,7 +1565,7 @@ def _output_bits(output_precision):
 _CORE_PORTS = ("a_rows", "b_cols", "bias_cols", "c_row")
 
 
-def _assert_core_port_widths(name, header_text, grid_v):
+def _assert_core_port_widths(name, header_text, grid_v, weights_in_core=False):
     """Cross-check the blackbox word widths between the generated C++ header and
     the generated grid RTL. Catapult wires a width-mismatched blackbox port
     without erroring and the simulator X-pads the missing bits (silent cosim
@@ -1374,6 +1579,12 @@ def _assert_core_port_widths(name, header_text, grid_v):
             r"\[(\d+):0\]\s*(%s)\b" % "|".join(_CORE_PORTS), grid_v):
         rtl.setdefault(port, set()).add(int(w) + 1)
     for port in _CORE_PORTS:
+        # Weight-stationary drops b_cols from the ccore run() AND the top wrapper
+        # (weights come from the ROM). The inner behavioral grid submodule still
+        # has a b_cols port fed by the ROM, so a whole-file scan would false-flag
+        # it — b_cols simply isn't a blackbox port in this mode, so skip it.
+        if weights_in_core and port == "b_cols":
+            continue
         hw, rw = hdr.get(port, set()), rtl.get(port, set())
         if len(hw) != 1 or len(rw) != 1 or hw != rw:
             raise RuntimeError(
@@ -1405,10 +1616,20 @@ def _assert_core_first_out(name, m, k, n, gemm_k_spatial, grid_v):
 
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
                           gemm_k_spatial=None, input_precision=None, weight_precision=None,
-                          clock_period_ns=None, n_frames=1):
+                          clock_period_ns=None, n_frames=1, weight_matrix=None):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     gemm_k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
+    # Weight-stationary (const-weight) variant: weights (B, shape [K, N]) baked into
+    # the core ROM AND the csim header; the wrapper takes no external weight port and
+    # the header entry takes A only. Single source of truth = weight_matrix.
+    weights_in_core = weight_matrix is not None
+    weight_rom = None
+    if weights_in_core:
+        if gemm_k_spatial != 1:
+            raise NotImplementedError(f"{name}: weight-stationary + gemm_k_spatial>1 not supported yet")
+        from gemm_ip.weights import build_weight_rom as _brom
+        weight_rom = _brom(weight_matrix, m, n, k)
     # The core saturates the raw integer dot-product to the physical 16-bit
     # output lane; result-precision quantization happens in the wrapper drain
     # (rescale + bias + result-type cast), not in the core.
@@ -1432,7 +1653,8 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     from generate_catapult_rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
     if gemm_k_spatial == 1:
         grid_v = generate_combined_core_verilog(m, k, n, module_name=f"{name}_core", out_bits=out_bits,
-                                                requant_shift=requant_shift, requant_bits=requant_bits)
+                                                requant_shift=requant_shift, requant_bits=requant_bits,
+                                                weight_rom=weight_rom)
     else:
         print(
             f"WARNING: {name}: gemm_k_spatial={gemm_k_spatial} is experimental; "
@@ -1452,8 +1674,9 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         weight_precision=weight_precision,
         clock_period_ns=clock_period_ns,
         n_frames=n_frames,
+        weight_rom=weight_rom,
     )
-    _assert_core_port_widths(name, header_text, grid_v)
+    _assert_core_port_widths(name, header_text, grid_v, weights_in_core=weights_in_core)
     _assert_core_first_out(name, m, k, n, gemm_k_spatial, grid_v)
     (pkg_dir / f"{name}_core.v").write_text(grid_v)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
@@ -1462,11 +1685,13 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         name, m, k, n, interface,
         requant_shift=requant_shift, requant_bits=requant_bits,
         drain_shift=(_out_frac if requant_shift else _gemm_shift),
+        weight_matrix=weight_matrix,
     ))
     (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(
         name, m, k, n, interface, n_frames=n_frames,
         requant_shift=requant_shift, requant_bits=requant_bits,
         drain_shift=(_out_frac if requant_shift else _gemm_shift),
+        weight_matrix=weight_matrix,
     ))
     (pkg_dir / "run_catapult.tcl").write_text(gen_tcl(name, m, k, n, interface))
     print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface}, k_spatial={gemm_k_spatial})")
@@ -1511,6 +1736,9 @@ def _normalize_config_items(cfg):
                 "input_precision": item.get("input_precision"),
                 "weight_precision": item.get("weight_precision"),
                 "clock_period_ns": item.get("clock_period_ns"),
+                # Weight-stationary (const-weight) selection + weights source.
+                "weights_in_core": bool(item.get("weights_in_core", False)),
+                "weight_file": item.get("weight_file"),
                 "gemm_k_spatial": _validate_gemm_k_spatial(
                     int(item.get("gemm_k", item.get("n_in", 8))),
                     item.get("gemm_k_spatial"),
