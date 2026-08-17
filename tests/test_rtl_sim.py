@@ -254,6 +254,54 @@ class TestCatapultWeightStationary:
         _assert_frame_latency(res, m, k, n)
         _assert_row_cadence(res, m)
 
+    # Full-K weight-stationary: the two features were previously only tested apart,
+    # and their combination raised NotImplementedError. K deliberately spans multiples
+    # of 8 and non-multiples (tail lanes must stay zero), and several k_spatial depths.
+    @pytest.mark.parametrize("m,k,n", [
+        pytest.param( 8, 16,  8, id="8x16x8-fullk"),
+        pytest.param(24, 16, 16, id="24x16x16-fullk"),
+        pytest.param(15, 24, 14, id="15x24x14-fullk"),
+        pytest.param( 8, 12,  8, id="8x12x8-fullk-tail"),
+        pytest.param( 9, 17, 10, id="9x17x10-fullk-tail"),
+        pytest.param(16, 72,  8, id="16x72x8-fullk-deep"),
+    ])
+    def test_weight_stationary_full_k_core_sim(self, m, k, n, tmp_path):
+        import numpy as np
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "gemm_ip"))
+        import weights as _weights
+
+        k_chunks = (k + 7) // 8
+        rng = np.random.default_rng(1)
+        max_val = max(1, int((127 / max(k, 1)) ** 0.5))
+        B = rng.integers(-max_val, max_val + 1, size=(k, n)).astype(np.int8)
+        rom = _weights.build_weight_rom_full_k(B, m, n, k)
+
+        # Full-K must NOT serialise the baked weights: one beat per input beat, with
+        # the word widened to carry every K chunk. Guards the no-added-latency rule.
+        assert len(rom) == max(m, n)
+
+        mod = f"wsfk_{m}x{k}x{n}"
+        core = generate_k_spatial_combined_core_verilog(
+            m, k, n, module_name=mod, k_spatial=k_chunks, weight_rom=rom)
+
+        # No external weight port on either branch's top module; ROM present instead.
+        assert "w_rom [0:" in core
+        for branch in core.split("`else"):
+            top = branch.split(f"module {mod}_behav_grid")[0]
+            if f"module {mod}(" in top:
+                ports = top.split(f"module {mod}(")[1].split(");")[0]
+                assert "b_cols" not in ports, f"top module still takes b_cols:\n{ports}"
+
+        res = _run_sim(
+            core,
+            generate_tb(m, k, n, module_name=mod, protocol="catapult", num_vectors=8,
+                        timing=True, full_k_spatial=True, weights_in_core=True, fixed_B=B),
+            tmp_path / f"{mod}.v",
+            tmp_path / f"tb_{mod}.v",
+        )
+        _assert_frame_latency(res, m, k, n, k_spatial=k_chunks)
+        _assert_row_cadence(res, m)
+
 
 TENSOR_SLICE_STUB = r"""
 module tensor_slice_int8(

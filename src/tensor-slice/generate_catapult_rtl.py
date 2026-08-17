@@ -122,9 +122,12 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
     # Weight-stationary (const-weight): the top sim wrapper drops its external b_cols
     # port and feeds the inner behav_grid from the shared ROM (w_rom_out). The behav_grid
     # keeps its internal b_cols input, now driven by the ROM. Bias stays external.
+    # Full-K is supported: b_width is already the narrow 64*k_chunks word above, and
+    # the ROM holds one beat per presented input cycle (total_input_beats ==
+    # input_beats under full-K), so the widened word carries every K chunk without
+    # adding beats. The ROM must be built with the matching narrow full-K packer —
+    # gemm_ip.weights.build_weight_rom_full_k.
     _sim_ws = weight_rom is not None
-    if _sim_ws and full_k_spatial:
-        raise NotImplementedError("weight-stationary + full_k_spatial not supported yet")
     if _sim_ws:
         sim_b_cols_port = ""
         sim_b_src = "w_rom_out"
@@ -1185,7 +1188,8 @@ def _k_spatial_partitions(k, k_spatial):
 
 
 def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
-                                     requant_shift=0, requant_bits=None):
+                                     requant_shift=0, requant_bits=None,
+                                     weight_rom=None, emit_rom=True):
     """Structural K-spatial core.
 
     Tensor-slice outputs (and therefore the K-chunk partials) are 16-bit, as in
@@ -1215,9 +1219,14 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
     else:
         requant_fn = ""
     if k_spatial == 1:
-        return generate_synth_verilog(m, k, n, module_name)
+        return generate_synth_verilog(m, k, n, module_name,
+                                      weight_rom=weight_rom, emit_rom=emit_rom)
 
     partitions = _k_spatial_partitions(k, k_spatial)
+    # Weight-stationary: same contract as the chunked emitter — drop the external
+    # b_cols port and register B from the shared ROM instead. emit_rom=False when the
+    # combined core hoists one ROM above the `ifndef so both branches read it.
+    ksp_ws = weight_rom is not None
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     a_width = grid_rows * 64
@@ -1237,6 +1246,15 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
         a_chunk_width = 64
         b_chunk_width = 64
     total_output_rows = grid_rows * 8
+
+    if ksp_ws:
+        ksp_b_cols_port = ""
+        ksp_b_cols_src = "w_rom_out"
+        ksp_rom_block = _weight_rom_block(b_width, weight_rom) if emit_rom else ""
+    else:
+        ksp_b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
+        ksp_b_cols_src = "b_cols"
+        ksp_rom_block = ""
 
     row_mask_vals = [tail_mask_hex(m, r) for r in range(grid_rows)]
     col_mask_vals = [tail_mask_hex(n, c) for c in range(grid_cols)]
@@ -1375,15 +1393,14 @@ module {module_name}(
     input  wire                   rst,
     input  wire                   en,
     input  wire [{a_width-1}:0]   a_rows,
-    input  wire [{b_width-1}:0]   b_cols,
-    input  wire [{bias_width-1}:0]   bias_cols,
+{ksp_b_cols_port}    input  wire [{bias_width-1}:0]   bias_cols,
     input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
     output reg                    out_valid,
     output reg                    out_last
 );
-
+{ksp_rom_block}
     localparam integer INPUT_BEATS = {input_beats};
     localparam integer K_CHUNKS = {k_chunks};
     localparam integer K_SPATIAL = {k_spatial};
@@ -1416,7 +1433,7 @@ module {module_name}(
             in_valid_q      <= 1'b0;
         end else if (en) begin
             a_rows_q        <= a_rows;
-            b_cols_q        <= b_cols;
+            b_cols_q        <= {ksp_b_cols_src};
             bias_cols_q     <= bias_cols;
             preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;
@@ -1510,10 +1527,12 @@ endmodule
 
 
 def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
-                                   requant_shift=0, requant_bits=None):
+                                   requant_shift=0, requant_bits=None,
+                                   weight_rom=None, emit_rom=True):
     k_chunks = (k + 7) // 8
     sim = generate_sim_verilog(m, k, n, module_name, full_k_spatial=(k_spatial == k_chunks),
-                               requant_shift=requant_shift, requant_bits=requant_bits)
+                               requant_shift=requant_shift, requant_bits=requant_bits,
+                               weight_rom=weight_rom, emit_rom=emit_rom)
     if k_spatial == 1:
         return sim
     banner = (
@@ -1524,15 +1543,24 @@ def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_s
 
 
 def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, out_bits=8,
-                                            requant_shift=0, requant_bits=None):
+                                            requant_shift=0, requant_bits=None, weight_rom=None):
     if k_spatial == 1:
         return generate_combined_core_verilog(m, k, n, module_name, out_bits=out_bits,
-                                              requant_shift=requant_shift, requant_bits=requant_bits)
+                                              requant_shift=requant_shift, requant_bits=requant_bits,
+                                              weight_rom=weight_rom)
     _k_spatial_partitions(k, k_spatial)
+    # Weight-stationary: each branch emits its own ROM. Unlike the chunked combined
+    # core — which splits the two modules apart to hoist a single shared ROM above the
+    # `ifndef — the K-spatial core keeps sim and synth as whole modules, so hoisting
+    # would mean the same module surgery on an experimental structural body. Both ROMs
+    # are built from the same weight_rom, so sim and synth weights stay identical by
+    # construction; only one branch is ever compiled.
     sim_top = generate_k_spatial_sim_verilog(m, k, n, module_name, k_spatial,
-                                            requant_shift=requant_shift, requant_bits=requant_bits)
+                                            requant_shift=requant_shift, requant_bits=requant_bits,
+                                            weight_rom=weight_rom)
     synth_top = generate_k_spatial_synth_verilog(m, k, n, module_name, k_spatial,
-                                                requant_shift=requant_shift, requant_bits=requant_bits)
+                                                requant_shift=requant_shift, requant_bits=requant_bits,
+                                                weight_rom=weight_rom)
 
     lines = []
     lines.append("// Auto-generated by generate_catapult_rtl.py")

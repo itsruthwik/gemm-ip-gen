@@ -216,3 +216,101 @@ class TestCcoreCsim:
         b2b_firsts = [int(outs[v * m][0]) for v in range(3, 7)]
         deltas = [b - a for a, b in zip(b2b_firsts, b2b_firsts[1:])]
         assert all(d == period for d in deltas), (deltas, period)
+
+
+# Compiling the generated header for the WEIGHTLESS (weight-stationary) variant.
+# The RTL-side tests drive iverilog on the generated Verilog and never touch the
+# generated C++, so a broken weightless wrapper compiled fine in CI and only failed
+# in the real HLS flow: the full-K feed loop emitted the external B beat
+# unconditionally, giving "'b_beat_T' was not declared in this scope" and a run()
+# arity mismatch. This forces a real template instantiation of the weightless entry
+# so both classes of error surface here.
+WEIGHTLESS_TU = r"""
+#include <ac_int.h>
+#include <ac_fixed.h>
+#include <ac_channel.h>
+
+STUB_HERE
+
+#include "gemm_hdr.h"
+
+struct cfg {
+    static const unsigned gemm_m = MVAL;
+    static const unsigned gemm_k = KVAL;
+    static const unsigned gemm_n = NVAL;
+    static const unsigned n_in = KVAL;
+    static const unsigned n_out = NVAL;
+    typedef ac_fixed<32, 16, true> accum_t;
+    typedef ac_fixed<16, 8, true> weight_t;
+    typedef ac_fixed<16, 8, true> bias_t;
+};
+
+typedef nnet_array_stub<KVAL> a_beat_t;
+typedef nnet_array_stub<NVAL> res_beat_t;
+
+int main() {
+    ac_channel<a_beat_t> a_stream;
+    ac_channel<res_beat_t> res_stream;
+    int biases[NVAL];
+    for (int i = 0; i < NVAL; i++) biases[i] = 0;
+    // Force instantiation of the weightless entry point.
+    nnet::NAME_gemm_ip_stream_weightless<a_beat_t, int, res_beat_t, cfg>(
+        a_stream, biases, res_stream);
+    return 0;
+}
+"""
+
+
+@pytest.mark.skipif(not HAVE_CXX, reason="dcs-gcc / AC headers not available")
+class TestWeightlessHeaderCompiles:
+    @pytest.mark.parametrize("m,k,n,gemm_k_spatial", [
+        pytest.param( 8,  8,  8, 1, id="8x8x8-chunked"),
+        pytest.param( 8, 16,  8, 1, id="8x16x8-chunked"),
+        pytest.param( 8, 16,  8, 2, id="8x16x8-fullk"),
+        pytest.param(24, 16, 16, 2, id="24x16x16-fullk"),
+        pytest.param(15, 24, 14, 3, id="15x24x14-fullk"),
+        pytest.param( 8, 12,  8, 2, id="8x12x8-fullk-tail"),
+    ])
+    def test_weightless_header_compiles(self, m, k, n, gemm_k_spatial, tmp_path):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "gemm_ip"))
+        import weights as _weights
+
+        k_chunks = (k + 7) // 8
+        full_k = k_chunks > 1 and gemm_k_spatial == k_chunks
+        rng = np.random.default_rng(3)
+        B = rng.integers(-4, 5, size=(k, n)).astype(np.int8)
+        rom = (_weights.build_weight_rom_full_k(B, m, n, k) if full_k
+               else _weights.build_weight_rom(B, m, n, k))
+
+        hdr = gen_public_header("uut", m, k, n, (m + 7) // 8, (n + 7) // 8,
+                                gemm_k_spatial=gemm_k_spatial, weight_rom=rom)
+        # Weight-stationary drops the external B operand everywhere; a leftover
+        # reference is the exact failure this test exists to catch.
+        assert "b_beat" not in hdr, "weightless header still references the external B beat"
+
+        # Minimal nnet::array stand-in. A beats carry gemm_k lanes, result rows
+        # gemm_n, so the width must be a template parameter — a single fixed size
+        # only happens to satisfy both when k == n.
+        stub = (
+            "template <unsigned SZ>\n"
+            "struct nnet_array_stub {\n"
+            "    static const unsigned size = SZ;\n"
+            "    typedef ac_fixed<16, 8, true> value_type;\n"
+            "    value_type d[SZ];\n"
+            "    value_type &operator[](int i) { return d[i]; }\n"
+            "    const value_type &operator[](int i) const { return d[i]; }\n"
+            "};\n"
+        )
+        (tmp_path / "gemm_hdr.h").write_text(hdr)
+        tu = (WEIGHTLESS_TU
+              .replace("STUB_HERE", stub)
+              .replace("NAME_", "uut_")
+              .replace("MVAL", str(m)).replace("KVAL", str(k)).replace("NVAL", str(n)))
+        (tmp_path / "tu.cpp").write_text(tu)
+
+        comp = subprocess.run(
+            [str(GXX), "-std=c++17", "-fsyntax-only", f"-I{ACDIR}", str(tmp_path / "tu.cpp")],
+            capture_output=True, text=True, cwd=str(tmp_path))
+        assert comp.returncode == 0, (
+            f"weightless header failed to compile (m={m} k={k} n={n} "
+            f"k_spatial={gemm_k_spatial}):\n{comp.stderr[-3000:]}")

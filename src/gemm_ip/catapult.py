@@ -208,6 +208,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         bbuf_src = "B_ROM[cc_slot[wr_slot]]"
         brom_decl = _weightless_brom_cpp(b_bits, grid_cols, total_beats, weight_rom)
         stream_bcols_decl = ""
+        # Full-K weight-stationary: the IP holds B, so the feed packs no B beat at all.
+        stream_bcols_pack_full_k = ""
         stream_bcols_pack = ""
     else:
         bcols_run_param = f"        ac_int<{b_bits}, false>  b_cols,\n"
@@ -216,6 +218,20 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         bbuf_src = "b_cols"
         brom_decl = ""
         stream_bcols_decl = f"ac_int<{b_bits}, false> b_cols = 0;"
+        stream_bcols_pack_full_k = f"""if (feeding_now && t < {n}) {{
+            b_beat_T b_beat = weight_cols[t];
+            #pragma hls_unroll
+            COL_PACK_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
+                #pragma hls_unroll
+                COL_PACK_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k}) {{
+                        b_cols.set_slc(kc * 64 + kl * 8,
+                                       {name}_to_gemm_int8(b_beat[kk]));
+                    }}
+                }}
+            }}
+        }}"""
         stream_bcols_pack = f"""if (feeding_now && t < {n}) {{
             b_beat_T b_beat = weight_cols[t];
             #pragma hls_unroll
@@ -302,7 +318,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         bool feeding_now = in_feed && (p >= 1) && (p <= {total_beats});
         int t = p - 1;
         ac_int<{a_bits}, false> a_rows = 0;
-        ac_int<{b_bits}, false> b_cols = 0;
+        {stream_bcols_decl}
 
         if (feeding_now && t < {m}) {{
             a_beat_T a_beat = a_stream.read();
@@ -318,20 +334,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                 }}
             }}
         }}
-        if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[t];
-            #pragma hls_unroll
-            COL_PACK_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
-                #pragma hls_unroll
-                COL_PACK_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
-                    int kk = kc * 8 + kl;
-                    if (kk < {k}) {{
-                        b_cols.set_slc(kc * 64 + kl * 8,
-                                       {name}_to_gemm_int8(b_beat[kk]));
-                    }}
-                }}
-            }}
-        }}
+        {stream_bcols_pack_full_k}
 
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
@@ -343,7 +346,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         // reuses the per-frame idle beat (formerly a trailing separator -> now a
         // leading preload, same period); bias stays 0 here (added in the drain).
         ac_int<1, false> frame_preload = (in_feed && p == 0) ? 1 : 0;
-        gemm.run(a_rows, b_cols, bias_packed, frame_preload, feed_valid, c_row, v, l);
+        gemm.run(a_rows, {bcols_run_arg}bias_packed, frame_preload, feed_valid, c_row, v, l);
 {stream_capture_b2b}
     }}
 """
@@ -1626,9 +1629,24 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     weights_in_core = weight_matrix is not None
     weight_rom = None
     if weights_in_core:
-        if gemm_k_spatial != 1:
-            raise NotImplementedError(f"{name}: weight-stationary + gemm_k_spatial>1 not supported yet")
-        from gemm_ip.weights import build_weight_rom as _brom
+        # Two supported feeds, each with its own beat layout:
+        #   k_spatial == 1        chunked   k_chunks*input_beats beats, grid_cols*64 bits
+        #   k_spatial == k_chunks full-K    input_beats beats, 64*k_chunks bits
+        # Full-K widens the word instead of adding beats, so baking the weights costs
+        # no latency. Partial (1 < k_spatial < k_chunks) has no weight-stationary beat
+        # layout yet and is rejected rather than mis-generated.
+        _k_chunks = _ceil_div(k, LANE_WIDTH)
+        _full_k = _k_chunks > 1 and gemm_k_spatial == _k_chunks
+        if gemm_k_spatial != 1 and not _full_k:
+            raise NotImplementedError(
+                f"{name}: weight-stationary supports gemm_k_spatial=1 (chunked) or "
+                f"{_k_chunks} (full-K) for K={k}; partial gemm_k_spatial="
+                f"{gemm_k_spatial} is not supported yet"
+            )
+        if _full_k:
+            from gemm_ip.weights import build_weight_rom_full_k as _brom
+        else:
+            from gemm_ip.weights import build_weight_rom as _brom
         weight_rom = _brom(weight_matrix, m, n, k)
     # The core saturates the raw integer dot-product to the physical 16-bit
     # output lane; result-precision quantization happens in the wrapper drain
@@ -1664,7 +1682,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         )
         grid_v = generate_k_spatial_combined_core_verilog(
             m, k, n, module_name=f"{name}_core", k_spatial=gemm_k_spatial, out_bits=out_bits,
-            requant_shift=requant_shift, requant_bits=requant_bits
+            requant_shift=requant_shift, requant_bits=requant_bits, weight_rom=weight_rom
         )
     header_text = gen_public_header(
         name, m, k, n, grid_rows, grid_cols,

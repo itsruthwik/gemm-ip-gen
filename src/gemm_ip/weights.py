@@ -63,7 +63,35 @@ def build_weight_rom(B, m, n, k):
     return rom
 
 
-def weight_rom_from_dat(path, m, n, k):
+def build_weight_rom_full_k(B, m, n, k):
+    """Per-beat ROM values for the full-K-spatial feed. ``B`` is ``[K, N]``.
+
+    Full-K feeds every K chunk in ONE ``max(M, N)``-beat pass, so the ROM holds
+    ``input_beats`` entries of ``64*k_chunks`` bits — the transpose of the chunked
+    layout's ``k_chunks*input_beats`` entries of ``grid_cols*64`` bits. Widening the
+    word rather than adding beats is deliberate: serialising the baked weights would
+    cost the very latency full-K exists to avoid.
+
+    Uses the NARROW packer (one tile at position 0, K chunk ``c`` at bits
+    ``[c*64, c*64+64)``, no grid tile offset) because the full-K wrapper RTL
+    re-inserts the tile offset by beat index — see the ``a_bits``/``b_bits``
+    derivation in ``catapult.gen_public_header``. Same packer the verified
+    testbench stimulus uses, so the baked ROM matches the beats the external
+    ``b_cols`` port would have received.
+
+    K need not be a multiple of 8: the packer walks only real K bytes, leaving
+    tail lanes zero, which is the masking the RTL contract requires.
+    """
+    _ts_dir_on_path()
+    from generate_verilog_tb import pack_b_full_k_spatial_narrow  # noqa: F401
+
+    input_beats = max(m, n)
+    return [int(pack_b_full_k_spatial_narrow(B, t, n, k)) for t in range(input_beats)]
+
+
+def weight_rom_from_dat(path, m, n, k, full_k_spatial=False):
     """Convenience: load a ``.dat`` and build the ROM beats in one call."""
     B = load_weight_dat(path, n, k)
+    if full_k_spatial:
+        return build_weight_rom_full_k(B, m, n, k)
     return build_weight_rom(B, m, n, k)

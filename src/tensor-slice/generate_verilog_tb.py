@@ -246,11 +246,16 @@ def _gen_all_stimulus(m, k, n, num_vectors, base_seed, fixed_B=None):
     return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols
 
 
-def _gen_all_stimulus_catapult_full_k_spatial(m, k, n, num_vectors, base_seed):
+def _gen_all_stimulus_catapult_full_k_spatial(m, k, n, num_vectors, base_seed, fixed_B=None):
     """Generate widened full-K spatial Catapult stimulus.
 
     Each beat carries one logical A row and one logical B column, with all
     K chunks packed spatially into widened A/B words.
+
+    ``fixed_B`` pins B across every vector, as the chunked generator does. It is
+    required for weight-stationary, where the DUT's baked ROM holds one B for the
+    whole run: without it each vector would be checked against a fresh random B
+    that the ROM never contained.
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
@@ -260,7 +265,7 @@ def _gen_all_stimulus_catapult_full_k_spatial(m, k, n, num_vectors, base_seed):
 
     for v in range(num_vectors):
         seed = base_seed + v
-        A, B, biases, C_sat = _random_matrices(m, k, n, seed)
+        A, B, biases, C_sat = _random_matrices(m, k, n, seed, fixed_B=fixed_B)
 
         a_stim, b_stim = [], []
         for t in range(input_beats):
@@ -921,7 +926,7 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
                              timing=timing, back2back=back2back, full_k_spatial=vfull)
     if full_k_spatial:
         all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_catapult_full_k_spatial(
-            m, k, n, num_vectors, seed)
+            m, k, n, num_vectors, seed, fixed_B=fixed_B)
     else:
         all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus(
             m, k, n, num_vectors, seed, fixed_B=fixed_B)
