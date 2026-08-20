@@ -153,6 +153,30 @@ def test_generate_weightless_array_package(tmp_path):
     assert "nnet::wq_gemm_ip_array_weightless" in tb_cpp
 
 
+def test_generate_weightless_stream_package(tmp_path):
+    """io_stream const-weight GEMM: A-channel-in / res-channel-out weightless entry,
+    no external weight port (weights live in the csim B_ROM / RTL wrapper ROM).
+    Structural mirror of test_generate_weightless_array_package."""
+    import numpy as np
+    B = np.zeros((8, 4), dtype=np.int8)  # baked weights [K, N]
+    generate_catapult_pkg(4, 8, 4, "sw", tmp_path, interface="stream", weight_matrix=B)
+
+    header = (tmp_path / "sw" / "sw_gemm_ip.h").read_text()
+    inst_cpp = (tmp_path / "sw" / "sw_inst.cpp").read_text()
+    tb_cpp = (tmp_path / "sw" / "sw_tb.cpp").read_text()
+
+    # The weightless stream entry is emitted and carries no external B beat / weight port.
+    assert "void sw_gemm_ip_stream_weightless(" in header
+    assert "b_beat" not in header
+    assert "weight_cols" not in header
+    # Direct feed: gemm.run gets a_rows + bias, no b_cols packed operand.
+    assert "gemm.run(a_rows, bias_packed" in header
+    # The standalone top and TB route to the weightless stream entry with channel ports.
+    assert "nnet::sw_gemm_ip_stream_weightless" in inst_cpp
+    assert "a_stream" in inst_cpp and "res_stream" in inst_cpp
+    assert "nnet::sw_gemm_ip_stream_weightless" in tb_cpp
+
+
 def test_combined_header_emits_array_weightless_dispatch():
     """A weightless array item routes to the gemm_ip_array_weightless dispatcher that
     hls4ml's nnet::gemm_array_weightless calls under GEMM_IP_HEADER."""
