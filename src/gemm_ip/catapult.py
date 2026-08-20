@@ -147,7 +147,15 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     # an ``ac_int`` may fail to compile or produce unexpected truncation.
     # Fixed-point types should preserve the normal AC-datatype conversion
     # (rounding / saturation) by omitting ``.to_int()``.
-    assign_expr = "value.to_int()" if _is_ac_integer_type(result_type) else "value"
+    #
+    # ``result_type is None`` is the legacy/default package, whose result lane
+    # typedef is the INTEGER ``ac_int<16, true>`` — so it needs ``.to_int()`` too.
+    # Emit the raw fixed-point conversion only for an explicit fixed-point result
+    # type; every other case (default None or an explicit integer type) uses
+    # ``.to_int()``. Casting an ``ac_fixed`` accumulator straight to an ``ac_int``
+    # lane does not compile under the AC datatypes (no such constructor).
+    _fixed_result = isinstance(result_type, str) and not _is_ac_integer_type(result_type)
+    assign_expr = "value" if _fixed_result else "value.to_int()"
 
     # The core is a pure INTEGER matmul: it multiplies operand int8 *codes*
     # (the fixed-point mantissa = value · 2^frac). The raw integer dot-product
@@ -211,6 +219,11 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         # Full-K weight-stationary: the IP holds B, so the feed packs no B beat at all.
         stream_bcols_pack_full_k = ""
         stream_bcols_pack = ""
+        # Array feed loop, weightless: no b_cols decl / pack / run-arg (weights in ROM).
+        array_bcols_decl = ""
+        array_bcols_run_arg = ""
+        array_bcols_pack_full_k = ""
+        array_bcols_pack = ""
     else:
         bcols_run_param = f"        ac_int<{b_bits}, false>  b_cols,\n"
         bcols_bb_xor = " ^ b_cols[0]"
@@ -243,6 +256,40 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                     if (col_tile == ct && kk < {k}) {{
                         b_cols.set_slc(ct * 64 + kl * 8,
                                        {name}_to_gemm_int8(b_beat[kk]));
+                    }}
+                }}
+            }}
+        }}"""
+        # Array feed loop, two-stream: pack the external weight_cols beat into b_cols_packed.
+        array_bcols_decl = f"\n        ac_int<{b_bits}, false> b_cols_packed = 0;"
+        array_bcols_run_arg = "b_cols_packed, "
+        array_bcols_pack_full_k = f"""
+        if (step > 0 && step <= {total_beats} && t < {n}) {{
+            b_beat_T b_beat = weight_cols[t];
+            #pragma hls_unroll
+            COL_PACK_ARRAY_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
+                #pragma hls_unroll
+                COL_PACK_ARRAY_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
+                    int kk = kc * 8 + kl;
+                    if (kk < {k}) {{
+                        b_cols_packed.set_slc(kc * 64 + kl * 8,
+                                              {name}_to_gemm_int8(b_beat[kk]));
+                    }}
+                }}
+            }}
+        }}"""
+        array_bcols_pack = f"""
+        if (step > 0 && step <= {total_beats} && t < {n}) {{
+            b_beat_T b_beat = weight_cols[t];
+            #pragma hls_unroll
+            for (int kl = 0; kl < 8; kl++) {{
+                int kk = kc * 8 + kl;
+                int col_tile = t / 8;
+                #pragma hls_unroll
+                for (int ct = 0; ct < {grid_cols}; ct++) {{
+                    if (col_tile == ct && kk < {k}) {{
+                        b_cols_packed.set_slc(ct * 64 + kl * 8,
+                                              {name}_to_gemm_int8(b_beat[kk]));
                     }}
                 }}
             }}
@@ -428,18 +475,21 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     }}
 """
 
+    # Merged feed+drain array loop, parameterised over weight-stationarity the same way
+    # the stream feed loop is: two-stream packs weight_cols into b_cols_packed and passes
+    # it to run(); weightless drops all three b_cols inserts (decl/pack/run-arg) because
+    # the ccore holds B in its ROM. One loop serves both the _gemm_ip_array (two-stream)
+    # and _gemm_ip_array_weightless entries.
     if full_k_spatial:
         array_feed_loop = f"""
-    // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats}
-    // preload then feed each logical A row and B column once (full K-spatial
-    // mode: A/B words widened to carry every 8-wide K chunk); every step
-    // polls out_valid, so the frame's rows are captured as they emerge
-    // instead of in a separate drain loop after the feed.
+    // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats} preload then
+    // feed each logical A row (and, two-stream, its B column) once — full K-spatial:
+    // A/B words widened to carry every 8-wide K chunk. Every step polls out_valid, so
+    // the frame's rows are captured as they emerge, not in a separate drain loop.
     #pragma hls_pipeline_init_interval 1
     RUN_ARRAY: for (int step = 0; step < {run_calls}; step++) {{
         int t = (step == 0) ? 0 : step - 1;
-        ac_int<{a_bits}, false> a_rows_packed = 0;
-        ac_int<{b_bits}, false> b_cols_packed = 0;
+        ac_int<{a_bits}, false> a_rows_packed = 0;{array_bcols_decl}
 
         if (step > 0 && step <= {total_beats} && t < {m}) {{
             a_beat_T a_beat = a_rows[t];
@@ -454,43 +504,27 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                     }}
                 }}
             }}
-        }}
-        if (step > 0 && step <= {total_beats} && t < {n}) {{
-            b_beat_T b_beat = weight_cols[t];
-            #pragma hls_unroll
-            COL_PACK_ARRAY_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
-                #pragma hls_unroll
-                COL_PACK_ARRAY_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
-                    int kk = kc * 8 + kl;
-                    if (kk < {k}) {{
-                        b_cols_packed.set_slc(kc * 64 + kl * 8,
-                                              {name}_to_gemm_int8(b_beat[kk]));
-                    }}
-                }}
-            }}
-        }}
+        }}{array_bcols_pack_full_k}
 
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = (step >= 1 && step <= {total_beats}) ? 1 : 0;
         ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
-        gemm.run(a_rows_packed, b_cols_packed, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
+        gemm.run(a_rows_packed, {array_bcols_run_arg}bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
 {array_capture}
     }}
 """
     else:
         array_feed_loop = f"""
-    // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats}
-    // preload then feed M A rows and N B columns as 8-lane K chunks; every
-    // step polls out_valid, so the frame's rows are captured as they emerge
-    // instead of in a separate drain loop after the feed.
+    // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats} preload then
+    // feed M A rows (and, two-stream, N B columns) as 8-lane K chunks. Every step polls
+    // out_valid, so the frame's rows are captured as they emerge, not in a drain loop.
     #pragma hls_pipeline_init_interval 1
     RUN_ARRAY: for (int step = 0; step < {run_calls}; step++) {{
         int eff_step = (step == 0 || step > {total_beats}) ? 0 : step - 1;
         int kc = eff_step / {input_beats};
         int t = eff_step % {input_beats};
-        ac_int<{a_bits}, false> a_rows_packed = 0;
-        ac_int<{b_bits}, false> b_cols_packed = 0;
+        ac_int<{a_bits}, false> a_rows_packed = 0;{array_bcols_decl}
 
         if (step > 0 && step <= {total_beats} && t < {m}) {{
             a_beat_T a_beat = a_rows[t];
@@ -506,37 +540,21 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                     }}
                 }}
             }}
-        }}
-        if (step > 0 && step <= {total_beats} && t < {n}) {{
-            b_beat_T b_beat = weight_cols[t];
-            #pragma hls_unroll
-            for (int kl = 0; kl < 8; kl++) {{
-                int kk = kc * 8 + kl;
-                int col_tile = t / 8;
-                #pragma hls_unroll
-                for (int ct = 0; ct < {grid_cols}; ct++) {{
-                    if (col_tile == ct && kk < {k}) {{
-                        b_cols_packed.set_slc(ct * 64 + kl * 8,
-                                              {name}_to_gemm_int8(b_beat[kk]));
-                    }}
-                }}
-            }}
-        }}
+        }}{array_bcols_pack}
 
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = (step >= 1 && step <= {total_beats}) ? 1 : 0;
         ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
-        gemm.run(a_rows_packed, b_cols_packed, bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
+        gemm.run(a_rows_packed, {array_bcols_run_arg}bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
 {array_capture}
     }}
 """
 
     if weights_in_core:
-        # Weight-stationary: ONLY the self-contained weightless entry. No
-        # const_weights / two-stream / array functions (they reference an external
-        # b_cols the weightless ccore run() no longer has). Weights live in the
-        # csim B_ROM (baked above) and the RTL wrapper ROM.
+        # Weight-stationary: the self-contained weightless STREAM entry plus the
+        # weightless ARRAY entry (io_parallel). Neither references an external b_cols;
+        # weights live in the csim B_ROM (baked above) and the RTL wrapper ROM.
         entries_block = f"""\
 // Weight-stationary (const-weight) entry: A only, no weight argument. Synthesis
 // binds gemm.run to the weightless RTL core (weights in the wrapper ROM); csim
@@ -571,6 +589,48 @@ void {name}_gemm_ip_stream_weightless(
     }}
 
 {stream_feed_loop}
+}}
+
+// Weight-stationary ARRAY entry (io_parallel): array in / array out, weights in
+// the core. Direct feed — A rows go straight into gemm.run() (no b_cols, weights
+// from the ROM), mirroring the two-stream _gemm_ip_array but weightless. Channel-
+// free, so it synthesises (a channel bridge to the stream entry hits HIER-11).
+template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
+void {name}_gemm_ip_array_weightless(
+    a_beat_T a_rows[CONFIG_T::gemm_m],
+    bias_T biases[CONFIG_T::gemm_n],
+    res_T results[CONFIG_T::gemm_m]
+) {{
+    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
+    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
+    static_assert(a_beat_T::size == CONFIG_T::gemm_k,
+                  "a_beat_T must carry one A-row K-width beat.");
+    static_assert(res_T::size == CONFIG_T::gemm_n,
+                  "res_T must carry one full GEMM result row.");
+
+    static {name}_ccore gemm;
+    int captured = 0;
+    ac_int<{a_bits}, false> last_a_rows = 0;
+    ac_int<{bias_bits}, false> bias_packed = 0;
+
+    #pragma hls_unroll
+    BIAS_PACK_ARRAY_WL: for (int col = 0; col < {n}; col++) {{
+        int col_tile = col / 8;
+        int col_local = col % 8;
+        (void) col_tile; (void) col_local;
+        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
+    }}
+
+{array_feed_loop}
+
+    #pragma hls_pipeline_init_interval 1
+    DRAIN_ARRAY_WL_PADDED_ROWS: for (int i = 0; i < {mr - m}; i++) {{
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        ac_int<1, false> drain_valid = 0;
+        ac_int<1, false> drain_preload_valid = 0;
+        gemm.run(last_a_rows, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
+    }}
 }}
 """
     else:
@@ -877,7 +937,33 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
             f"        }}\n"
             f"    }}"
         )
-    if weights_in_core:
+    if weights_in_core and interface == "array":
+        # Weight-stationary ARRAY tb (io_parallel): array in/out, no weight port
+        # (weights baked in core). Single-frame smoke test. Golden uses the same
+        # baked weights (see weights init above).
+        call_setup = f"""\
+    a_beat_t a_rows[{m}];
+    res_t results[{m}];
+
+    for (int i = 0; i < {m}; i++) {{
+        for (int kk = 0; kk < {k}; kk++) {{
+            a_rows[i][kk] = activations[0][i][kk];
+        }}
+    }}
+
+#ifdef CCS_SCVERIFY
+    CCS_DESIGN({name}_inst)(a_rows, biases, results);
+#else
+    nnet::{name}_gemm_ip_array_weightless<a_beat_t, int, res_t, {name}_config>(
+        a_rows, biases, results);
+#endif
+
+    for (int i = 0; i < {m}; i++) {{
+        res_t out = results[i];
+        check_row(out, activations[0][i], weights, biases, 0, i, failed);
+    }}
+"""
+    elif weights_in_core:
         # Weight-stationary stream tb: no b_stream (weights baked in core); call the
         # weightless entry. Golden uses the same baked weights (see weights init below).
         call_setup = f"""\
@@ -1154,8 +1240,16 @@ def gen_inst_cpp(name, m, k, n, interface="stream",
     from gemm_ip.metadata import grid_rows, grid_cols
     weights_in_core = weight_matrix is not None
     if weights_in_core and interface == "array":
-        raise NotImplementedError(f"{name}: weight-stationary array interface not supported")
-    if weights_in_core:
+        # Weight-stationary array (io_parallel): array ports, no external weight port.
+        top_signature = f"""\
+    a_beat_t a_rows[{m}],
+    int biases[{n}],
+    res_t results[{m}]
+) {{
+    nnet::{name}_gemm_ip_array_weightless<a_beat_t, int, res_t, {name}_config>(
+        a_rows, biases, results);
+}}"""
+    elif weights_in_core:
         top_signature = f"""\
     ac_channel<a_beat_t> &a_stream,
     int biases[{n}],
@@ -1218,21 +1312,30 @@ void {name}_inst(
 """
 
 
-def gen_tcl(name, m, k, n, interface="stream"):
+def gen_tcl(name, m, k, n, interface="stream", weights_in_core=False):
+    # Map each top-level port to a ccs_ioport resource. The resource name is the
+    # top argument's variable name, so the map MUST track the four signatures'
+    # actual ports: the weightless tops carry NO B operand (weights live in the
+    # core ROM), and the array top's operands are a_rows / weight_cols (not the
+    # Vitis-style a_beats / b_beats). A directive on a non-existent port fails the
+    # Catapult run, so we emit exactly the ports the standalone top declares.
     if interface == "array":
+        # The array top's operands/result are arrays of nnet::array structs, which
+        # Catapult synthesizes as MEMORY interfaces (not ccs_ioport streaming
+        # resources). Forcing them onto ccs_ioport.ccs_in_wait fails ("Unknown path
+        # .../a_rows:rsc"); the default memory mapping schedules and cosims cleanly,
+        # so the array top adds no explicit port directives.
         map_lines = f"""\
 # Array top-level package smoke synthesis. hls4ml integration instantiates the
 # ccore through the generated combined header rather than this standalone top.
-directive set /{name}_inst/a_beats:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_inst/b_beats:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_inst/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_inst/results:rsc -MAP_TO_MODULE ccs_ioport.ccs_out_wait"""
+# Array ports default-map as memories — no explicit ccs_ioport directives."""
     else:
+        b_map = "" if weights_in_core else (
+            f"directive set /{name}_inst/b_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait\n")
         map_lines = f"""\
 # Phase 5: Map streams to real streaming resources
 directive set /{name}_inst/a_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_inst/b_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
-directive set /{name}_inst/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
+{b_map}directive set /{name}_inst/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
 directive set /{name}_inst/res_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_out_wait"""
 
     return f"""\
@@ -1317,6 +1420,7 @@ def gen_combined_header(items):
     const_weight_stream_branches = []
     array_branches = []
     weightless_branches = []
+    array_weightless_branches = []
     for item in items:
         target = item.get("interface", "stream")
         # Weight-stationary items emit ONLY the weightless entry (A-only; weights in
@@ -1326,15 +1430,23 @@ def gen_combined_header(items):
         # `if constexpr` branch). Route each item to exactly the dispatchers whose
         # per-core function its package actually emits.
         if item.get("weights_in_core"):
+            # Weight-stationary packages emit BOTH the stream and array weightless
+            # entries (shared RTL core), so route each item's shape to both
+            # dispatchers — io_stream layers reach the stream one, io_parallel the array.
             weightless_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_stream_weightless<a_beat_T, bias_T, res_T, CONFIG_T>(
+        {item["name"]}_gemm_ip_stream_weightless<a_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
             a_stream, biases, res_stream);
+    }}""")
+            array_weightless_branches.append(f"""\
+    if constexpr ({_dispatch_condition(item)}) {{
+        {item["name"]}_gemm_ip_array_weightless<a_beat_T, bias_T, res_T, CONFIG_T>(
+            a_rows, biases, results);
     }}""")
             continue
         branch = f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_{target}<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
+        {item["name"]}_gemm_ip_{target}<a_beat_T, b_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
             TARGET_ARGS);
     }}"""
         # The const-weight stream wrapper is emitted by every two-stream package
@@ -1396,6 +1508,16 @@ def gen_combined_header(items):
         static_assert(CONFIG_T::gemm_m == 0,
                       "No generated weight-stationary GEMM IP implementation matches this CONFIG_T.");
     }"""
+    array_weightless_branches_text = " else ".join(array_weightless_branches)
+    if not array_weightless_branches_text:
+        array_weightless_branches_text = """\
+    static_assert(CONFIG_T::gemm_m == 0,
+                  "No generated weight-stationary array GEMM IP implementation is present in this package.");"""
+    else:
+        array_weightless_branches_text += """ else {
+        static_assert(CONFIG_T::gemm_m == 0,
+                      "No generated weight-stationary array GEMM IP implementation matches this CONFIG_T.");
+    }"""
     return f"""\
 #ifndef GEMM_IP_COMBINED_H_
 #define GEMM_IP_COMBINED_H_
@@ -1405,12 +1527,12 @@ def gen_combined_header(items):
 
 namespace nnet {{
 
-template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void gemm_ip_stream(
+template <class a_beat_T, class b_beat_T, class res_T, typename CONFIG_T>
+void gemm_stream(
     ac_channel<a_beat_T> &a_stream,
     ac_channel<b_beat_T> &b_stream,
-    bias_T biases[CONFIG_T::gemm_n],
-    ac_channel<res_T> &res_stream
+    ac_channel<res_T> &res_stream,
+    typename CONFIG_T::bias_t biases[CONFIG_T::n_out]
 ) {{
 {stream_branches_text}
 }}
@@ -1424,22 +1546,31 @@ void gemm_ip_stream_const_weights(
 {const_weight_stream_branches_text}
 }}
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void gemm_ip_array(
+void gemm_array(
     a_beat_T a_rows[CONFIG_T::gemm_m],
     b_beat_T weight_cols[CONFIG_T::gemm_n],
-    bias_T biases[CONFIG_T::gemm_n],
-    res_T results[CONFIG_T::gemm_m]
+    res_T results[CONFIG_T::gemm_m],
+    bias_T biases[CONFIG_T::gemm_n]
 ) {{
 {array_branches_text}
 }}
 
-template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void gemm_ip_stream_weightless(
+template <class a_beat_T, class res_T, typename CONFIG_T>
+void gemm_stream_weightless(
     ac_channel<a_beat_T> &a_stream,
-    bias_T biases[CONFIG_T::gemm_n],
-    ac_channel<res_T> &res_stream
+    ac_channel<res_T> &res_stream,
+    typename CONFIG_T::bias_t biases[CONFIG_T::n_out]
 ) {{
 {weightless_branches_text}
+}}
+
+template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
+void gemm_array_weightless(
+    a_beat_T a_rows[CONFIG_T::gemm_m],
+    res_T results[CONFIG_T::gemm_m],
+    bias_T biases[CONFIG_T::gemm_n]
+) {{
+{array_weightless_branches_text}
 }}
 
 template <class data_T, class weight_T, class bias_T, class res_T, typename CONFIG_T>
@@ -1711,7 +1842,8 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         drain_shift=(_out_frac if requant_shift else _gemm_shift),
         weight_matrix=weight_matrix,
     ))
-    (pkg_dir / "run_catapult.tcl").write_text(gen_tcl(name, m, k, n, interface))
+    (pkg_dir / "run_catapult.tcl").write_text(
+        gen_tcl(name, m, k, n, interface, weights_in_core=weight_matrix is not None))
     print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface}, k_spatial={gemm_k_spatial})")
 
 

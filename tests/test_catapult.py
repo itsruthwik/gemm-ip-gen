@@ -109,9 +109,9 @@ def test_combined_header_emits_stream_array_and_layer_id_dispatch():
 
     header = gen_combined_header(items)
 
-    assert "void gemm_ip_stream(" in header
+    assert "void gemm_stream(" in header
     assert "void gemm_ip_stream_const_weights(" in header
-    assert "void gemm_ip_array(" in header
+    assert "void gemm_array(" in header
     assert "CONFIG_T::gemm_ip_id == 3" in header
     assert "CONFIG_T::gemm_ip_id == 7" in header
     assert "dense1_gemm_ip_stream" in header
@@ -130,6 +130,39 @@ def test_generate_array_package_uses_array_top(tmp_path):
     assert "nnet::query_gemm_ip_array" in inst_cpp
     assert "res_t results[4]" in inst_cpp
     assert "nnet::query_gemm_ip_array" in tb_cpp
+
+
+def test_generate_weightless_array_package(tmp_path):
+    """io_parallel const-weight GEMM: array-in/out weightless entry, direct feed
+    (no channel — a channel bridge to the stream entry hits Catapult HIER-11)."""
+    import numpy as np
+    B = np.zeros((8, 4), dtype=np.int8)  # baked weights [K, N]
+    generate_catapult_pkg(4, 8, 4, "wq", tmp_path, interface="array", weight_matrix=B)
+
+    header = (tmp_path / "wq" / "wq_gemm_ip.h").read_text()
+    inst_cpp = (tmp_path / "wq" / "wq_inst.cpp").read_text()
+    tb_cpp = (tmp_path / "wq" / "wq_tb.cpp").read_text()
+
+    # The weightless array entry is emitted and takes A + bias only (no weight port).
+    assert "void wq_gemm_ip_array_weightless" in header
+    # Direct feed: gemm.run gets a_rows + bias, no b_cols packed operand.
+    assert "gemm.run(a_rows_packed, bias_packed" in header
+    # The standalone top and TB route to the weightless array entry with array ports.
+    assert "nnet::wq_gemm_ip_array_weightless" in inst_cpp
+    assert "res_t results[4]" in inst_cpp
+    assert "nnet::wq_gemm_ip_array_weightless" in tb_cpp
+
+
+def test_combined_header_emits_array_weightless_dispatch():
+    """A weightless array item routes to the gemm_ip_array_weightless dispatcher that
+    hls4ml's nnet::gemm_array_weightless calls under GEMM_IP_HEADER."""
+    items = [
+        {"name": "wq", "m": 4, "k": 8, "n": 4, "interface": "array",
+         "weights_in_core": True, "gemm_ip_index": 5},
+    ]
+    header = gen_combined_header(items)
+    assert "void gemm_array_weightless(" in header
+    assert "wq_gemm_ip_array_weightless<a_beat_T, bias_T, res_T, CONFIG_T>" in header
 
 
 # ---------------------------------------------------------------------------
@@ -185,17 +218,21 @@ def test_output_assignment_omits_to_int_for_fixed_result(tmp_path):
     )
 
 
-def test_output_assignment_defaults_to_value_when_no_precision(tmp_path):
-    """When ``output_precision`` is not provided the header uses ``value`` (no .to_int())."""
+def test_output_assignment_uses_to_int_when_no_precision(tmp_path):
+    """When ``output_precision`` is not provided the result lane defaults to the
+    INTEGER ``ac_int<16, true>`` typedef, so the output assignment must use
+    ``value.to_int()`` — casting the ac_fixed accumulator straight to an ac_int
+    lane does not compile under the AC datatypes (Catapult CRD-312)."""
     generate_catapult_pkg(4, 8, 4, "test_default", tmp_path)
     header = (tmp_path / "test_default" / "test_default_gemm_ip.h").read_text()
-    lines = header.split('\n')
-    found_value_to_int_in_output = False
-    for line in lines:
-        if '>(value.to_int())' in line and 'out_pack' in line:
-            found_value_to_int_in_output = True
-    assert not found_value_to_int_in_output, (
-        "Default (no precision) header should not use value.to_int() in output assignment"
+    out_assign_sites = [
+        line for line in header.split('\n')
+        if 'out_pack' in line and 'value' in line and 'static_cast' in line
+    ]
+    assert out_assign_sites, "expected output-assignment sites in the header"
+    assert all('value.to_int()' in line for line in out_assign_sites), (
+        "Default (integer result lane) header must use value.to_int() in every "
+        "output assignment"
     )
 
 
