@@ -2,19 +2,12 @@
 """
 Generate self-checking Verilog testbenches for tensor-slice GEMM RTL.
 
-Supports two protocols via ``--protocol catapult|vitis``:
+Drives the Catapult ``{core}`` with ``clk/rst/en``, ``a_rows/b_cols/bias_cols``,
+``preload_valid/in_valid``, and checks ``c_row/out_valid/out_last``.
 
-- **catapult** (default): Drives ``{core}`` with ``clk/rst/en``,
-  ``a_rows/b_cols/bias_cols``, ``preload_valid/in_valid``, and checks
-  ``c_row/out_valid/out_last``.
-
-- **vitis**: Drives ``{wrapper}`` with ``ap_clk/ap_rst/ap_ce``,
-  AXI-stream FIFO handshake (``a_tdata/a_tvalid/a_tready``,
-  ``bias_tdata/…``, ``b_tdata/…``), and reads ``c_tdata/c_tvalid``.
-
-Both variants use the same golden reference: random INT8 matrices A, B are
-generated in Python, multiplied with int32 accumulation, saturated to int8,
-and embedded as Verilog literals for self-checking.
+Stimulus: random INT8 matrices A, B are generated in Python, multiplied with
+int32 accumulation, bias added, saturated to int8/result type, and embedded as
+Verilog literals for self-checking.
 """
 import argparse
 import numpy as np
@@ -122,8 +115,7 @@ def pack_b_full_k_spatial(B, col_idx, grid_cols, n, k):
 
 def pack_a_full_k_spatial_narrow(A, t, m, k):
     """Narrow full-K spatial A beat (64*k_chunks bits): one row tile at position 0,
-    K chunk c at bits [c*64 : c*64+64], no tile-row offset.  Matches the Vitis
-    narrow full_k_spatial RTL, which routes the tile to amat[beat] by beat index."""
+    K chunk c at bits [c*64 : c*64+64], no tile-row offset."""
     val = 0
     if t < m:
         for kk in range(k):
@@ -158,33 +150,25 @@ def pack_bias(biases, grid_cols, n):
 
 
 def pack_c_row(C_sat, r_tile, row_in_tile, grid_cols, m, n, protocol="catapult"):
-    """Pack one output row of C.
+    """Pack one output row of C: 128 bits per column tile — eight signed INT16
+    result lanes.
 
-    Catapult grid: 128 bits per column tile — eight signed INT16 result lanes.
-    Vitis wrapper: 64 bits per column tile — 8 int8 lanes packed adjacently.
+    ``C_sat`` is the Catapult matmul + bias, saturated to the result type. The
+    ``protocol`` argument is accepted for call-site compatibility but unused.
     """
+    del protocol
     actual_row = r_tile * 8 + row_in_tile
     val = 0
     for c in range(grid_cols):
         tile_val = 0
         for col in range(8):
             actual_col = c * 8 + col
-            if protocol == "vitis":
-                if actual_row < m and actual_col < n:
-                    byte = int(C_sat[actual_row, actual_col]) & 0xFF
-                else:
-                    byte = 0
-                tile_val |= byte << (col * 8)
+            if actual_row < m and actual_col < n:
+                lane = int(C_sat[actual_row, actual_col]) & 0xFFFF
             else:
-                if actual_row < m and actual_col < n:
-                    lane = int(C_sat[actual_row, actual_col]) & 0xFFFF
-                else:
-                    lane = 0
-                tile_val |= lane << (col * 16)
-        if protocol == "vitis":
-            val |= tile_val << (c * 64)
-        else:
-            val |= tile_val << (c * 128)
+                lane = 0
+            tile_val |= lane << (col * 16)
+        val |= tile_val << (c * 128)
     return val
 
 
@@ -194,9 +178,12 @@ def hex_literal(val, width_bytes):
     return f"{bits}'h{val:0{width_bytes*2}x}"
 
 
-def _random_matrices(m, k, n, seed, fixed_B=None):
+def _random_matrices(m, k, n, seed, fixed_B=None, max_val=None):
     rng = np.random.default_rng(seed)
-    max_val = max(1, int((127 / max(k, 1)) ** 0.5))
+    # Default range keeps the *integer* matmul within int8 for the Catapult
+    # int8-saturated golden.
+    if max_val is None:
+        max_val = max(1, int((127 / max(k, 1)) ** 0.5))
     A = rng.integers(-max_val, max_val + 1, size=(m, k), dtype=np.int8)
     # Weight-stationary: B is the baked const weight (same every vector), not random.
     if fixed_B is not None:
@@ -283,72 +270,6 @@ def _gen_all_stimulus_catapult_full_k_spatial(m, k, n, num_vectors, base_seed, f
 
     return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols
 
-
-def _gen_all_stimulus_vitis(m, k, n, num_vectors, base_seed):
-    """Same as _gen_all_stimulus but golden uses Vitis packing (gc*64 bits/row, grid_rows*8 rows)."""
-    grid_rows = (m + 7) // 8
-    grid_cols = (n + 7) // 8
-    input_beats = max(m, n)  # row/col: one row + one col per cycle
-    k_chunks = (k + 7) // 8
-
-    all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
-
-    for v in range(num_vectors):
-        seed = base_seed + v
-        A, B, biases, C_sat = _random_matrices(m, k, n, seed)
-
-        a_stim, b_stim = [], []
-        for chunk in range(k_chunks):
-            for t in range(input_beats):
-                a_stim.append(pack_a_chunk(A, t, chunk, grid_rows, m, k))
-                b_stim.append(pack_b_chunk(B, t, chunk, grid_cols, n, k))
-        all_a_stim.append(a_stim)
-        all_b_stim.append(b_stim)
-        all_bias.append(pack_bias(biases, grid_cols, n))
-
-        golden = []
-        for rt in range(grid_rows):
-            for row in range(8):
-                golden.append(pack_c_row(C_sat, rt, row, grid_cols, m, n, "vitis"))
-        all_golden.append(golden)
-
-    return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols
-
-
-def _gen_all_stimulus_vitis_full_k_narrow(m, k, n, num_vectors, base_seed):
-    """Vitis full-K-spatial stimulus with the NARROW packed word (64*k_chunks bits).
-
-    One A row and one B column per beat (input_beats beats), each carrying all K
-    chunks in a single 64*k_chunks-bit tile at position 0.  Golden uses Vitis int8
-    packing.  Matches generate_vitis_{sim,synth}_rtl in full_k_spatial mode."""
-    grid_rows = (m + 7) // 8
-    grid_cols = (n + 7) // 8
-    input_beats = max(m, n)
-
-    all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
-
-    for v in range(num_vectors):
-        seed = base_seed + v
-        A, B, biases, C_sat = _random_matrices(m, k, n, seed)
-
-        a_stim, b_stim = [], []
-        for t in range(input_beats):
-            a_stim.append(pack_a_full_k_spatial_narrow(A, t, m, k))
-            b_stim.append(pack_b_full_k_spatial_narrow(B, t, n, k))
-        all_a_stim.append(a_stim)
-        all_b_stim.append(b_stim)
-        all_bias.append(pack_bias(biases, grid_cols, n))
-
-        golden = []
-        for rt in range(grid_rows):
-            for row in range(8):
-                golden.append(pack_c_row(C_sat, rt, row, grid_cols, m, n, "vitis"))
-        all_golden.append(golden)
-
-    return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols
-
-
-# ── Catapult testbench ─────────────────────────────────────────────────────────
 
 
 def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, full_k_spatial=False, weights_in_core=False):
@@ -647,248 +568,6 @@ endmodule
 """
 
 
-# ── Vitis testbench ────────────────────────────────────────────────────────────
-
-
-def _gen_vitis_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, full_k_spatial=False):
-    """Generate a multi-vector Vitis testbench.
-
-    back2back=False (default): Drain each vector completely before feeding the next.
-
-    back2back=True: Feed all vectors in quick succession; drain all outputs
-        afterwards.  Tests double-buffer pipelining.
-    """
-    grid_rows = (m + 7) // 8
-    grid_cols = (n + 7) // 8
-    input_beats = max(m, n)  # row/col: one A row + one B col per cycle
-    k_chunks = (k + 7) // 8
-    if full_k_spatial:
-        # Narrow word: one row/col tile per beat carrying all K chunks (64*k_chunks).
-        total_input_beats = input_beats
-        a_bytes = 8 * k_chunks
-        b_bytes = 8 * k_chunks
-    else:
-        total_input_beats = k_chunks * input_beats
-        a_bytes = grid_rows * 8
-        b_bytes = grid_cols * 8
-    c_bytes = grid_cols * 8
-    bias_bytes = grid_cols * 8   # bias is always grid_cols*64 bits (one byte per col tile-lane)
-    aw = a_bytes * 8
-    bw = b_bytes * 8
-    cw = c_bytes * 8
-    biasw = bias_bytes * 8
-
-    num_vectors = len(all_a_stim)
-    total_out_rows = m
-    b2b_flag = 1 if back2back else 0
-
-    a_init, b_init, bias_init, golden_init = [], [], [], []
-    for v in range(num_vectors):
-        for t in range(total_input_beats):
-            a_init.append(f"        a_stim[{v}][{t}] = {hex_literal(all_a_stim[v][t], a_bytes)};")
-            b_init.append(f"        b_stim[{v}][{t}] = {hex_literal(all_b_stim[v][t], b_bytes)};")
-        bias_init.append(f"        bias_stim[{v}] = {hex_literal(all_bias[v], bias_bytes)};")
-        for row in range(total_out_rows):
-            golden_init.append(f"        golden[{v}][{row}] = {hex_literal(all_golden[v][row], c_bytes)};")
-
-    vt_first_out = '                if (out_row_idx == 0) $display("T:first_output=%0d", $realtime);' if timing else ""
-    vt_last_out  = f'                if (out_row_idx == {total_out_rows} - 1) $display("T:last_output=%0d", $realtime);' if timing else ""
-
-    mode_tag = "back2back" if back2back else "sequential"
-
-    if back2back:
-        init_block = f"""
-    initial begin
-        $display("=== Vitis TB {m}x{k}x{n}  ({num_vectors} vectors) ===");
-        pass_count = 0; fail_count = 0;
-        out_last_count = 0;
-        out_row_idx = 0;
-        $display("MODE back2back");
-
-        for (vec_idx = 0; vec_idx < NV; vec_idx = vec_idx + 1) begin
-            $display("--- Vector %0d (seed %0d) ---", vec_idx, {base_seed} + vec_idx);
-
-            // Reset only on first vector
-            if (vec_idx == 0) begin
-                ap_rst <= 1;
-                repeat (2) @(posedge ap_clk);
-                ap_rst <= 0;
-            end
-
-            // Feed bias
-            @(posedge ap_clk);
-            bias_tdata  <= bias_stim[vec_idx];
-            bias_tvalid <= 1;
-            @(posedge ap_clk);
-            bias_tvalid <= 0;
-
-            // Feed A+B
-            a_tdata <= a_stim[vec_idx][0];
-            b_tdata <= b_stim[vec_idx][0];
-            a_tvalid <= 1;
-            b_tvalid <= 1;
-            @(posedge ap_clk);
-            for (t = 1; t < TOTAL_INPUT_BEATS; t = t + 1) begin
-                a_tdata <= a_stim[vec_idx][t];
-                b_tdata <= b_stim[vec_idx][t];
-                @(posedge ap_clk);
-            end
-            a_tvalid <= 0;
-            b_tvalid <= 0;
-        end
-
-        // Drain ALL results from all vectors sequentially
-        while (out_last_count < NV) begin
-            while (!c_tvalid) @(posedge ap_clk);
-{vt_first_out}
-{vt_last_out}
-            if (c_tdata !== golden[out_last_count][out_row_idx]) begin
-                $display("FAIL vec %0d row %0d: got %h expected %h", out_last_count, out_row_idx, c_tdata, golden[out_last_count][out_row_idx]);
-                fail_count = fail_count + 1;
-            end else begin
-                pass_count = pass_count + 1;
-            end
-            out_row_idx = out_row_idx + 1;
-            if (out_row_idx == {total_out_rows}) begin
-                out_last_count = out_last_count + 1;
-                out_row_idx = 0;
-            end
-            @(posedge ap_clk);
-        end
-
-        if (fail_count == 0) $display("ALL_PASS  (%0d vectors)", NV);
-        else $display("FAILURES=%0d", fail_count);
-        $finish;
-    end
-"""
-    else:
-        init_block = f"""
-    initial begin
-        $display("=== Vitis TB {m}x{k}x{n}  ({num_vectors} vectors) ===");
-        pass_count = 0; fail_count = 0;
-        $display("MODE sequential");
-
-        for (vec_idx = 0; vec_idx < NV; vec_idx = vec_idx + 1) begin
-            $display("--- Vector %0d (seed %0d) ---", vec_idx, {base_seed} + vec_idx);
-            out_row_idx = 0;
-
-            // Even vectors: full reset.  Odd vectors: back-to-back without reset.
-            if (vec_idx == 0 || (vec_idx % 2) == 0) begin
-                ap_rst <= 1;
-                repeat (2) @(posedge ap_clk);
-                ap_rst <= 0;
-            end
-
-            // Feed bias
-            @(posedge ap_clk);
-            bias_tdata  <= bias_stim[vec_idx];
-            bias_tvalid <= 1;
-            @(posedge ap_clk);
-            bias_tvalid <= 0;
-
-            // Feed A+B
-            a_tdata <= a_stim[vec_idx][0];
-            b_tdata <= b_stim[vec_idx][0];
-            a_tvalid <= 1;
-            b_tvalid <= 1;
-            @(posedge ap_clk);
-            for (t = 1; t < TOTAL_INPUT_BEATS; t = t + 1) begin
-                a_tdata <= a_stim[vec_idx][t];
-                b_tdata <= b_stim[vec_idx][t];
-                @(posedge ap_clk);
-            end
-            a_tvalid <= 0;
-            b_tvalid <= 0;
-
-            // Drain results
-            for (int i = 0; i < {total_out_rows}; i++) begin
-                while (!c_tvalid) @(posedge ap_clk);
-{vt_first_out}
-{vt_last_out}
-                if (c_tdata !== golden[vec_idx][out_row_idx]) begin
-                    $display("FAIL vec %0d row %0d: got %h expected %h", vec_idx, out_row_idx, c_tdata, golden[vec_idx][out_row_idx]);
-                    fail_count = fail_count + 1;
-                end else begin
-                    pass_count = pass_count + 1;
-                end
-                out_row_idx = out_row_idx + 1;
-                @(posedge ap_clk);
-            end
-        end
-
-        if (fail_count == 0) $display("ALL_PASS  (%0d vectors)", NV);
-        else $display("FAILURES=%0d", fail_count);
-        $finish;
-    end
-"""
-
-    return f"""\
-`timescale 1ns/1ps
-// Auto-generated Vitis-RTL multi-vector testbench  (row/col streaming, valid/ready/last)
-// M={m}, K={k}, N={n}  |  base_seed={base_seed}  |  {num_vectors} vectors
-// mode: {mode_tag}
-
-module tb_vitis_{m}x{k}x{n};
-
-    localparam NV = {num_vectors};
-    localparam INPUT_BEATS = {input_beats};
-    localparam K_CHUNKS = {k_chunks};
-    localparam TOTAL_INPUT_BEATS = {total_input_beats};
-    localparam TOTAL_ROWS = {total_out_rows};
-
-    reg  ap_clk = 0;
-    reg  ap_rst = 1;
-    reg  ap_ce = 1;
-
-    reg  [{aw - 1}:0] a_tdata = 0;
-    reg        a_tvalid = 0;
-    wire       a_tready;
-
-    reg  [{biasw - 1}:0] bias_tdata = 0;
-    reg        bias_tvalid = 0;
-    wire       bias_tready;
-
-    reg  [{bw - 1}:0] b_tdata = 0;
-    reg        b_tvalid = 0;
-    wire       b_tready;
-
-    wire [{cw - 1}:0] c_tdata;
-    wire       c_tvalid;
-    reg        c_tready = 1;
-
-    {module_name} dut (
-        .ap_clk(ap_clk), .ap_rst(ap_rst), .ap_ce(ap_ce),
-        .a_tdata(a_tdata), .a_tvalid(a_tvalid), .a_tready(a_tready),
-        .bias_tdata(bias_tdata), .bias_tvalid(bias_tvalid), .bias_tready(bias_tready),
-        .b_tdata(b_tdata), .b_tvalid(b_tvalid), .b_tready(b_tready),
-        .c_tdata(c_tdata), .c_tvalid(c_tvalid), .c_tready(c_tready)
-    );
-
-    always #5 ap_clk = ~ap_clk;
-
-    // Stimulus & golden memories
-    reg [{aw - 1}:0] a_stim    [0:NV-1][0:TOTAL_INPUT_BEATS - 1];
-    reg [{bw - 1}:0] b_stim    [0:NV-1][0:TOTAL_INPUT_BEATS - 1];
-    reg [{biasw - 1}:0] bias_stim [0:NV-1];
-    reg [{cw - 1}:0] golden    [0:NV-1][0:{total_out_rows - 1}];
-
-    initial begin
-{chr(10).join(a_init)}
-{chr(10).join(b_init)}
-{chr(10).join(bias_init)}
-{chr(10).join(golden_init)}
-    end
-
-    integer vec_idx, out_row_idx;
-    integer t;
-    integer pass_count, fail_count;
-    integer out_last_count;
-{init_block}
-
-endmodule
-"""
-
-
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 
@@ -901,7 +580,7 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
         m, k, n: GEMM dimensions.
         module_name: Name of the DUT module to instantiate.
         seed: Base random seed (vectors use seed, seed+1, ..., seed+N-1).
-        protocol: ``"catapult"`` or ``"vitis"``.
+        protocol: ``"catapult"`` (the only supported protocol).
         num_vectors: Number of random test vectors (default 10).
         timing: If True, emit ``$display`` with ``$realtime`` at key events.
         back2back: If True, feed vectors in quick succession without waiting
@@ -911,19 +590,6 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
     Returns:
         Verilog source as a string.
     """
-    if protocol == "vitis":
-        k_chunks = (k + 7) // 8
-        # Mirror generate_vitis_sim_rtl's default: gemm_k_spatial defaults to 1, so
-        # full_k_spatial == (1 == k_chunks).  Callers may force it for k_chunks>1.
-        vfull = full_k_spatial or (k_chunks == 1)
-        if vfull:
-            all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_vitis_full_k_narrow(
-                m, k, n, num_vectors, seed)
-        else:
-            all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_vitis(
-                m, k, n, num_vectors, seed)
-        return _gen_vitis_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden,
-                             timing=timing, back2back=back2back, full_k_spatial=vfull)
     if full_k_spatial:
         all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_catapult_full_k_spatial(
             m, k, n, num_vectors, seed, fixed_B=fixed_B)
@@ -934,7 +600,10 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
 
 
 def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_sat, timing=False):
-    """Single-vector testbench (backward compat — used for manual timing runs)."""
+    """Single-vector testbench (backward compat — used for manual timing runs).
+
+    ``C_sat`` bakes bias into the Catapult int8/result-type saturated golden.
+    """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     input_beats = max(m, n)  # row/col: one row + one col per cycle
@@ -944,15 +613,8 @@ def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_
         for t in range(input_beats):
             a_stim.append(pack_a_chunk(A, t, chunk, grid_rows, m, k))
             b_stim.append(pack_b_chunk(B, t, chunk, grid_cols, n, k))
-    bias_packed = pack_bias(biases, grid_cols, n)
-    golden = []
-    for actual_row in range(m):
-        rt = actual_row // 8
-        rl = actual_row % 8
-        golden.append(pack_c_row(C_sat, rt, rl, grid_cols, m, n, protocol))
-    if protocol == "vitis":
-        return _gen_vitis_tb(m, k, n, module_name, seed, [a_stim], [b_stim], [bias_packed], [golden], timing=timing)
     # Catapult: need (grid_rows*8) rows of golden
+    bias_packed = pack_bias(biases, grid_cols, n)
     total_out_rows = m
     cat_golden = []
     for rt in range(grid_rows):
@@ -970,7 +632,7 @@ if __name__ == "__main__":
     parser.add_argument("--n", type=int, required=True)
     parser.add_argument("--name", type=str, default="gemm_grid_wrapper")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--protocol", choices=("catapult", "vitis"), default="catapult")
+    parser.add_argument("--protocol", choices=("catapult",), default="catapult")
     parser.add_argument("--output", type=str, default="tb_gemm.v")
     args = parser.parse_args()
 

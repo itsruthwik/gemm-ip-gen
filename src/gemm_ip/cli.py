@@ -3,29 +3,26 @@ Unified CLI entry point for gemm-ip-gen.
 
 Usage::
 
-    # Catapult (default)
+    # tensor_slice (the default target)
     python -m gemm_ip --m 8 --k 8 --n 8 --name gemm_8x8x8
 
-    # Vitis
-    python -m gemm_ip --backend vitis --m 8 --k 8 --n 8 --name gemm_8x8x8
-
     # From config file
-    python -m gemm_ip --backend vitis --config gemm_config.json
+    python -m gemm_ip --config gemm_config.json
 """
 
 import argparse
 import json
 from pathlib import Path
 
-from gemm_ip.metadata import SUPPORTED_BACKENDS, normalize_gemm_config
+from gemm_ip.registry import TARGETS
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate GEMM IP packages for Catapult or Vitis HLS"
+        description="Generate GEMM IP blackbox packages for a hardblock target"
     )
-    parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="catapult",
-                        help="Target HLS backend (default: catapult)")
+    parser.add_argument("--target", choices=TARGETS, default="tensor_slice",
+                        help="Hardblock target (default: tensor_slice)")
     parser.add_argument("--config", type=str, help="Path to gemm_config.json")
     parser.add_argument("--m", type=int, default=8, help="GEMM M (rows per tile)")
     parser.add_argument("--k", type=int, default=8, help="GEMM K (inner dimension)")
@@ -42,20 +39,19 @@ def main():
                         help="Output directory (default: ./output)")
     args = parser.parse_args()
 
-    if args.backend == "catapult":
-        _run_catapult(args)
-    elif args.backend == "vitis":
-        _run_vitis(args)
+    _run(args)
 
 
-def _run_catapult(args):
-    from gemm_ip.catapult import generate_catapult_pkg, gen_combined_header, gen_integration_manifest, gen_blackbox_tcl, _normalize_config_items
+def _run(args):
+    from gemm_ip.registry import load_target
+
+    target = load_target(args.target)
 
     if args.config:
         from gemm_ip import weights as _weights
         cfg_path = Path(args.config)
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        items = _normalize_config_items(cfg)
+        items = target.normalize_config(cfg)
         for item in items:
             # Weight-stationary (const-weight): bake weights into the core ROM + csim
             # header. The .dat is column-major [n][k] raw ints emitted by hls4ml, path
@@ -64,45 +60,40 @@ def _run_catapult(args):
             if item.get("weights_in_core") and item.get("weight_file"):
                 dat = (cfg_path.parent / item["weight_file"]).resolve()
                 weight_matrix = _weights.load_weight_dat(str(dat), item["n"], item["k"])
-            generate_catapult_pkg(
-                item["m"], item["k"], item["n"], item["name"],
-                args.output_dir,
-                interface=item.get("interface", "stream"),
-                output_precision=item.get("output_precision"),
-                gemm_k_spatial=item.get("gemm_k_spatial"),
-                input_precision=item.get("input_precision"),
-                weight_precision=item.get("weight_precision"),
-                clock_period_ns=item.get("clock_period_ns"),
-                weight_matrix=weight_matrix,
+            target.package(
+                (item["m"], item["k"], item["n"]),
+                {
+                    "name": item["name"],
+                    "output_dir": args.output_dir,
+                    "interface": item.get("interface", "stream"),
+                    "output_precision": item.get("output_precision"),
+                    "gemm_k_spatial": item.get("gemm_k_spatial"),
+                    "input_precision": item.get("input_precision"),
+                    "weight_precision": item.get("weight_precision"),
+                    "clock_period_ns": item.get("clock_period_ns"),
+                    "weight_matrix": weight_matrix,
+                },
             )
         output_dir = Path(args.output_dir)
-        (output_dir / "gemm_ip_combined.h").write_text(gen_combined_header(items))
-        (output_dir / "integration_manifest.json").write_text(gen_integration_manifest(items) + "\n")
-        (output_dir / "catapult_gemm_blackboxes.tcl").write_text(gen_blackbox_tcl(items))
+        (output_dir / "gemm_ip_combined.h").write_text(target.combined_header(items))
+        (output_dir / "integration_manifest.json").write_text(target.integration_manifest(items) + "\n")
+        (output_dir / "catapult_gemm_blackboxes.tcl").write_text(target.blackbox_tcl(items))
     else:
-        generate_catapult_pkg(
-            args.m, args.k, args.n, args.name,
-            args.output_dir, interface=args.interface, gemm_k_spatial=args.k_spatial,
-            # Standalone unit packages use integer operand codes / int16 result
-            # lanes; an integer result type makes the wrapper drain emit
-            # value.to_int() so the ac_fixed rescale accumulator converts cleanly
-            # to the int16 output lane (the real hls4ml flow passes ac_fixed here).
-            output_precision="ac_int<16, true>",
-            n_frames=args.n_frames,
+        target.package(
+            (args.m, args.k, args.n),
+            {
+                "name": args.name,
+                "output_dir": args.output_dir,
+                "interface": args.interface,
+                "gemm_k_spatial": args.k_spatial,
+                # Standalone unit packages use integer operand codes / int16 result
+                # lanes; an integer result type makes the wrapper drain emit
+                # value.to_int() so the ac_fixed rescale accumulator converts cleanly
+                # to the int16 output lane (the real hls4ml flow passes ac_fixed here).
+                "output_precision": "ac_int<16, true>",
+                "n_frames": args.n_frames,
+            },
         )
-
-
-def _run_vitis(args):
-    from gemm_ip.vitis import generate_vitis_pkg, generate_from_config_file
-
-    if args.config:
-        generate_from_config_file(args.config, args.output_dir)
-    else:
-        item = normalize_gemm_config({
-            "name": args.name, "m": args.m, "k": args.k, "n": args.n,
-            "backend": "vitis", "interface": args.interface, "gemm_k_spatial": args.k_spatial,
-        })[0]
-        generate_vitis_pkg(item, args.output_dir)
 
 
 if __name__ == "__main__":

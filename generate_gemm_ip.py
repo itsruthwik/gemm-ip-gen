@@ -11,8 +11,13 @@ sys.path.insert(0, "src")
 import json
 from pathlib import Path
 
-from gemm_ip.metadata import normalize_gemm_config
-from gemm_ip.catapult import generate_catapult_pkg, gen_combined_header, gen_integration_manifest
+from gemm_ip.config import normalize_gemm_config
+from gemm_ip.registry import load_target_package
+
+_pkg = load_target_package()
+generate_catapult_pkg = _pkg.generate_catapult_pkg
+gen_combined_header = _pkg.gen_combined_header
+gen_integration_manifest = _pkg.gen_integration_manifest
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:

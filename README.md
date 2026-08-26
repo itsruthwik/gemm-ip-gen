@@ -1,9 +1,32 @@
 # gemm-ip-gen
 
-Generates GEMM IP blackbox packages for Catapult HLS, targeting the tensor-slice
-INT8 GEMM hardblock. Each package contains the RTL core, an hls4ml-native C++
-wrapper, and a Catapult synthesis script. A combined dispatch header is emitted
-when multiple packages are generated together.
+Generates GEMM IP blackbox packages for hardblock **targets**. A target is one
+hardblock welded to a single HLS tool; the only target today is `tensor_slice`
+(an INT8 GEMM hardblock, tool: Catapult). Each package contains the RTL core, an
+hls4ml-native C++ wrapper, and a Catapult synthesis script. A combined dispatch
+header is emitted when multiple packages are generated together.
+
+## Layout
+
+The framework core is thin and target-agnostic; each hardblock is a
+self-contained plugin under `src/targets/`:
+
+```text
+src/
+  gemm_ip/          core: cli, config, common, quant, registry, weights
+  targets/
+    base.py         the Target contract
+    tensor_slice/   geometry, rtl, golden, package, flow, tb/, run_rtl_tests
+```
+
+A **target** = one hardblock + its single HLS tool (one tool per hardblock — no
+hardblock×tool matrix, no shared protocol/shim layer). A target's `flow.py`
+implements the `Target` contract (`geometry`, `emit_rtl`, `emit_behavioral`,
+`golden`, `package`, `verify`, `rtl_test`) by delegating to its sibling modules,
+and registers under a name in `gemm_ip/registry.py`. The CLI picks one with
+`--target` (default: `tensor_slice`). Adding a hardblock is a new
+`src/targets/<name>/` directory plus a name in the registry — the core and other
+targets are untouched.
 
 ## Quick start
 
@@ -16,7 +39,7 @@ source .venv/bin/activate
 # Already have an environment? Editable install only
 pip install -e .
 
-# Generate a single package
+# Generate a single package (default target: tensor_slice)
 python -m gemm_ip --m 8 --k 8 --n 8 --name gemm_8x8x8 --output_dir ./output
 
 # From config file
@@ -64,7 +87,7 @@ For a package named `<name>`:
 | `<name>/<name>_tb.cpp` | Standalone C-simulation testbench |
 | `<name>/run_catapult.tcl` | Catapult synthesis script |
 | `gemm_ip_combined.h` | Shape/id dispatch header for multi-package builds |
-| `blackbox_files.tcl` | Catapult file-add helper |
+| `catapult_gemm_blackboxes.tcl` | Catapult file-add helper |
 | `integration_manifest.json` | Package metadata for multi-layer models |
 
 ## Interfaces
@@ -80,23 +103,22 @@ shape.
 
 ## Testing
 
+The RTL-level regression generates the behavioral wrapper + a self-checking
+testbench for a spread of shapes and runs them under Icarus Verilog:
+
 ```bash
-# Full suite
-pytest tests/ -v
+# 10 shapes x 3 seeds (behavioral combined core; no external slice IP needed)
+src/targets/tensor_slice/run_rtl_tests.sh
 
-# RTL simulation
-pytest tests/test_rtl_sim.py -v
-
-# Catapult package tests
-pytest tests/test_catapult.py -v
+# a subset
+src/targets/tensor_slice/run_rtl_tests.sh --cases 8x8x8 16x16x16 --seeds 1 7
 ```
 
-RTL simulation tests cover all 10 DEFAULT_CASES configs (K≤8 and K>8):
-sequential 10-vector, back-to-back 2-vector pipelined (shadow FIFO, II=9
-for 8×8×8), and synth structural smoke with `-DSYNTHESIS` iverilog flag.
-All tests use the combined core (`ifndef SYNTHESIS` behavioral model, `else`
-synth wrapper). Catapult package tests validate C++ header emission,
-`CCS_MAIN` SCVerify TB, TCL instantiation names, and bias wiring.
+It compiles the combined core without `-DSYNTHESIS`, so the `ifndef SYNTHESIS`
+behavioral branch (which does the matmul directly) is the one simulated. The same
+regression is reachable through the target contract as `Target.rtl_test(...)`.
+The tool-level bar — a real Catapult C-synth + QuestaSim C-vs-RTL cosim — is
+covered under **Catapult SCVerify** below.
 
 ## Catapult SCVerify
 
@@ -120,4 +142,6 @@ C++ golden against the RTL behavioral model automatically.
 - `docs/rtl_contract.md` — RTL port interfaces, data layout, synth protocol
 - `docs/gemm-ip-integration.md` — hls4ml contract, wrapper phases, verification
 - `docs/wrapper_timing_model.md` — latency formulas, blackbox binding
-- `src/tensor-slice/` — RTL generators, testbench generators, slice RTL
+- `src/gemm_ip/` — thin, target-agnostic core (cli, config, quant, registry, …)
+- `src/targets/base.py` — the Target contract
+- `src/targets/tensor_slice/` — the tensor_slice target: geometry, RTL/testbench generators, package

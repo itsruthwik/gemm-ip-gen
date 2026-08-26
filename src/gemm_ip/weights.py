@@ -20,7 +20,7 @@ import numpy as np
 
 
 def _ts_dir_on_path():
-    ts_dir = str(Path(__file__).resolve().parent.parent / "tensor-slice")
+    ts_dir = str(Path(__file__).resolve().parent.parent / "targets" / "tensor_slice")
     if ts_dir not in _sys.path:
         _sys.path.insert(0, ts_dir)
 
@@ -48,10 +48,10 @@ def build_weight_rom(B, m, n, k):
 
     Returns a list of ints, one per beat, each ``grid_cols*64`` bits wide, in the
     exact ``for chunk: for t`` order the RUN loop consumes (see ``_gen_all_stimulus``
-    in ``generate_verilog_tb.py``). ``B`` is ``[K, N]``.
+    in ``golden.py``). ``B`` is ``[K, N]``.
     """
     _ts_dir_on_path()
-    from generate_verilog_tb import pack_b_chunk  # noqa: F401
+    from golden import pack_b_chunk  # noqa: F401
 
     grid_cols = (n + 7) // 8
     k_chunks = (k + 7) // 8
@@ -83,7 +83,7 @@ def build_weight_rom_full_k(B, m, n, k):
     tail lanes zero, which is the masking the RTL contract requires.
     """
     _ts_dir_on_path()
-    from generate_verilog_tb import pack_b_full_k_spatial_narrow  # noqa: F401
+    from golden import pack_b_full_k_spatial_narrow  # noqa: F401
 
     input_beats = max(m, n)
     return [int(pack_b_full_k_spatial_narrow(B, t, n, k)) for t in range(input_beats)]

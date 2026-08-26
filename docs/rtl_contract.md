@@ -24,18 +24,6 @@ pack public rows/columns into 8-lane K chunks before driving the RTL wrapper.
 
 ## RTL Blackbox Interface
 
-Vitis AXI-stream wrapper:
-
-```verilog
-module {name}_wrapper(
-    ap_clk, ap_rst, ap_ce,
-    a_tdata, a_tvalid, a_tready,
-    b_tdata, b_tvalid, b_tready,
-    bias_tdata, bias_tvalid, bias_tready,
-    c_tdata, c_tvalid, c_tready
-);
-```
-
 Catapult-style core:
 
 ```verilog
@@ -138,8 +126,7 @@ releases them one at a time in row-major order for their 8-row bursts.
 
 This replaced an earlier per-tile delay-line alignment pyramid, whose shift
 registers cost sum-of-delays x 129 FFs (~6.2k on a 2x2 grid, ~29k on 4x2). That
-pyramid survives only in the unused `_generate_buffered_synth_verilog` path and
-is not reachable from any generator entry point.
+pyramid — and its unused buffered-synth generator — has since been removed.
 
 ## Tensor-Slice Assumption
 
@@ -174,5 +161,4 @@ The synth wrapper:
 - preloads bias into each column tile
 - uses every slice output to assemble full C rows
 
-It must not contain a second GEMM datapath. The Vitis AXI wrapper may use a
-one-row skid register so `c_tdata` remains stable while `c_tready` is low.
+It must not contain a second GEMM datapath.

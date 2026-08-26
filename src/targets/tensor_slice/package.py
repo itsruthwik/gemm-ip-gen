@@ -1,25 +1,27 @@
-"""
-Catapult HLS GEMM blackbox package generator.
+"""tensor_slice HLS package generator (tool: Catapult).
 
-Generates per-layer packages with ac_channel-based wrappers,
-tensor-slice grid RTL, Catapult synthesis Tcl, and a combined
-dispatch header for hls4ml integration.
+Assembles a per-layer blackbox package for the tensor_slice hardblock:
+ac_channel-based C++ wrappers, the grid RTL core, the Catapult synthesis Tcl,
+and a combined dispatch header for hls4ml integration. This is the ``package``
+half of the target — the ``rtl`` / ``golden`` / ``geometry`` siblings supply the
+RTL, testbenches, and tile geometry; the core supplies quant math (``gemm_ip.quant``)
+and common helpers (``gemm_ip.common``).
 """
 
-import argparse
 import json
 import re
 import sys
 from pathlib import Path
 
-from gemm_ip.metadata import (
-    LANE_WIDTH,
-    TENSOR_SLICE_SRC,
-    _safe_name,
-    _ceil_div,
-    _is_ac_integer_type,
-    load_catapult_rtl_generator,
-)
+from gemm_ip.common import _is_ac_integer_type
+from gemm_ip.quant import _frac_bits, _output_bits
+
+# geometry is a sibling target module; put this dir on the path and import by
+# name (the same idiom the RTL loaders below use).
+_here = str(Path(__file__).resolve().parent)
+if _here not in sys.path:
+    sys.path.insert(0, _here)
+from geometry import LANE_WIDTH, _ceil_div, _validate_gemm_k_spatial  # noqa: E402
 
 # Combinational delay (ns) Catapult must budget for any cycle that touches the
 # blackbox boundary. The structural grid registers its inputs and outputs, but
@@ -1237,7 +1239,7 @@ def _weightless_brom_cpp(b_bits, grid_cols, total_beats, weight_rom):
 
 def gen_inst_cpp(name, m, k, n, interface="stream",
                  requant_shift=0, requant_bits=None, drain_shift=None, weight_matrix=None):
-    from gemm_ip.metadata import grid_rows, grid_cols
+    from geometry import grid_rows, grid_cols
     weights_in_core = weight_matrix is not None
     if weights_in_core and interface == "array":
         # Weight-stationary array (io_parallel): array ports, no external weight port.
@@ -1316,9 +1318,9 @@ def gen_tcl(name, m, k, n, interface="stream", weights_in_core=False):
     # Map each top-level port to a ccs_ioport resource. The resource name is the
     # top argument's variable name, so the map MUST track the four signatures'
     # actual ports: the weightless tops carry NO B operand (weights live in the
-    # core ROM), and the array top's operands are a_rows / weight_cols (not the
-    # Vitis-style a_beats / b_beats). A directive on a non-existent port fails the
-    # Catapult run, so we emit exactly the ports the standalone top declares.
+    # core ROM), and the array top's operands are a_rows / weight_cols. A directive
+    # on a non-existent port fails the Catapult run, so we emit exactly the ports
+    # the standalone top declares.
     if interface == "array":
         # The array top's operands/result are arrays of nnet::array structs, which
         # Catapult synthesizes as MEMORY interfaces (not ccs_ioport streaming
@@ -1649,53 +1651,6 @@ def gen_blackbox_tcl(items):
     return "\n".join(lines) + "\n"
 
 
-def _validate_gemm_k_spatial(k, gemm_k_spatial):
-    k_chunks = _ceil_div(k, LANE_WIDTH)
-    if gemm_k_spatial is None:
-        return k_chunks
-    k_spatial = int(gemm_k_spatial)
-    if k_spatial < 1:
-        raise ValueError("gemm_k_spatial must be >= 1")
-    if k_spatial > k_chunks:
-        raise ValueError(
-            f"gemm_k_spatial={k_spatial} exceeds K_CHUNKS={k_chunks}; "
-            "v1 requires at most one spatial grid per K chunk"
-        )
-    return k_spatial
-
-
-def _frac_bits(precision):
-    """Fractional-bit count (W - I) of a precision like 'fixed<9,5,…>'.
-
-    The GEMM IP feeds operands as int8 *codes* = the fixed-point mantissa
-    (value · 2^frac). The product of two operands therefore carries
-    2^(frac_a + frac_b), which the wrapper drain divides back out. Returns 0 for
-    an unset/unparseable precision (integer-coded operand ⇒ no rescale), so the
-    rescale collapses to the identity for the legacy integer-input case.
-    """
-    if not precision:
-        return 0
-    m = re.search(r"u?fixed<\s*(\d+)\s*,\s*(-?\d+)", str(precision))
-    if not m:
-        return 0
-    width, integer_bits = int(m.group(1)), int(m.group(2))
-    return width - integer_bits
-
-
-def _output_bits(output_precision):
-    """Result-lane width (bits) from an output_precision like 'fixed<16,6,…>'.
-
-    Drives the GEMM-IP output saturation/packing so the result honors the
-    configured precision instead of the legacy hardcoded int8 clamp. Returns 8
-    (legacy int8) when unset/unparseable so callers without a precision keep
-    the old behavior. The first ``fixed<>`` field is the total bit width.
-    """
-    if not output_precision:
-        return 8
-    m = re.search(r"u?fixed<\s*(\d+)", str(output_precision))
-    return int(m.group(1)) if m else 8
-
-
 _CORE_PORTS = ("a_rows", "b_cols", "bias_cols", "c_row")
 
 
@@ -1795,11 +1750,11 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
 
-    # The combined core (ifndef SYNTHESIS) is in the tensor-slice module
-    ts_dir = str(Path(__file__).resolve().parent.parent / "tensor-slice")
+    # The combined core (ifndef SYNTHESIS) lives in the rtl sibling module.
+    ts_dir = str(Path(__file__).resolve().parent)
     if ts_dir not in sys.path:
         sys.path.insert(0, ts_dir)
-    from generate_catapult_rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
+    from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
     if gemm_k_spatial == 1:
         grid_v = generate_combined_core_verilog(m, k, n, module_name=f"{name}_core", out_bits=out_bits,
                                                 requant_shift=requant_shift, requant_bits=requant_bits,
@@ -1845,54 +1800,3 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     (pkg_dir / "run_catapult.tcl").write_text(
         gen_tcl(name, m, k, n, interface, weights_in_core=weight_matrix is not None))
     print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface}, k_spatial={gemm_k_spatial})")
-
-
-def _normalize_config_items(cfg):
-    if isinstance(cfg, list):
-        for item in cfg:
-            item.setdefault("interface", "stream")
-            item.setdefault("protocol", {})
-            item.setdefault("gemm_ip_id", item.get("name"))
-            item.setdefault("gemm_ip_index", None)
-            item["gemm_k_spatial"] = _validate_gemm_k_spatial(
-                int(item.get("gemm_k", item.get("k", item.get("n_in", 8)))),
-                item.get("gemm_k_spatial"),
-            )
-        return cfg
-    if isinstance(cfg, dict):
-        if "m" in cfg and "k" in cfg and "n" in cfg and "name" in cfg:
-            cfg.setdefault("interface", "stream")
-            cfg.setdefault("protocol", {})
-            cfg.setdefault("gemm_ip_id", cfg.get("name"))
-            cfg.setdefault("gemm_ip_index", None)
-            cfg["gemm_k_spatial"] = _validate_gemm_k_spatial(
-                int(cfg.get("gemm_k", cfg.get("k", cfg.get("n_in", 8)))),
-                cfg.get("gemm_k_spatial"),
-            )
-            return [cfg]
-        items = []
-        for name, item in cfg.items():
-            interface = item.get("interface", "stream")
-            items.append({
-                "name": name,
-                "m": item.get("gemm_m", 1),
-                "k": item.get("gemm_k", item["n_in"]),
-                "n": item.get("gemm_n", item["n_out"]),
-                "interface": interface,
-                "protocol": item.get("protocol", {}),
-                "gemm_ip_id": item.get("gemm_ip_id", name),
-                "gemm_ip_index": item.get("gemm_ip_index"),
-                "output_precision": item.get("output_precision"),
-                "input_precision": item.get("input_precision"),
-                "weight_precision": item.get("weight_precision"),
-                "clock_period_ns": item.get("clock_period_ns"),
-                # Weight-stationary (const-weight) selection + weights source.
-                "weights_in_core": bool(item.get("weights_in_core", False)),
-                "weight_file": item.get("weight_file"),
-                "gemm_k_spatial": _validate_gemm_k_spatial(
-                    int(item.get("gemm_k", item.get("n_in", 8))),
-                    item.get("gemm_k_spatial"),
-                ),
-            })
-        return items
-    raise TypeError("Unsupported config format")

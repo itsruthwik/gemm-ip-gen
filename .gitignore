@@ -31,6 +31,9 @@ __pycache__/
 dist/
 build/
 
+# Generated RTL-level test artifacts (run_rtl_tests.py)
+src/targets/tensor_slice/tb/generated/
+
 # Catapult and simulator output
 *.log
 *.jou
@@ -60,4 +63,3 @@ SIF/
 
 
 catapult_pkgs/
-vitis_run*

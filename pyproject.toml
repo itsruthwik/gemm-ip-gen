@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gemm-ip-gen"
 version = "0.2.0"
-description = "GEMM IP package generator for Catapult and Vitis HLS backends"
+description = "GEMM IP package generator for the Catapult HLS backend"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",

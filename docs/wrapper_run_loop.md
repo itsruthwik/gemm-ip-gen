@@ -2,7 +2,7 @@
 
 This note documents the frame schedule of the generated Catapult C++ wrapper —
 the `RUN` / `RUN_ARRAY` loop emitted into every package's public header by
-`gen_public_header` (`src/gemm_ip/catapult.py`). For the timing formulas
+`gen_public_header` (`src/targets/tensor_slice/package.py`). For the timing formulas
 (`latency_cycles`, frame slots, per-mode `first_out`) see
 `wrapper_timing_model.md`.
 

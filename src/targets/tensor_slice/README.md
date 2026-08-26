@@ -5,10 +5,9 @@
 ## Contents
 
 - `tensor_slice_int8.v`: standalone 8×8 int8 systolic slice RTL
-- `generate_catapult_rtl.py`: generates Catapult RTL wrappers (behavioral sim, synth, combined core)
-- `generate_vitis_rtl.py`: generates Vitis RTL wrappers (behavioral sim, synth)
-- `generate_verilog_tb.py`: generates self-checking Verilog testbenches for both protocols
-- `_generate_rtl_common.py`: shared helpers (tail mask, cycle counter)
+- `rtl.py`: generates Catapult RTL wrappers (behavioral sim, synth, combined core)
+- `golden.py`: generates self-checking Verilog testbenches for both protocols
+- `geometry.py`: shared helpers (tail mask, cycle counter)
 - `tb/`: standalone slice testbenches and regressions
 
 ## Interface Summary
