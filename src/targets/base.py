@@ -52,5 +52,14 @@ class Target(ABC):
     def rtl_test(self, **kwargs):
         """Run the target's RTL-level regression; return a process-style code (0 = pass)."""
 
+    def sources_tcl(self, items):
+        """Return the tcl the HLS tool sources to bring this target's IP into the
+        project. This is the seam that lets the frontend stay target-blind: it emits a
+        single ``source $tcldir/gemm_pkg/gemm_ip_sources.tcl`` line, and the target
+        decides what goes in it — ``add_files -blackbox <wrapper.json>`` for an
+        RTL-blackbox target, or nothing (header-only) for a behavioral-HLS one. The
+        default is a no-op suitable for header-only targets."""
+        return "# no IP sources to add (header-only target)\n"
+
     def __repr__(self):
         return f"<Target {self.name!r} tool={self.tool!r}>"

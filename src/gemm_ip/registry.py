@@ -13,7 +13,7 @@ from pathlib import Path
 
 # Registered targets (one tool per hardblock; tensor_slice's tool is Catapult).
 # Adding a hardblock = one new directory under src/targets/ plus its name here.
-TARGETS = ("tensor_slice",)
+TARGETS = ("tensor_slice", "generic")
 
 
 def _target_dir(target):

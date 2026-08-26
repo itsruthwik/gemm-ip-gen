@@ -196,6 +196,146 @@ def gemm_ip_header(name):
     )
 
 
+# ── Whole-model combined header (the hls4ml Vitis integration seam) ───────────────
+#
+# Unlike the per-shape RTL blackbox targets, the generic funcs are one templated
+# definition that covers every layer, so there is no per-core dispatch: the four
+# entry points below ARE the combined header. Their signatures match the hls4ml
+# contract exactly (the "declaration only" prototypes in nnet_gemm_ip.h /
+# nnet_gemm_stream.h): the weightless entries take NO weight argument and source the
+# constant columns from CONFIG_T::gemm_weight_cols() (the ROM the writer injects into
+# each layer's CONFIG_T), and gemm_stream_weightless unpacks narrow input beats into a
+# gemm_k-wide row. Header-only + synthesizable -> no add_files (see sources tcl).
+_GEMM_IP_COMBINED_FUNCS = r"""
+namespace nnet {
+
+// gemm_array — io_parallel, TWO activation operands (attention QK^T / A.V).
+template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
+void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
+                res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
+    GEMM_ARRAY_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        res_row_T c_row;
+        GEMM_ARRAY_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
+            #pragma HLS PIPELINE II=1
+            typename CONFIG_T::accum_t accum = 0;
+            GEMM_ARRAY_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
+                #pragma HLS UNROLL
+                accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * b_cols[n][k]);
+            }
+            accum += biases[n];
+            c_row[n] = accum;
+        }
+        results[m] = c_row;
+    }
+}
+
+// gemm_array_weightless — io_parallel, constant operand held by the IP. No weight
+// argument: the columns come from CONFIG_T::gemm_weight_cols() (contract signature).
+template <class a_row_T, class bias_T, class res_row_T, typename CONFIG_T>
+void gemm_array_weightless(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m],
+                           bias_T biases[CONFIG_T::gemm_n]) {
+    typename CONFIG_T::weight_col_t *weight_cols = CONFIG_T::gemm_weight_cols();
+    GEMM_AWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        res_row_T c_row;
+        GEMM_AWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
+            #pragma HLS PIPELINE II=1
+            typename CONFIG_T::accum_t accum = 0;
+            GEMM_AWL_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
+                #pragma HLS UNROLL
+                accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * weight_cols[n][k]);
+            }
+            accum += biases[n];
+            c_row[n] = accum;
+        }
+        results[m] = c_row;
+    }
+}
+
+// gemm_stream — io_stream, TWO activation operands. B is read into local storage
+// (operand residency), then C = A * B streams out.
+template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
+void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
+                 hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
+    static_assert(data0_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
+    static_assert(data1_T::size == CONFIG_T::gemm_k, "B column height must equal gemm_k.");
+    static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
+
+    data1_T b_cols[CONFIG_T::gemm_n];
+    GEMM_STREAM_READB: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
+        #pragma HLS PIPELINE II=1
+        b_cols[n] = b_stream.read();
+    }
+    GEMM_STREAM_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        data0_T a_row = a_stream.read();
+        res_T c_row;
+        GEMM_STREAM_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
+            #pragma HLS PIPELINE II=1
+            typename CONFIG_T::accum_t accum = 0;
+            GEMM_STREAM_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
+                #pragma HLS UNROLL
+                accum += (typename CONFIG_T::accum_t)(a_row[k] * b_cols[n][k]);
+            }
+            accum += biases[n];
+            c_row[n] = accum;
+        }
+        res_stream.write(c_row);
+    }
+}
+
+// gemm_stream_weightless — io_stream, constant operand held by the IP. No weight
+// argument (contract signature): columns come from CONFIG_T::gemm_weight_cols(). The
+// input may arrive as several narrower beats (gemm_k / data_T::size) that are packed
+// into a gemm_k-wide row, mirroring the hls4ml behavioral entry.
+template <class data_T, class res_T, typename CONFIG_T>
+void gemm_stream_weightless(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream,
+                            typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
+    static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
+    typedef nnet::array<typename data_T::value_type, CONFIG_T::gemm_k> a_row_T;
+    typename CONFIG_T::weight_col_t *weight_cols = CONFIG_T::gemm_weight_cols();
+
+    GEMM_SWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        a_row_T a_row;
+        GEMM_SWL_READA: for (unsigned kp = 0; kp < CONFIG_T::gemm_k / data_T::size; kp++) {
+            #pragma HLS PIPELINE II=1
+            data_T a_pack = data_stream.read();
+            for (unsigned k = 0; k < data_T::size; k++) {
+                #pragma HLS UNROLL
+                a_row[kp * data_T::size + k] = a_pack[k];
+            }
+        }
+        res_T c_row;
+        GEMM_SWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
+            #pragma HLS PIPELINE II=1
+            typename CONFIG_T::accum_t accum = 0;
+            GEMM_SWL_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
+                #pragma HLS UNROLL
+                accum += (typename CONFIG_T::accum_t)(a_row[k] * weight_cols[n][k]);
+            }
+            accum += biases[n];
+            c_row[n] = accum;
+        }
+        res_stream.write(c_row);
+    }
+}
+
+} // namespace nnet
+"""
+
+
+def combined_header():
+    """The whole-model integration header included by the firmware when
+    GEMM_IP_HEADER is set: the four contract entry points, one template each,
+    shape-generic. Deliberately includes no nnet_types.h — the firmware already
+    provides nnet::array / hls::stream — so there is no type redefinition."""
+    return (
+        "#ifndef GEMM_IP_COMBINED_H_\n"
+        "#define GEMM_IP_COMBINED_H_\n\n"
+        "#include <hls_stream.h>\n"
+        f"{_GEMM_IP_COMBINED_FUNCS}\n"
+        "#endif // GEMM_IP_COMBINED_H_\n"
+    )
+
+
 def config_header(name, m, k, n, input_precision=None, weight_precision=None,
                   output_precision=None, bias_precision=None, accum_precision=None,
                   weights_in_core=False):

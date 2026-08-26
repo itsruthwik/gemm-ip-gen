@@ -50,7 +50,17 @@ class GenericTarget(Target):
         name = cfg.pop("name")
         output_dir = cfg.pop("output_dir")
         m, k, n = shape
-        return _package.generate_generic_pkg(m, k, n, name, output_dir, **cfg)
+        # A weight-stationary layer is signalled by a baked weight matrix (the CLI loads
+        # it from the layer's .dat). generate_generic_pkg then emits the ROM header and
+        # the weightless standalone top. Drop keys the standalone emitter has no use for
+        # (e.g. gemm_k_spatial — a spatial-partition knob for the RTL targets, not the
+        # behavioral one) so the config-driven and unit paths share one entry point.
+        weight_matrix = cfg.pop("weight_matrix", None)
+        cfg.pop("gemm_k_spatial", None)
+        return _package.generate_generic_pkg(
+            m, k, n, name, output_dir,
+            weights_in_core=weight_matrix is not None,
+            weight_matrix=weight_matrix, **cfg)
 
     def verify(self, package):
         pkg = Path(package)
@@ -84,6 +94,33 @@ class GenericTarget(Target):
         if not ok:
             print(log[-4000:], file=sys.stderr)
         return 0 if ok else 1
+
+    # ── batch orchestration (multi-package; used by the CLI) ─────────────────
+    def normalize_config(self, cfg):
+        # Target-independent: same item schema every target consumes.
+        from gemm_ip.config import _normalize_config_items
+        return _normalize_config_items(cfg)
+
+    def combined_header(self, items):
+        # Shape-generic: one templated definition covers every layer, so the items
+        # only confirm there is work to do — the header content is the same regardless.
+        return _hls.combined_header()
+
+    def integration_manifest(self, items):
+        import json
+        cores = [{"name": item["name"], "kind": "behavioral", "header": "gemm_ip_combined.h"}
+                 for item in items]
+        return json.dumps({"tool": "vitis", "flow": "behavioral", "cores": cores}, indent=2)
+
+    def sources_tcl(self, items):
+        # Behavioral flow: the combined header IS the implementation and the firmware
+        # includes it via the -I<pkg> path, so Vitis needs no add_files. hls4ml sources
+        # this file unconditionally, so emit an explanatory no-op rather than nothing.
+        names = ", ".join(item["name"] for item in items)
+        return ("# generic (behavioral-HLS) GEMM IP: header-only, synthesized from\n"
+                "# gemm_ip_combined.h on the firmware include path -- no add_files needed.\n"
+                f"# cores: {names}\n"
+                'puts "gemm-ip-gen (generic): behavioral GEMM IP, no blackbox sources to add"\n')
 
 
 TARGET = GenericTarget()

@@ -42,7 +42,8 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
                          weights_in_core=False, weight_matrix=None,
                          input_precision=None, weight_precision=None,
                          output_precision=None, bias_precision=None,
-                         accum_precision=None, part=DEFAULT_PART, clock_period_ns=5):
+                         accum_precision=None, part=DEFAULT_PART, clock_period_ns=5,
+                         **_ignored):
     if interface not in ("stream", "array"):
         raise ValueError(f"generic target: unsupported interface '{interface}'")
     pkg_dir = Path(output_dir) / name

@@ -77,7 +77,12 @@ def _run(args):
         output_dir = Path(args.output_dir)
         (output_dir / "gemm_ip_combined.h").write_text(target.combined_header(items))
         (output_dir / "integration_manifest.json").write_text(target.integration_manifest(items) + "\n")
-        (output_dir / "catapult_gemm_blackboxes.tcl").write_text(target.blackbox_tcl(items))
+        # The tool-agnostic integration seam: the frontend sources this one file, and
+        # the target decides what it contains (blackbox add_files vs. header-only no-op).
+        (output_dir / "gemm_ip_sources.tcl").write_text(target.sources_tcl(items))
+        # Catapult-only artifact: only targets welded to Catapult emit it.
+        if hasattr(target, "blackbox_tcl"):
+            (output_dir / "catapult_gemm_blackboxes.tcl").write_text(target.blackbox_tcl(items))
     else:
         target.package(
             (args.m, args.k, args.n),
