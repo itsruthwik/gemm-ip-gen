@@ -44,7 +44,18 @@ def _ap_type(precision, default):
 
 
 # ── The four synthesizable entry points (shape-independent template) ─────────────
-
+#
+# Identical microarchitecture to the whole-model combined header (see
+# _GEMM_IP_COMBINED_FUNCS): the row (M) loop is pipelined at II=CONFIG_T::reuse_factor,
+# the N (output) and K (contraction) loops are fully UNROLLed, and the multiplier count
+# is capped by CONFIG_T::multiplier_limit. Strategy/ReuseFactor reach the core purely
+# through CONFIG_T (which config_header emits), so this standalone package and the flow
+# synthesize the same RTL:
+#   - Latency  (reuse_factor=1): II=1, multiplier_limit=gemm_k*gemm_n -> full array.
+#   - Resource (reuse_factor=R): II=R, multiplier_limit=ceil(gemm_k*gemm_n/R) -> shared.
+# The only difference from the combined funcs is the signature: here the weightless
+# entries take the weight ROM as an explicit argument (the standalone top feeds it from
+# <name>_weights.h) rather than sourcing it from CONFIG_T::gemm_weight_cols().
 _GEMM_IP_FUNCS = r"""
 namespace nnet {
 
@@ -52,10 +63,12 @@ namespace nnet {
 template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
                 res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     GEMM_ARRAY_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
         res_row_T c_row;
         GEMM_ARRAY_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
             GEMM_ARRAY_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
                 #pragma HLS UNROLL
@@ -74,10 +87,12 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
 template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_array_weightless(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T weight_cols[CONFIG_T::gemm_n],
                            res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     GEMM_AWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
         res_row_T c_row;
         GEMM_AWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
             GEMM_AWL_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
                 #pragma HLS UNROLL
@@ -98,6 +113,7 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
     static_assert(data0_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
     static_assert(data1_T::size == CONFIG_T::gemm_k, "B column height must equal gemm_k.");
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
 
     data1_T b_cols[CONFIG_T::gemm_n];
     GEMM_STREAM_READB: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
@@ -105,10 +121,11 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
         b_cols[n] = b_stream.read();
     }
     GEMM_STREAM_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
         data0_T a_row = a_stream.read();
         res_T c_row;
         GEMM_STREAM_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
             GEMM_STREAM_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
                 #pragma HLS UNROLL
@@ -129,12 +146,14 @@ void gemm_stream_weightless(hls::stream<data_T> &data_stream, b_col_T weight_col
                             hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
     static_assert(data_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
 
     GEMM_SWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
         data_T a_row = data_stream.read();
         res_T c_row;
         GEMM_SWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
             GEMM_SWL_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
                 #pragma HLS UNROLL
@@ -183,7 +202,10 @@ template <typename T, unsigned N> struct array {
 
 
 def gemm_ip_header(name):
-    """The four synthesizable entry points (shape-independent)."""
+    """The four synthesizable entry points (shape-generic). Strategy/ReuseFactor are
+    honored via CONFIG_T (reuse_factor / multiplier_limit), so the funcs need no
+    per-shape specialisation here — config_header emits the knobs into the struct."""
+    funcs = _GEMM_IP_FUNCS
     return (
         f"#ifndef {name.upper()}_GEMM_IP_H_\n"
         f"#define {name.upper()}_GEMM_IP_H_\n\n"
@@ -191,7 +213,7 @@ def gemm_ip_header(name):
         "#include <ap_int.h>\n"
         "#include <hls_stream.h>\n"
         '#include "nnet_types.h"\n'
-        f"{_GEMM_IP_FUNCS}\n"
+        f"{funcs}\n"
         f"#endif // {name.upper()}_GEMM_IP_H_\n"
     )
 
@@ -206,6 +228,16 @@ def gemm_ip_header(name):
 # constant columns from CONFIG_T::gemm_weight_cols() (the ROM the writer injects into
 # each layer's CONFIG_T), and gemm_stream_weightless unpacks narrow input beats into a
 # gemm_k-wide row. Header-only + synthesizable -> no add_files (see sources tcl).
+#
+# Microarchitecture (mirrors hls4ml's nnet_dense_latency): each streamed/array A row
+# is one pipelined region — the N (output) and K (contraction) loops are fully
+# UNROLLed, the row (M) loop is pipelined at II=CONFIG_T::reuse_factor, and the
+# multiplier count is capped by CONFIG_T::multiplier_limit. So Strategy/ReuseFactor
+# reach the core through CONFIG_T (hls4ml injects both into each layer's gemm config):
+#   - Latency  (reuse_factor=1): II=1, multiplier_limit=gemm_k*gemm_n -> the full
+#     K*N multiplier array fires per row, one row/cycle (the DenseLatency point).
+#   - Resource (reuse_factor=R): II=R, multiplier_limit=ceil(gemm_k*gemm_n/R) -> the
+#     scheduler shares that many multipliers across R cycles/row (DenseResource point).
 _GEMM_IP_COMBINED_FUNCS = r"""
 namespace nnet {
 
@@ -213,10 +245,12 @@ namespace nnet {
 template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
                 res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     GEMM_ARRAY_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
         res_row_T c_row;
         GEMM_ARRAY_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
             GEMM_ARRAY_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
                 #pragma HLS UNROLL
@@ -234,11 +268,13 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
 template <class a_row_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_array_weightless(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m],
                            bias_T biases[CONFIG_T::gemm_n]) {
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     typename CONFIG_T::weight_col_t *weight_cols = CONFIG_T::gemm_weight_cols();
     GEMM_AWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
         res_row_T c_row;
         GEMM_AWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
             GEMM_AWL_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
                 #pragma HLS UNROLL
@@ -259,6 +295,7 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
     static_assert(data0_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
     static_assert(data1_T::size == CONFIG_T::gemm_k, "B column height must equal gemm_k.");
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
 
     data1_T b_cols[CONFIG_T::gemm_n];
     GEMM_STREAM_READB: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
@@ -266,10 +303,11 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
         b_cols[n] = b_stream.read();
     }
     GEMM_STREAM_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
         data0_T a_row = a_stream.read();
         res_T c_row;
         GEMM_STREAM_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
             GEMM_STREAM_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
                 #pragma HLS UNROLL
@@ -290,13 +328,15 @@ template <class data_T, class res_T, typename CONFIG_T>
 void gemm_stream_weightless(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream,
                             typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     typedef nnet::array<typename data_T::value_type, CONFIG_T::gemm_k> a_row_T;
     typename CONFIG_T::weight_col_t *weight_cols = CONFIG_T::gemm_weight_cols();
 
     GEMM_SWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
+        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
         a_row_T a_row;
         GEMM_SWL_READA: for (unsigned kp = 0; kp < CONFIG_T::gemm_k / data_T::size; kp++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS UNROLL
             data_T a_pack = data_stream.read();
             for (unsigned k = 0; k < data_T::size; k++) {
                 #pragma HLS UNROLL
@@ -305,7 +345,7 @@ void gemm_stream_weightless(hls::stream<data_T> &data_stream, hls::stream<res_T>
         }
         res_T c_row;
         GEMM_SWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS PIPELINE II=1
+            #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
             GEMM_SWL_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
                 #pragma HLS UNROLL
@@ -338,8 +378,10 @@ def combined_header():
 
 def config_header(name, m, k, n, input_precision=None, weight_precision=None,
                   output_precision=None, bias_precision=None, accum_precision=None,
-                  weights_in_core=False):
+                  weights_in_core=False, strategy="latency", reuse_factor=1):
     """Per-shape config struct + beat typedefs."""
+    rf = max(1, int(reuse_factor or 1))
+    mult_limit = -(-(int(k) * int(n)) // rf)   # ceil(gemm_k*gemm_n / reuse_factor)
     input_t = _ap_type(input_precision, "ap_fixed<16,6>")
     weight_t = _ap_type(weight_precision, input_t)
     result_t = _ap_type(output_precision, "ap_fixed<16,6>")
@@ -369,6 +411,8 @@ struct {name}_config {{
     static const unsigned gemm_k    = {k};
     static const unsigned gemm_n    = {n};
     static const bool transpose_weights = true;
+    static const unsigned reuse_factor = {rf};
+    static const unsigned multiplier_limit = {mult_limit};
     typedef {name}_bias_t bias_t;
     typedef {accum_t} accum_t;
 }};

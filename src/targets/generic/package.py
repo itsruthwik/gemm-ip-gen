@@ -43,6 +43,7 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
                          input_precision=None, weight_precision=None,
                          output_precision=None, bias_precision=None,
                          accum_precision=None, part=DEFAULT_PART, clock_period_ns=5,
+                         strategy="latency", reuse_factor=1,
                          **_ignored):
     if interface not in ("stream", "array"):
         raise ValueError(f"generic target: unsupported interface '{interface}'")
@@ -55,7 +56,8 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
         name, m, k, n,
         input_precision=input_precision, weight_precision=weight_precision,
         output_precision=output_precision, bias_precision=bias_precision,
-        accum_precision=accum_precision))
+        accum_precision=accum_precision,
+        strategy=strategy, reuse_factor=reuse_factor))
     if weights_in_core:
         B = weight_matrix if weight_matrix is not None else _default_weight_matrix(k, n)
         (pkg_dir / f"{name}_weights.h").write_text(_hls.weights_header(name, m, k, n, B))
@@ -66,5 +68,6 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
     (pkg_dir / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_period_ns))
 
     print(f"Generated {pkg_dir}  (generic vitis: M={m}, K={k}, N={n}, "
-          f"interface={interface}, weights_in_core={weights_in_core})")
+          f"interface={interface}, weights_in_core={weights_in_core}, "
+          f"strategy={strategy}, reuse_factor={reuse_factor})")
     return pkg_dir

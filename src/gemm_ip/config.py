@@ -91,6 +91,10 @@ def _normalize_config_items(cfg):
             item.setdefault("protocol", {})
             item.setdefault("gemm_ip_id", item.get("name"))
             item.setdefault("gemm_ip_index", None)
+            # Resource/throughput knobs hls4ml emits per GEMM (honored by the
+            # generic/behavioral target; the RTL targets have their own tiling).
+            item.setdefault("strategy", "latency")
+            item.setdefault("reuse_factor", 1)
             item["gemm_k_spatial"] = _validate_gemm_k_spatial(
                 int(item.get("gemm_k", item.get("k", item.get("n_in", 8)))),
                 item.get("gemm_k_spatial"),
@@ -102,6 +106,8 @@ def _normalize_config_items(cfg):
             cfg.setdefault("protocol", {})
             cfg.setdefault("gemm_ip_id", cfg.get("name"))
             cfg.setdefault("gemm_ip_index", None)
+            cfg.setdefault("strategy", "latency")
+            cfg.setdefault("reuse_factor", 1)
             cfg["gemm_k_spatial"] = _validate_gemm_k_spatial(
                 int(cfg.get("gemm_k", cfg.get("k", cfg.get("n_in", 8)))),
                 cfg.get("gemm_k_spatial"),
@@ -119,6 +125,8 @@ def _normalize_config_items(cfg):
                 "protocol": item.get("protocol", {}),
                 "gemm_ip_id": item.get("gemm_ip_id", name),
                 "gemm_ip_index": item.get("gemm_ip_index"),
+                "strategy": item.get("strategy", "latency"),
+                "reuse_factor": item.get("reuse_factor", 1),
                 "output_precision": item.get("output_precision"),
                 "input_precision": item.get("input_precision"),
                 "weight_precision": item.get("weight_precision"),
