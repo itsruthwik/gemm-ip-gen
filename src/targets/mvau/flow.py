@@ -29,7 +29,7 @@ import geometry as _geom  # noqa: E402
 #: The vendored FINN static RTL compiled alongside every generated wrapper/shim.
 RTL_STATIC = Path(__file__).resolve().parent / "rtl_static"
 STATIC_SOURCES = [
-    "mvu_vvu_axi.sv", "replay_buffer.sv",
+    "mvu_vvu_axi.sv", "replay_buffer.sv", "memstream.sv",
     "mvu_4sx4u.sv", "mvu_8sx8u_dsp48.sv", "mvu_vvu_8sx9_dsp58.sv",
 ]
 

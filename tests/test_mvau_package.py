@@ -48,9 +48,11 @@ def test_blackbox_json_contract(tmp_path):
     assert rcs["module_clock_enable"] == "ap_ce"
     for k in ("idle", "start", "ready", "done", "continue"):
         assert f"ap_ctrl_chain_protocol_{k}" in rcs
-    # FIFO port map, not AXIS
+    # FIFO port map, not AXIS. Weight-stationary: weights are baked in the memstream,
+    # so there is no weight port -- only the activation input and the result output.
     pnames = {p["c_name"]: p["rtl_ports"] for p in j["c_parameters"]}
-    assert pnames["w"]["FIFO_data_read_in"] == "w_dout"
+    assert "w" not in pnames
+    assert pnames["a"]["FIFO_data_read_in"] == "a_dout"
     assert pnames["p"]["FIFO_data_write_out"] == "p_din"
 
 
@@ -66,8 +68,41 @@ def test_folded_top_beat_counts(tmp_path):
     # (3,16,8) rf=16 folds to PE=4 SIMD=4 SF=4 NF=2, M=3.
     pkg = _gen(tmp_path, (3, 16, 8), "gemm_3x16x8_f", reuse_factor=16)
     top = (pkg / "gemm_3x16x8_f_top.cpp").read_text()
-    # weights M*NF*SF = 3*2*4 = 24 ; acts M*SF = 3*4 = 12 ; requant loops M=3 vectors
-    assert "i < 24;" in top and "i < 12;" in top and "vec < 3;" in top
+    # weight-stationary: weights baked in the memstream (no feed_w). acts M*SF = 3*4 = 12 ;
+    # requant loops M=3 vectors.
+    assert "i < 12;" in top and "vec < 3;" in top
+    assert "feed_w" not in top and "i < 24;" not in top
+
+
+def test_weight_stationary_package(tmp_path):
+    pkg = _gen(tmp_path, (4, 4, 4), "gemm_4x4x4")
+    # the packed memstream init lives alongside the vendored RTL
+    dat = pkg / "rtl_static" / "gemm_4x4x4_weights.dat"
+    assert dat.is_file() and dat.stat().st_size > 0
+    assert (pkg / "rtl_static" / "memstream.sv").is_file()
+    v = (pkg / "gemm_4x4x4_core.v").read_text()
+    assert "memstream #(" in v and "$readmemh" not in v      # instantiated, path via INIT_FILE
+    assert f'.INIT_FILE("{dat.resolve()}")' in v             # absolute init path
+    assert "w_dout" not in v                                 # no external weight port
+    # C twin + TB bake the weights (no w stream)
+    twin = (pkg / "gemm_4x4x4_core.cpp").read_text()
+    assert "gemm_4x4x4_core_W[4][4]" in twin
+    tb = (pkg / "gemm_4x4x4_tb.cpp").read_text()
+    assert "static const long W[4][4]" in tb and "w_in" not in tb
+
+
+def test_baked_weights_match_packer(tmp_path):
+    # a real weight_matrix ([K][N]) must be packed byte-identically by the package
+    import numpy as np
+    sys.path.insert(0, str(_SRC / "targets" / "mvau"))
+    import weightpack as wp
+    K, N = 4, 4
+    B = [[((k * 3 + n) % 7) - 3 for n in range(N)] for k in range(K)]   # [K][N]
+    pkg = _gen(tmp_path, (1, K, N), "gemm_wm", weight_matrix=np.asarray(B))
+    got = (pkg / "rtl_static" / "gemm_wm_weights.dat").read_text()
+    # PE=SIMD=4 single tile at this shape; word = byte-aligned weight-stream width
+    exp = wp.pack_memstream_hex(B, N, K, 4, 4, 8, word_bits=128)
+    assert got == exp
 
 
 def test_affine_drain_present(tmp_path):

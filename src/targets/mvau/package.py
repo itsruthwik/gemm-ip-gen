@@ -19,10 +19,24 @@ from pathlib import Path
 import geometry as _geom
 import rtl as _rtl
 import golden as _golden
+import weightpack as _wpack
 
 _RTL_STATIC = Path(__file__).resolve().parent / "rtl_static"
-_STATIC_SOURCES = ["mvu_vvu_axi.sv", "replay_buffer.sv",
+# memstream is the weight-stationary weight ROM (baked from <name>_weights.dat);
+# always vendored -- the weightless path instantiates it, the (future) two-operand
+# streamed path simply leaves it uninstantiated.
+_STATIC_SOURCES = ["mvu_vvu_axi.sv", "replay_buffer.sv", "memstream.sv",
                    "mvu_4sx4u.sv", "mvu_8sx8u_dsp48.sv", "mvu_vvu_8sx9_dsp58.sv"]
+_WEIGHTS_DAT = "{name}_weights.dat"   # per-IP memstream $readmemh init, in rtl_static/
+
+
+def _core_rtl_files(name, prefix=""):
+    """The complete, ordered RTL source set for one core: the generated shim top
+    first, then the vendored FINN cores under rtl_static/. `prefix` (e.g. the
+    package-relative "<name>/") is prepended so the same list serves both the
+    per-IP blackbox JSON (prefix="") and the integration manifest."""
+    return ([f"{prefix}{name}_core.v"]
+            + [f"{prefix}rtl_static/{s}" for s in _STATIC_SOURCES])
 
 _PLAN_KEYS = ("weight_precision", "input_precision", "output_precision", "part",
               "clock_period_ns", "reuse_factor", "strategy", "target_cycles",
@@ -49,7 +63,7 @@ def bias_acc_codes(bias, product_frac, n):
     return codes if any(codes) else None
 
 
-def _dataflow_top(name, plan, bias_codes=None):
+def _dataflow_top(name, plan, bias_codes=None, weights_in_core=False):
     """The DUT: feed -> blackbox (raw integer matmul) -> affine requant drain, in
     a dataflow region. Per vector: NF raw beats in, one N-wide C-row beat out.
 
@@ -57,6 +71,10 @@ def _dataflow_top(name, plan, bias_codes=None):
     accumulator (2^(fa+fb)) domain, reinterpret as fixed-point, cast to the output
     ap_fixed with AP_RND (round-half-up) + AP_SAT. bias_codes is the bias already
     scaled to that domain (None => no bias; the two-operand GEMMs have none).
+
+    ``weights_in_core`` (weight-stationary): the blackbox bakes its weights in the
+    memstream, so the top has no weight input and no ``feed_w`` -- only activations
+    flow in. The streamed variant (``w_in`` + ``feed_w``) is reserved for two-operand.
     """
     t = plan["tile"]
     m = plan["num_input_vectors"]
@@ -73,6 +91,25 @@ def _dataflow_top(name, plan, bias_codes=None):
         bias_add = f" + {name}_bias[oc]"
     else:
         bias_decl, bias_add = "", ""
+    core_decl = (f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{pad}hls::stream<ap_uint<{PB}> >&);"
+                 if weights_in_core else
+                 f"void {name}_core(hls::stream<ap_uint<{WB}> >&, hls::stream<ap_uint<{AB}> >&,\n{pad}hls::stream<ap_uint<{PB}> >&);")
+    feed_w_fn = "" if weights_in_core else f"""static void feed_w(hls::stream<ap_uint<{WB}> >& in, hls::stream<ap_uint<{WB}> >& out) {{
+    for (int i = 0; i < {wbeats}; i++) out.write(in.read());
+}}
+"""
+    indent = ' ' * (len(name) + 1)
+    if weights_in_core:
+        top_sig = f"void {name}(hls::stream<ap_uint<{AB}> >& a_in,\n{indent}hls::stream<ap_uint<{CB}> >& c_out)"
+        w_stream_decl, w_stream_pragma = "", ""
+        feed_calls = (f"    feed_a(a_in, a_s);\n"
+                      f"    {name}_core(a_s, p_s);   // <-- FINN MVU RTL blackbox (weights baked in memstream)")
+    else:
+        top_sig = f"void {name}(hls::stream<ap_uint<{WB}> >& w_in, hls::stream<ap_uint<{AB}> >& a_in,\n{indent}hls::stream<ap_uint<{CB}> >& c_out)"
+        w_stream_decl = f"    hls::stream<ap_uint<{WB}> > w_s;\n"
+        w_stream_pragma = f"#pragma HLS STREAM variable=w_s depth=4\n"
+        feed_calls = (f"    feed_w(w_in, w_s);\n    feed_a(a_in, a_s);\n"
+                      f"    {name}_core(w_s, a_s, p_s);   // <-- FINN MVU RTL blackbox (pure integer matmul)")
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 #include <ap_fixed.h>
@@ -80,13 +117,9 @@ def _dataflow_top(name, plan, bias_codes=None):
 // output precision: fixed<{outW},{outI}> with round-half-up + saturate
 typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> {name}_result_t;
 {bias_decl}
-void {name}_core(hls::stream<ap_uint<{WB}> >&, hls::stream<ap_uint<{AB}> >&,
-{pad}hls::stream<ap_uint<{PB}> >&);
+{core_decl}
 
-static void feed_w(hls::stream<ap_uint<{WB}> >& in, hls::stream<ap_uint<{WB}> >& out) {{
-    for (int i = 0; i < {wbeats}; i++) out.write(in.read());
-}}
-static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
+{feed_w_fn}static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
     for (int i = 0; i < {abeats}; i++) out.write(in.read());
 }}
 
@@ -110,40 +143,37 @@ static void requant(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >
     }}
 }}
 
-void {name}(hls::stream<ap_uint<{WB}> >& w_in, hls::stream<ap_uint<{AB}> >& a_in,
-{' ' * (len(name) + 1)}hls::stream<ap_uint<{CB}> >& c_out) {{
+{top_sig} {{
 #pragma HLS DATAFLOW
-    hls::stream<ap_uint<{WB}> > w_s;
-    hls::stream<ap_uint<{AB}> > a_s;
+{w_stream_decl}    hls::stream<ap_uint<{AB}> > a_s;
     hls::stream<ap_uint<{PB}> > p_s;
-#pragma HLS STREAM variable=w_s depth=4
-#pragma HLS STREAM variable=a_s depth=4
+{w_stream_pragma}#pragma HLS STREAM variable=a_s depth=4
 #pragma HLS STREAM variable=p_s depth=4
-    feed_w(w_in, w_s);
-    feed_a(a_in, a_s);
-    {name}_core(w_s, a_s, p_s);   // <-- FINN MVU RTL blackbox (pure integer matmul)
+{feed_calls}
     requant(p_s, c_out);
 }}
 """
 
 
-def _blackbox_json(name, t):
+def _blackbox_json(name, t, weights_in_core=False):
     WB, AB, PB = t["weight_stream_width_ba"], t["input_stream_width_ba"], t["output_stream_width_ba"]
     fn = f"{name}_core"
     dsp = t["dsp_estimate"]
+    # weight-stationary: weights are baked in the memstream, so the blackbox has no
+    # weight FIFO -- only the activation input and the result output.
+    a_param = {"c_name": "a", "c_port_direction": "in",
+               "rtl_ports": {"FIFO_data_read_in": "a_dout", "FIFO_read_enable": "a_read", "FIFO_empty_flag": "a_empty_n"}}
+    p_param = {"c_name": "p", "c_port_direction": "out",
+               "rtl_ports": {"FIFO_data_write_out": "p_din", "FIFO_write_enable": "p_write", "FIFO_full_flag": "p_full_n"}}
+    w_param = {"c_name": "w", "c_port_direction": "in",
+               "rtl_ports": {"FIFO_data_read_in": "w_dout", "FIFO_read_enable": "w_read", "FIFO_empty_flag": "w_empty_n"}}
+    c_params = [a_param, p_param] if weights_in_core else [w_param, a_param, p_param]
     return json.dumps({
         "c_function_name": fn,
         "rtl_top_module_name": fn,     # MUST equal c_function_name (Vitis cosim gotcha)
         "c_files": [{"c_file": f"{fn}.cpp", "cflag": ""}],
-        "rtl_files": [f"{fn}.v"] + [f"rtl_static/{s}" for s in _STATIC_SOURCES],
-        "c_parameters": [
-            {"c_name": "w", "c_port_direction": "in",
-             "rtl_ports": {"FIFO_data_read_in": "w_dout", "FIFO_read_enable": "w_read", "FIFO_empty_flag": "w_empty_n"}},
-            {"c_name": "a", "c_port_direction": "in",
-             "rtl_ports": {"FIFO_data_read_in": "a_dout", "FIFO_read_enable": "a_read", "FIFO_empty_flag": "a_empty_n"}},
-            {"c_name": "p", "c_port_direction": "out",
-             "rtl_ports": {"FIFO_data_write_out": "p_din", "FIFO_write_enable": "p_write", "FIFO_full_flag": "p_full_n"}},
-        ],
+        "rtl_files": _core_rtl_files(name),
+        "c_parameters": c_params,
         "rtl_common_signal": {
             "module_clock": "ap_clk",
             "module_reset": "ap_rst",
@@ -183,7 +213,7 @@ exit
 """
 
 
-def _gemm_ip_header(name, plan):
+def _gemm_ip_header(name, plan, weights_in_core=True):
     """The dedicated hls4ml-facing IP for one gemm config: an HLS C++ dataflow IP
     with the internal FINN-MVU blackbox. Repacks hls4ml beats -> FINN beats,
     runs the blackbox, requant-drains (runtime bias) -> hls4ml C row. The combined
@@ -199,6 +229,52 @@ def _gemm_ip_header(name, plan):
     WW, AW, K, N = t["weight_width"], t["activation_width"], plan["k"], plan["n"]
     outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
     guard = ' ' * 6
+    core_hdr_pad = ' ' * (len(name) + 6)
+    core_decl = (f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{core_hdr_pad}hls::stream<ap_uint<{PB}> >&);"
+                 if weights_in_core else
+                 f"void {name}_core(hls::stream<ap_uint<{WB}> >&, hls::stream<ap_uint<{AB}> >&,\n{core_hdr_pad}hls::stream<ap_uint<{PB}> >&);")
+    # weightless (weight-stationary): weights are baked in the RTL memstream, so no
+    # feed_w / weight stream. Streamed feed_w kept for the future two-operand path.
+    if weights_in_core:
+        feed_w_tmpl = ""
+        ws_streams = (f"    hls::stream<ap_uint<{AB}> > a_s;\n"
+                      f"    hls::stream<ap_uint<{PB}> > p_s;\n"
+                      f"#pragma HLS STREAM variable=a_s depth={SF + 2}\n"
+                      f"#pragma HLS STREAM variable=p_s depth={NF + 2}")
+        ws_calls = (f"    {name}_repack_a<data_T>(a_stream, a_s);\n"
+                    f"    {name}_core(a_s, p_s);\n"
+                    f"    {name}_drain<res_T, CONFIG_T>(p_s, res_stream, biases);")
+    else:
+        feed_w_tmpl = f"""// weight-stationary feed: source B^T from CONFIG_T::gemm_weight_cols() (weight_cols[n][k]),
+// re-emit as {m}*NF*SF FINN weight beats in (nf outer, sf inner) order, PE-packed.
+template <typename CONFIG_T>
+void {name}_feed_w(hls::stream<ap_uint<{WB}> > &w_s) {{
+    typename CONFIG_T::weight_col_t *wc = CONFIG_T::gemm_weight_cols();
+    for (unsigned mm = 0; mm < {m}; mm++)
+        for (unsigned nf = 0; nf < {NF}; nf++)
+            for (unsigned sf = 0; sf < {SF}; sf++) {{
+                ap_uint<{WB}> wb = 0;
+                for (unsigned pe = 0; pe < {PE}; pe++)
+                    for (unsigned s = 0; s < {t['simd']}; s++) {{
+                        unsigned nn = nf * {PE} + pe, kk = sf * {t['simd']} + s;
+                        ap_int<{WW}> wv = wc[nn][kk].range({WW} - 1, 0);
+                        wb.range((pe * {t['simd']} + s) * {WW} + {WW} - 1, (pe * {t['simd']} + s) * {WW}) = (ap_uint<{WW}>)wv;
+                    }}
+                w_s.write(wb);
+            }}
+}}
+
+"""
+        ws_streams = (f"    hls::stream<ap_uint<{WB}> > w_s;\n"
+                      f"    hls::stream<ap_uint<{AB}> > a_s;\n"
+                      f"    hls::stream<ap_uint<{PB}> > p_s;\n"
+                      f"#pragma HLS STREAM variable=w_s depth={NF * SF + 2}\n"
+                      f"#pragma HLS STREAM variable=a_s depth={SF + 2}\n"
+                      f"#pragma HLS STREAM variable=p_s depth={NF + 2}")
+        ws_calls = (f"    {name}_repack_a<data_T>(a_stream, a_s);\n"
+                    f"    {name}_feed_w<CONFIG_T>(w_s);\n"
+                    f"    {name}_core(w_s, a_s, p_s);\n"
+                    f"    {name}_drain<res_T, CONFIG_T>(p_s, res_stream, biases);")
     return f"""#ifndef {name.upper()}_GEMM_IP_H_
 #define {name.upper()}_GEMM_IP_H_
 #include <hls_stream.h>
@@ -206,8 +282,7 @@ def _gemm_ip_header(name, plan):
 #include <ap_fixed.h>
 
 // internal FINN-MVU blackbox (shim {name}_core.v; C twin {name}_core.cpp)
-void {name}_core(hls::stream<ap_uint<{WB}> >&, hls::stream<ap_uint<{AB}> >&,
-{' ' * (len(name) + 6)}hls::stream<ap_uint<{PB}> >&);
+{core_decl}
 
 namespace nnet {{
 
@@ -234,26 +309,7 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > 
     }}
 }}
 
-// weight-stationary feed: source B^T from CONFIG_T::gemm_weight_cols() (weight_cols[n][k]),
-// re-emit as {m}*NF*SF FINN weight beats in (nf outer, sf inner) order, PE-packed.
-template <typename CONFIG_T>
-void {name}_feed_w(hls::stream<ap_uint<{WB}> > &w_s) {{
-    typename CONFIG_T::weight_col_t *wc = CONFIG_T::gemm_weight_cols();
-    for (unsigned mm = 0; mm < {m}; mm++)
-        for (unsigned nf = 0; nf < {NF}; nf++)
-            for (unsigned sf = 0; sf < {SF}; sf++) {{
-                ap_uint<{WB}> wb = 0;
-                for (unsigned pe = 0; pe < {PE}; pe++)
-                    for (unsigned s = 0; s < {t['simd']}; s++) {{
-                        unsigned nn = nf * {PE} + pe, kk = sf * {t['simd']} + s;
-                        ap_int<{WW}> wv = wc[nn][kk].range({WW} - 1, 0);
-                        wb.range((pe * {t['simd']} + s) * {WW} + {WW} - 1, (pe * {t['simd']} + s) * {WW}) = (ap_uint<{WW}>)wv;
-                    }}
-                w_s.write(wb);
-            }}
-}}
-
-// requant drain (runtime per-column bias, Keras order): raw ACCU -> fixed -> +bias -> round+sat.
+{feed_w_tmpl}// requant drain (runtime per-column bias, Keras order): raw ACCU -> fixed -> +bias -> round+sat.
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PB}> > &p_s, hls::stream<res_T> &res_stream,
 {' ' * (len(name) + 7)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
@@ -281,16 +337,8 @@ template <class data_T, class res_T, typename CONFIG_T>
 void {name}_gemm_stream_weightless(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
 {' ' * (len(name) + 28)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
 #pragma HLS DATAFLOW
-    hls::stream<ap_uint<{WB}> > w_s;
-    hls::stream<ap_uint<{AB}> > a_s;
-    hls::stream<ap_uint<{PB}> > p_s;
-#pragma HLS STREAM variable=w_s depth={NF * SF + 2}
-#pragma HLS STREAM variable=a_s depth={SF + 2}
-#pragma HLS STREAM variable=p_s depth={NF + 2}
-    {name}_repack_a<data_T>(a_stream, a_s);
-    {name}_feed_w<CONFIG_T>(w_s);
-    {name}_core(w_s, a_s, p_s);
-    {name}_drain<res_T, CONFIG_T>(p_s, res_stream, biases);
+{ws_streams}
+{ws_calls}
 }}
 
 }} // namespace nnet
@@ -298,8 +346,36 @@ void {name}_gemm_stream_weightless(hls::stream<data_T> &a_stream, hls::stream<re
 """
 
 
+def _synth_weights(n, k, ww, seed=42):
+    """Deterministic in-range B ([K][N]) when no real weights are supplied (unit
+    tests / standalone). Same small [-3, 3]-ish spread the old streamed TB used, so
+    the self-check stays representative; narrow-safe (never the most-negative code)."""
+    wrange = (1 << (ww - 1)) - 1
+    wmod = min(7, 2 * wrange + 1)
+    off = wrange if wmod == 2 * wrange + 1 else 3
+    return [[((oo + kk + seed) % wmod) - off for oo in range(n)] for kk in range(k)]
+
+
+def _weight_matrix_as_B(cfg, n, k, ww):
+    """Return baked weights as a plain ``[K][N]`` int list. Uses the hls4ml weights
+    (``cfg['weight_matrix']``, already ``[K, N]`` from load_weight_dat) when present,
+    else a deterministic synthetic matrix so tests / standalone packages still bake."""
+    wm = cfg.get("weight_matrix")
+    if wm is None:
+        return _synth_weights(n, k, ww)
+    B = [[int(wm[kk][oo]) for oo in range(n)] for kk in range(k)]
+    if len(B) != k or (B and len(B[0]) != n):
+        raise ValueError(f"weight_matrix shape != ({k}, {n})")
+    return B
+
+
 def generate_mvau_pkg(shape, name, output_dir, **cfg):
-    """Emit a full mvau blackbox package into ``<output_dir>/<name>/``."""
+    """Emit a full mvau blackbox package into ``<output_dir>/<name>/``.
+
+    Weight-stationary: the constant weights are packed into the FINN memstream
+    ``$readmemh`` init (``rtl_static/<name>_weights.dat``) and baked into the shim,
+    C twin and TB. The blackbox has no weight port -- only activations in, C row out.
+    """
     if cfg.get("interface") == "array":
         raise ValueError(
             f"mvau target does not support io_parallel (interface=array) for '{name}'. "
@@ -309,25 +385,39 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
     m = plan["num_input_vectors"]
     part = cfg.get("part") or "xcvu13p-flga2577-2-e"
     clock_ns = cfg.get("clock_period_ns") or 5
+    N, K, PE, SIMD, WW = plan["n"], plan["k"], t["pe"], t["simd"], t["weight_width"]
 
     pkg = Path(output_dir) / name
     (pkg / "rtl_static").mkdir(parents=True, exist_ok=True)
+
+    # Pack the baked weights into the memstream init, alongside the vendored RTL.
+    B = _weight_matrix_as_B(cfg, N, K, WW)
+    dat_name = _WEIGHTS_DAT.format(name=name)
+    dat_path = pkg / "rtl_static" / dat_name
+    dat_path.write_text(_wpack.pack_memstream_hex(
+        B, N, K, PE, SIMD, WW, word_bits=t["weight_stream_width_ba"]))
+    # Absolute $readmemh path: relative is unresolvable in Vitis cosim's XSIM dir
+    # (empirically -- see jojo-track); the package builds in place, so the absolute
+    # path computed here stays valid for csim/cosim/impl.
+    init_file = str(dat_path.resolve())
 
     # FORCE_BEHAVIORAL=0 -> real DSP48/DSP58 primitives (impl-ready; cosim runs them via
     # XSIM unisim models). Set force_behavioral=True in cfg for unisim-free behavioral cosim.
     force_behavioral = bool(cfg.get("force_behavioral", False))
     (pkg / f"{name}_core.v").write_text(
         _rtl.generate_shim(shape, module_name=f"{name}_core",
-                           force_behavioral=force_behavioral, tile=t))
+                           force_behavioral=force_behavioral, tile=t,
+                           weights_in_core=True, init_file=init_file))
     (pkg / f"{name}_core.cpp").write_text(
-        _golden.generate_core_twin(shape, func_name=f"{name}_core", plan=plan))
+        _golden.generate_core_twin(shape, func_name=f"{name}_core", plan=plan, baked_weights=B))
     bias_codes = bias_acc_codes(cfg.get("bias"), plan["product_frac"], plan["n"])
-    (pkg / f"{name}_top.cpp").write_text(_dataflow_top(name, plan, bias_codes=bias_codes))
-    (pkg / f"{name}.json").write_text(_blackbox_json(name, t))
+    (pkg / f"{name}_top.cpp").write_text(
+        _dataflow_top(name, plan, bias_codes=bias_codes, weights_in_core=True))
+    (pkg / f"{name}.json").write_text(_blackbox_json(name, t, weights_in_core=True))
     (pkg / f"{name}_tb.cpp").write_text(
         _golden.generate_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
-                            bias_codes=bias_codes))
-    (pkg / f"{name}_gemm_ip.h").write_text(_gemm_ip_header(name, plan))
+                            bias_codes=bias_codes, baked_weights=B))
+    (pkg / f"{name}_gemm_ip.h").write_text(_gemm_ip_header(name, plan, weights_in_core=True))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 
     for s in _STATIC_SOURCES:
@@ -408,10 +498,17 @@ def gen_integration_manifest(items):
     cores = []
     for it in items:
         nm = it.get("emit_name") or it["name"]
-        cores.append({"name": nm, "kind": "rtl_blackbox", "tool": "vitis",
-                      "entity": f"{nm}_core", "rtl": f"{nm}/{nm}_core.v",
-                      "json": f"{nm}/{nm}.json",
-                      "m": it.get("m"), "k": it.get("k"), "n": it.get("n")})
+        core = {"name": nm, "kind": "rtl_blackbox", "tool": "vitis",
+                "entity": f"{nm}_core", "rtl": f"{nm}/{nm}_core.v",
+                # full RTL set (shim + vendored FINN cores), not just the shim
+                "rtl_files": _core_rtl_files(nm, prefix=f"{nm}/"),
+                "json": f"{nm}/{nm}.json",
+                "m": it.get("m"), "k": it.get("k"), "n": it.get("n")}
+        # weight-stationary: the packed memstream init is a data dependency the shim
+        # $readmemh's by absolute path -- record it so downstream keeps it with the
+        # package (it cannot go in rtl_files: Vitis rejects a .dat as blackbox RTL).
+        core["weight_data"] = f"{nm}/rtl_static/{_WEIGHTS_DAT.format(name=nm)}"
+        cores.append(core)
     return json.dumps({"tool": "vitis", "flow": "rtl_blackbox",
                        "header": "gemm_ip_combined.h", "cores": cores}, indent=2) + "\n"
 

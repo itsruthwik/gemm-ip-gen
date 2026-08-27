@@ -26,10 +26,23 @@ def _act_ctype(signed, aw):
     return f"ap_int<{aw}>" if signed else f"ap_uint<{aw}>"
 
 
-def generate_core_twin(shape, func_name="mvau_core", plan=None, **kw):
-    """C++ behavioral twin of the blackbox (the JSON ``c_files`` model)."""
+def _w_matrix_literal(B, n, k):
+    """C initializer for ``long W[N][K]`` from ``B`` (``[K][N]``): W[o][k]=B[k][o]."""
+    rows = ["{" + ", ".join(str(int(B[kk][oo])) for kk in range(k)) + "}" for oo in range(n)]
+    return "{" + ", ".join(rows) + "}"
+
+
+def generate_core_twin(shape, func_name="mvau_core", plan=None, baked_weights=None, **kw):
+    """C++ behavioral twin of the blackbox (the JSON ``c_files`` model).
+
+    ``baked_weights`` (``B`` as ``[K][N]``) selects the weight-stationary twin: the
+    weights are baked into the model (no ``w`` stream), matching the memstream the
+    RTL bakes. Absent -> the streamed twin (``w`` stream, reserved for two-operand).
+    """
     p = _plan(shape, plan=plan, **kw)
     t = p["tile"]
+    if baked_weights is not None:
+        return _ws_core_twin(p, t, func_name, baked_weights)
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     WW, AW, ACCU = t["weight_width"], t["activation_width"], t["accu_width"]
     WB, AB, PB = t["weight_stream_width_ba"], t["input_stream_width_ba"], t["output_stream_width_ba"]
@@ -73,14 +86,147 @@ void {func_name}(hls::stream<ap_uint<{WB}> >& w,
 """
 
 
+def _ws_core_twin(p, t, func_name, B):
+    """Weight-stationary C twin: baked weights, signature ``(a, p)`` (no ``w``)."""
+    PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
+    ACCU = t["accu_width"]
+    AW = t["activation_width"]
+    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
+    M, K, N = p["num_input_vectors"], p["k"], p["n"]
+    actt = _act_ctype(t["signed_activations"], AW)
+    wlit = _w_matrix_literal(B, N, K)
+    pad = ' ' * (len(func_name) + 6)
+    return f"""#include <hls_stream.h>
+#include <ap_int.h>
+
+// Weight-stationary C twin of {func_name} (FINN MVU tile: PE={PE} SIMD={SIMD} SF={SF} NF={NF}).
+// Weights baked here match the memstream the RTL bakes; Vitis substitutes the RTL
+// (memstream + mvu_vvu_axi) for csynth/cosim. Bit-identical integer matmul.
+static const long {func_name}_W[{N}][{K}] = {wlit};
+
+void {func_name}(hls::stream<ap_uint<{AB}> >& a,
+{pad}hls::stream<ap_uint<{PB}> >& p) {{
+    for (int vec = 0; vec < {M}; vec++) {{
+        {actt} x[{SF}][{SIMD}];
+        for (int sf = 0; sf < {SF}; sf++) {{
+            ap_uint<{AB}> ab = a.read();
+            for (int s = 0; s < {SIMD}; s++)
+                x[sf][s] = ab.range(s * {AW} + {AW} - 1, s * {AW});
+        }}
+        for (int nf = 0; nf < {NF}; nf++) {{
+            ap_int<{ACCU}> acc[{PE}];
+            for (int pe = 0; pe < {PE}; pe++) acc[pe] = 0;
+            for (int sf = 0; sf < {SF}; sf++)
+                for (int pe = 0; pe < {PE}; pe++)
+                    for (int s = 0; s < {SIMD}; s++)
+                        acc[pe] += (ap_int<64>){func_name}_W[nf * {PE} + pe][sf * {SIMD} + s]
+                                 * (ap_int<64>)x[sf][s];
+            ap_uint<{PB}> ob = 0;
+            for (int pe = 0; pe < {PE}; pe++)
+                ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU}) = (ap_uint<{ACCU}>)acc[pe];
+            p.write(ob);
+        }}
+    }}
+}}
+"""
+
+
+def _ws_tb(p, t, top_name, seed, bias_codes, B):
+    """Weight-stationary self-checking TB: baked weights, top ``(a, c)`` (no ``w``).
+    Independent golden with the same round-half-up + saturate requant reference."""
+    PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
+    AW = t["activation_width"]
+    AB = t["input_stream_width_ba"]
+    M, K, N = p["num_input_vectors"], p["k"], p["n"]
+    outW = p["output_width"]
+    req_shift = p["product_frac"] - p["output_frac"]
+    CB = ((N * outW) + 7) // 8 * 8
+    wlit = _w_matrix_literal(B, N, K)
+    if bias_codes:
+        bias_arr = "    long bias[%d] = {%s};\n" % (N, ", ".join(str(c) for c in bias_codes))
+        bias_add_tb = " + bias[o]"
+    else:
+        bias_arr, bias_add_tb = "", ""
+    signed = bool(t["signed_activations"])
+    arange = (1 << (AW - 1)) - 1 if signed else (1 << AW) - 1
+    amod = min(7, arange + 1)
+    aoff = 3 if signed else 0
+    return f"""#include <hls_stream.h>
+#include <ap_int.h>
+#include <cstdio>
+
+void {top_name}(hls::stream<ap_uint<{AB}> >&,
+{' ' * (len(top_name) + 1)}hls::stream<ap_uint<{CB}> >&);
+
+// Independent requant reference: round-half-up shift by req_shift, then saturate
+// to a signed {outW}-bit code (must match the drain's ap_fixed AP_RND/AP_SAT).
+static long requant_ref(long acc) {{
+    long shift = {req_shift};
+    long q;
+    if (shift > 0)      q = (acc + (1L << (shift - 1))) >> shift;   // round half up
+    else if (shift < 0) q = acc << (-shift);
+    else                q = acc;
+    long qmax = (1L << ({outW} - 1)) - 1, qmin = -(1L << ({outW} - 1));
+    if (q > qmax) q = qmax;
+    if (q < qmin) q = qmin;
+    return q;
+}}
+
+// weight-stationary tile: N={N} K={K} PE={PE} SIMD={SIMD} SF={SF} NF={NF}, M={M} vectors.
+// Weights baked (must match the memstream init the RTL loads); only activations fed.
+static const long W[{N}][{K}] = {wlit};
+
+int main() {{
+    hls::stream<ap_uint<{AB}> > a_in;
+    hls::stream<ap_uint<{CB}> > c_out;
+
+    long X[{M}][{K}], golden[{M}][{N}];
+{bias_arr}    for (int v = 0; v < {M}; v++)
+        for (int k = 0; k < {K}; k++) X[v][k] = ((v * 2 + k + {seed}) % {amod}) - {aoff};
+    for (int v = 0; v < {M}; v++)
+        for (int o = 0; o < {N}; o++) {{
+            long acc = 0;
+            for (int k = 0; k < {K}; k++) acc += W[o][k] * X[v][k];
+            golden[v][o] = requant_ref(acc{bias_add_tb});
+        }}
+
+    for (int v = 0; v < {M}; v++)
+        for (int sf = 0; sf < {SF}; sf++) {{
+            ap_uint<{AB}> ab = 0;
+            for (int s = 0; s < {SIMD}; s++)
+                ab.range(s * {AW} + {AW} - 1, s * {AW}) =
+                    (ap_uint<{AW}>)(ap_int<{AW}>)X[v][sf * {SIMD} + s];
+            a_in.write(ab);
+        }}
+
+    {top_name}(a_in, c_out);
+
+    int errors = 0;
+    for (int v = 0; v < {M}; v++) {{
+        ap_uint<{CB}> crow = c_out.read();
+        for (int o = 0; o < {N}; o++) {{
+            ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
+            long got = (long)y, exp = golden[v][o];
+            if (got != exp) {{ errors++; std::printf("MISMATCH v=%d o=%d got=%ld exp=%ld\\n", v, o, got, exp); }}
+        }}
+    }}
+    if (errors == 0) std::printf("MVAU_PKG PASS\\n");
+    else             std::printf("MVAU_PKG FAIL errors=%d\\n", errors);
+    return errors;
+}}
+"""
+
+
 def generate_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, plan=None,
-                bias_codes=None, **kw):
+                bias_codes=None, baked_weights=None, **kw):
     """Self-checking TB. Independent golden: full-K integer matmul, add per-column
     bias in the accumulator domain, then an independent affine requant (round-half-up
     shift + saturate) to the output ``fixed<outW,outI>`` code -- must equal the drain's
     ``ap_fixed<AP_RND,AP_SAT>``. Weights re-fed each vector (same W across vectors)."""
     p = _plan(shape, plan=plan, **kw)
     t = p["tile"]
+    if baked_weights is not None:
+        return _ws_tb(p, t, top_name, seed, bias_codes, baked_weights)
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     WW, AW = t["weight_width"], t["activation_width"]
     WB, AB = t["weight_stream_width_ba"], t["input_stream_width_ba"]
