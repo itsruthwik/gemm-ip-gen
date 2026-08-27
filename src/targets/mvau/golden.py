@@ -1,0 +1,175 @@
+"""mvau C twin (blackbox behavioral model) + self-checking csim/cosim testbench.
+
+Both encode the FINN MVU beat protocol for one tile, generalized from the
+cosim-validated ``temp_space/mvau-spike`` (which was the SF=NF=1 case):
+
+  * activations: ``SF`` beats per input vector (``x[sf*SIMD+simd]``); the replay
+    buffer re-streams them ``NF`` times internally.
+  * weights: ``NF*SF`` beats per vector, consumed in ``(nf outer, sf inner)``
+    order; beat ``(nf,sf)`` holds ``W[nf*PE+pe][sf*SIMD+simd]`` packed ``[pe][simd]``
+    LSB-first at ``(pe*SIMD+simd)*WEIGHT_WIDTH``.
+  * output: ``NF`` beats per vector; beat ``nf`` holds accumulators for output
+    rows ``nf*PE .. nf*PE+PE-1`` at ``pe*ACCU_WIDTH``.
+
+The C twin is bit-identical to the RTL (pure integer ``Σ w·x``); csim runs it,
+cosim runs the FINN RTL, and they must agree.
+"""
+
+import geometry as _geom
+
+
+def _plan(shape, plan=None, **kw):
+    return plan if plan is not None else _geom.fold_plan(*shape, **kw)
+
+
+def _act_ctype(signed, aw):
+    return f"ap_int<{aw}>" if signed else f"ap_uint<{aw}>"
+
+
+def generate_core_twin(shape, func_name="mvau_core", plan=None, **kw):
+    """C++ behavioral twin of the blackbox (the JSON ``c_files`` model)."""
+    p = _plan(shape, plan=plan, **kw)
+    t = p["tile"]
+    PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
+    WW, AW, ACCU = t["weight_width"], t["activation_width"], t["accu_width"]
+    WB, AB, PB = t["weight_stream_width_ba"], t["input_stream_width_ba"], t["output_stream_width_ba"]
+    M = p["num_input_vectors"]
+    actt = _act_ctype(t["signed_activations"], AW)
+
+    return f"""#include <hls_stream.h>
+#include <ap_int.h>
+
+// Behavioral C twin of {func_name} (FINN MVU tile: PE={PE} SIMD={SIMD} SF={SF} NF={NF}).
+// Bit-identical integer matmul; Vitis substitutes the RTL for csynth/cosim.
+void {func_name}(hls::stream<ap_uint<{WB}> >& w,
+{' ' * (len(func_name) + 6)}hls::stream<ap_uint<{AB}> >& a,
+{' ' * (len(func_name) + 6)}hls::stream<ap_uint<{PB}> >& p) {{
+    for (int vec = 0; vec < {M}; vec++) {{
+        {actt} x[{SF}][{SIMD}];
+        for (int sf = 0; sf < {SF}; sf++) {{
+            ap_uint<{AB}> ab = a.read();
+            for (int s = 0; s < {SIMD}; s++)
+                x[sf][s] = ab.range(s * {AW} + {AW} - 1, s * {AW});
+        }}
+        for (int nf = 0; nf < {NF}; nf++) {{
+            ap_int<{ACCU}> acc[{PE}];
+            for (int pe = 0; pe < {PE}; pe++) acc[pe] = 0;
+            for (int sf = 0; sf < {SF}; sf++) {{
+                ap_uint<{WB}> wb = w.read();
+                for (int pe = 0; pe < {PE}; pe++)
+                    for (int s = 0; s < {SIMD}; s++) {{
+                        ap_int<{WW}> wv = wb.range((pe * {SIMD} + s) * {WW} + {WW} - 1,
+                                                   (pe * {SIMD} + s) * {WW});
+                        acc[pe] += (ap_int<64>)wv * (ap_int<64>)x[sf][s];
+                    }}
+            }}
+            ap_uint<{PB}> ob = 0;
+            for (int pe = 0; pe < {PE}; pe++)
+                ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU}) = (ap_uint<{ACCU}>)acc[pe];
+            p.write(ob);
+        }}
+    }}
+}}
+"""
+
+
+def generate_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, plan=None,
+                bias_codes=None, **kw):
+    """Self-checking TB. Independent golden: full-K integer matmul, add per-column
+    bias in the accumulator domain, then an independent affine requant (round-half-up
+    shift + saturate) to the output ``fixed<outW,outI>`` code -- must equal the drain's
+    ``ap_fixed<AP_RND,AP_SAT>``. Weights re-fed each vector (same W across vectors)."""
+    p = _plan(shape, plan=plan, **kw)
+    t = p["tile"]
+    PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
+    WW, AW = t["weight_width"], t["activation_width"]
+    WB, AB = t["weight_stream_width_ba"], t["input_stream_width_ba"]
+    M, K, N = p["num_input_vectors"], p["k"], p["n"]
+    outW = p["output_width"]
+    req_shift = p["product_frac"] - p["output_frac"]   # (fa+fb) - out_frac
+    CB = ((N * outW) + 7) // 8 * 8
+    if bias_codes:
+        bias_arr = "    long bias[%d] = {%s};\n" % (N, ", ".join(str(c) for c in bias_codes))
+        bias_add_tb = " + bias[o]"
+    else:
+        bias_arr, bias_add_tb = "", ""
+    signed = bool(t["signed_activations"])
+    wrange = (1 << (WW - 1)) - 1
+    arange = (1 << (AW - 1)) - 1 if signed else (1 << AW) - 1
+    wmod, amod = min(7, 2 * wrange + 1), min(7, arange + 1)
+    aoff = 3 if signed else 0
+
+    return f"""#include <hls_stream.h>
+#include <ap_int.h>
+#include <cstdio>
+
+void {top_name}(hls::stream<ap_uint<{WB}> >&, hls::stream<ap_uint<{AB}> >&,
+{' ' * (len(top_name) + 1)}hls::stream<ap_uint<{CB}> >&);
+
+// Independent requant reference: round-half-up shift by req_shift, then saturate
+// to a signed {outW}-bit code (must match the drain's ap_fixed AP_RND/AP_SAT).
+static long requant_ref(long acc) {{
+    long shift = {req_shift};
+    long q;
+    if (shift > 0)      q = (acc + (1L << (shift - 1))) >> shift;   // round half up
+    else if (shift < 0) q = acc << (-shift);
+    else                q = acc;
+    long qmax = (1L << ({outW} - 1)) - 1, qmin = -(1L << ({outW} - 1));
+    if (q > qmax) q = qmax;
+    if (q < qmin) q = qmin;
+    return q;
+}}
+
+// tile: N={N} K={K} PE={PE} SIMD={SIMD} SF={SF} NF={NF}, M={M} vectors, out=fixed<{outW},{p['output_int']}>
+int main() {{
+    hls::stream<ap_uint<{WB}> > w_in;
+    hls::stream<ap_uint<{AB}> > a_in;
+    hls::stream<ap_uint<{CB}> > c_out;
+
+    long W[{N}][{K}], X[{M}][{K}], golden[{M}][{N}];
+{bias_arr}    for (int o = 0; o < {N}; o++)
+        for (int k = 0; k < {K}; k++) W[o][k] = ((o + k + {seed}) % {wmod}) - {wrange if wmod == 2*wrange+1 else 3};
+    for (int v = 0; v < {M}; v++)
+        for (int k = 0; k < {K}; k++) X[v][k] = ((v * 2 + k + {seed}) % {amod}) - {aoff};
+    for (int v = 0; v < {M}; v++)
+        for (int o = 0; o < {N}; o++) {{
+            long acc = 0;
+            for (int k = 0; k < {K}; k++) acc += W[o][k] * X[v][k];
+            golden[v][o] = requant_ref(acc{bias_add_tb});
+        }}
+
+    for (int v = 0; v < {M}; v++) {{
+        for (int sf = 0; sf < {SF}; sf++) {{
+            ap_uint<{AB}> ab = 0;
+            for (int s = 0; s < {SIMD}; s++)
+                ab.range(s * {AW} + {AW} - 1, s * {AW}) =
+                    (ap_uint<{AW}>)(ap_int<{AW}>)X[v][sf * {SIMD} + s];
+            a_in.write(ab);
+        }}
+        for (int nf = 0; nf < {NF}; nf++)
+            for (int sf = 0; sf < {SF}; sf++) {{
+                ap_uint<{WB}> wb = 0;
+                for (int pe = 0; pe < {PE}; pe++)
+                    for (int s = 0; s < {SIMD}; s++)
+                        wb.range((pe * {SIMD} + s) * {WW} + {WW} - 1, (pe * {SIMD} + s) * {WW}) =
+                            (ap_uint<{WW}>)(ap_int<{WW}>)W[nf * {PE} + pe][sf * {SIMD} + s];
+                w_in.write(wb);
+            }}
+    }}
+
+    {top_name}(w_in, a_in, c_out);
+
+    int errors = 0;
+    for (int v = 0; v < {M}; v++) {{
+        ap_uint<{CB}> crow = c_out.read();
+        for (int o = 0; o < {N}; o++) {{
+            ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
+            long got = (long)y, exp = golden[v][o];
+            if (got != exp) {{ errors++; std::printf("MISMATCH v=%d o=%d got=%ld exp=%ld\\n", v, o, got, exp); }}
+        }}
+    }}
+    if (errors == 0) std::printf("MVAU_PKG PASS\\n");
+    else             std::printf("MVAU_PKG FAIL errors=%d\\n", errors);
+    return errors;
+}}
+"""

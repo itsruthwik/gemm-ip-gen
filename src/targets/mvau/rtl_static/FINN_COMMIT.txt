@@ -1,0 +1,2 @@
+Vendored from FINN finn-rtllib/mvu at commit 39f0c9a6b (branch main).
+Do not edit; regenerate by re-copying from that pinned commit.

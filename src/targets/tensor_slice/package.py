@@ -1705,7 +1705,7 @@ def _assert_core_first_out(name, m, k, n, gemm_k_spatial, grid_v):
 
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
                           gemm_k_spatial=None, input_precision=None, weight_precision=None,
-                          clock_period_ns=None, n_frames=1, weight_matrix=None):
+                          clock_period_ns=None, n_frames=1, weight_matrix=None, **_ignored):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     gemm_k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)

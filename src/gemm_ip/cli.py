@@ -72,6 +72,15 @@ def _run(args):
                     "weight_precision": item.get("weight_precision"),
                     "clock_period_ns": item.get("clock_period_ns"),
                     "weight_matrix": weight_matrix,
+                    # Forwarded for targets that select core / fold from them (mvau).
+                    # tensor_slice tolerates unknowns via **_ignored; generic accepts
+                    # part/strategy/reuse_factor as params. (weights_in_core is NOT
+                    # forwarded — generic's flow.package sets it explicitly.)
+                    "part": item.get("part"),
+                    "reuse_factor": item.get("reuse_factor"),
+                    "strategy": item.get("strategy"),
+                    "parallelization_factor": item.get("parallelization_factor"),
+                    "target_cycles": item.get("target_cycles"),
                 },
             )
         output_dir = Path(args.output_dir)
