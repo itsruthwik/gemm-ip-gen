@@ -66,7 +66,6 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
     #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     GEMM_ARRAY_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
         #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
-        res_row_T c_row;
         GEMM_ARRAY_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
             #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
@@ -75,9 +74,11 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
                 accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * b_cols[n][k]);
             }
             accum += biases[n];
-            c_row[n] = accum;
+            // Write the output element directly: the io_parallel caller partitions
+            // results[] complete, and a whole-row nnet::array operator= copy under the
+            // pipelined M loop is not a transformable instruction for Vitis HLS.
+            results[m][n] = accum;
         }
-        results[m] = c_row;
     }
 }
 
@@ -90,7 +91,6 @@ void gemm_array_weightless(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T weight_cols
     #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     GEMM_AWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
         #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
-        res_row_T c_row;
         GEMM_AWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
             #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
@@ -99,9 +99,10 @@ void gemm_array_weightless(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T weight_cols
                 accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * weight_cols[n][k]);
             }
             accum += biases[n];
-            c_row[n] = accum;
+            // Direct element write (see gemm_array): avoids the whole-row operator=
+            // copy that Vitis cannot transform under complete partition + pipelined M.
+            results[m][n] = accum;
         }
-        results[m] = c_row;
     }
 }
 
@@ -248,7 +249,6 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
     #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     GEMM_ARRAY_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
         #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
-        res_row_T c_row;
         GEMM_ARRAY_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
             #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
@@ -257,9 +257,11 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
                 accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * b_cols[n][k]);
             }
             accum += biases[n];
-            c_row[n] = accum;
+            // Write the output element directly: the io_parallel caller partitions
+            // results[] complete, and a whole-row nnet::array operator= copy under the
+            // pipelined M loop is not a transformable instruction for Vitis HLS.
+            results[m][n] = accum;
         }
-        results[m] = c_row;
     }
 }
 
@@ -272,7 +274,6 @@ void gemm_array_weightless(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[C
     typename CONFIG_T::weight_col_t *weight_cols = CONFIG_T::gemm_weight_cols();
     GEMM_AWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
         #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
-        res_row_T c_row;
         GEMM_AWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
             #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
@@ -281,9 +282,10 @@ void gemm_array_weightless(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[C
                 accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * weight_cols[n][k]);
             }
             accum += biases[n];
-            c_row[n] = accum;
+            // Direct element write (see gemm_array): avoids the whole-row operator=
+            // copy that Vitis cannot transform under complete partition + pipelined M.
+            results[m][n] = accum;
         }
-        results[m] = c_row;
     }
 }
 
