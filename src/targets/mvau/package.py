@@ -560,6 +560,144 @@ void {name}_gemm_stream_weightless(hls::stream<data_T> &a_stream, hls::stream<re
 """
 
 
+def _2op_dataflow_top(name, plan):
+    """DUT for the two-operand blackbox (NF=1 single tile): pure passthrough of both A and
+    B streams into the core, then the affine requant drain (no bias; act×act product scale
+    ``fa+fb``). B is buffered/replayed inside the RTL, so the top just forwards its beats."""
+    t = plan["tile"]
+    m = plan["num_input_vectors"]
+    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    PE, SF = t["pe"], t["sf"]
+    N, WW = plan["n"], t["weight_width"]
+    BB = ((N * WW) + 7) // 8 * 8
+    K = plan["k_pad"]
+    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
+    CB = cbits(plan)
+    abeats, bbeats = m * SF, K
+    pad = ' ' * (len(name) + 6)
+    indent = ' ' * (len(name) + 1)
+    return f"""#include <hls_stream.h>
+#include <ap_int.h>
+#include <ap_fixed.h>
+
+// output precision: fixed<{outW},{outI}> with round-half-up + saturate
+typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> {name}_result_t;
+
+void {name}_core(hls::stream<ap_uint<{AB}> >&, hls::stream<ap_uint<{BB}> >&,
+{pad}hls::stream<ap_uint<{PB}> >&);
+
+static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
+    for (int i = 0; i < {abeats}; i++) out.write(in.read());
+}}
+static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >& out) {{
+    for (int i = 0; i < {bbeats}; i++) out.write(in.read());
+}}
+
+// Affine requant drain (no bias): raw ACCU codes -> N-wide requantized C row (NF=1).
+static void requant(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
+    for (int vec = 0; vec < {m}; vec++) {{
+        ap_uint<{CB}> crow = 0;
+        ap_uint<{PB}> ob = in.read();
+        for (int pe = 0; pe < {PE}; pe++) {{
+            ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
+            ap_fixed<64, {64 - pfrac}> rv;
+            rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;   // code -> fixed (frac={pfrac})
+            {name}_result_t r = rv;                           // rescale + round + saturate
+            crow.range(pe * {outW} + {outW} - 1, pe * {outW}) = r.range({outW} - 1, 0);
+        }}
+        out.write(crow);
+    }}
+}}
+
+void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in,
+{indent}hls::stream<ap_uint<{CB}> >& c_out) {{
+#pragma HLS DATAFLOW
+    hls::stream<ap_uint<{AB}> > a_s;
+    hls::stream<ap_uint<{BB}> > b_s;
+    hls::stream<ap_uint<{PB}> > p_s;
+#pragma HLS STREAM variable=a_s depth=4
+#pragma HLS STREAM variable=b_s depth=4
+#pragma HLS STREAM variable=p_s depth=4
+    feed_a(a_in, a_s);
+    feed_b(b_in, b_s);
+    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU RTL blackbox (B loaded+replayed in-core)
+    requant(p_s, c_out);
+}}
+"""
+
+
+def _2op_blackbox_json(name, t, n, ww):
+    """Blackbox JSON for the two-operand core: two input FIFOs (a, b) + one output (p)."""
+    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
+    fn = f"{name}_core"
+    dsp = t["dsp_estimate"]
+    a_param = {"c_name": "a", "c_port_direction": "in",
+               "rtl_ports": {"FIFO_data_read_in": "a_dout", "FIFO_read_enable": "a_read", "FIFO_empty_flag": "a_empty_n"}}
+    b_param = {"c_name": "b", "c_port_direction": "in",
+               "rtl_ports": {"FIFO_data_read_in": "b_dout", "FIFO_read_enable": "b_read", "FIFO_empty_flag": "b_empty_n"}}
+    p_param = {"c_name": "p", "c_port_direction": "out",
+               "rtl_ports": {"FIFO_data_write_out": "p_din", "FIFO_write_enable": "p_write", "FIFO_full_flag": "p_full_n"}}
+    return json.dumps({
+        "c_function_name": fn,
+        "rtl_top_module_name": fn,
+        "c_files": [{"c_file": f"{fn}.cpp", "cflag": ""}],
+        "rtl_files": _core_rtl_files(name),
+        "c_parameters": [a_param, b_param, p_param],
+        "rtl_common_signal": {
+            "module_clock": "ap_clk",
+            "module_reset": "ap_rst",
+            "module_clock_enable": "ap_ce",
+            "ap_ctrl_chain_protocol_idle": "",
+            "ap_ctrl_chain_protocol_start": "",
+            "ap_ctrl_chain_protocol_ready": "",
+            "ap_ctrl_chain_protocol_done": "",
+            "ap_ctrl_chain_protocol_continue": "",
+        },
+        "rtl_performance": {"latency": str(t["latency_cycles"]), "II": str(t["ii"])},
+        "_comment": "These resource counts are not accurate, TODO: Fix",
+        "rtl_resource_usage": {"FF": str(30 * dsp), "LUT": str(40 * dsp),
+                               "DSP": str(dsp), "BRAM": "0", "URAM": "0"},
+    }, indent=2) + "\n"
+
+
+def generate_two_operand_pkg(shape, name, output_dir, **cfg):
+    """Emit a two-operand (``gemm_stream``) mvau blackbox package into ``<output_dir>/<name>/``.
+
+    Both operands are runtime streams: A activations, B (= the MVU weight matrix) fed as
+    N-wide K-row beats and loaded into ``memstream`` at runtime, replayed across the M rows
+    of A. No baked weights; no bias. MVP: single tile, NF=1 (PE=N), any SF."""
+    if cfg.get("interface") == "array":
+        raise ValueError(f"mvau two-operand does not support io_parallel for '{name}'.")
+    plan = _geom.fold_plan(*shape, **_plan_kwargs(cfg))
+    t = plan["tile"]
+    if plan["n_tiles"] != 1 or plan.get("k_tiles", 1) != 1:
+        raise NotImplementedError("two-operand MVP is single-tile (no N/K tiling yet).")
+    if t["compute_core"] == "mvu_4sx4u_dsp48e1":
+        raise ValueError("two-operand cannot use mvu_4sx4u/DSP48E1 (requires NARROW_WEIGHTS, "
+                         "which a runtime B operand cannot guarantee); target DSP48E2/DSP58.")
+    part = cfg.get("part") or "xcvu13p-flga2577-2-e"
+    clock_ns = cfg.get("clock_period_ns") or 5
+    pkg = Path(output_dir) / name
+    (pkg / "rtl_static").mkdir(parents=True, exist_ok=True)
+
+    force_behavioral = bool(cfg.get("force_behavioral", False))
+    (pkg / f"{name}_core.v").write_text(_with_timescale(
+        _rtl.generate_two_operand_shim(shape, module_name=f"{name}_core",
+                                       force_behavioral=force_behavioral, tile=t, plan=plan)))
+    (pkg / f"{name}_core.cpp").write_text(
+        _golden.generate_2op_core_twin(shape, func_name=f"{name}_core", plan=plan))
+    (pkg / f"{name}_top.cpp").write_text(_2op_dataflow_top(name, plan))
+    (pkg / f"{name}.json").write_text(_2op_blackbox_json(name, t, plan["n"], t["weight_width"]))
+    (pkg / f"{name}_tb.cpp").write_text(
+        _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan))
+    (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
+
+    for s in _STATIC_SOURCES:
+        (pkg / "rtl_static" / s).write_text(_with_timescale((_RTL_STATIC / s).read_text()))
+    shutil.copy(_RTL_STATIC / "FINN_COMMIT.txt", pkg / "rtl_static" / "FINN_COMMIT.txt")
+    return str(pkg)
+
+
 def _synth_weights(n, k, ww, seed=42):
     """Deterministic in-range B ([K][N]) when no real weights are supplied (unit
     tests / standalone). Same small [-3, 3]-ish spread the old streamed TB used, so

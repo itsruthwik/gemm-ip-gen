@@ -275,6 +275,154 @@ int main() {{
 """
 
 
+def _2op_core_twin(p, t, func_name):
+    """Two-operand C twin (NF=1 single tile): both A and B are runtime streams. Reads B
+    as ``K`` N-wide K-row beats (``b[pe]=B[k][pe]``) into residency, then per input vector
+    reads ``SF`` activation beats and emits one raw-ACCU output beat. Bit-identical to the
+    load-then-run RTL shim (pure integer Σ w·x)."""
+    PE, SIMD, SF = t["pe"], t["simd"], t["sf"]
+    WW, AW, ACCU = t["weight_width"], t["activation_width"], t["accu_width"]
+    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
+    N, K, M = p["n"], p["k_pad"], p["num_input_vectors"]
+    BB = ((N * WW) + 7) // 8 * 8
+    actt = _act_ctype(t["signed_activations"], AW)
+    pad = ' ' * (len(func_name) + 6)
+    return f"""#include <hls_stream.h>
+#include <ap_int.h>
+
+// Two-operand C twin of {func_name} (FINN MVU: PE={PE} SIMD={SIMD} SF={SF} NF=1). B is a
+// runtime stream (N-wide K-row beats), buffered then replayed across M vectors; A streams
+// per vector. Vitis substitutes the RTL for csynth/cosim. Integer matmul, raw ACCU out.
+void {func_name}(hls::stream<ap_uint<{AB}> >& a,
+{pad}hls::stream<ap_uint<{BB}> >& b,
+{pad}hls::stream<ap_uint<{PB}> >& p) {{
+    ap_int<{WW}> W[{N}][{K}];              // W[o][k] = B[k][o]
+    for (int k = 0; k < {K}; k++) {{
+        ap_uint<{BB}> bb = b.read();       // one N-wide K-row: bb[o] = B[k][o]
+        for (int o = 0; o < {N}; o++)
+            W[o][k] = bb.range(o * {WW} + {WW} - 1, o * {WW});
+    }}
+    for (int vec = 0; vec < {M}; vec++) {{
+        {actt} x[{K}];
+        for (int sf = 0; sf < {SF}; sf++) {{
+            ap_uint<{AB}> ab = a.read();
+            for (int s = 0; s < {SIMD}; s++)
+                x[sf * {SIMD} + s] = ab.range(s * {AW} + {AW} - 1, s * {AW});
+        }}
+        ap_uint<{PB}> ob = 0;
+        for (int pe = 0; pe < {PE}; pe++) {{
+            ap_int<{ACCU}> acc = 0;
+            for (int k = 0; k < {K}; k++)
+                acc += (ap_int<64>)W[pe][k] * (ap_int<64>)x[k];
+            ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU}) = (ap_uint<{ACCU}>)acc;
+        }}
+        p.write(ob);
+    }}
+}}
+"""
+
+
+def _2op_tb(p, t, top_name, func_name, seed):
+    """Two-operand self-checking TB (no bias): feed synthetic A (M×K) and B (K×N, as N-wide
+    K-row beats), golden = integer matmul + affine requant, compare the requantized C rows."""
+    PE, SIMD, SF = t["pe"], t["simd"], t["sf"]
+    WW, AW = t["weight_width"], t["activation_width"]
+    AB = t["input_stream_width_ba"]
+    N, K, M = p["n"], p["k_pad"], p["num_input_vectors"]
+    BB = ((N * WW) + 7) // 8 * 8
+    outW = p["output_width"]
+    req_shift = p["product_frac"] - p["output_frac"]
+    CB = ((N * outW) + 7) // 8 * 8
+    signed = bool(t["signed_activations"])
+    wrange = (1 << (WW - 1)) - 1
+    arange = (1 << (AW - 1)) - 1 if signed else (1 << AW) - 1
+    wmod, amod = min(7, 2 * wrange + 1), min(7, arange + 1)
+    woff = wrange if wmod == 2 * wrange + 1 else 3
+    aoff = 3 if signed else 0
+    return f"""#include <hls_stream.h>
+#include <ap_int.h>
+#include <cstdio>
+
+void {top_name}(hls::stream<ap_uint<{AB}> >&, hls::stream<ap_uint<{BB}> >&,
+{' ' * (len(top_name) + 1)}hls::stream<ap_uint<{CB}> >&);
+
+static long requant_ref(long acc) {{
+    long shift = {req_shift};
+    long q;
+    if (shift > 0)      q = (acc + (1L << (shift - 1))) >> shift;
+    else if (shift < 0) q = acc << (-shift);
+    else                q = acc;
+    long qmax = (1L << ({outW} - 1)) - 1, qmin = -(1L << ({outW} - 1));
+    if (q > qmax) q = qmax;
+    if (q < qmin) q = qmin;
+    return q;
+}}
+
+// two-operand tile: N={N} K={K} PE={PE} SIMD={SIMD} SF={SF} NF=1, M={M} vectors, no bias.
+int main() {{
+    hls::stream<ap_uint<{AB}> > a_in;
+    hls::stream<ap_uint<{BB}> > b_in;
+    hls::stream<ap_uint<{CB}> > c_out;
+
+    long Bm[{K}][{N}], X[{M}][{K}], golden[{M}][{N}];
+    for (int k = 0; k < {K}; k++)
+        for (int o = 0; o < {N}; o++) Bm[k][o] = ((o + k + {seed}) % {wmod}) - {woff};
+    for (int v = 0; v < {M}; v++)
+        for (int k = 0; k < {K}; k++) X[v][k] = ((v * 2 + k + {seed}) % {amod}) - {aoff};
+    for (int v = 0; v < {M}; v++)
+        for (int o = 0; o < {N}; o++) {{
+            long acc = 0;
+            for (int k = 0; k < {K}; k++) acc += Bm[k][o] * X[v][k];
+            golden[v][o] = requant_ref(acc);
+        }}
+
+    // B first: K beats, each an N-wide K-row (b[o] = B[k][o])
+    for (int k = 0; k < {K}; k++) {{
+        ap_uint<{BB}> bb = 0;
+        for (int o = 0; o < {N}; o++)
+            bb.range(o * {WW} + {WW} - 1, o * {WW}) = (ap_uint<{WW}>)(ap_int<{WW}>)Bm[k][o];
+        b_in.write(bb);
+    }}
+    // then A: M vectors, SF beats of SIMD activations each
+    for (int v = 0; v < {M}; v++)
+        for (int sf = 0; sf < {SF}; sf++) {{
+            ap_uint<{AB}> ab = 0;
+            for (int s = 0; s < {SIMD}; s++)
+                ab.range(s * {AW} + {AW} - 1, s * {AW}) =
+                    (ap_uint<{AW}>)(ap_int<{AW}>)X[v][sf * {SIMD} + s];
+            a_in.write(ab);
+        }}
+
+    {top_name}(a_in, b_in, c_out);
+
+    int errors = 0;
+    for (int v = 0; v < {M}; v++) {{
+        ap_uint<{CB}> crow = c_out.read();
+        for (int o = 0; o < {N}; o++) {{
+            ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
+            long got = (long)y, exp = golden[v][o];
+            if (got != exp) {{ errors++; std::printf("MISMATCH v=%d o=%d got=%ld exp=%ld\\n", v, o, got, exp); }}
+        }}
+    }}
+    if (errors == 0) std::printf("MVAU_PKG PASS\\n");
+    else             std::printf("MVAU_PKG FAIL errors=%d\\n", errors);
+    return errors;
+}}
+"""
+
+
+def generate_2op_core_twin(shape, func_name="mvau_core", plan=None, **kw):
+    """Public entry for the two-operand C twin."""
+    p = _plan(shape, plan=plan, **kw)
+    return _2op_core_twin(p, p["tile"], func_name)
+
+
+def generate_2op_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, plan=None, **kw):
+    """Public entry for the two-operand self-checking TB."""
+    p = _plan(shape, plan=plan, **kw)
+    return _2op_tb(p, p["tile"], top_name, func_name, seed)
+
+
 def _ws_tb(p, t, top_name, seed, bias_codes, B):
     """Weight-stationary self-checking TB: baked weights, top ``(a, c)`` (no ``w``).
     Independent golden with the same round-half-up + saturate requant reference."""
