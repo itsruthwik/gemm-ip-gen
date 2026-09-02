@@ -280,7 +280,7 @@ def _2op_core_twin(p, t, func_name):
     as ``K`` N-wide K-row beats (``b[pe]=B[k][pe]``) into residency, then per input vector
     reads ``SF`` activation beats and emits one raw-ACCU output beat. Bit-identical to the
     load-then-run RTL shim (pure integer Σ w·x)."""
-    PE, SIMD, SF = t["pe"], t["simd"], t["sf"]
+    PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     WW, AW, ACCU = t["weight_width"], t["activation_width"], t["accu_width"]
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
     N, K, M = p["n"], p["k_pad"], p["num_input_vectors"]
@@ -290,9 +290,9 @@ def _2op_core_twin(p, t, func_name):
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 
-// Two-operand C twin of {func_name} (FINN MVU: PE={PE} SIMD={SIMD} SF={SF} NF=1). B is a
+// Two-operand C twin of {func_name} (FINN MVU: PE={PE} SIMD={SIMD} SF={SF} NF={NF}). B is a
 // runtime stream (N-wide K-row beats), buffered then replayed across M vectors; A streams
-// per vector. Vitis substitutes the RTL for csynth/cosim. Integer matmul, raw ACCU out.
+// per vector. Vitis substitutes the RTL for csynth/cosim. Integer matmul, NF raw-ACCU beats/vec.
 void {func_name}(hls::stream<ap_uint<{AB}> >& a,
 {pad}hls::stream<ap_uint<{BB}> >& b,
 {pad}hls::stream<ap_uint<{PB}> >& p) {{
@@ -309,14 +309,16 @@ void {func_name}(hls::stream<ap_uint<{AB}> >& a,
             for (int s = 0; s < {SIMD}; s++)
                 x[sf * {SIMD} + s] = ab.range(s * {AW} + {AW} - 1, s * {AW});
         }}
-        ap_uint<{PB}> ob = 0;
-        for (int pe = 0; pe < {PE}; pe++) {{
-            ap_int<{ACCU}> acc = 0;
-            for (int k = 0; k < {K}; k++)
-                acc += (ap_int<64>)W[pe][k] * (ap_int<64>)x[k];
-            ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU}) = (ap_uint<{ACCU}>)acc;
+        for (int nf = 0; nf < {NF}; nf++) {{        // one output beat per column block
+            ap_uint<{PB}> ob = 0;
+            for (int pe = 0; pe < {PE}; pe++) {{
+                ap_int<{ACCU}> acc = 0;
+                for (int k = 0; k < {K}; k++)
+                    acc += (ap_int<64>)W[nf * {PE} + pe][k] * (ap_int<64>)x[k];
+                ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU}) = (ap_uint<{ACCU}>)acc;
+            }}
+            p.write(ob);
         }}
-        p.write(ob);
     }}
 }}
 """

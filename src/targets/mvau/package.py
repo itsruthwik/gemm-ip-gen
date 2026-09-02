@@ -567,7 +567,7 @@ def _2op_dataflow_top(name, plan):
     t = plan["tile"]
     m = plan["num_input_vectors"]
     AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
-    PE, SF = t["pe"], t["sf"]
+    PE, SF, NF = t["pe"], t["sf"], t["nf"]
     N, WW = plan["n"], t["weight_width"]
     BB = ((N * WW) + 7) // 8 * 8
     K = plan["k_pad"]
@@ -593,17 +593,21 @@ static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >&
     for (int i = 0; i < {bbeats}; i++) out.write(in.read());
 }}
 
-// Affine requant drain (no bias): raw ACCU codes -> N-wide requantized C row (NF=1).
+// Affine requant drain (no bias): NF raw-ACCU beats -> one N-wide requantized C row.
+// Beat nf lane pe holds output column nf*PE+pe.
 static void requant(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
     for (int vec = 0; vec < {m}; vec++) {{
         ap_uint<{CB}> crow = 0;
-        ap_uint<{PB}> ob = in.read();
-        for (int pe = 0; pe < {PE}; pe++) {{
-            ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
-            ap_fixed<64, {64 - pfrac}> rv;
-            rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;   // code -> fixed (frac={pfrac})
-            {name}_result_t r = rv;                           // rescale + round + saturate
-            crow.range(pe * {outW} + {outW} - 1, pe * {outW}) = r.range({outW} - 1, 0);
+        for (int nf = 0; nf < {NF}; nf++) {{
+            ap_uint<{PB}> ob = in.read();
+            for (int pe = 0; pe < {PE}; pe++) {{
+                int oc = nf * {PE} + pe;
+                ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
+                ap_fixed<64, {64 - pfrac}> rv;
+                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;   // code -> fixed (frac={pfrac})
+                {name}_result_t r = rv;                           // rescale + round + saturate
+                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+            }}
         }}
         out.write(crow);
     }}
