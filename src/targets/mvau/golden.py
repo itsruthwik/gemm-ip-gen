@@ -87,25 +87,31 @@ void {func_name}(hls::stream<ap_uint<{WB}> >& w,
 
 
 def _ws_core_twin(p, t, func_name, B):
-    """Weight-stationary C twin: baked weights, signature ``(a, p)`` (no ``w``)."""
+    """Weight-stationary C twin: baked weights, signature ``(a, p)`` (no ``w``).
+
+    N-tiling: the result beat concatenates the ``n_tiles`` tiles; in beat ``nf``,
+    tile ``ti`` lane ``pe`` (bits ``ti*PB + pe*ACCU +: ACCU``) holds global output
+    column ``ti*n_tile + nf*PE + pe`` -- matching the RTL shim's concatenation."""
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     ACCU = t["accu_width"]
     AW = t["activation_width"]
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    M, K, N = p["num_input_vectors"], p["k"], p["n"]
+    NT, NTILE = p["n_tiles"], p["n_tile"]
+    PB_TOTAL = NT * PB
+    M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
     actt = _act_ctype(t["signed_activations"], AW)
     wlit = _w_matrix_literal(B, N, K)
     pad = ' ' * (len(func_name) + 6)
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 
-// Weight-stationary C twin of {func_name} (FINN MVU tile: PE={PE} SIMD={SIMD} SF={SF} NF={NF}).
-// Weights baked here match the memstream the RTL bakes; Vitis substitutes the RTL
-// (memstream + mvu_vvu_axi) for csynth/cosim. Bit-identical integer matmul.
+// Weight-stationary C twin of {func_name} (FINN MVU: PE={PE} SIMD={SIMD} SF={SF} NF={NF},
+// N_TILES={NT}). Weights baked here match the memstreams the RTL bakes; Vitis
+// substitutes the RTL (memstream(s) + mvu_vvu_axi) for csynth/cosim. Integer matmul.
 static const long {func_name}_W[{N}][{K}] = {wlit};
 
 void {func_name}(hls::stream<ap_uint<{AB}> >& a,
-{pad}hls::stream<ap_uint<{PB}> >& p) {{
+{pad}hls::stream<ap_uint<{PB_TOTAL}> >& p) {{
     for (int vec = 0; vec < {M}; vec++) {{
         {actt} x[{SF}][{SIMD}];
         for (int sf = 0; sf < {SF}; sf++) {{
@@ -114,16 +120,18 @@ void {func_name}(hls::stream<ap_uint<{AB}> >& a,
                 x[sf][s] = ab.range(s * {AW} + {AW} - 1, s * {AW});
         }}
         for (int nf = 0; nf < {NF}; nf++) {{
-            ap_int<{ACCU}> acc[{PE}];
-            for (int pe = 0; pe < {PE}; pe++) acc[pe] = 0;
-            for (int sf = 0; sf < {SF}; sf++)
-                for (int pe = 0; pe < {PE}; pe++)
-                    for (int s = 0; s < {SIMD}; s++)
-                        acc[pe] += (ap_int<64>){func_name}_W[nf * {PE} + pe][sf * {SIMD} + s]
+            ap_uint<{PB_TOTAL}> ob = 0;
+            for (int ti = 0; ti < {NT}; ti++)
+                for (int pe = 0; pe < {PE}; pe++) {{
+                    int oc = ti * {NTILE} + nf * {PE} + pe;   // global output column
+                    ap_int<{ACCU}> acc = 0;
+                    for (int sf = 0; sf < {SF}; sf++)
+                        for (int s = 0; s < {SIMD}; s++)
+                            acc += (ap_int<64>){func_name}_W[oc][sf * {SIMD} + s]
                                  * (ap_int<64>)x[sf][s];
-            ap_uint<{PB}> ob = 0;
-            for (int pe = 0; pe < {PE}; pe++)
-                ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU}) = (ap_uint<{ACCU}>)acc[pe];
+                    ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU})
+                        = (ap_uint<{ACCU}>)acc;
+                }}
             p.write(ob);
         }}
     }}
@@ -137,7 +145,7 @@ def _ws_tb(p, t, top_name, seed, bias_codes, B):
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     AW = t["activation_width"]
     AB = t["input_stream_width_ba"]
-    M, K, N = p["num_input_vectors"], p["k"], p["n"]
+    M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
     outW = p["output_width"]
     req_shift = p["product_frac"] - p["output_frac"]
     CB = ((N * outW) + 7) // 8 * 8
@@ -230,7 +238,7 @@ def generate_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, plan
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     WW, AW = t["weight_width"], t["activation_width"]
     WB, AB = t["weight_stream_width_ba"], t["input_stream_width_ba"]
-    M, K, N = p["num_input_vectors"], p["k"], p["n"]
+    M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
     outW = p["output_width"]
     req_shift = p["product_frac"] - p["output_frac"]   # (fa+fb) - out_frac
     CB = ((N * outW) + 7) // 8 * 8

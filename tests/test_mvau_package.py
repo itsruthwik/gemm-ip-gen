@@ -50,6 +50,8 @@ def test_blackbox_json_contract(tmp_path):
         assert f"ap_ctrl_chain_protocol_{k}" in rcs
     # FIFO port map, not AXIS. Weight-stationary: weights are baked in the memstream,
     # so there is no weight port -- only the activation input and the result output.
+    # resource counts are known-inaccurate hints -- every JSON carries the note
+    assert j["_comment"] == "These resource counts are not accurate, TODO: Fix"
     pnames = {p["c_name"]: p["rtl_ports"] for p in j["c_parameters"]}
     assert "w" not in pnames
     assert pnames["a"]["FIFO_data_read_in"] == "a_dout"
@@ -103,6 +105,55 @@ def test_baked_weights_match_packer(tmp_path):
     # PE=SIMD=4 single tile at this shape; word = byte-aligned weight-stream width
     exp = wp.pack_memstream_hex(B, N, K, 4, 4, 8, word_bits=128)
     assert got == exp
+
+
+def test_n_tiling_stitched_in_rtl(tmp_path):
+    # N split into 2 column slices, each an independent MVU tile stitched in the
+    # RTL shim: shared activation broadcast in, tile outputs concatenated out.
+    import numpy as np
+    sys.path.insert(0, str(_SRC / "targets" / "mvau"))
+    import weightpack as wp
+    K, N, NT = 8, 8, 2
+    NTILE = N // NT
+    B = [[((k * 5 + n) % 7) - 3 for n in range(N)] for k in range(K)]   # [K][N]
+    pkg = _gen(tmp_path, (1, K, N), "gemm_nt", n_tiles=NT, weight_matrix=np.asarray(B))
+
+    # one memstream init (.dat) per N-column slice, packed from that slice of B
+    for ti in range(NT):
+        dat = pkg / "rtl_static" / f"gemm_nt_weights_t{ti}.dat"
+        assert dat.is_file() and dat.stat().st_size > 0
+        B_ti = [[B[kk][ti * NTILE + oo] for oo in range(NTILE)] for kk in range(K)]
+        assert dat.read_text() == wp.pack_memstream_hex(B_ti, NTILE, K, 4, 4, 8, word_bits=128)
+
+    v = (pkg / "gemm_nt_core.v").read_text()
+    assert v.count("memstream #(") == NT and v.count("mvu_vvu_axi #(") == NT
+    assert all(f"inst_{ti}" in v and f"wmem_{ti}" in v for ti in range(NT))
+    assert "(&in_tready)" in v and "(&out_tvalid)" in v      # lockstep broadcast + fan-in
+    # p_din is the concatenation of the tiles (PE*ACCU=4*20=80 per tile -> 160 total)
+    assert "[159:0] p_din" in v
+    assert "p_din[79:0] = out_tdata_0" in v and "p_din[159:80] = out_tdata_1" in v
+    for ti in range(NT):
+        dat = (pkg / "rtl_static" / f"gemm_nt_weights_t{ti}.dat").resolve()
+        assert f'.INIT_FILE("{dat}")' in v
+
+    # C twin + drain widen to the concatenated beat and index the global columns
+    twin = (pkg / "gemm_nt_core.cpp").read_text()
+    assert "ap_uint<160>" in twin and "ti < 2" in twin and "gemm_nt_core_W[8][8]" in twin
+    top = (pkg / "gemm_nt_top.cpp").read_text()
+    assert "ap_uint<160>" in top and "ti < 2" in top
+
+
+def test_n_tiling_manifest_lists_all_weight_files(tmp_path):
+    sys.path.insert(0, str(_SRC / "targets" / "mvau"))
+    import package as pkgmod
+    items = [{"name": "gemm_nt", "m": 1, "k": 8, "n": 8, "n_tiles": 2},
+             {"name": "gemm_1", "m": 1, "k": 4, "n": 4}]   # default single tile
+    man = json.loads(pkgmod.gen_integration_manifest(items))
+    cores = {c["name"]: c for c in man["cores"]}
+    assert cores["gemm_nt"]["weight_data"] == [
+        "gemm_nt/rtl_static/gemm_nt_weights_t0.dat",
+        "gemm_nt/rtl_static/gemm_nt_weights_t1.dat"]
+    assert cores["gemm_1"]["weight_data"] == ["gemm_1/rtl_static/gemm_1_weights.dat"]
 
 
 def test_affine_drain_present(tmp_path):

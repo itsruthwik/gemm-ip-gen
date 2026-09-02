@@ -148,6 +148,29 @@ def test_plan_n_tiling():
         g.fold_plan(1, 8, 8, part="xcvu13p", n_tiles=3)   # 3 does not divide 8
 
 
+def test_dsp_packing_warning():
+    # N=257 is prime -> PE snaps to 257 (odd) on the DSP48 8-bit core, which packs 2
+    # MACs/DSP along PE -> under-utilized. Warn (not error, not snap).
+    with pytest.warns(UserWarning, match="DSP-packing factor"):
+        g.fold_plan(1, 256, 257, weight_precision="fixed<8,4>",
+                    input_precision="fixed<8,4>", part="xcvu13p")
+    # aligned PE (N=512 -> PE=512, multiple of 2) must NOT warn
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        g.fold_plan(1, 256, 512, weight_precision="fixed<8,4>",
+                    input_precision="fixed<8,4>", part="xcvu13p")
+
+
+def test_dsp58_tiling_no_packing_warning():
+    # DSP58 packs along SIMD, so odd PE must NOT warn (tiling-neutral).
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        g.fold_plan(1, 256, 257, weight_precision="fixed<8,4>",
+                    input_precision="fixed<8,4>", part="xcve2802")   # Versal -> DSP58
+
+
 def test_plan_dsp48e1_narrow_required():
     # 4-bit on a 7-series part with unknown weights must reject (NARROW required).
     with pytest.raises(ValueError):
@@ -172,11 +195,14 @@ def test_latency_and_ii_deterministic():
 
 
 def test_plan_carries_deterministic_perf():
-    # fc on Versal: PE=16 SIMD=4 SF=2 DSP58 -> lat=5, II=2, DSP=32.
+    # fc on Versal, 8b: DSP58 packs 3 K-lanes/DSP, so the fold prefers SIMD=3 (1 DSP,
+    # no waste) over SIMD=4 (2 DSPs, 33% waste). K=8 -> K_pad=9, SIMD=3, PE=16, SF=3
+    # -> lat = SF+CHAINLEN+2 = 3+1+2 = 6, II=3, DSP = PE*ceil(3/3) = PE.
     t = g.fold_plan(1, 8, 16, weight_precision="fixed<8,4>", input_precision="fixed<8,4>",
                     output_precision="fixed<16,6>", part="xcve2802-vsvh1760-2MP-e-S")["tile"]
-    assert t["latency_cycles"] == 5 and t["ii"] == 2
-    assert t["dsp_estimate"] == t["pe"] * 2   # PE*ceil(SIMD/3)
+    assert t["simd"] == 3 and t["sf"] == 3
+    assert t["latency_cycles"] == 6 and t["ii"] == 3
+    assert t["dsp_estimate"] == t["pe"] * 1   # PE*ceil(SIMD/3), CHAINLEN=1 (perfect packing)
 
 
 def test_plan_reject_wide_precision():

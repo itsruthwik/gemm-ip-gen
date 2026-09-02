@@ -14,6 +14,7 @@ sequential fold counts, so one input vector costs ``SF*NF`` cycles (II=1).
 
 import math
 import re
+import warnings
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -230,13 +231,17 @@ def exp_cycles(k, n, pe, simd):
     return (k // simd) * (n // pe)
 
 
-def fold(k, n, weight_width, target_cycles, wwidth_max=WWIDTH_MAX):
+def fold(k, n, weight_width, target_cycles, wwidth_max=WWIDTH_MAX, simd_cap=None):
     """Choose ``(PE, SIMD)`` for one MVU instance over ``(K=MW, N=MH)``.
 
     Mirrors FINN ``SetFolding`` (``set_folding.py:129-152``): reset PE=SIMD=1;
     ramp SIMD over divisors of K until the per-vector cycle target is met or the
     weight-stream width cap is hit; then ramp PE over divisors of N until the
     target is met. Divisor-only, so ``K%SIMD==0`` / ``N%PE==0`` by construction.
+
+    ``simd_cap`` (optional) additionally bounds SIMD — used to hold SIMD at the
+    DSP-packing-optimal value (e.g. a multiple of 3 on DSP58, where each DSP packs 3
+    K-lanes; SIMD=4 would spill into a 2-DSP cascade at 33% waste).
     """
     target = max(1, int(target_cycles))
     simd = 1
@@ -245,7 +250,7 @@ def fold(k, n, weight_width, target_cycles, wwidth_max=WWIDTH_MAX):
         simd = s
         if exp_cycles(k, n, 1, simd) < target:
             break
-        if weight_width * simd > wwidth_max:
+        if weight_width * simd > wwidth_max or (simd_cap and simd > simd_cap):
             simd = prev
             break
     pe = 1
@@ -259,9 +264,16 @@ def fold(k, n, weight_width, target_cycles, wwidth_max=WWIDTH_MAX):
 def target_from_knobs(m, reuse_factor=1, strategy="latency", target_cycles=None):
     """Map hls4ml knobs to the per-vector cycle target the fold search stops at.
 
-    - ``ReuseFactor`` is the per-vector II == NF*SF, so target = RF.
-    - ``TargetCycles`` (whole-frame budget) -> per-vector = ceil(target/M).
-    - ``Strategy: Latency`` leaves RF at its default (1) => full unroll.
+    Knob contract (mvau): **ReuseFactor only**. Strategy answers "*how* is the MAC
+    computed?" (which soft kernel) — but the MVAU is one hardened FINN DSP MVU, there is
+    no kernel to select, so **Strategy is read-but-inert** for mvau (as is
+    ParallelizationFactor). RF answers "*how many* / what II?", which is exactly the fold
+    the MVAU exposes. So:
+    - ``target = RF`` (per-vector II = NF*SF*... ). RF=1 (the default) => maximum
+      parallelism / minimum II; reaching II=1 on K when SIMD is capped needs K-tiling
+      (see fold_plan's ``k_tiles_full_spatial``).
+    - ``TargetCycles`` (whole-frame budget) -> per-vector = ceil(target/M), overrides RF.
+    ``strategy`` is accepted for signature compatibility but ignored.
 
     Returns ``(target, source)`` where source names which knob drove it.
     """
@@ -292,11 +304,18 @@ def stream_widths(pe, simd, weight_width, act_width, accu):
 def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
               output_precision=None, part=None, clock_period_ns=5.0,
               reuse_factor=1, strategy="latency", target_cycles=None,
-              parallelization_factor=1, n_tiles=1, weights=None):
+              parallelization_factor=1, n_tiles=1, k_tiles=1, weights=None):
     """Resolve the full folding/geometry plan for a GEMM ``(m, k, n)``.
 
     N-tiling splits N into ``n_tiles`` equal column blocks, each an independent
-    MVU instance (shared A, own B^T slice); every tile is folded identically.
+    MVU instance (shared A, own B^T slice; outputs concatenated).
+
+    K-tiling splits K into ``k_tiles`` equal row blocks (each MVU reduces its K-slice
+    for ALL outputs; the partial results are SUMMED). ``k_tiles="auto"`` chooses the
+    smallest divisor of SF that meets the RF/II target (RF=1 -> full spatial, SF_tile=1).
+    ``k_tiles=1`` (default) is the single-K-core path. The summed accumulator is widened
+    by ceil(log2 k_tiles).
+
     Returns a dict with the per-tile MVU parameters and the aggregate view.
     """
     m, k, n = int(m), int(k), int(n)
@@ -319,12 +338,40 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
     check_envelope(dsp_block, weight_width, act_width, signed_act)
     core = select_core(dsp_block, weight_width, act_width)
 
+    # K-padding so SIMD can reach the DSP-packing-optimal value. SIMD is bounded by
+    # weight_width*SIMD <= WWIDTH_MAX (routability), but the *packing* granularity is the
+    # DSP's K-lanes-per-DSP: DSP58 packs 3 (mvu_vvu_8sx9_dsp58), so SIMD should be a
+    # multiple of 3 (SIMD=3 -> 1 DSP, no waste; SIMD=4 -> 2 DSPs at 33% waste). DSP48
+    # cores pack along PE, not SIMD, so no SIMD granularity preference there.
+    # simd_target = largest DSP-optimal SIMD within the cap; pad K to a multiple of it
+    # (zero rows -> bit-exact) so the divisor-only fold can actually use it. A tiny K
+    # (< simd_target) keeps SIMD=K, no pad.
+    simd_cap = max(1, WWIDTH_MAX // weight_width)
+    pack = 3 if core == "mvu_vvu_8sx9_dsp58" else 1        # DSP58 K-lanes per DSP
+    simd_target = (simd_cap // pack) * pack if simd_cap >= pack else simd_cap
+    simd_target = max(1, simd_target)
+    k_pad = k if k < simd_target else math.ceil(k / simd_target) * simd_target
+
     target, target_src = target_from_knobs(
         m, reuse_factor=reuse_factor, strategy=strategy, target_cycles=target_cycles)
 
-    pe, simd = fold(k, n_tile, weight_width, target)
+    pe, simd = fold(k_pad, n_tile, weight_width, target, simd_cap=simd_target)
 
-    accu = accu_width(k, weight_width, act_width)
+    # DSP48 cores pack MACs along PE (8sx8u: 2/DSP, 4sx4u: 4/DSP). When PE is not a
+    # multiple of that factor the DSP estimate's ceil() rounds up -> wasted DSP. This
+    # bites N-tiling with a small PE_tile and single cores on prime-ish N. DSP58 packs
+    # along SIMD, so PE alignment is irrelevant there. Warn only -- no guard/snap.
+    _pack_pe = {"mvu_8sx8u_dsp48": 2,
+                "mvu_4sx4u_dsp48e1": 4, "mvu_4sx4u_dsp48e2": 4}.get(core)
+    if _pack_pe and pe % _pack_pe:
+        warnings.warn(
+            f"mvau: PE={pe} is not a multiple of the {core} DSP-packing factor "
+            f"{_pack_pe}; DSP packing is under-utilized (rounds up as if "
+            f"PE={math.ceil(pe / _pack_pe) * _pack_pe}). Consider an aligned "
+            f"reuse_factor or n_tiles for better DSP efficiency.",
+            stacklevel=2)
+
+    accu = accu_width(k_pad, weight_width, act_width)
     seg = segment_len(simd, clock_period_ns, dsp_block)
     narrow = narrow_weights(weights, weight_width, signed_act)
 
@@ -333,18 +380,33 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
             "mvu_4sx4u on DSP48E1 requires NARROW_WEIGHTS=1 (weights must exclude "
             "the most-negative code); constrain the range or target DSP48E2/DSP58")
 
-    sf, nf = k // simd, n_tile // pe
+    sf_full, nf = k_pad // simd, n_tile // pe
+
+    # K-tiling: split the SF_full K-folds across k_tiles MVU cores, each reducing a
+    # K_pad/k_tiles slice for ALL outputs; the partials are summed downstream. Each tile
+    # is folded identically (MW = K_pad/k_tiles), so SF drops to SF_full/k_tiles.
+    if k_tiles == "auto":
+        want = max(1, int(math.ceil((sf_full * nf) / max(1, target))))
+        gk = next((d for d in divisors(sf_full) if d >= want), sf_full)
+    else:
+        gk = max(1, int(k_tiles))
+        if sf_full % gk != 0:
+            raise ValueError(f"k_tiles={gk} must divide SF={sf_full} (K_pad/SIMD)")
+    k_per_tile = k_pad // gk
+    sf = sf_full // gk                     # per-tile SF
+    accu_sum = accu + (math.ceil(math.log2(gk)) if gk > 1 else 0)  # summed-partials width
+
     widths = stream_widths(pe, simd, weight_width, act_width, accu)
 
-    # per-vector II and the RF it corresponds to (after divisor snapping)
-    ii_per_vector = exp_cycles(k, n_tile, pe, simd)
+    # per-vector II and the RF it corresponds to (after divisor snapping + K-tiling)
+    ii_per_vector = sf * nf
     achieved_rf = ii_per_vector  # RF == NF*SF per vector
     requested_rf = int(reuse_factor or 1)
 
     tile = {
         "is_mvu": 1,
         "compute_core": core,
-        "mw": k, "mh": n_tile,
+        "mw": k_per_tile, "mh": n_tile,
         "pe": pe, "simd": simd, "sf": sf, "nf": nf,
         "activation_width": act_width,
         "weight_width": weight_width,
@@ -355,14 +417,14 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         "weight_stream_width_ba": widths["weight_ba"],
         "input_stream_width_ba": widths["input_ba"],
         "output_stream_width_ba": widths["output_ba"],
-        "wmem": (k * n_tile) // (pe * simd),  # weight beats per input vector
+        "wmem": (k_per_tile * n_tile) // (pe * simd),  # weight beats per input vector
         "dsp_estimate": dsp_estimate(core, pe, simd),   # FINN cost model, per tile
         "latency_cycles": latency_cycles(core, sf, simd, seg),  # deterministic fill latency
         "ii": output_ii(sf),                            # deterministic output II (= SF)
     }
 
     return {
-        "m": m, "k": k, "n": n,
+        "m": m, "k": k, "k_pad": k_pad, "n": n,
         "dsp_block": dsp_block,
         "output_width": out_width,
         "output_int": output_int,
@@ -380,4 +442,11 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         "requested_reuse_factor": requested_rf,
         "reuse_factor_snapped": achieved_rf != requested_rf and target_src == "reuse_factor",
         "parallelization_factor": int(parallelization_factor or 1),
+        # K-tiling: k_tiles MVU cores each reduce K_pad/k_tiles for all outputs; partials
+        # summed (accumulator widened to accu_sum). k_tiles=1 => single K-core (default).
+        "simd_pack": pack,                 # DSP K-lanes/DSP (3 on DSP58) -> SIMD granularity
+        "k_tiles": gk,                     # number of K-tiles (MVU cores summed along K)
+        "k_per_tile": k_per_tile,          # each tile's MW (K slice), a multiple of SIMD
+        "sf_full": sf_full,                # pre-tiling SF; k_tiles=SF_full => SF_tile=1
+        "accu_sum": accu_sum,              # width of the summed-partials accumulator
     }

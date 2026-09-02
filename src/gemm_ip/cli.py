@@ -23,6 +23,12 @@ def main():
     )
     parser.add_argument("--target", choices=TARGETS, default="tensor_slice",
                         help="Hardblock target (default: tensor_slice)")
+    parser.add_argument("--describe", type=str, metavar="TARGET",
+                        help="Print JSON capability metadata {name, tool} for TARGET "
+                             "and exit (the target->tool source of truth for callers "
+                             "that must not hardcode target knowledge)")
+    parser.add_argument("--list-targets", action="store_true",
+                        help="Print the registered target names as JSON and exit")
     parser.add_argument("--config", type=str, help="Path to gemm_config.json")
     parser.add_argument("--m", type=int, default=8, help="GEMM M (rows per tile)")
     parser.add_argument("--k", type=int, default=8, help="GEMM K (inner dimension)")
@@ -38,6 +44,17 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./output",
                         help="Output directory (default: ./output)")
     args = parser.parse_args()
+
+    # Capability queries: metadata only, no generation. Each loads at most one target,
+    # so the one-target-per-process module-import model (see registry.py) is respected.
+    if args.list_targets:
+        print(json.dumps({"targets": list(TARGETS)}))
+        return
+    if args.describe:
+        from gemm_ip.registry import load_target
+        t = load_target(args.describe)
+        print(json.dumps({"name": t.name, "tool": t.tool}))
+        return
 
     _run(args)
 
@@ -81,6 +98,7 @@ def _run(args):
                     "strategy": item.get("strategy"),
                     "parallelization_factor": item.get("parallelization_factor"),
                     "target_cycles": item.get("target_cycles"),
+                    "n_tiles": item.get("n_tiles"),
                 },
             )
         output_dir = Path(args.output_dir)
@@ -92,6 +110,9 @@ def _run(args):
         # Catapult-only artifact: only targets welded to Catapult emit it.
         if hasattr(target, "blackbox_tcl"):
             (output_dir / "catapult_gemm_blackboxes.tcl").write_text(target.blackbox_tcl(items))
+        # Optional post-batch step (e.g. mvau dedups shared static RTL across IPs).
+        if hasattr(target, "finalize"):
+            target.finalize(items, str(output_dir))
     else:
         target.package(
             (args.m, args.k, args.n),

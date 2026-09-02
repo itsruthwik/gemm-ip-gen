@@ -62,6 +62,7 @@ def _normalize_mvau_items(cfg):
             "part": it.get("part"),
             "weights_in_core": bool(it.get("weights_in_core", False)),
             "weight_file": it.get("weight_file"),
+            "n_tiles": int(it.get("n_tiles", 1) or 1),
             "has_bias": bool(it.get("has_bias", True)),
         }
     if isinstance(cfg, list):
@@ -155,6 +156,11 @@ class MvauTarget(Target):
         hls4ml's Vitis writer brings the IP into the build (unlike the base
         no-op / the header-only ``generic`` target)."""
         return _package().gen_sources_tcl(items)
+
+    def finalize(self, items, output_dir):
+        """Post-batch: dedup the identical vendored FINN static RTL across IPs so a
+        multi-mvau design doesn't hand Vitis two same-named blackbox .sv files."""
+        _package().hoist_shared_static(items, output_dir)
 
 
 TARGET = MvauTarget()
