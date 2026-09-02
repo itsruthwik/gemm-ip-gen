@@ -42,6 +42,8 @@ def generate_core_twin(shape, func_name="mvau_core", plan=None, baked_weights=No
     p = _plan(shape, plan=plan, **kw)
     t = p["tile"]
     if baked_weights is not None:
+        if p.get("k_tiles", 1) > 1:
+            return _kt_core_twin(p, t, func_name, baked_weights)
         return _ws_core_twin(p, t, func_name, baked_weights)
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     WW, AW, ACCU = t["weight_width"], t["activation_width"], t["accu_width"]
@@ -135,6 +137,140 @@ void {func_name}(hls::stream<ap_uint<{AB}> >& a,
             p.write(ob);
         }}
     }}
+}}
+"""
+
+
+def _kt_core_twin(p, t, func_name, B):
+    """K-tiled weight-stationary C twin (fully-spatial per-tile, SF=NF=1). Input is one
+    wide beat of ``KT*AB`` (all K_pad activations, contiguous since AB=SIMD*AW); output
+    is one wide beat of ``KT*PB`` holding each tile's PARTIAL for all N columns. Tile ti
+    reduces K-slice rows ``ti*SIMD .. ti*SIMD+SIMD-1`` -- matching its memstream slice."""
+    PE, SIMD = t["pe"], t["simd"]
+    ACCU = t["accu_width"]
+    AW = t["activation_width"]
+    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
+    KT = p["k_tiles"]
+    A_TOTAL, PB_TOTAL = KT * AB, KT * PB
+    M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
+    actt = _act_ctype(t["signed_activations"], AW)
+    wlit = _w_matrix_literal(B, N, K)
+    pad = ' ' * (len(func_name) + 6)
+    apmax = max(1024, ((PB_TOTAL + 1023) // 1024 + 1) * 1024)
+    return f"""#define AP_INT_MAX_W {apmax}   // wide K-tiled beats (KT*PB={PB_TOTAL}) exceed the 1024-bit default
+#include <hls_stream.h>
+#include <ap_int.h>
+
+// K-tiled weight-stationary C twin of {func_name} (FINN MVU: KT={KT} K-tiles of
+// SIMD={SIMD} each, PE={PE} full-N). Weights baked here match the KT memstreams the
+// RTL bakes; Vitis substitutes the RTL for csynth/cosim. Per-tile integer matmul (partial).
+static const long {func_name}_W[{N}][{K}] = {wlit};
+
+void {func_name}(hls::stream<ap_uint<{A_TOTAL}> >& a,
+{pad}hls::stream<ap_uint<{PB_TOTAL}> >& p) {{
+    for (int vec = 0; vec < {M}; vec++) {{
+        {actt} x[{K}];
+        ap_uint<{A_TOTAL}> ab = a.read();
+        for (int kk = 0; kk < {K}; kk++)
+            x[kk] = ab.range(kk * {AW} + {AW} - 1, kk * {AW});   // contiguous K_pad lanes
+        ap_uint<{PB_TOTAL}> ob = 0;
+        for (int ti = 0; ti < {KT}; ti++)
+            for (int pe = 0; pe < {PE}; pe++) {{
+                ap_int<{ACCU}> acc = 0;
+                for (int s = 0; s < {SIMD}; s++)
+                    acc += (ap_int<64>){func_name}_W[pe][ti * {SIMD} + s]
+                         * (ap_int<64>)x[ti * {SIMD} + s];
+                ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU})
+                    = (ap_uint<{ACCU}>)acc;
+            }}
+        p.write(ob);
+    }}
+}}
+"""
+
+
+def _kt_tb(p, t, top_name, seed, bias_codes, B):
+    """K-tiled self-checking TB: baked weights, top ``(a, c)`` with one wide ``KT*AB``
+    activation beat per vector. Independent full-K golden matmul + requant reference."""
+    PE, SIMD = t["pe"], t["simd"]
+    AW = t["activation_width"]
+    AB = t["input_stream_width_ba"]
+    KT = p["k_tiles"]
+    A_TOTAL = KT * AB
+    M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
+    outW = p["output_width"]
+    req_shift = p["product_frac"] - p["output_frac"]
+    CB = ((N * outW) + 7) // 8 * 8
+    wlit = _w_matrix_literal(B, N, K)
+    if bias_codes:
+        bias_arr = "    long bias[%d] = {%s};\n" % (N, ", ".join(str(c) for c in bias_codes))
+        bias_add_tb = " + bias[o]"
+    else:
+        bias_arr, bias_add_tb = "", ""
+    signed = bool(t["signed_activations"])
+    arange = (1 << (AW - 1)) - 1 if signed else (1 << AW) - 1
+    amod = min(7, arange + 1)
+    aoff = 3 if signed else 0
+    return f"""#include <hls_stream.h>
+#include <ap_int.h>
+#include <cstdio>
+
+void {top_name}(hls::stream<ap_uint<{A_TOTAL}> >&,
+{' ' * (len(top_name) + 1)}hls::stream<ap_uint<{CB}> >&);
+
+// Independent requant reference: round-half-up shift by req_shift, then saturate
+// to a signed {outW}-bit code (must match the drain's ap_fixed AP_RND/AP_SAT).
+static long requant_ref(long acc) {{
+    long shift = {req_shift};
+    long q;
+    if (shift > 0)      q = (acc + (1L << (shift - 1))) >> shift;   // round half up
+    else if (shift < 0) q = acc << (-shift);
+    else                q = acc;
+    long qmax = (1L << ({outW} - 1)) - 1, qmin = -(1L << ({outW} - 1));
+    if (q > qmax) q = qmax;
+    if (q < qmin) q = qmin;
+    return q;
+}}
+
+// K-tiled tile set: N={N} K={K} KT={KT} SIMD={SIMD} PE={PE}, M={M} vectors.
+// Weights baked (must match the KT memstream inits the RTL loads); only activations fed.
+static const long W[{N}][{K}] = {wlit};
+
+int main() {{
+    hls::stream<ap_uint<{A_TOTAL}> > a_in;
+    hls::stream<ap_uint<{CB}> > c_out;
+
+    long X[{M}][{K}], golden[{M}][{N}];
+{bias_arr}    for (int v = 0; v < {M}; v++)
+        for (int k = 0; k < {K}; k++) X[v][k] = ((v * 2 + k + {seed}) % {amod}) - {aoff};
+    for (int v = 0; v < {M}; v++)
+        for (int o = 0; o < {N}; o++) {{
+            long acc = 0;
+            for (int k = 0; k < {K}; k++) acc += W[o][k] * X[v][k];
+            golden[v][o] = requant_ref(acc{bias_add_tb});
+        }}
+
+    for (int v = 0; v < {M}; v++) {{
+        ap_uint<{A_TOTAL}> ab = 0;
+        for (int k = 0; k < {K}; k++)
+            ab.range(k * {AW} + {AW} - 1, k * {AW}) = (ap_uint<{AW}>)(ap_int<{AW}>)X[v][k];
+        a_in.write(ab);
+    }}
+
+    {top_name}(a_in, c_out);
+
+    int errors = 0;
+    for (int v = 0; v < {M}; v++) {{
+        ap_uint<{CB}> crow = c_out.read();
+        for (int o = 0; o < {N}; o++) {{
+            ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
+            long got = (long)y, exp = golden[v][o];
+            if (got != exp) {{ errors++; std::printf("MISMATCH v=%d o=%d got=%ld exp=%ld\\n", v, o, got, exp); }}
+        }}
+    }}
+    if (errors == 0) std::printf("MVAU_PKG PASS\\n");
+    else             std::printf("MVAU_PKG FAIL errors=%d\\n", errors);
+    return errors;
 }}
 """
 
@@ -234,6 +370,8 @@ def generate_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, plan
     p = _plan(shape, plan=plan, **kw)
     t = p["tile"]
     if baked_weights is not None:
+        if p.get("k_tiles", 1) > 1:
+            return _kt_tb(p, t, top_name, seed, bias_codes, baked_weights)
         return _ws_tb(p, t, top_name, seed, bias_codes, baked_weights)
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     WW, AW = t["weight_width"], t["activation_width"]

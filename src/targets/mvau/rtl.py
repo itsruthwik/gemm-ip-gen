@@ -29,7 +29,7 @@ def _tile(shape, tile=None, **plan_kwargs):
 
 def generate_shim(shape, module_name="mvau_core", force_behavioral=True,
                   tile=None, weights_in_core=False, init_file=None,
-                  init_files=None, n_tiles=1, **plan_kwargs):
+                  init_files=None, n_tiles=1, k_tiles=1, **plan_kwargs):
     """Emit the shim Verilog wrapping ``mvu_vvu_axi`` for one MVU tile.
 
     ``module_name`` must match the blackbox C function name. ``force_behavioral``
@@ -51,9 +51,13 @@ def generate_shim(shape, module_name="mvau_core", force_behavioral=True,
     pbits = t["output_stream_width_ba"]
     fb = 1 if force_behavioral else 0
     n_tiles = int(n_tiles)
+    k_tiles = int(k_tiles)
     if weights_in_core:
         if init_files is None:
             init_files = [init_file] if init_file else None
+        if k_tiles > 1:
+            return _generate_kt_shim(t, module_name, fb, wbits, abits, pbits,
+                                     init_files, k_tiles)
         return _generate_ws_shim(t, module_name, fb, wbits, abits, pbits,
                                  init_files, n_tiles)
     if n_tiles != 1:
@@ -126,10 +130,11 @@ endmodule
 """
 
 
-def _mvu_inst(t, fb, i):
+def _mvu_inst(t, fb, i, act_expr="a_dout"):
     """One ``mvu_vvu_axi`` instance for tile ``i`` with the tile's fold params,
-    wired to that tile's memstream (weights) and the shared activation broadcast
-    / concatenated output beat."""
+    wired to that tile's memstream (weights) and its activation input ``act_expr``
+    (the whole ``a_dout`` for N-tiling/broadcast, or a per-tile slice for K-tiling).
+    """
     return f"""    mvu_vvu_axi #(
         .IS_MVU({t['is_mvu']}),
         .COMPUTE_CORE("{t['compute_core']}"),
@@ -145,7 +150,7 @@ def _mvu_inst(t, fb, i):
         .s_axis_weights_tdata(w_odat_{i}),
         .s_axis_weights_tvalid(wgt_tvalid_{i}),
         .s_axis_weights_tready(wgt_tready_{i}),
-        .s_axis_input_tdata(a_dout),
+        .s_axis_input_tdata({act_expr}),
         .s_axis_input_tvalid(in_tvalid),
         .s_axis_input_tready(in_tready[{i}]),
         .m_axis_output_tdata(out_tdata_{i}),
@@ -155,14 +160,15 @@ def _mvu_inst(t, fb, i):
 """
 
 
-def _ws_tile_block(t, fb, wbits, pbits, wmem, i, init_file):
-    """RTL for tile ``i``: its own memstream (baked weights for the tile's
-    N-column slice), the ce-gated weight handshake, the slice of ``p_din`` the
-    tile drives, and the ``mvu_vvu_axi`` instance."""
+def _ws_tile_block(t, fb, wbits, pbits, wmem, i, init_file, act_expr="a_dout", label=None):
+    """RTL for tile ``i``: its own memstream (baked weights for the tile's slice),
+    the ce-gated weight handshake, the slice of ``p_din`` the tile drives, and the
+    ``mvu_vvu_axi`` instance fed activation ``act_expr``."""
     lo, hi = i * pbits, (i + 1) * pbits - 1
     col0, col1 = i * t["mh"], (i + 1) * t["mh"] - 1
     zero = "{%d{1'b0}}" % wbits
-    return f"""    // ---- tile {i}: output columns [{col0}, {col1}] ----
+    tag = label if label is not None else f"output columns [{col0}, {col1}]"
+    return f"""    // ---- tile {i}: {tag} ----
     wire [{wbits - 1}:0] w_odat_{i};
     wire                 w_ovld_{i}, w_ordy_{i}, wgt_tvalid_{i}, wgt_tready_{i};
     wire [{pbits - 1}:0] out_tdata_{i};
@@ -178,7 +184,67 @@ def _ws_tile_block(t, fb, wbits, pbits, wmem, i, init_file):
     assign wgt_tvalid_{i} = ap_ce & w_ovld_{i};   // ce-gated memstream -> weight AXIS
     assign w_ordy_{i}     = ap_ce & wgt_tready_{i};
     assign p_din[{hi}:{lo}] = out_tdata_{i};      // tile output -> concatenated result beat
-{_mvu_inst(t, fb, i)}"""
+{_mvu_inst(t, fb, i, act_expr)}"""
+
+
+def _generate_kt_shim(t, module_name, fb, wbits, abits, pbits, init_files, k_tiles):
+    """K-tiled weight-stationary shim: ``k_tiles`` MVU cores each reduce a K-slice
+    (MW = K_pad/k_tiles) for ALL outputs, producing a PARTIAL result. Unlike N-tiling
+    (broadcast activation, distinct output columns), K-tiling **slices** the activation
+    and the partials share the same columns — the drain SUMS them.
+
+    Realized for the fully-spatial per-tile fold (SF_tile=1): the activation arrives as
+    one wide beat of ``k_tiles*abits`` (all K_pad activations); tile ``i`` consumes lanes
+    ``[i*abits +: abits]`` (its SIMD-slice). Per-tile memstream = that tile's K-row slice.
+    Outputs concatenate into ``k_tiles*PB`` (partials, summed downstream)."""
+    if not init_files or any(not f for f in init_files) or len(init_files) != k_tiles:
+        raise ValueError(f"K-tiled shim needs {k_tiles} memstream init file(s)")
+    if t["mw"] != t["simd"]:
+        raise NotImplementedError(
+            f"K-tiled shim is implemented for the fully-spatial per-tile fold only "
+            f"(SF_tile=1, i.e. K_pad/k_tiles == SIMD); got MW={t['mw']} SIMD={t['simd']} "
+            f"(SF_tile={t['mw'] // t['simd']}). Use k_tiles = SF_full, or the future "
+            f"per-tile-streaming K-tiled shim for partial K-tiling.")
+    wmem = t["wmem"]
+    a_total = k_tiles * abits
+    pb_total = k_tiles * pbits
+    blocks = "\n".join(
+        _ws_tile_block(t, fb, wbits, pbits, wmem, i, init_files[i],
+                       act_expr=f"a_dout[{(i + 1) * abits - 1}:{i * abits}]",
+                       label=f"K-slice {i} partial (all {t['mh']} outputs)")
+        for i in range(k_tiles))
+    return f"""// Generated by gemm-ip-gen (mvau target). K-tiled weight-stationary shim:
+// {k_tiles} MVU tile(s) each reducing a K-slice (MW={t['mw']}) for all {t['mh']} outputs;
+// activation sliced per tile, partial outputs concatenated (summed in the drain).
+// Tile: MW(K/tile)={t['mw']} MH(N)={t['mh']} PE={t['pe']} SIMD={t['simd']} \
+core={t['compute_core']} ACCU={t['accu_width']} WMEM={wmem} K_TILES={k_tiles}
+// Module name MUST equal the JSON c_function_name (Vitis instantiates by it).
+module {module_name} (
+    input  wire                 ap_clk,
+    input  wire                 ap_rst,     // active-high
+    input  wire                 ap_ce,      // active-high clock enable / stall
+
+    // activation FIFO (input)  {a_total} = K_TILES * ceil(SIMD*ACTIVATION_WIDTH/8)*8
+    input  wire [{a_total - 1}:0] a_dout,
+    input  wire                 a_empty_n,
+    output wire                 a_read,
+    // output FIFO (output)     {pb_total} = K_TILES * ceil(PE*ACCU_WIDTH/8)*8 (partials)
+    output wire [{pb_total - 1}:0] p_din,
+    input  wire                 p_full_n,
+    output wire                 p_write
+);
+    wire rst_n = ~ap_rst;
+
+    // one wide activation beat feeds all tiles (each its own lane slice); lockstep.
+    wire in_tvalid  = ap_ce & a_empty_n;
+    wire out_tready = ap_ce & p_full_n;
+    wire [{k_tiles - 1}:0] in_tready;
+    wire [{k_tiles - 1}:0] out_tvalid;
+    assign a_read  = ap_ce & (&in_tready);
+    assign p_write = ap_ce & (&out_tvalid);
+
+{blocks}endmodule
+"""
 
 
 def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_tiles):

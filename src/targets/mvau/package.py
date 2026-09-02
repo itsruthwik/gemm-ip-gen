@@ -38,12 +38,25 @@ def _with_timescale(text):
     return text if "`timescale" in text else _TIMESCALE + text
 
 
+def _apmaxw(bits):
+    """AP_INT_MAX_W setting for a design whose widest ap_uint is ``bits`` wide.
+    The default cap is 1024; K-tiled result beats (KT*PB) blow past it. Round up to
+    the next KiB with a KiB of headroom (min 1024 = the default, so narrow cases are
+    unaffected)."""
+    return max(1024, ((bits + 1023) // 1024 + 1) * 1024)
+
+
 def _dat_name(name, ti, n_tiles):
     """memstream ``$readmemh`` init filename for tile ``ti``. Single-tile keeps the
     original ``<name>_weights.dat``; N-tiling suffixes ``_t{ti}`` per column slice."""
     if n_tiles <= 1:
         return _WEIGHTS_DAT.format(name=name)
     return f"{name}_weights_t{ti}.dat"
+
+
+def _kdat_name(name, ti):
+    """memstream ``$readmemh`` init filename for K-tile ``ti`` (one per K-row slice)."""
+    return f"{name}_weights_k{ti}.dat"
 
 
 def _core_rtl_files(name, prefix=""):
@@ -56,7 +69,7 @@ def _core_rtl_files(name, prefix=""):
 
 _PLAN_KEYS = ("weight_precision", "input_precision", "output_precision", "part",
               "clock_period_ns", "reuse_factor", "strategy", "target_cycles",
-              "parallelization_factor", "n_tiles", "weights")
+              "parallelization_factor", "n_tiles", "k_tiles", "weights")
 
 
 def _plan_kwargs(cfg):
@@ -378,6 +391,175 @@ void {name}_gemm_stream_weightless(hls::stream<data_T> &a_stream, hls::stream<re
 """
 
 
+def _kt_dataflow_top(name, plan, bias_codes=None):
+    """DUT for the K-tiled blackbox (fully-spatial per-tile, SF=NF=1). The activation
+    arrives as one wide beat of ``KT*AB`` (all K_pad activations); the blackbox emits
+    one wide beat of ``KT*PB`` holding the ``KT`` per-tile PARTIALS for all N columns.
+    The drain SUMS the partials per column (accumulator widened by ceil(log2 KT)),
+    then adds bias and requantizes -- the K-tiling counterpart of the single-tile drain."""
+    t = plan["tile"]
+    m = plan["num_input_vectors"]
+    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    KT = plan["k_tiles"]
+    A_TOTAL, PB_TOTAL = KT * AB, KT * PB
+    ACCU_SUM = plan["accu_sum"]
+    N, outW, outI = plan["n"], plan["output_width"], plan["output_int"]
+    pfrac = plan["product_frac"]
+    CB = cbits(plan)
+    pad = ' ' * (len(name) + 6)
+    if bias_codes:
+        bias_decl = (f"static const long {name}_bias[{N}] = {{"
+                     + ", ".join(str(c) for c in bias_codes) + "};\n")
+        bias_add = f" + {name}_bias[oc]"
+    else:
+        bias_decl, bias_add = "", ""
+    indent = ' ' * (len(name) + 1)
+    apmax = _apmaxw(PB_TOTAL)
+    return f"""#define AP_INT_MAX_W {apmax}   // wide K-tiled beats (KT*PB={PB_TOTAL}) exceed the 1024-bit default
+#include <hls_stream.h>
+#include <ap_int.h>
+#include <ap_fixed.h>
+
+// output precision: fixed<{outW},{outI}> with round-half-up + saturate
+typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> {name}_result_t;
+{bias_decl}
+void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&,
+{pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
+
+static void feed_a(hls::stream<ap_uint<{A_TOTAL}> >& in, hls::stream<ap_uint<{A_TOTAL}> >& out) {{
+    for (int i = 0; i < {m}; i++) out.write(in.read());
+}}
+
+// K-tiled requant drain: sum the KT per-tile partials for each column (accum widened
+// to {ACCU_SUM} = ACCU + ceil(log2 KT)), then + bias and quantize (Keras order).
+static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
+    for (int vec = 0; vec < {m}; vec++) {{
+        ap_uint<{CB}> crow = 0;
+        ap_uint<{PB_TOTAL}> ob = in.read();
+        for (int oc = 0; oc < {N}; oc++) {{
+            ap_int<{ACCU_SUM}> raw = 0;
+            for (int ti = 0; ti < {KT}; ti++)
+                raw += (ap_int<{ACCU}>)ob.range(ti * {PB} + oc * {ACCU} + {ACCU} - 1, ti * {PB} + oc * {ACCU});
+            ap_int<64> v = (ap_int<64>)raw{bias_add};         // Σ partials + bias, accum domain
+            ap_fixed<64, {64 - pfrac}> rv;
+            rv.range(63, 0) = (ap_uint<64>)v;                 // code -> fixed (frac={pfrac})
+            {name}_result_t r = rv;                           // rescale + round + saturate
+            crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+        }}
+        out.write(crow);
+    }}
+}}
+
+void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in,
+{indent}hls::stream<ap_uint<{CB}> >& c_out) {{
+#pragma HLS DATAFLOW
+    hls::stream<ap_uint<{A_TOTAL}> > a_s;
+    hls::stream<ap_uint<{PB_TOTAL}> > p_s;
+#pragma HLS STREAM variable=a_s depth=4
+#pragma HLS STREAM variable=p_s depth=4
+    feed_a(a_in, a_s);
+    {name}_core(a_s, p_s);   // <-- FINN MVU RTL blackbox ({KT} K-tiles, partials)
+    requant(p_s, c_out);
+}}
+"""
+
+
+def _kt_gemm_ip_header(name, plan):
+    """hls4ml-facing IP for a K-tiled gemm config (fully-spatial per-tile). Repacks the
+    K activations into one wide ``KT*AB`` beat, runs the blackbox, and drains by summing
+    the KT partials per column (runtime bias) -- the K-tiling twin of ``_gemm_ip_header``."""
+    t = plan["tile"]
+    m = plan["num_input_vectors"]
+    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    KT = plan["k_tiles"]
+    A_TOTAL, PB_TOTAL = KT * AB, KT * PB
+    ACCU_SUM = plan["accu_sum"]
+    AW, K, N = t["activation_width"], plan["k"], plan["n"]
+    KPAD = plan["k_pad"]
+    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
+    core_hdr_pad = ' ' * (len(name) + 6)
+    apmax = _apmaxw(PB_TOTAL)
+    return f"""#ifndef {name.upper()}_GEMM_IP_H_
+#define {name.upper()}_GEMM_IP_H_
+#ifndef AP_INT_MAX_W
+#define AP_INT_MAX_W {apmax}   // wide K-tiled beats (KT*PB={PB_TOTAL}) exceed the 1024-bit default
+#endif
+#include <hls_stream.h>
+#include <ap_int.h>
+#include <ap_fixed.h>
+
+// internal FINN-MVU blackbox (K-tiled shim {name}_core.v; C twin {name}_core.cpp)
+void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&,
+{core_hdr_pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
+
+namespace nnet {{
+
+// Dedicated K-tiled IP for gemm config M={m} K={K} N={N} (core={t['compute_core']},
+// KT={KT} K-tiles of SIMD={t['simd']} each, PE={t['pe']} full-N). Baked geometry.
+
+// repack: {m} rows of K={K} activations -> {m} wide beats of KT*AB (all K_pad lanes,
+// pad lanes 0 -> bit-exact; tile ti reads lanes [ti*AB +: AB]).
+template <class data_T>
+void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{A_TOTAL}> > &a_s) {{
+    for (unsigned mm = 0; mm < {m}; mm++) {{
+        ap_int<{AW}> arow[{KPAD}];
+        #pragma HLS ARRAY_PARTITION variable=arow complete
+        for (unsigned i = 0; i < {KPAD}; i++) {{
+            #pragma HLS UNROLL
+            arow[i] = 0;   // zero-fill the K-pad lanes (their weights are 0 -> bit-exact)
+        }}
+        for (unsigned kp = 0; kp < {K} / data_T::size; kp++) {{
+            data_T beat = a_stream.read();
+            for (unsigned j = 0; j < data_T::size; j++) arow[kp * data_T::size + j] = beat[j].range({AW} - 1, 0);
+        }}
+        ap_uint<{A_TOTAL}> ab = 0;                 // AB=SIMD*AW -> K_pad lanes pack contiguously
+        for (unsigned kk = 0; kk < {KPAD}; kk++)
+            ab.range(kk * {AW} + {AW} - 1, kk * {AW}) = (ap_uint<{AW}>)arow[kk];
+        a_s.write(ab);
+    }}
+}}
+
+// K-tiled requant drain: sum the KT partials per column, + runtime bias, round+sat.
+template <class res_T, typename CONFIG_T>
+void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream,
+{' ' * (len(name) + 7)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
+    typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> result_t;
+    for (unsigned mm = 0; mm < {m}; mm++) {{
+        res_T crow;
+        ap_uint<{PB_TOTAL}> ob = p_s.read();
+        for (unsigned oc = 0; oc < {N}; oc++) {{
+            ap_int<{ACCU_SUM}> raw = 0;
+            for (unsigned ti = 0; ti < {KT}; ti++)
+                raw += (ap_int<{ACCU}>)ob.range(ti * {PB} + oc * {ACCU} + {ACCU} - 1, ti * {PB} + oc * {ACCU});
+            ap_fixed<64, {64 - pfrac}> rv;
+            rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;   // code -> fixed (frac={pfrac})
+            rv += biases[oc];                                 // + bias (fixed-point, aligned)
+            result_t r = rv;                                  // rescale + round + saturate
+            crow[oc] = r;
+        }}
+        res_stream.write(crow);
+    }}
+}}
+
+// The dedicated K-tiled IP: hls4ml io_stream weightless GEMM -> internal MVU blackbox.
+template <class data_T, class res_T, typename CONFIG_T>
+void {name}_gemm_stream_weightless(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
+{' ' * (len(name) + 28)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
+#pragma HLS DATAFLOW
+    hls::stream<ap_uint<{A_TOTAL}> > a_s;
+    hls::stream<ap_uint<{PB_TOTAL}> > p_s;
+#pragma HLS STREAM variable=a_s depth=4
+#pragma HLS STREAM variable=p_s depth=4
+    {name}_repack_a<data_T>(a_stream, a_s);
+    {name}_core(a_s, p_s);
+    {name}_drain<res_T, CONFIG_T>(p_s, res_stream, biases);
+}}
+
+}} // namespace nnet
+#endif
+"""
+
+
 def _synth_weights(n, k, ww, seed=42):
     """Deterministic in-range B ([K][N]) when no real weights are supplied (unit
     tests / standalone). Same small [-3, 3]-ish spread the old streamed TB used, so
@@ -453,24 +635,38 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
     # matrix is zero-padded to it and the repack zero-fills the extra activation lanes.
     N, K, PE, SIMD, WW = plan["n"], plan["k_pad"], t["pe"], t["simd"], t["weight_width"]
     NT, NTILE = plan["n_tiles"], plan["n_tile"]
+    KT = plan.get("k_tiles", 1)
+    if KT > 1 and NT > 1:
+        raise NotImplementedError(
+            f"combined N-tiling and K-tiling not supported yet ('{name}': n_tiles={NT}, "
+            f"k_tiles={KT}); use one tiling axis at a time.")
 
     pkg = Path(output_dir) / name
     (pkg / "rtl_static").mkdir(parents=True, exist_ok=True)
 
     # Pack the baked weights into the memstream init(s), alongside the vendored RTL.
-    # N-tiling: one memstream per N-column slice, so slice B ([K][N]) into n_tiles
-    # blocks of NTILE columns and pack each into its own $readmemh init file.
+    #   N-tiling: one memstream per N-column slice ([K][NTILE]).
+    #   K-tiling: one memstream per K-row slice ([SIMD][N]); each tile reduces its K-slice
+    #             for all N columns (fully-spatial per-tile, SF=NF=1) -> a partial.
     B = _weight_matrix_as_B(cfg, N, K, WW)
     init_files = []
-    for ti in range(NT):
-        B_ti = [[B[kk][ti * NTILE + oo] for oo in range(NTILE)] for kk in range(K)]
-        dat_path = pkg / "rtl_static" / _dat_name(name, ti, NT)
-        dat_path.write_text(_wpack.pack_memstream_hex(
-            B_ti, NTILE, K, PE, SIMD, WW, word_bits=t["weight_stream_width_ba"]))
-        # Absolute $readmemh path: relative is unresolvable in Vitis cosim's XSIM dir
-        # (empirically -- see jojo-track); the package builds in place, so the
-        # absolute path computed here stays valid for csim/cosim/impl.
-        init_files.append(str(dat_path.resolve()))
+    if KT > 1:
+        for ti in range(KT):
+            B_ti = [[B[ti * SIMD + kk][oo] for oo in range(N)] for kk in range(SIMD)]
+            dat_path = pkg / "rtl_static" / _kdat_name(name, ti)
+            dat_path.write_text(_wpack.pack_memstream_hex(
+                B_ti, N, SIMD, PE, SIMD, WW, word_bits=t["weight_stream_width_ba"]))
+            init_files.append(str(dat_path.resolve()))
+    else:
+        for ti in range(NT):
+            B_ti = [[B[kk][ti * NTILE + oo] for oo in range(NTILE)] for kk in range(K)]
+            dat_path = pkg / "rtl_static" / _dat_name(name, ti, NT)
+            dat_path.write_text(_wpack.pack_memstream_hex(
+                B_ti, NTILE, K, PE, SIMD, WW, word_bits=t["weight_stream_width_ba"]))
+            # Absolute $readmemh path: relative is unresolvable in Vitis cosim's XSIM dir
+            # (empirically -- see jojo-track); the package builds in place, so the
+            # absolute path computed here stays valid for csim/cosim/impl.
+            init_files.append(str(dat_path.resolve()))
 
     # FORCE_BEHAVIORAL=0 -> real DSP48/DSP58 primitives (impl-ready; cosim runs them via
     # XSIM unisim models). Set force_behavioral=True in cfg for unisim-free behavioral cosim.
@@ -478,17 +674,21 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
     (pkg / f"{name}_core.v").write_text(_with_timescale(
         _rtl.generate_shim(shape, module_name=f"{name}_core",
                            force_behavioral=force_behavioral, tile=t,
-                           weights_in_core=True, init_files=init_files, n_tiles=NT)))
+                           weights_in_core=True, init_files=init_files,
+                           n_tiles=NT, k_tiles=KT)))
     (pkg / f"{name}_core.cpp").write_text(
         _golden.generate_core_twin(shape, func_name=f"{name}_core", plan=plan, baked_weights=B))
     bias_codes = bias_acc_codes(cfg.get("bias"), plan["product_frac"], plan["n"])
-    (pkg / f"{name}_top.cpp").write_text(
-        _dataflow_top(name, plan, bias_codes=bias_codes, weights_in_core=True))
+    top_src = (_kt_dataflow_top(name, plan, bias_codes=bias_codes) if KT > 1
+               else _dataflow_top(name, plan, bias_codes=bias_codes, weights_in_core=True))
+    (pkg / f"{name}_top.cpp").write_text(top_src)
     (pkg / f"{name}.json").write_text(_blackbox_json(name, t, weights_in_core=True))
     (pkg / f"{name}_tb.cpp").write_text(
         _golden.generate_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
                             bias_codes=bias_codes, baked_weights=B))
-    (pkg / f"{name}_gemm_ip.h").write_text(_gemm_ip_header(name, plan, weights_in_core=True))
+    ip_hdr = (_kt_gemm_ip_header(name, plan) if KT > 1
+              else _gemm_ip_header(name, plan, weights_in_core=True))
+    (pkg / f"{name}_gemm_ip.h").write_text(ip_hdr)
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 
     for s in _STATIC_SOURCES:
@@ -580,7 +780,14 @@ def gen_integration_manifest(items):
         # with the package (they cannot go in rtl_files: Vitis rejects a .dat as
         # blackbox RTL). One file per N-tile column slice.
         nt = int(it.get("n_tiles", 1) or 1)
-        core["weight_data"] = [f"{nm}/rtl_static/{_dat_name(nm, ti, nt)}" for ti in range(nt)]
+        try:
+            kt = int(it.get("k_tiles", 1) or 1)   # resolved tile count; "auto" -> ignore here
+        except (TypeError, ValueError):
+            kt = 1
+        if kt > 1:
+            core["weight_data"] = [f"{nm}/rtl_static/{_kdat_name(nm, ti)}" for ti in range(kt)]
+        else:
+            core["weight_data"] = [f"{nm}/rtl_static/{_dat_name(nm, ti, nt)}" for ti in range(nt)]
         cores.append(core)
     return json.dumps({"tool": "vitis", "flow": "rtl_blackbox",
                        "header": "gemm_ip_combined.h", "cores": cores}, indent=2) + "\n"
