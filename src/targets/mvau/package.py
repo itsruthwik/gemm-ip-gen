@@ -701,6 +701,78 @@ void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in, hls::stream<ap_uint<{BB}> >&
 """
 
 
+def _2op_nt_dataflow_top(name, plan):
+    """DUT for the N-tiled two-operand blackbox: passthrough of A (broadcast) and B into the
+    core, then a concatenating requant drain (no summing; tile ti lane pe -> column ti*N_tile+pe;
+    no bias; act*act scale fa+fb)."""
+    t = plan["tile"]
+    m = plan["num_input_vectors"]
+    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    PE, SF = t["pe"], t["sf"]
+    nt, ntile = plan["n_tiles"], plan["n_tile"]
+    PB_TOTAL = nt * PB
+    N, WW = plan["n"], t["weight_width"]
+    BB = ((N * WW) + 7) // 8 * 8
+    K = plan["k_pad"]
+    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
+    CB = cbits(plan)
+    abeats = m * SF
+    apmax = _apmaxw(PB_TOTAL)
+    guard = f"#define AP_INT_MAX_W {apmax}\n" if PB_TOTAL > 1024 else ""
+    pad = ' ' * (len(name) + 6)
+    indent = ' ' * (len(name) + 1)
+    return f"""{guard}#include <hls_stream.h>
+#include <ap_int.h>
+#include <ap_fixed.h>
+
+typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> {name}_result_t;
+
+void {name}_core(hls::stream<ap_uint<{AB}> >&, hls::stream<ap_uint<{BB}> >&,
+{pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
+
+static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
+    for (int i = 0; i < {abeats}; i++) out.write(in.read());
+}}
+static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >& out) {{
+    for (int i = 0; i < {K}; i++) out.write(in.read());
+}}
+
+// Concatenating requant drain (no bias): one nt*PB beat/vector -> N-wide C row; tile ti lane
+// pe is global column ti*N_tile+pe.
+static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
+    for (int vec = 0; vec < {m}; vec++) {{
+        ap_uint<{CB}> crow = 0;
+        ap_uint<{PB_TOTAL}> ob = in.read();
+        for (int ti = 0; ti < {nt}; ti++)
+            for (int pe = 0; pe < {PE}; pe++) {{
+                int oc = ti * {ntile} + pe;
+                ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
+                ap_fixed<64, {64 - pfrac}> rv;
+                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
+                {name}_result_t r = rv;
+                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+            }}
+        out.write(crow);
+    }}
+}}
+
+void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in,
+{indent}hls::stream<ap_uint<{CB}> >& c_out) {{
+#pragma HLS DATAFLOW
+    hls::stream<ap_uint<{AB}> > a_s;
+    hls::stream<ap_uint<{BB}> > b_s;
+    hls::stream<ap_uint<{PB_TOTAL}> > p_s;
+#pragma HLS STREAM variable=a_s depth=4
+#pragma HLS STREAM variable=b_s depth=4
+#pragma HLS STREAM variable=p_s depth=4
+    feed_a(a_in, a_s);
+    feed_b(b_in, b_s);
+    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU N-tiled blackbox (concat outputs, B in-core)
+    requant(p_s, c_out);
+}}
+"""
+
+
 def _2op_blackbox_json(name, t, n, ww):
     """Blackbox JSON for the two-operand core: two input FIFOs (a, b) + one output (p)."""
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
@@ -746,15 +818,17 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     plan = _geom.fold_plan(*shape, **_plan_kwargs(cfg))
     t = plan["tile"]
     kt = plan.get("k_tiles", 1)
-    if plan["n_tiles"] != 1:
-        raise NotImplementedError("two-operand does not support N-tiling yet.")
+    nt = plan["n_tiles"]
+    if nt > 1 and kt > 1:
+        raise NotImplementedError("two-operand does not support combined N+K tiling yet.")
     if t["compute_core"] == "mvu_4sx4u_dsp48e1":
         raise ValueError("two-operand cannot use mvu_4sx4u/DSP48E1 (requires NARROW_WEIGHTS, "
                          "which a runtime B operand cannot guarantee); target DSP48E2/DSP58.")
-    # The K-tiled register shim serves both real K-tiling (gk>1) and the fully-spatial
-    # single tile (SF=NF=1, one weight word/vector): a memstream cannot be config-written at
-    # DEPTH=1, so those weights live in a latched register. The memstream single-tile shim
-    # serves only the temporal fold (DEPTH=NF*SF>=2).
+    # Shim selection:
+    #   N-tiling (nt>1): per-tile memstream, activation broadcast, outputs concatenated.
+    #   K-tiled register shim: real K-tiling (gk>1) OR the fully-spatial single tile (SF=NF=1,
+    #     one weight word/vector -- a memstream cannot be config-written at DEPTH=1).
+    #   memstream single-tile shim: the temporal fold (DEPTH=NF*SF>=2).
     use_kt = (kt > 1) or (t["sf"] == 1 and t["nf"] == 1)
     part = cfg.get("part") or "xcvu13p-flga2577-2-e"
     clock_ns = cfg.get("clock_period_ns") or 5
@@ -762,13 +836,17 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     (pkg / "rtl_static").mkdir(parents=True, exist_ok=True)
 
     force_behavioral = bool(cfg.get("force_behavioral", False))
-    shim = (_rtl.generate_two_operand_kt_shim if use_kt else _rtl.generate_two_operand_shim)
+    if nt > 1:
+        shim, top_src = (_rtl.generate_two_operand_nt_shim, _2op_nt_dataflow_top(name, plan))
+    elif use_kt:
+        shim, top_src = (_rtl.generate_two_operand_kt_shim, _2op_kt_dataflow_top(name, plan))
+    else:
+        shim, top_src = (_rtl.generate_two_operand_shim, _2op_dataflow_top(name, plan))
     (pkg / f"{name}_core.v").write_text(_with_timescale(
         shim(shape, module_name=f"{name}_core",
              force_behavioral=force_behavioral, tile=t, plan=plan)))
     (pkg / f"{name}_core.cpp").write_text(
         _golden.generate_2op_core_twin(shape, func_name=f"{name}_core", plan=plan))
-    top_src = (_2op_kt_dataflow_top(name, plan) if use_kt else _2op_dataflow_top(name, plan))
     (pkg / f"{name}_top.cpp").write_text(top_src)
     (pkg / f"{name}.json").write_text(_2op_blackbox_json(name, t, plan["n"], t["weight_width"]))
     (pkg / f"{name}_tb.cpp").write_text(
