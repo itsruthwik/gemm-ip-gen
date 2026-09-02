@@ -773,6 +773,183 @@ void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in
 """
 
 
+def _2op_gemm_ip_header(name, plan):
+    """hls4ml-facing two-operand IP: ``<name>_gemm_stream<data0_T,data1_T,res_T,CONFIG_T>``
+    (repack A -> shim activations, repack B -> shim N-wide K-row beats, internal MVU blackbox,
+    requant drain). Requires B streamed **row-major** (data1_T::size == N, one K-row per beat);
+    hls4ml must set SecondOperandRowMajor=True to route here. Handles the three shim forms:
+    kt (K-tiled register / fully-spatial, wide activation, summed partials), nt (N-tiled memstream,
+    broadcast activation, concatenated), single (temporal memstream)."""
+    t = plan["tile"]
+    m = plan["num_input_vectors"]
+    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
+    AW, WW = t["activation_width"], t["weight_width"]
+    N, K, KPAD = plan["n"], plan["k"], plan["k_pad"]
+    BB = ((N * WW) + 7) // 8 * 8
+    NT_, NTILE = plan["n_tiles"], plan["n_tile"]
+    KT_ = plan.get("k_tiles", 1)
+    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
+    nt_form = NT_ > 1
+    kt_form = (not nt_form) and (KT_ > 1 or (SF == 1 and NF == 1))
+    gk = KT_ if kt_form else 1
+    if kt_form:
+        a_width, p_width = gk * AB, gk * PB
+    elif nt_form:
+        a_width, p_width = AB, NT_ * PB
+    else:
+        a_width, p_width = AB, PB
+    apmax = _apmaxw(p_width)
+    guard = (f"#ifndef AP_INT_MAX_W\n#define AP_INT_MAX_W {apmax}\n#endif\n"
+             if p_width > 1024 else "")
+    core_pad = ' ' * (len(name) + 6)
+
+    # repack A: kt packs one wide K_pad beat/vector; single/nt pack SF SIMD-beats/vector.
+    if kt_form:
+        repack_a = f"""template <class data0_T>
+void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{a_width}> > &a_s) {{
+    for (unsigned mm = 0; mm < {m}; mm++) {{
+        ap_int<{AW}> arow[{KPAD}];
+        #pragma HLS ARRAY_PARTITION variable=arow complete
+        for (unsigned i = 0; i < {KPAD}; i++) {{
+            #pragma HLS UNROLL
+            arow[i] = 0;
+        }}
+        for (unsigned kp = 0; kp < {K} / data0_T::size; kp++) {{
+            data0_T beat = a_stream.read();
+            for (unsigned j = 0; j < data0_T::size; j++) arow[kp * data0_T::size + j] = beat[j].range({AW} - 1, 0);
+        }}
+        ap_uint<{a_width}> ab = 0;
+        for (unsigned kk = 0; kk < {KPAD}; kk++)
+            ab.range(kk * {AW} + {AW} - 1, kk * {AW}) = (ap_uint<{AW}>)arow[kk];
+        a_s.write(ab);
+    }}
+}}"""
+    else:
+        repack_a = f"""template <class data0_T>
+void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> > &a_s) {{
+    for (unsigned mm = 0; mm < {m}; mm++) {{
+        ap_int<{AW}> arow[{KPAD}];
+        #pragma HLS ARRAY_PARTITION variable=arow complete
+        for (unsigned i = 0; i < {KPAD}; i++) {{
+            #pragma HLS UNROLL
+            arow[i] = 0;
+        }}
+        for (unsigned kp = 0; kp < {K} / data0_T::size; kp++) {{
+            data0_T beat = a_stream.read();
+            for (unsigned j = 0; j < data0_T::size; j++) arow[kp * data0_T::size + j] = beat[j].range({AW} - 1, 0);
+        }}
+        for (unsigned sf = 0; sf < {SF}; sf++) {{
+            ap_uint<{AB}> ab = 0;
+            for (unsigned s = 0; s < {SIMD}; s++)
+                ab.range(s * {AW} + {AW} - 1, s * {AW}) = (ap_uint<{AW}>)arow[sf * {SIMD} + s];
+            a_s.write(ab);
+        }}
+    }}
+}}"""
+
+    # requant drain: kt sums gk partials; nt concatenates; single walks NF beats.
+    if kt_form:
+        ACCU_SUM = plan["accu_sum"]
+        drain_body = f"""        ap_uint<{p_width}> ob = p_s.read();
+        for (unsigned oc = 0; oc < {N}; oc++) {{
+            ap_int<{ACCU_SUM}> raw = 0;
+            for (unsigned ti = 0; ti < {gk}; ti++)
+                raw += (ap_int<{ACCU}>)ob.range(ti * {PB} + oc * {ACCU} + {ACCU} - 1, ti * {PB} + oc * {ACCU});
+            ap_fixed<64, {64 - pfrac}> rv;
+            rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
+            rv += biases[oc];
+            crow[oc] = (result_t)rv;
+        }}"""
+    elif nt_form:
+        drain_body = f"""        ap_uint<{p_width}> ob = p_s.read();
+        for (unsigned ti = 0; ti < {NT_}; ti++)
+            for (unsigned pe = 0; pe < {PE}; pe++) {{
+                unsigned oc = ti * {NTILE} + pe;
+                ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
+                ap_fixed<64, {64 - pfrac}> rv;
+                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
+                rv += biases[oc];
+                crow[oc] = (result_t)rv;
+            }}"""
+    else:
+        drain_body = f"""        for (unsigned nf = 0; nf < {NF}; nf++) {{
+            ap_uint<{p_width}> ob = p_s.read();
+            for (unsigned pe = 0; pe < {PE}; pe++) {{
+                unsigned oc = nf * {PE} + pe;
+                ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
+                ap_fixed<64, {64 - pfrac}> rv;
+                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
+                rv += biases[oc];
+                crow[oc] = (result_t)rv;
+            }}
+        }}"""
+
+    return f"""#ifndef {name.upper()}_GEMM_IP_H_
+#define {name.upper()}_GEMM_IP_H_
+{guard}#include <hls_stream.h>
+#include <ap_int.h>
+#include <ap_fixed.h>
+
+// internal FINN-MVU blackbox (two-operand shim {name}_core.v; C twin {name}_core.cpp)
+void {name}_core(hls::stream<ap_uint<{a_width}> >&, hls::stream<ap_uint<{BB}> >&,
+{core_pad}hls::stream<ap_uint<{p_width}> >&);
+
+namespace nnet {{
+
+// Dedicated two-operand IP for gemm config M={m} K={K} N={N} (core={t['compute_core']}).
+// B MUST arrive row-major: data1_T::size == N, one K-row per beat (SecondOperandRowMajor).
+
+{repack_a}
+
+// repack B: {K} row-major K-row beats (N-wide) -> shim beats, zero-padded K -> {KPAD}.
+template <class data1_T>
+void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BB}> > &b_s) {{
+    for (unsigned k = 0; k < {K}; k++) {{
+        data1_T beat = b_stream.read();
+        ap_uint<{BB}> bb = 0;
+        for (unsigned n = 0; n < {N}; n++) bb.range(n * {WW} + {WW} - 1, n * {WW}) = beat[n].range({WW} - 1, 0);
+        b_s.write(bb);
+    }}
+    for (unsigned k = {K}; k < {KPAD}; k++) b_s.write(0);   // zero-pad K -> K_pad (bit-exact)
+}}
+
+// requant drain (no per-column bias for two-operand; biases[] are zero from hls4ml): raw ACCU
+// -> fixed (frac={pfrac}) -> + bias -> round + saturate to the output precision.
+template <class res_T, typename CONFIG_T>
+void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream,
+{' ' * (len(name) + 7)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
+    typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> result_t;
+    for (unsigned mm = 0; mm < {m}; mm++) {{
+        res_T crow;
+{drain_body}
+        res_stream.write(crow);
+    }}
+}}
+
+// The dedicated IP: hls4ml io_stream two-operand GEMM -> internal MVU blackbox.
+template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
+void {name}_gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
+{' ' * (len(name) + 17)}hls::stream<res_T> &res_stream,
+{' ' * (len(name) + 17)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
+#pragma HLS DATAFLOW
+    hls::stream<ap_uint<{a_width}> > a_s;
+    hls::stream<ap_uint<{BB}> > b_s;
+    hls::stream<ap_uint<{p_width}> > p_s;
+#pragma HLS STREAM variable=a_s depth={SF + 2}
+#pragma HLS STREAM variable=b_s depth={KPAD + 2}
+#pragma HLS STREAM variable=p_s depth={NF + 2}
+    {name}_repack_a<data0_T>(a_stream, a_s);
+    {name}_repack_b<data1_T>(b_stream, b_s);
+    {name}_core(a_s, b_s, p_s);
+    {name}_drain<res_T, CONFIG_T>(p_s, res_stream, biases);
+}}
+
+}} // namespace nnet
+#endif
+"""
+
+
 def _2op_blackbox_json(name, t, n, ww):
     """Blackbox JSON for the two-operand core: two input FIFOs (a, b) + one output (p)."""
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
@@ -851,6 +1028,7 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     (pkg / f"{name}.json").write_text(_2op_blackbox_json(name, t, plan["n"], t["weight_width"]))
     (pkg / f"{name}_tb.cpp").write_text(
         _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan))
+    (pkg / f"{name}_gemm_ip.h").write_text(_2op_gemm_ip_header(name, plan))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 
     for s in _STATIC_SOURCES:

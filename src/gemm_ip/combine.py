@@ -48,6 +48,12 @@ def unified_combined_header(layers):
     includes = "".join(
         f'#include "{l["target"]}/{l["name"]}/{l["name"]}_gemm_ip.h"\n' for l in ip_layers)
 
+    # weightless (one-operand) layers specialize the weightless dispatcher; two-operand
+    # (func == "stream") layers specialize the two-operand dispatcher (see below). A layer's
+    # func defaults to weightless so existing single-operand manifests are unchanged.
+    wl_layers = [l for l in ip_layers if l.get("func", "stream_weightless") != "stream"]
+    two_op_layers = [l for l in ip_layers if l.get("func") == "stream"]
+
     specs = "\n".join(
         f"template <> struct gemm_ip_dispatch<{l['id']}> {{\n"
         f"    template <class data_T, class res_T, typename CONFIG_T>\n"
@@ -56,7 +62,30 @@ def unified_combined_header(layers):
         f"        {l['name']}_gemm_stream_weightless<data_T, res_T, CONFIG_T>(a, r, b);\n"
         f"    }}\n"
         f"}};"
-        for l in ip_layers)
+        for l in wl_layers)
+
+    two_op_specs = "\n".join(
+        f"template <> struct gemm_ip_stream_dispatch<{l['id']}> {{\n"
+        f"    template <class data0_T, class data1_T, class res_T, typename CONFIG_T>\n"
+        f"    static void stream(hls::stream<data0_T> &a, hls::stream<data1_T> &b, hls::stream<res_T> &r,\n"
+        f"                       typename CONFIG_T::bias_t bias[CONFIG_T::n_out]) {{\n"
+        f"        {l['name']}_gemm_stream<data0_T, data1_T, res_T, CONFIG_T>(a, b, r, bias);\n"
+        f"    }}\n"
+        f"}};"
+        for l in two_op_layers)
+
+    # The two-operand dispatcher + public entry are only emitted when a two-operand IP layer
+    # exists (no soft two-operand primary today, so an unrouted id would be a compile error --
+    # which is the correct signal that a gemm_stream layer wasn't given an IP).
+    two_op_block = "" if not two_op_layers else (
+        "\ntemplate <int ID> struct gemm_ip_stream_dispatch;\n"
+        f"{two_op_specs}\n\n"
+        "template <class data0_T, class data1_T, class res_T, typename CONFIG_T>\n"
+        "void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,\n"
+        "                 hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {\n"
+        "    gemm_ip_stream_dispatch<CONFIG_T::gemm_ip_id>::template stream<data0_T, data1_T, res_T, CONFIG_T>(\n"
+        "        a_stream, b_stream, res_stream, biases);\n"
+        "}\n")
 
     return (
         "#ifndef GEMM_IP_COMBINED_H_\n"
@@ -82,7 +111,8 @@ def unified_combined_header(layers):
         "                            typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {\n"
         "    gemm_ip_dispatch<CONFIG_T::gemm_ip_id>::template stream_weightless<data_T, res_T, CONFIG_T>(\n"
         "        a_stream, res_stream, biases);\n"
-        "}\n\n"
+        "}\n"
+        f"{two_op_block}\n"
         "} // namespace nnet\n"
         "#endif // GEMM_IP_COMBINED_H_\n"
     )
