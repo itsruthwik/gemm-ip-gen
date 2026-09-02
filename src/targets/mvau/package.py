@@ -992,6 +992,15 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     of A. No baked weights; no bias. MVP: single tile, NF=1 (PE=N), any SF."""
     if cfg.get("interface") == "array":
         raise ValueError(f"mvau two-operand does not support io_parallel for '{name}'.")
+    # The mvau two-operand IP consumes B row-major (N-wide beats, one contraction row per
+    # beat). A manifest that explicitly routes a col-major two-operand node here is a
+    # misconfiguration -- hls4ml must set SecondOperandRowMajor=True. (Absent == standalone
+    # generation, which is row-major by construction, so only reject an explicit False.)
+    if cfg.get("second_operand_row_major") is False:
+        raise ValueError(
+            f"mvau two-operand IP '{name}' requires SecondOperandRowMajor=True (B row-major, "
+            "N-wide beats); the manifest declares col-major B. Set SecondOperandRowMajor on the "
+            "hls4ml layer, or route this node to the generic/soft target.")
     plan = _geom.fold_plan(*shape, **_plan_kwargs(cfg))
     t = plan["tile"]
     kt = plan.get("k_tiles", 1)
