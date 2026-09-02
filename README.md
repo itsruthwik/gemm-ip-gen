@@ -57,7 +57,7 @@ python generate_catapult_pkg.py --m 8 --k 8 --n 8 --name gemm_8x8x8
 python generate_gemm_ip.py gemm_config.json ./output
 ```
 
-The config file is written automatically by hls4ml when `GemmIP: True` is
+The config file is written automatically by hls4ml when `Strategy: GEMM` is
 set for a layer. Each entry carries `gemm_m`, `gemm_k`, `gemm_n`,
 `interface`, and `protocol` metadata.
 
