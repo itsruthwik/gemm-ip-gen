@@ -1213,8 +1213,15 @@ def gen_combined_header(items):
         return int(v) if v is not None else None
 
     incs = "\n".join(f'#include "{_nm(it)}/{_nm(it)}_gemm_ip.h"' for it in items)
+
+    # weights_in_core True (or missing) -> weightless (baked-B) IP; False -> two-operand
+    # (runtime-B) IP. A two-operand IP emits <name>_gemm_stream instead of
+    # <name>_gemm_stream_weightless, so it needs the two-operand dispatcher below.
+    wl_items = [it for it in items if it.get("weights_in_core", True)]
+    two_op_items = [it for it in items if not it.get("weights_in_core", True)]
+
     specs = []
-    for it in items:
+    for it in wl_items:
         i, nm = _id(it), _nm(it)
         if i is None:
             continue
@@ -1227,6 +1234,41 @@ def gen_combined_header(items):
             f"    }}\n"
             f"}};")
     specs_s = "\n".join(specs)
+
+    two_op_specs = []
+    for it in two_op_items:
+        i, nm = _id(it), _nm(it)
+        if i is None:
+            continue
+        two_op_specs.append(
+            f"template <> struct mvau_ip_stream<{i}> {{\n"
+            f"    template <class data0_T, class data1_T, class res_T, typename CONFIG_T>\n"
+            f"    static void stream(hls::stream<data0_T> &a, hls::stream<data1_T> &b,\n"
+            f"                       hls::stream<res_T> &r,\n"
+            f"                       typename CONFIG_T::bias_t bias[CONFIG_T::n_out]) {{\n"
+            f"        {nm}_gemm_stream<data0_T, data1_T, res_T, CONFIG_T>(a, b, r, bias);\n"
+            f"    }}\n"
+            f"}};")
+    two_op_specs_s = "\n".join(two_op_specs)
+
+    # The two-operand dispatcher + public gemm_stream entry are only emitted when a
+    # two-operand IP exists (no soft two-operand primary; an unrouted id is a compile
+    # error, the correct signal that a gemm_stream layer wasn't given an IP).
+    two_op_block = "" if not two_op_specs else f"""
+// id -> two-operand (runtime-B) IP dispatch.
+template <int ID> struct mvau_ip_stream;
+{two_op_specs_s}
+
+// io_stream two-operand entry hls4ml calls; routes to the config's IP by id.
+template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
+void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
+                 hls::stream<res_T> &res_stream,
+                 typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
+    mvau_ip_stream<CONFIG_T::gemm_ip_id>::template stream<data0_T, data1_T, res_T, CONFIG_T>(
+        a_stream, b_stream, res_stream, biases);
+}}
+"""
+
     return f"""#ifndef GEMM_IP_COMBINED_H_
 #define GEMM_IP_COMBINED_H_
 #include <hls_stream.h>
@@ -1245,7 +1287,7 @@ void gemm_stream_weightless(hls::stream<data_T> &a_stream, hls::stream<res_T> &r
     mvau_ip<CONFIG_T::gemm_ip_id>::template stream_weightless<data_T, res_T, CONFIG_T>(
         a_stream, res_stream, biases);
 }}
-
+{two_op_block}
 }} // namespace nnet
 #endif // GEMM_IP_COMBINED_H_
 """

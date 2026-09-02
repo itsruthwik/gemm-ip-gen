@@ -99,6 +99,12 @@ def _run(args):
                     "parallelization_factor": item.get("parallelization_factor"),
                     "target_cycles": item.get("target_cycles"),
                     "n_tiles": item.get("n_tiles"),
+                    # Two-operand routing: weights_in_core False selects a target's
+                    # runtime-B (gemm_stream) generator over the weight-stationary one;
+                    # second_operand_row_major is the B beat order it expects. Targets
+                    # that don't distinguish these pop/ignore them (see generic).
+                    "weights_in_core": item.get("weights_in_core"),
+                    "second_operand_row_major": item.get("second_operand_row_major"),
                 },
             )
         output_dir = Path(args.output_dir)

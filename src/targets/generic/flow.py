@@ -57,6 +57,11 @@ class GenericTarget(Target):
         # behavioral one) so the config-driven and unit paths share one entry point.
         weight_matrix = cfg.pop("weight_matrix", None)
         cfg.pop("gemm_k_spatial", None)
+        # Two-operand routing hints the CLI forwards for the RTL targets: generic derives
+        # weights_in_core from the baked weight matrix and has no runtime-B variant, so
+        # drop both (weights_in_core would also collide with the explicit kwarg below).
+        cfg.pop("weights_in_core", None)
+        cfg.pop("second_operand_row_major", None)
         return _package.generate_generic_pkg(
             m, k, n, name, output_dir,
             weights_in_core=weight_matrix is not None,

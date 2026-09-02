@@ -64,6 +64,8 @@ def _normalize_mvau_items(cfg):
             "weight_file": it.get("weight_file"),
             "n_tiles": int(it.get("n_tiles", 1) or 1),
             "has_bias": bool(it.get("has_bias", True)),
+            # Two-operand (runtime-B) nodes: B beat order. Absent for weightless items.
+            "second_operand_row_major": it.get("second_operand_row_major"),
         }
     if isinstance(cfg, list):
         return [one(it.get("name"), it) for it in cfg]
@@ -120,6 +122,11 @@ class MvauTarget(Target):
         cfg = dict(cfg)
         name = cfg.pop("name")
         output_dir = cfg.pop("output_dir")
+        # weights_in_core True (or absent) => weight-stationary (baked-B) IP; False =>
+        # two-operand (runtime-B) IP fed both operands as streams. The QK^T / A.V
+        # attention matmuls are the two-operand case.
+        if not cfg.get("weights_in_core", True):
+            return _package().generate_two_operand_pkg(shape, name, output_dir, **cfg)
         return _package().generate_mvau_pkg(shape, name, output_dir, **cfg)
 
     def verify(self, package):
