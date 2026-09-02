@@ -276,10 +276,28 @@ def generate_two_operand_shim(shape, module_name="mvau_core", force_behavioral=T
     PB = t["output_stream_width_ba"]     # output beat (PE*ACCU)
     BB = ((N * WW) + 7) // 8 * 8         # B beat: N weight codes, byte-aligned
     DEPTH = NF * SF
+    # This shim serves the temporal-fold case (DEPTH = NF*SF >= 2). The fully-spatial
+    # DEPTH==1 case (one weight word/vector) is served by the K-tiled register shim with
+    # gk=1 (a memstream cannot be config-written at DEPTH=1), routed in generate_two_operand_pkg.
+    if DEPTH < 2:
+        raise NotImplementedError(
+            "single-tile two-operand shim requires DEPTH=NF*SF>=2; the fully-spatial "
+            "DEPTH==1 case is handled by the K-tiled register shim (gk=1).")
     run_total = M * NF                    # output beats per node (NF beats per vector)
 
     def _w(n):                            # bit-width to hold values 0..n-1
         return max(1, (n - 1).bit_length())
+    wa_decl = ""
+    cfg_we_expr = "ap_ce & (state == WRITE)"
+    cfg_addr_expr = f"nfc * {SF} + sfc"
+    write_body = f"""                WRITE: begin      // emit the NF words of this band, one per cycle
+                    if (nfc == {NF - 1}) begin
+                        nfc <= 0;
+                        if (sfc == {SF - 1}) begin sfc <= 0; state <= DRAIN; dcnt <= 0; end
+                        else begin sfc <= sfc + 1'b1; state <= FILL; end
+                    end else nfc <= nfc + 1'b1;
+                end"""
+    fill_reset = "sc <= 0; nfc <= 0; state <= WRITE;"
     # combinational pack of the current band's word for column block nfc:
     #   wword[(pe*SIMD+s)*WW +: WW] = band[s][(nfc*PE+pe)*WW +: WW]
     fill = "\n".join(
@@ -317,7 +335,7 @@ module {module_name} (
     reg  [{_w(NF) - 1}:0]  nfc = 0;     // column block within band (0..NF-1)
     reg  [1:0]            dcnt = 0;     // drain counter
     reg  [{_w(run_total) - 1}:0]  ocnt = 0;   // output beats seen this node
-
+{wa_decl}
     // band buffer: SIMD consecutive N-wide K-rows (all columns), refilled per band
     reg  [{BB - 1}:0]  band [0:{SIMD - 1}];
 
@@ -334,8 +352,8 @@ module {module_name} (
     // memstream config-write load port (config_ce held through FILL/WRITE/DRAIN so the
     // stream pointer stays frozen at 0 until RUN; config_we pulses one word per WRITE cycle)
     wire        cfg_ce = ap_ce & (state == FILL || state == WRITE || state == DRAIN);
-    wire        cfg_we = ap_ce & (state == WRITE);
-    wire [31:0] cfg_addr = nfc * {SF} + sfc;   // (nf*SF+sf), zero-extended
+    wire        cfg_we = {cfg_we_expr};
+    wire [31:0] cfg_addr = {cfg_addr_expr};   // memstream word address
     wire [{WB - 1}:0] cfg_d0 = wword;
 
     always @(posedge ap_clk) begin
@@ -345,16 +363,10 @@ module {module_name} (
             case (state)
                 FILL: if (b_read) begin
                     band[sc] <= b_dout;
-                    if (sc == {SIMD - 1}) begin sc <= 0; nfc <= 0; state <= WRITE; end
+                    if (sc == {SIMD - 1}) begin {fill_reset} end
                     else sc <= sc + 1'b1;
                 end
-                WRITE: begin      // emit the NF words of this band, one per cycle
-                    if (nfc == {NF - 1}) begin
-                        nfc <= 0;
-                        if (sfc == {SF - 1}) begin sfc <= 0; state <= DRAIN; dcnt <= 0; end
-                        else begin sfc <= sfc + 1'b1; state <= FILL; end
-                    end else nfc <= nfc + 1'b1;
-                end
+{write_body}
                 DRAIN: begin
                     dcnt <= dcnt + 1'b1;
                     if (dcnt == 2'd1) begin state <= RUN; ocnt <= 0; end
@@ -414,6 +426,130 @@ module {module_name} (
         .m_axis_output_tvalid(out_tvalid),
         .m_axis_output_tready(out_tready)
     );
+endmodule
+"""
+
+
+def generate_two_operand_kt_shim(shape, module_name="mvau_core", force_behavioral=True,
+                                 tile=None, plan=None, **plan_kwargs):
+    """K-tiled two-operand shim: ``gk`` MVU cores each reduce a K-slice for all N columns
+    (fully-spatial per tile: SF=1, NF=1), their partials concatenated (summed in the drain).
+    Both operands are runtime streams. B arrives as N-wide K-row beats; the load FSM buffers
+    a band of SIMD rows and writes it into the *current* tile's runtime ``memstream`` (one
+    word per tile, DEPTH=1), demuxed by K-row range. A arrives as one wide beat of
+    ``gk*AB`` per vector; tile ``i`` reads its ``[i*AB +: AB]`` K-slice."""
+    t = tile if tile is not None else _geom.fold_plan(*shape, **plan_kwargs)["tile"]
+    p = plan if plan is not None else _geom.fold_plan(*shape, **plan_kwargs)
+    gk = p["k_tiles"]
+    if t["mw"] != t["simd"] or t["nf"] != 1:
+        raise NotImplementedError(
+            f"two-operand K-tiled shim is fully-spatial per tile only (SF=1, NF=1): "
+            f"got MW={t['mw']} SIMD={t['simd']} NF={t['nf']}. Use k_tiles=auto at RF=1.")
+    fb = 1 if force_behavioral else 0
+    N, M = p["n"], p["num_input_vectors"]
+    PE, SIMD, WW, ACCU = t["pe"], t["simd"], t["weight_width"], t["accu_width"]
+    WB = t["weight_stream_width_ba"]
+    AB = t["input_stream_width_ba"]
+    PB = t["output_stream_width_ba"]
+    BB = ((N * WW) + 7) // 8 * 8
+    A_TOTAL, PB_TOTAL = gk * AB, gk * PB
+
+    def _w(n):
+        return max(1, (n - 1).bit_length())
+    fill = "\n".join(
+        f"        wword[{(pe * SIMD + s) * WW} +: {WW}] = band[{s}][{pe * WW} +: {WW}];"
+        for pe in range(PE) for s in range(SIMD))
+    # Per-tile weights are ONE word each (fully-spatial), so a latched register drives the
+    # MVU weight port directly -- no memstream (its config-write path is unusable at DEPTH=1,
+    # and DEPTH must equal NF*SF=1 for the mvu to stay aligned). wgt_tvalid held in RUN.
+    tiles = "\n".join(f"""    wire                 wgt_tready_{i};
+    wire [{PB - 1}:0] out_tdata_{i};
+    assign p_din[{(i + 1) * PB - 1}:{i * PB}] = out_tdata_{i};   // K-slice {i} partial
+    mvu_vvu_axi #(
+        .IS_MVU({t['is_mvu']}), .COMPUTE_CORE("{t['compute_core']}"),
+        .MW({t['mw']}), .MH({N}), .PE({PE}), .SIMD({SIMD}),
+        .ACTIVATION_WIDTH({t['activation_width']}), .WEIGHT_WIDTH({WW}), .ACCU_WIDTH({ACCU}),
+        .NARROW_WEIGHTS({t['narrow_weights']}), .SIGNED_ACTIVATIONS({t['signed_activations']}),
+        .SEGMENTLEN({t['segmentlen']}), .PUMPED_COMPUTE(0), .FORCE_BEHAVIORAL({fb})
+    ) inst_{i} (
+        .ap_clk(ap_clk), .ap_clk2x(1'b0), .ap_rst_n(rst_n),
+        .s_axis_weights_tdata(wreg[{i}]), .s_axis_weights_tvalid(ap_ce & run), .s_axis_weights_tready(wgt_tready_{i}),
+        .s_axis_input_tdata(a_dout[{(i + 1) * AB - 1}:{i * AB}]),
+        .s_axis_input_tvalid(in_tvalid), .s_axis_input_tready(in_tready[{i}]),
+        .m_axis_output_tdata(out_tdata_{i}), .m_axis_output_tvalid(out_tvalid[{i}]), .m_axis_output_tready(out_tready)
+    );""" for i in range(gk))
+    return f"""// Generated by gemm-ip-gen (mvau target). K-tiled two-operand (gemm_stream) shim:
+// {gk} MVU cores, each reducing a K-slice (MW={t['mw']}) for all {N} columns; partials
+// concatenated (summed in the drain). B loaded at runtime into per-tile weight registers.
+// Tile: MW={t['mw']} MH(N)={N} PE={PE} SIMD={SIMD} K_TILES={gk} core={t['compute_core']} ACCU={ACCU} M={M}
+module {module_name} (
+    input  wire                 ap_clk,
+    input  wire                 ap_rst,
+    input  wire                 ap_ce,
+
+    // wide activation FIFO (input)  {A_TOTAL} = K_TILES * ceil(SIMD*ACTIVATION_WIDTH/8)*8
+    input  wire [{A_TOTAL - 1}:0] a_dout,
+    input  wire                 a_empty_n,
+    output wire                 a_read,
+    // B FIFO (input)                {BB} = ceil(N*WEIGHT_WIDTH/8)*8 (N-wide K-row beats)
+    input  wire [{BB - 1}:0] b_dout,
+    input  wire                 b_empty_n,
+    output wire                 b_read,
+    // output FIFO (output)          {PB_TOTAL} = K_TILES * ceil(PE*ACCU_WIDTH/8)*8 (partials)
+    output wire [{PB_TOTAL - 1}:0] p_din,
+    input  wire                 p_full_n,
+    output wire                 p_write
+);
+    wire rst_n = ~ap_rst;
+    localparam [1:0] FILL = 2'd0, LATCH = 2'd1, RUN = 2'd2;
+
+    reg  [1:0]            state = FILL;
+    reg  [{_w(SIMD) - 1}:0]  sc = 0;    // lane within band (0..SIMD-1)
+    reg  [{_w(gk) - 1}:0]  ti = 0;      // current K-tile being loaded (0..gk-1)
+    reg  [{_w(M) - 1}:0]  ocnt = 0;     // output beats seen this node (NF=1 -> M)
+
+    reg  [{BB - 1}:0]  band [0:{SIMD - 1}];   // SIMD N-wide K-rows of the current tile
+    reg  [{WB - 1}:0]  wreg [0:{gk - 1}];     // per-tile packed weight word (latched)
+    assign b_read = ap_ce & (state == FILL) & b_empty_n;
+
+    reg  [{WB - 1}:0]  wword;           // packed weight word from the buffered band
+    always @* begin
+        wword = {{{WB}{{1'b0}}}};
+{fill}
+    end
+
+    wire        run = (state == RUN);
+    wire in_tvalid  = ap_ce & run & a_empty_n;
+    wire out_tready = ap_ce & p_full_n;
+    wire [{gk - 1}:0] in_tready;
+    wire [{gk - 1}:0] out_tvalid;
+    assign a_read  = ap_ce & run & (&in_tready);
+    assign p_write = ap_ce & (&out_tvalid);
+
+    always @(posedge ap_clk) begin
+        if (ap_rst) begin
+            state <= FILL; sc <= 0; ti <= 0; ocnt <= 0;
+        end else if (ap_ce) begin
+            case (state)
+                FILL: if (b_read) begin
+                    band[sc] <= b_dout;
+                    if (sc == {SIMD - 1}) begin sc <= 0; state <= LATCH; end
+                    else sc <= sc + 1'b1;
+                end
+                LATCH: begin      // band complete -> latch this tile's weight word
+                    wreg[ti] <= wword;
+                    if (ti == {gk - 1}) begin ti <= 0; state <= RUN; ocnt <= 0; end
+                    else begin ti <= ti + 1'b1; state <= FILL; end
+                end
+                RUN: if (p_write) begin
+                    if (ocnt == {M - 1}) begin state <= FILL; ocnt <= 0; end
+                    else ocnt <= ocnt + 1'b1;
+                end
+            endcase
+        end
+    end
+
+{tiles}
 endmodule
 """
 

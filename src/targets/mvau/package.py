@@ -630,6 +630,77 @@ void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in
 """
 
 
+def _2op_kt_dataflow_top(name, plan):
+    """DUT for the K-tiled two-operand blackbox: passthrough of the wide A beat + the B
+    stream into the core, then the summing requant drain (sum the gk per-tile partials per
+    column, accumulator widened to accu_sum; no bias; act×act scale fa+fb)."""
+    t = plan["tile"]
+    m = plan["num_input_vectors"]
+    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    gk = plan["k_tiles"]
+    A_TOTAL, PB_TOTAL = gk * AB, gk * PB
+    ACCU_SUM = plan["accu_sum"]
+    N, WW = plan["n"], t["weight_width"]
+    BB = ((N * WW) + 7) // 8 * 8
+    K = plan["k_pad"]
+    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
+    CB = cbits(plan)
+    apmax = _apmaxw(PB_TOTAL)
+    pad = ' ' * (len(name) + 6)
+    indent = ' ' * (len(name) + 1)
+    return f"""#define AP_INT_MAX_W {apmax}   // concatenated partial beat (gk*PB={PB_TOTAL}) exceeds the 1024-bit default
+#include <hls_stream.h>
+#include <ap_int.h>
+#include <ap_fixed.h>
+
+typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> {name}_result_t;
+
+void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&, hls::stream<ap_uint<{BB}> >&,
+{pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
+
+static void feed_a(hls::stream<ap_uint<{A_TOTAL}> >& in, hls::stream<ap_uint<{A_TOTAL}> >& out) {{
+    for (int i = 0; i < {m}; i++) out.write(in.read());
+}}
+static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >& out) {{
+    for (int i = 0; i < {K}; i++) out.write(in.read());
+}}
+
+// K-tiled requant drain (no bias): sum the gk per-tile partials per column (accum widened
+// to {ACCU_SUM} = ACCU + ceil(log2 gk)), then quantize.
+static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
+    for (int vec = 0; vec < {m}; vec++) {{
+        ap_uint<{CB}> crow = 0;
+        ap_uint<{PB_TOTAL}> ob = in.read();
+        for (int oc = 0; oc < {N}; oc++) {{
+            ap_int<{ACCU_SUM}> raw = 0;
+            for (int ti = 0; ti < {gk}; ti++)
+                raw += (ap_int<{ACCU}>)ob.range(ti * {PB} + oc * {ACCU} + {ACCU} - 1, ti * {PB} + oc * {ACCU});
+            ap_fixed<64, {64 - pfrac}> rv;
+            rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
+            {name}_result_t r = rv;
+            crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+        }}
+        out.write(crow);
+    }}
+}}
+
+void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in,
+{indent}hls::stream<ap_uint<{CB}> >& c_out) {{
+#pragma HLS DATAFLOW
+    hls::stream<ap_uint<{A_TOTAL}> > a_s;
+    hls::stream<ap_uint<{BB}> > b_s;
+    hls::stream<ap_uint<{PB_TOTAL}> > p_s;
+#pragma HLS STREAM variable=a_s depth=4
+#pragma HLS STREAM variable=b_s depth=4
+#pragma HLS STREAM variable=p_s depth=4
+    feed_a(a_in, a_s);
+    feed_b(b_in, b_s);
+    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU K-tiled blackbox (gk partials, B in-core)
+    requant(p_s, c_out);
+}}
+"""
+
+
 def _2op_blackbox_json(name, t, n, ww):
     """Blackbox JSON for the two-operand core: two input FIFOs (a, b) + one output (p)."""
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
@@ -674,23 +745,31 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
         raise ValueError(f"mvau two-operand does not support io_parallel for '{name}'.")
     plan = _geom.fold_plan(*shape, **_plan_kwargs(cfg))
     t = plan["tile"]
-    if plan["n_tiles"] != 1 or plan.get("k_tiles", 1) != 1:
-        raise NotImplementedError("two-operand MVP is single-tile (no N/K tiling yet).")
+    kt = plan.get("k_tiles", 1)
+    if plan["n_tiles"] != 1:
+        raise NotImplementedError("two-operand does not support N-tiling yet.")
     if t["compute_core"] == "mvu_4sx4u_dsp48e1":
         raise ValueError("two-operand cannot use mvu_4sx4u/DSP48E1 (requires NARROW_WEIGHTS, "
                          "which a runtime B operand cannot guarantee); target DSP48E2/DSP58.")
+    # The K-tiled register shim serves both real K-tiling (gk>1) and the fully-spatial
+    # single tile (SF=NF=1, one weight word/vector): a memstream cannot be config-written at
+    # DEPTH=1, so those weights live in a latched register. The memstream single-tile shim
+    # serves only the temporal fold (DEPTH=NF*SF>=2).
+    use_kt = (kt > 1) or (t["sf"] == 1 and t["nf"] == 1)
     part = cfg.get("part") or "xcvu13p-flga2577-2-e"
     clock_ns = cfg.get("clock_period_ns") or 5
     pkg = Path(output_dir) / name
     (pkg / "rtl_static").mkdir(parents=True, exist_ok=True)
 
     force_behavioral = bool(cfg.get("force_behavioral", False))
+    shim = (_rtl.generate_two_operand_kt_shim if use_kt else _rtl.generate_two_operand_shim)
     (pkg / f"{name}_core.v").write_text(_with_timescale(
-        _rtl.generate_two_operand_shim(shape, module_name=f"{name}_core",
-                                       force_behavioral=force_behavioral, tile=t, plan=plan)))
+        shim(shape, module_name=f"{name}_core",
+             force_behavioral=force_behavioral, tile=t, plan=plan)))
     (pkg / f"{name}_core.cpp").write_text(
         _golden.generate_2op_core_twin(shape, func_name=f"{name}_core", plan=plan))
-    (pkg / f"{name}_top.cpp").write_text(_2op_dataflow_top(name, plan))
+    top_src = (_2op_kt_dataflow_top(name, plan) if use_kt else _2op_dataflow_top(name, plan))
+    (pkg / f"{name}_top.cpp").write_text(top_src)
     (pkg / f"{name}.json").write_text(_2op_blackbox_json(name, t, plan["n"], t["weight_width"]))
     (pkg / f"{name}_tb.cpp").write_text(
         _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan))
