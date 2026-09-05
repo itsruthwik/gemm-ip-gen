@@ -63,6 +63,11 @@ def _normalize_mvau_items(cfg):
             "weights_in_core": bool(it.get("weights_in_core", False)),
             "weight_file": it.get("weight_file"),
             "n_tiles": int(it.get("n_tiles", 1) or 1),
+            # DEBUG: mvau user-directed fold knobs injected via ATLASConfig (bypassing
+            # hls4ml's gemm_config). TODO: Ruthwik change this.
+            "pe": it.get("pe"),
+            "simd": it.get("simd"),
+            "k_tiles": it.get("k_tiles"),
             "has_bias": bool(it.get("has_bias", True)),
             # Two-operand (runtime-B) nodes: B beat order. Absent for weightless items.
             "second_operand_row_major": it.get("second_operand_row_major"),

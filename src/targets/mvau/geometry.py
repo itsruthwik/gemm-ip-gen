@@ -304,7 +304,8 @@ def stream_widths(pe, simd, weight_width, act_width, accu):
 def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
               output_precision=None, part=None, clock_period_ns=5.0,
               reuse_factor=1, strategy="latency", target_cycles=None,
-              parallelization_factor=1, n_tiles=1, k_tiles=1, weights=None):
+              parallelization_factor=1, n_tiles=1, k_tiles=1, weights=None,
+              pe=None, simd=None):
     """Resolve the full folding/geometry plan for a GEMM ``(m, k, n)``.
 
     N-tiling splits N into ``n_tiles`` equal column blocks, each an independent
@@ -350,12 +351,27 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
     pack = 3 if core == "mvu_vvu_8sx9_dsp58" else 1        # DSP58 K-lanes per DSP
     simd_target = (simd_cap // pack) * pack if simd_cap >= pack else simd_cap
     simd_target = max(1, simd_target)
-    k_pad = k if k < simd_target else math.ceil(k / simd_target) * simd_target
-
-    target, target_src = target_from_knobs(
-        m, reuse_factor=reuse_factor, strategy=strategy, target_cycles=target_cycles)
-
-    pe, simd = fold(k_pad, n_tile, weight_width, target, simd_cap=simd_target)
+    if pe is not None and simd is not None:
+        # ── user-directed fold: use (pe, simd) verbatim, no search ──
+        pe, simd = int(pe), int(simd)
+        if weight_width * simd > WWIDTH_MAX:
+            raise ValueError(f"weight_width*simd = {weight_width * simd} exceeds the weight-stream "
+                             f"cap WWIDTH_MAX={WWIDTH_MAX}; reduce simd")
+        if pack and simd % pack:
+            warnings.warn(f"mvau: simd={simd} is not a multiple of the {core} DSP-packing factor "
+                          f"{pack}; the DSP cascade is under-utilized.", stacklevel=2)
+        # K-pad to a multiple of simd*k_tiles so SF_full/k_tiles is integral.
+        kt_int = 1 if k_tiles in (None, "auto") else max(1, int(k_tiles))
+        unit = simd * kt_int
+        k_pad = math.ceil(k / unit) * unit if k > 0 else unit
+        if n_tile % pe:
+            raise ValueError(f"pe={pe} must divide n_tile (= N/n_tiles = {n_tile})")
+        target, target_src = (k_pad // simd) * (n_tile // pe), "manual"
+    else:
+        k_pad = k if k < simd_target else math.ceil(k / simd_target) * simd_target
+        target, target_src = target_from_knobs(
+            m, reuse_factor=reuse_factor, strategy=strategy, target_cycles=target_cycles)
+        pe, simd = fold(k_pad, n_tile, weight_width, target, simd_cap=simd_target)
 
     # DSP48 cores pack MACs along PE (8sx8u: 2/DSP, 4sx4u: 4/DSP). When PE is not a
     # multiple of that factor the DSP estimate's ceil() rounds up -> wasted DSP. This
@@ -450,3 +466,25 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         "sf_full": sf_full,                # pre-tiling SF; k_tiles=SF_full => SF_tile=1
         "accu_sum": accu_sum,              # width of the summed-partials accumulator
     }
+
+
+#: config keys fold_plan accepts (resolve_plan filters the config down to these).
+_FOLD_PLAN_KEYS = (
+    "weight_precision", "input_precision", "output_precision", "part",
+    "clock_period_ns", "reuse_factor", "strategy", "target_cycles",
+    "parallelization_factor", "n_tiles", "k_tiles", "weights", "pe", "simd",
+)
+
+
+def resolve_plan(shape, **cfg):
+    """Resolve the MVU plan for *shape* ``(m, k, n)``.
+
+    On this branch there is no shared mapper: the fold is user-directed (the tiling
+    knobs ``n_tiles``/``k_tiles`` and ReuseFactor come straight from the config) and
+    :func:`fold_plan` derives everything. This is a thin compatibility entry so the
+    emitters (``rtl``/``golden``/``package``) can call one plan resolver; it filters
+    the (possibly package-level) config down to the folding params ``fold_plan`` takes.
+    """
+    m, k, n = int(shape[0]), int(shape[1]), int(shape[2])
+    kw = {key: cfg[key] for key in _FOLD_PLAN_KEYS if cfg.get(key) is not None}
+    return fold_plan(m, k, n, **kw)

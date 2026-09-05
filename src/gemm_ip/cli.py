@@ -38,6 +38,27 @@ def main():
                         help="Interface type for generated package metadata/dispatch (default: stream)")
     parser.add_argument("--k-spatial", type=int, default=None,
                         help="Number of spatial K grid partitions (default: full K-chunk unroll)")
+    # ── mvau user-directed fold/tiling (standalone generation; no hls4ml) ──
+    parser.add_argument("--pe", type=int, default=None,
+                        help="mvau: N-parallelism (lanes/tile on N). With --simd, pins the fold "
+                             "directly (skips the search).")
+    parser.add_argument("--simd", type=int, default=None,
+                        help="mvau: K-parallelism (lanes/tile on K). With --pe, pins the fold.")
+    parser.add_argument("--k-tiles", type=int, default=None,
+                        help="mvau: K-partial tiles (spatial, summed).")
+    parser.add_argument("--n-tiles", type=int, default=None,
+                        help="mvau: N tiles (spatial, concatenated).")
+    parser.add_argument("--reuse-factor", type=int, default=None,
+                        help="mvau: ReuseFactor (per-vector cycle target) when --pe/--simd are unset.")
+    parser.add_argument("--part", type=str, default=None,
+                        help="FPGA part (selects the DSP core; e.g. xcve2802... -> DSP58).")
+    parser.add_argument("--weight-precision", type=str, default="fixed<8,4>",
+                        help="Weight precision (ac_fixed string); bounds SIMD and the MVU envelope.")
+    parser.add_argument("--input-precision", type=str, default="fixed<8,4>",
+                        help="Activation precision (ac_fixed string).")
+    parser.add_argument("--clock-period-ns", type=float, default=5.0, help="Target clock period (ns).")
+    parser.add_argument("--two-operand", action="store_true",
+                        help="mvau: generate the runtime-B (dual-operand) IP instead of weight-stationary.")
     parser.add_argument("--n-frames", type=int, default=1,
                         help="Number of frames the wrapper feeds back-to-back (default: 1). "
                              ">1 builds a multi-frame back-to-back unit package for cosim.")
@@ -99,6 +120,11 @@ def _run(args):
                     "parallelization_factor": item.get("parallelization_factor"),
                     "target_cycles": item.get("target_cycles"),
                     "n_tiles": item.get("n_tiles"),
+                    # DEBUG: direct mvau fold knobs injected via ATLASConfig (bypassing
+                    # hls4ml's gemm_config). TODO: Ruthwik change this.
+                    "pe": item.get("pe"),
+                    "simd": item.get("simd"),
+                    "k_tiles": item.get("k_tiles"),
                     # Two-operand routing: weights_in_core False selects a target's
                     # runtime-B (gemm_stream) generator over the weight-stationary one;
                     # second_operand_row_major is the B beat order it expects. Targets
@@ -120,21 +146,32 @@ def _run(args):
         if hasattr(target, "finalize"):
             target.finalize(items, str(output_dir))
     else:
-        target.package(
-            (args.m, args.k, args.n),
-            {
-                "name": args.name,
-                "output_dir": args.output_dir,
-                "interface": args.interface,
-                "gemm_k_spatial": args.k_spatial,
-                # Standalone unit packages use integer operand codes / int16 result
-                # lanes; an integer result type makes the wrapper drain emit
-                # value.to_int() so the ac_fixed rescale accumulator converts cleanly
-                # to the int16 output lane (the real hls4ml flow passes ac_fixed here).
-                "output_precision": "ac_int<16, true>",
-                "n_frames": args.n_frames,
-            },
-        )
+        cfg = {
+            "name": args.name,
+            "output_dir": args.output_dir,
+            "interface": args.interface,
+            "gemm_k_spatial": args.k_spatial,
+            # Standalone unit packages use integer operand codes / int16 result
+            # lanes; an integer result type makes the wrapper drain emit
+            # value.to_int() so the ac_fixed rescale accumulator converts cleanly
+            # to the int16 output lane (the real hls4ml flow passes ac_fixed here).
+            "output_precision": "ac_int<16, true>",
+            "n_frames": args.n_frames,
+            # mvau user-directed fold/tiling knobs (ignored by targets that don't fold).
+            "weight_precision": args.weight_precision,
+            "input_precision": args.input_precision,
+            "clock_period_ns": args.clock_period_ns,
+            "part": args.part,
+            "pe": args.pe,
+            "simd": args.simd,
+            "k_tiles": args.k_tiles,
+            "n_tiles": args.n_tiles,
+            "reuse_factor": args.reuse_factor,
+            "weights_in_core": not args.two_operand,
+            # dual-operand needs B row-major; harmless for the weight-stationary path.
+            "second_operand_row_major": True if args.two_operand else None,
+        }
+        target.package((args.m, args.k, args.n), cfg)
 
 
 if __name__ == "__main__":

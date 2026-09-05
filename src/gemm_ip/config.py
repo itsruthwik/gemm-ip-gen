@@ -131,6 +131,14 @@ def _normalize_config_items(cfg):
                 "input_precision": item.get("input_precision"),
                 "weight_precision": item.get("weight_precision"),
                 "clock_period_ns": item.get("clock_period_ns"),
+                "part": item.get("part"),
+                # DEBUG: mvau user-directed fold/tiling knobs injected via ATLASConfig
+                # (bypassing hls4ml). TODO: Ruthwik change this.
+                "pe": item.get("pe"),
+                "simd": item.get("simd"),
+                "k_tiles": item.get("k_tiles"),
+                "n_tiles": item.get("n_tiles"),
+                "second_operand_row_major": item.get("second_operand_row_major"),
                 # Weight-stationary (const-weight) selection + weights source.
                 "weights_in_core": bool(item.get("weights_in_core", False)),
                 "weight_file": item.get("weight_file"),

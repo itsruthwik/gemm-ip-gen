@@ -13,6 +13,7 @@ Generalizes the cosim-validated ``temp_space/mvau-spike``. Per package ``<name>`
 """
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -46,6 +47,32 @@ def _apmaxw(bits):
     return max(1024, ((bits + 1023) // 1024 + 1) * 1024)
 
 
+#: any ap_int / ap_uint / ap_fixed / ap_ufixed declaration, capturing the bit width.
+_AP_WIDTH_RE = re.compile(r"ap_u?(?:int|fixed)<\s*(\d+)")
+
+
+def _with_ap_int_max_w(src):
+    """Guarantee a generated C++/header TU raises ``AP_INT_MAX_W`` above the ap_int
+    default (1024) whenever it declares a wider ``ap_uint``/``ap_fixed``. Scans the
+    emitted source for its widest ap type and prepends an ``#ifndef``-guarded define
+    ahead of the includes. Idempotent: a TU that already sets the macro (the grid
+    tops/twins size it from the result beat) is left untouched, and a TU whose types
+    all fit the default gets nothing — so narrow single-tile packages are unchanged.
+
+    Without this, a layer that folds to a single tile with a wide beat (e.g. a wide
+    dense layer at moderate ReuseFactor) aborts csim with 'Bitwidth exceeds the
+    default max value 1024'."""
+    if "AP_INT_MAX_W" in src:
+        return src
+    widths = [int(w) for w in _AP_WIDTH_RE.findall(src)]
+    if not widths or max(widths) <= 1024:
+        return src
+    apmax = _apmaxw(max(widths))
+    return (f"#ifndef AP_INT_MAX_W\n#define AP_INT_MAX_W {apmax}   "
+            f"// widest ap type ({max(widths)}b) exceeds the 1024-bit default\n#endif\n"
+            + src)
+
+
 def _dat_name(name, ti, n_tiles):
     """memstream ``$readmemh`` init filename for tile ``ti``. Single-tile keeps the
     original ``<name>_weights.dat``; N-tiling suffixes ``_t{ti}`` per column slice."""
@@ -74,6 +101,13 @@ _PLAN_KEYS = ("weight_precision", "input_precision", "output_precision", "part",
 
 def _plan_kwargs(cfg):
     return {k: cfg[k] for k in _PLAN_KEYS if k in cfg and cfg[k] is not None}
+
+
+def _resolve_plan(shape, cfg):
+    """Resolve the MVU plan for *shape* (see :func:`geometry.resolve_plan`): the fold is
+    user-directed here — the tiling knobs (``n_tiles``/``k_tiles``) and ReuseFactor come
+    from the config and ``fold_plan`` derives the rest. No mapper / cost model on this branch."""
+    return _geom.resolve_plan(shape, **cfg)
 
 
 def cbits(plan):
@@ -189,10 +223,14 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
 """
 
 
-def _blackbox_json(name, t, weights_in_core=False):
+def _blackbox_json(name, t, weights_in_core=False, tiles=1, resources=None):
     WB, AB, PB = t["weight_stream_width_ba"], t["input_stream_width_ba"], t["output_stream_width_ba"]
     fn = f"{name}_core"
-    dsp = t["dsp_estimate"]
+    # Cost-model resource estimate over all copies.K·copies.N tiles: DSP + BRAM18 from
+    # geometry/cost (validated against Vivado OOC synth). If the caller didn't resolve a
+    # plan (legacy path), fall back to the per-tile DSP × tiles and no BRAM.
+    res = resources or {"dsp": t["dsp_estimate"] * int(tiles), "bram18": 0}
+    dsp, bram = int(res["dsp"]), int(res.get("bram18", 0))
     # weight-stationary: weights are baked in the memstream, so the blackbox has no
     # weight FIFO -- only the activation input and the result output.
     a_param = {"c_name": "a", "c_port_direction": "in",
@@ -222,12 +260,11 @@ def _blackbox_json(name, t, weights_in_core=False):
         # of the fold, verified against XSIM (geometry.latency_cycles / output_ii).
         "rtl_performance": {"latency": str(t["latency_cycles"]), "II": str(t["ii"])},
         # JSON has no comment syntax; this underscore-key carries a note in the file.
-        # (Per-tile hints, not scaled by n_tiles -- see TODO.)
-        "_comment": "These resource counts are not accurate, TODO: Fix",
-        # FINN cost-model DSP for the tile; FF/LUT are rough per-DSP hints. (For a
-        # blackbox these are what csynth reports; the real count comes from Vivado.)
+        "_comment": "FINN cost-model DSP estimate scaled by the tile count; FF/LUT/BRAM "
+                    "are rough hints, not synthesis-accurate (TODO: measure).",
+        # DSP + BRAM18 over all tiles from the cost model; FF/LUT are rough per-DSP hints.
         "rtl_resource_usage": {"FF": str(30 * dsp), "LUT": str(40 * dsp),
-                               "DSP": str(dsp), "BRAM": "0", "URAM": "0"},
+                               "DSP": str(dsp), "BRAM": str(bram), "URAM": "0"},
     }, indent=2) + "\n"
 
 
@@ -400,10 +437,13 @@ def _kt_dataflow_top(name, plan, bias_codes=None):
     t = plan["tile"]
     m = plan["num_input_vectors"]
     AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
-    KT = plan["k_tiles"]
-    A_TOTAL, PB_TOTAL = KT * AB, KT * PB
+    PE, NF, MW = t["pe"], t["nf"], t["mw"]
+    SFT = MW // t["simd"]
+    KT, NT = plan["k_tiles"], plan["n_tiles"]
+    A_TOTAL, PB_TOTAL = KT * AB, NT * KT * PB
     ACCU_SUM = plan["accu_sum"]
     N, outW, outI = plan["n"], plan["output_width"], plan["output_int"]
+    NTILE = N // NT
     pfrac = plan["product_frac"]
     CB = cbits(plan)
     pad = ' ' * (len(name) + 6)
@@ -427,24 +467,29 @@ void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&,
 {pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
 
 static void feed_a(hls::stream<ap_uint<{A_TOTAL}> >& in, hls::stream<ap_uint<{A_TOTAL}> >& out) {{
-    for (int i = 0; i < {m}; i++) out.write(in.read());
+    for (int i = 0; i < {m * SFT}; i++) out.write(in.read());
 }}
 
-// K-tiled requant drain: sum the KT per-tile partials for each column (accum widened
-// to {ACCU_SUM} = ACCU + ceil(log2 KT)), then + bias and quantize (Keras order).
+// Grid requant drain: each vector emits NF={NF} partial beats; sum the KT K-partials per
+// column (accum widened to {ACCU_SUM} = ACCU + ceil(log2 KT)) and concatenate the NT N-slices
+// (tile (j,i) at [(j*KT+i)*PB]), then + bias and quantize (Keras order).
 static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
     for (int vec = 0; vec < {m}; vec++) {{
         ap_uint<{CB}> crow = 0;
-        ap_uint<{PB_TOTAL}> ob = in.read();
-        for (int oc = 0; oc < {N}; oc++) {{
-            ap_int<{ACCU_SUM}> raw = 0;
-            for (int ti = 0; ti < {KT}; ti++)
-                raw += (ap_int<{ACCU}>)ob.range(ti * {PB} + oc * {ACCU} + {ACCU} - 1, ti * {PB} + oc * {ACCU});
-            ap_int<64> v = (ap_int<64>)raw{bias_add};         // Σ partials + bias, accum domain
-            ap_fixed<64, {64 - pfrac}> rv;
-            rv.range(63, 0) = (ap_uint<64>)v;                 // code -> fixed (frac={pfrac})
-            {name}_result_t r = rv;                           // rescale + round + saturate
-            crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+        for (int nf = 0; nf < {NF}; nf++) {{
+            ap_uint<{PB_TOTAL}> ob = in.read();
+            for (int j = 0; j < {NT}; j++)
+            for (int pe = 0; pe < {PE}; pe++) {{
+                int oc = j * {NTILE} + nf * {PE} + pe;
+                ap_int<{ACCU_SUM}> raw = 0;
+                for (int i = 0; i < {KT}; i++)
+                    raw += (ap_int<{ACCU}>)ob.range((j * {KT} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {KT} + i) * {PB} + pe * {ACCU});
+                ap_int<64> v = (ap_int<64>)raw{bias_add};         // Σ partials + bias, accum domain
+                ap_fixed<64, {64 - pfrac}> rv;
+                rv.range(63, 0) = (ap_uint<64>)v;                 // code -> fixed (frac={pfrac})
+                {name}_result_t r = rv;                           // rescale + round + saturate
+                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+            }}
         }}
         out.write(crow);
     }}
@@ -471,10 +516,13 @@ def _kt_gemm_ip_header(name, plan):
     t = plan["tile"]
     m = plan["num_input_vectors"]
     AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
-    KT = plan["k_tiles"]
-    A_TOTAL, PB_TOTAL = KT * AB, KT * PB
+    PE, NF, MW, SIMD = t["pe"], t["nf"], t["mw"], t["simd"]
+    SFT = MW // SIMD
+    KT, NT = plan["k_tiles"], plan["n_tiles"]
+    A_TOTAL, PB_TOTAL = KT * AB, NT * KT * PB
     ACCU_SUM = plan["accu_sum"]
     AW, K, N = t["activation_width"], plan["k"], plan["n"]
+    NTILE = N // NT
     KPAD = plan["k_pad"]
     outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
     core_hdr_pad = ' ' * (len(name) + 6)
@@ -512,10 +560,15 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{A_TOTAL
             data_T beat = a_stream.read();
             for (unsigned j = 0; j < data_T::size; j++) arow[kp * data_T::size + j] = beat[j].range({AW} - 1, 0);
         }}
-        ap_uint<{A_TOTAL}> ab = 0;                 // AB=SIMD*AW -> K_pad lanes pack contiguously
-        for (unsigned kk = 0; kk < {KPAD}; kk++)
-            ab.range(kk * {AW} + {AW} - 1, kk * {AW}) = (ap_uint<{AW}>)arow[kk];
-        a_s.write(ab);
+        // emit SF_tile beats/vector; band sf carries each tile's SIMD lanes at [ti*AB +: AB]
+        for (unsigned sf = 0; sf < {SFT}; sf++) {{
+            ap_uint<{A_TOTAL}> ab = 0;
+            for (unsigned ti = 0; ti < {KT}; ti++)
+                for (unsigned s = 0; s < {SIMD}; s++)
+                    ab.range(ti * {AB} + s * {AW} + {AW} - 1, ti * {AB} + s * {AW}) =
+                        (ap_uint<{AW}>)arow[ti * {MW} + sf * {SIMD} + s];
+            a_s.write(ab);
+        }}
     }}
 }}
 
@@ -526,16 +579,20 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
     typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> result_t;
     for (unsigned mm = 0; mm < {m}; mm++) {{
         res_T crow;
-        ap_uint<{PB_TOTAL}> ob = p_s.read();
-        for (unsigned oc = 0; oc < {N}; oc++) {{
-            ap_int<{ACCU_SUM}> raw = 0;
-            for (unsigned ti = 0; ti < {KT}; ti++)
-                raw += (ap_int<{ACCU}>)ob.range(ti * {PB} + oc * {ACCU} + {ACCU} - 1, ti * {PB} + oc * {ACCU});
-            ap_fixed<64, {64 - pfrac}> rv;
-            rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;   // code -> fixed (frac={pfrac})
-            rv += biases[oc];                                 // + bias (fixed-point, aligned)
-            result_t r = rv;                                  // rescale + round + saturate
-            crow[oc] = r;
+        for (unsigned nf = 0; nf < {NF}; nf++) {{     // NF partial beats/vector, PE columns each
+            ap_uint<{PB_TOTAL}> ob = p_s.read();
+            for (unsigned j = 0; j < {NT}; j++)
+            for (unsigned pe = 0; pe < {PE}; pe++) {{
+                unsigned oc = j * {NTILE} + nf * {PE} + pe;
+                ap_int<{ACCU_SUM}> raw = 0;
+                for (unsigned i = 0; i < {KT}; i++)
+                    raw += (ap_int<{ACCU}>)ob.range((j * {KT} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {KT} + i) * {PB} + pe * {ACCU});
+                ap_fixed<64, {64 - pfrac}> rv;
+                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;   // code -> fixed (frac={pfrac})
+                rv += biases[oc];                                 // + bias (fixed-point, aligned)
+                result_t r = rv;                                  // rescale + round + saturate
+                crow[oc] = r;
+            }}
         }}
         res_stream.write(crow);
     }}
@@ -637,10 +694,13 @@ def _2op_kt_dataflow_top(name, plan):
     t = plan["tile"]
     m = plan["num_input_vectors"]
     AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
-    gk = plan["k_tiles"]
-    A_TOTAL, PB_TOTAL = gk * AB, gk * PB
+    PE, NF, MW = t["pe"], t["nf"], t["mw"]
+    SFT = MW // t["simd"]
+    gk, nt = plan["k_tiles"], plan["n_tiles"]
+    A_TOTAL, PB_TOTAL = gk * AB, nt * gk * PB
     ACCU_SUM = plan["accu_sum"]
     N, WW = plan["n"], t["weight_width"]
+    NTILE = N // nt
     BB = ((N * WW) + 7) // 8 * 8
     K = plan["k_pad"]
     outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
@@ -659,26 +719,31 @@ void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&, hls::stream<ap_uint<{BB}> >&
 {pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
 
 static void feed_a(hls::stream<ap_uint<{A_TOTAL}> >& in, hls::stream<ap_uint<{A_TOTAL}> >& out) {{
-    for (int i = 0; i < {m}; i++) out.write(in.read());
+    for (int i = 0; i < {m * SFT}; i++) out.write(in.read());
 }}
 static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >& out) {{
     for (int i = 0; i < {K}; i++) out.write(in.read());
 }}
 
-// K-tiled requant drain (no bias): sum the gk per-tile partials per column (accum widened
-// to {ACCU_SUM} = ACCU + ceil(log2 gk)), then quantize.
+// Grid requant drain (no bias): each vector emits NF={NF} partial beats; sum the gk K-partials
+// per column (accum widened to {ACCU_SUM} = ACCU + ceil(log2 gk)) and concatenate the nt
+// N-slices (tile (j,i) at [(j*gk+i)*PB]), then quantize.
 static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
     for (int vec = 0; vec < {m}; vec++) {{
         ap_uint<{CB}> crow = 0;
-        ap_uint<{PB_TOTAL}> ob = in.read();
-        for (int oc = 0; oc < {N}; oc++) {{
-            ap_int<{ACCU_SUM}> raw = 0;
-            for (int ti = 0; ti < {gk}; ti++)
-                raw += (ap_int<{ACCU}>)ob.range(ti * {PB} + oc * {ACCU} + {ACCU} - 1, ti * {PB} + oc * {ACCU});
-            ap_fixed<64, {64 - pfrac}> rv;
-            rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
-            {name}_result_t r = rv;
-            crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+        for (int nf = 0; nf < {NF}; nf++) {{
+            ap_uint<{PB_TOTAL}> ob = in.read();
+            for (int j = 0; j < {nt}; j++)
+            for (int pe = 0; pe < {PE}; pe++) {{
+                int oc = j * {NTILE} + nf * {PE} + pe;
+                ap_int<{ACCU_SUM}> raw = 0;
+                for (int i = 0; i < {gk}; i++)
+                    raw += (ap_int<{ACCU}>)ob.range((j * {gk} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {gk} + i) * {PB} + pe * {ACCU});
+                ap_fixed<64, {64 - pfrac}> rv;
+                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
+                {name}_result_t r = rv;
+                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+            }}
         }}
         out.write(crow);
     }}
@@ -696,78 +761,6 @@ void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in, hls::stream<ap_uint<{BB}> >&
     feed_a(a_in, a_s);
     feed_b(b_in, b_s);
     {name}_core(a_s, b_s, p_s);   // <-- FINN MVU K-tiled blackbox (gk partials, B in-core)
-    requant(p_s, c_out);
-}}
-"""
-
-
-def _2op_nt_dataflow_top(name, plan):
-    """DUT for the N-tiled two-operand blackbox: passthrough of A (broadcast) and B into the
-    core, then a concatenating requant drain (no summing; tile ti lane pe -> column ti*N_tile+pe;
-    no bias; act*act scale fa+fb)."""
-    t = plan["tile"]
-    m = plan["num_input_vectors"]
-    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
-    PE, SF = t["pe"], t["sf"]
-    nt, ntile = plan["n_tiles"], plan["n_tile"]
-    PB_TOTAL = nt * PB
-    N, WW = plan["n"], t["weight_width"]
-    BB = ((N * WW) + 7) // 8 * 8
-    K = plan["k_pad"]
-    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
-    CB = cbits(plan)
-    abeats = m * SF
-    apmax = _apmaxw(PB_TOTAL)
-    guard = f"#define AP_INT_MAX_W {apmax}\n" if PB_TOTAL > 1024 else ""
-    pad = ' ' * (len(name) + 6)
-    indent = ' ' * (len(name) + 1)
-    return f"""{guard}#include <hls_stream.h>
-#include <ap_int.h>
-#include <ap_fixed.h>
-
-typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> {name}_result_t;
-
-void {name}_core(hls::stream<ap_uint<{AB}> >&, hls::stream<ap_uint<{BB}> >&,
-{pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
-
-static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
-    for (int i = 0; i < {abeats}; i++) out.write(in.read());
-}}
-static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >& out) {{
-    for (int i = 0; i < {K}; i++) out.write(in.read());
-}}
-
-// Concatenating requant drain (no bias): one nt*PB beat/vector -> N-wide C row; tile ti lane
-// pe is global column ti*N_tile+pe.
-static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
-    for (int vec = 0; vec < {m}; vec++) {{
-        ap_uint<{CB}> crow = 0;
-        ap_uint<{PB_TOTAL}> ob = in.read();
-        for (int ti = 0; ti < {nt}; ti++)
-            for (int pe = 0; pe < {PE}; pe++) {{
-                int oc = ti * {ntile} + pe;
-                ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
-                ap_fixed<64, {64 - pfrac}> rv;
-                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
-                {name}_result_t r = rv;
-                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
-            }}
-        out.write(crow);
-    }}
-}}
-
-void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in,
-{indent}hls::stream<ap_uint<{CB}> >& c_out) {{
-#pragma HLS DATAFLOW
-    hls::stream<ap_uint<{AB}> > a_s;
-    hls::stream<ap_uint<{BB}> > b_s;
-    hls::stream<ap_uint<{PB_TOTAL}> > p_s;
-#pragma HLS STREAM variable=a_s depth=4
-#pragma HLS STREAM variable=b_s depth=4
-#pragma HLS STREAM variable=p_s depth=4
-    feed_a(a_in, a_s);
-    feed_b(b_in, b_s);
-    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU N-tiled blackbox (concat outputs, B in-core)
     requant(p_s, c_out);
 }}
 """
@@ -950,11 +943,13 @@ void {name}_gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_
 """
 
 
-def _2op_blackbox_json(name, t, n, ww):
+def _2op_blackbox_json(name, t, n, ww, tiles=1, resources=None):
     """Blackbox JSON for the two-operand core: two input FIFOs (a, b) + one output (p)."""
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
     fn = f"{name}_core"
-    dsp = t["dsp_estimate"]
+    # Cost-model resource estimate over all tiles (see _blackbox_json).
+    res = resources or {"dsp": t["dsp_estimate"] * int(tiles), "bram18": 0}
+    dsp, bram = int(res["dsp"]), int(res.get("bram18", 0))
     a_param = {"c_name": "a", "c_port_direction": "in",
                "rtl_ports": {"FIFO_data_read_in": "a_dout", "FIFO_read_enable": "a_read", "FIFO_empty_flag": "a_empty_n"}}
     b_param = {"c_name": "b", "c_port_direction": "in",
@@ -978,9 +973,10 @@ def _2op_blackbox_json(name, t, n, ww):
             "ap_ctrl_chain_protocol_continue": "",
         },
         "rtl_performance": {"latency": str(t["latency_cycles"]), "II": str(t["ii"])},
-        "_comment": "These resource counts are not accurate, TODO: Fix",
+        "_comment": "FINN cost-model DSP estimate scaled by the tile count; FF/LUT/BRAM "
+                    "are rough hints, not synthesis-accurate (TODO: measure).",
         "rtl_resource_usage": {"FF": str(30 * dsp), "LUT": str(40 * dsp),
-                               "DSP": str(dsp), "BRAM": "0", "URAM": "0"},
+                               "DSP": str(dsp), "BRAM": str(bram), "URAM": "0"},
     }, indent=2) + "\n"
 
 
@@ -1001,20 +997,18 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
             f"mvau two-operand IP '{name}' requires SecondOperandRowMajor=True (B row-major, "
             "N-wide beats); the manifest declares col-major B. Set SecondOperandRowMajor on the "
             "hls4ml layer, or route this node to the generic/soft target.")
-    plan = _geom.fold_plan(*shape, **_plan_kwargs(cfg))
+    plan = _resolve_plan(shape, cfg)
     t = plan["tile"]
     kt = plan.get("k_tiles", 1)
     nt = plan["n_tiles"]
-    if nt > 1 and kt > 1:
-        raise NotImplementedError("two-operand does not support combined N+K tiling yet.")
     if t["compute_core"] == "mvu_4sx4u_dsp48e1":
         raise ValueError("two-operand cannot use mvu_4sx4u/DSP48E1 (requires NARROW_WEIGHTS, "
                          "which a runtime B operand cannot guarantee); target DSP48E2/DSP58.")
     # Shim selection:
-    #   N-tiling (nt>1): per-tile memstream, activation broadcast, outputs concatenated.
-    #   K-tiled register shim: real K-tiling (gk>1) OR the fully-spatial single tile (SF=NF=1,
-    #     one weight word/vector -- a memstream cannot be config-written at DEPTH=1).
-    #   memstream single-tile shim: the temporal fold (DEPTH=NF*SF>=2).
+    #   grid shim (nt>1 or gk>1): an nt×gk grid of MVU cores (memstream per tile, DEPTH>=2),
+    #     activation K-sliced + broadcast over N-slices, partials summed over K + concatenated
+    #     over N. Also serves the fully-spatial single tile (SF=NF=1) via the register path.
+    #   memstream single-tile shim: the untiled temporal fold (DEPTH=NF*SF>=2).
     use_kt = (kt > 1) or (t["sf"] == 1 and t["nf"] == 1)
     part = cfg.get("part") or "xcvu13p-flga2577-2-e"
     clock_ns = cfg.get("clock_period_ns") or 5
@@ -1023,7 +1017,7 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
 
     force_behavioral = bool(cfg.get("force_behavioral", False))
     if nt > 1:
-        shim, top_src = (_rtl.generate_two_operand_nt_shim, _2op_nt_dataflow_top(name, plan))
+        shim, top_src = (_rtl.generate_two_operand_nt_shim, _2op_kt_dataflow_top(name, plan))
     elif use_kt:
         shim, top_src = (_rtl.generate_two_operand_kt_shim, _2op_kt_dataflow_top(name, plan))
     else:
@@ -1031,13 +1025,15 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     (pkg / f"{name}_core.v").write_text(_with_timescale(
         shim(shape, module_name=f"{name}_core",
              force_behavioral=force_behavioral, tile=t, plan=plan)))
-    (pkg / f"{name}_core.cpp").write_text(
-        _golden.generate_2op_core_twin(shape, func_name=f"{name}_core", plan=plan))
-    (pkg / f"{name}_top.cpp").write_text(top_src)
-    (pkg / f"{name}.json").write_text(_2op_blackbox_json(name, t, plan["n"], t["weight_width"]))
-    (pkg / f"{name}_tb.cpp").write_text(
-        _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan))
-    (pkg / f"{name}_gemm_ip.h").write_text(_2op_gemm_ip_header(name, plan))
+    (pkg / f"{name}_core.cpp").write_text(_with_ap_int_max_w(
+        _golden.generate_2op_core_twin(shape, func_name=f"{name}_core", plan=plan)))
+    (pkg / f"{name}_top.cpp").write_text(_with_ap_int_max_w(top_src))
+    (pkg / f"{name}.json").write_text(
+        _2op_blackbox_json(name, t, plan["n"], t["weight_width"], tiles=kt * nt,
+                           resources=plan.get("resources")))
+    (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
+        _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan)))
+    (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(_2op_gemm_ip_header(name, plan)))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 
     for s in _STATIC_SOURCES:
@@ -1112,7 +1108,7 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
         raise ValueError(
             f"mvau target does not support io_parallel (interface=array) for '{name}'. "
             "The FINN MVU is a streaming AXIS core; use io_stream (interface=stream).")
-    plan = _geom.fold_plan(*shape, **_plan_kwargs(cfg))
+    plan = _resolve_plan(shape, cfg)
     t = plan["tile"]
     m = plan["num_input_vectors"]
     part = cfg.get("part") or "xcvu13p-flga2577-2-e"
@@ -1122,27 +1118,26 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
     N, K, PE, SIMD, WW = plan["n"], plan["k_pad"], t["pe"], t["simd"], t["weight_width"]
     NT, NTILE = plan["n_tiles"], plan["n_tile"]
     KT = plan.get("k_tiles", 1)
-    if KT > 1 and NT > 1:
-        raise NotImplementedError(
-            f"combined N-tiling and K-tiling not supported yet ('{name}': n_tiles={NT}, "
-            f"k_tiles={KT}); use one tiling axis at a time.")
 
     pkg = Path(output_dir) / name
     (pkg / "rtl_static").mkdir(parents=True, exist_ok=True)
 
     # Pack the baked weights into the memstream init(s), alongside the vendored RTL.
-    #   N-tiling: one memstream per N-column slice ([K][NTILE]).
-    #   K-tiling: one memstream per K-row slice ([SIMD][N]); each tile reduces its K-slice
-    #             for all N columns (fully-spatial per-tile, SF=NF=1) -> a partial.
+    #   grid (K-tiling, possibly N-tiling): one memstream per (N-slice j, K-slice i) — the
+    #     [MW_tile][NTILE] block; each reduces its K-slice for its N-slice -> a partial.
+    #   N-tiling only: one memstream per N-column slice ([K][NTILE]).
     B = _weight_matrix_as_B(cfg, N, K, WW)
+    MW = t["mw"]                       # per-tile K rows (= K_pad/KT = SF_tile*SIMD)
     init_files = []
     if KT > 1:
-        for ti in range(KT):
-            B_ti = [[B[ti * SIMD + kk][oo] for oo in range(N)] for kk in range(SIMD)]
-            dat_path = pkg / "rtl_static" / _kdat_name(name, ti)
-            dat_path.write_text(_wpack.pack_memstream_hex(
-                B_ti, N, SIMD, PE, SIMD, WW, word_bits=t["weight_stream_width_ba"]))
-            init_files.append(str(dat_path.resolve()))
+        for j in range(NT):
+            for i in range(KT):
+                B_ji = [[B[i * MW + kk][j * NTILE + oo] for oo in range(NTILE)]
+                        for kk in range(MW)]
+                dat_path = pkg / "rtl_static" / _kdat_name(name, j * KT + i)
+                dat_path.write_text(_wpack.pack_memstream_hex(
+                    B_ji, NTILE, MW, PE, SIMD, WW, word_bits=t["weight_stream_width_ba"]))
+                init_files.append(str(dat_path.resolve()))
     else:
         for ti in range(NT):
             B_ti = [[B[kk][ti * NTILE + oo] for oo in range(NTILE)] for kk in range(K)]
@@ -1162,19 +1157,20 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
                            force_behavioral=force_behavioral, tile=t,
                            weights_in_core=True, init_files=init_files,
                            n_tiles=NT, k_tiles=KT)))
-    (pkg / f"{name}_core.cpp").write_text(
-        _golden.generate_core_twin(shape, func_name=f"{name}_core", plan=plan, baked_weights=B))
+    (pkg / f"{name}_core.cpp").write_text(_with_ap_int_max_w(
+        _golden.generate_core_twin(shape, func_name=f"{name}_core", plan=plan, baked_weights=B)))
     bias_codes = bias_acc_codes(cfg.get("bias"), plan["product_frac"], plan["n"])
     top_src = (_kt_dataflow_top(name, plan, bias_codes=bias_codes) if KT > 1
                else _dataflow_top(name, plan, bias_codes=bias_codes, weights_in_core=True))
-    (pkg / f"{name}_top.cpp").write_text(top_src)
-    (pkg / f"{name}.json").write_text(_blackbox_json(name, t, weights_in_core=True))
-    (pkg / f"{name}_tb.cpp").write_text(
+    (pkg / f"{name}_top.cpp").write_text(_with_ap_int_max_w(top_src))
+    (pkg / f"{name}.json").write_text(_blackbox_json(
+        name, t, weights_in_core=True, tiles=KT * NT, resources=plan.get("resources")))
+    (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
-                            bias_codes=bias_codes, baked_weights=B))
+                            bias_codes=bias_codes, baked_weights=B)))
     ip_hdr = (_kt_gemm_ip_header(name, plan) if KT > 1
               else _gemm_ip_header(name, plan, weights_in_core=True))
-    (pkg / f"{name}_gemm_ip.h").write_text(ip_hdr)
+    (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(ip_hdr))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 
     for s in _STATIC_SOURCES:
@@ -1293,6 +1289,25 @@ void gemm_stream_weightless(hls::stream<data_T> &a_stream, hls::stream<res_T> &r
 """
 
 
+def _manifest_resources(it):
+    """The cost-model ``{dsp, bram18}`` for a manifest item, or ``None`` if it can't be
+    resolved (missing shape / mapper error). Re-resolves the plan (cheap) so the manifest
+    carries the same estimate the emitted blackbox JSON does."""
+    try:
+        m, k, n = int(it["m"]), int(it["k"]), int(it["n"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    cfg = {key: it.get(key) for key in
+           ("input_precision", "weight_precision", "output_precision", "part",
+            "clock_period_ns", "reuse_factor", "strategy", "target_cycles",
+            "parallelization_factor", "n_tiles", "k_tiles", "weights",
+            "weights_in_core", "name")}
+    try:
+        return _resolve_plan((m, k, n), cfg).get("resources")
+    except Exception:
+        return None
+
+
 def gen_integration_manifest(items):
     cores = []
     for it in items:
@@ -1313,14 +1328,85 @@ def gen_integration_manifest(items):
         except (TypeError, ValueError):
             kt = 1
         if kt > 1:
-            core["weight_data"] = [f"{nm}/rtl_static/{_kdat_name(nm, ti)}" for ti in range(kt)]
+            # grid: one .dat per (N-slice j, K-slice i), flat index j*kt+i
+            core["weight_data"] = [f"{nm}/rtl_static/{_kdat_name(nm, j * kt + i)}"
+                                   for j in range(nt) for i in range(kt)]
         else:
             core["weight_data"] = [f"{nm}/rtl_static/{_dat_name(nm, ti, nt)}" for ti in range(nt)]
+        # Cost-model resource estimate {dsp, bram18} for the node (same mapper decomposition
+        # the package emitted). Best-effort: skip if the node has no resolvable shape.
+        res = _manifest_resources(it)
+        if res is not None:
+            core["resources"] = res
         cores.append(core)
     return json.dumps({"tool": "vitis", "flow": "rtl_blackbox",
                        "header": "gemm_ip_combined.h", "cores": cores}, indent=2) + "\n"
 
 
-def run_vitis_smoke(cases=None, keep=False):
-    """Placeholder for a standalone vitis-run smoke test (mirrors generic target)."""
-    raise NotImplementedError("mvau run_vitis_smoke: pending")
+def run_vitis_smoke(package=None, cases=None, keep=False):
+    """Run Vitis csim + csynth + cosim on generated mvau package(s) via ``vitis-run``.
+
+    Returns a process-style code: 0 = all pass, 1 = a failure, 2 = ``vitis-run`` not found
+    (skipped). With *package* given, run that package dir. Otherwise build the built-in smoke
+    set (*cases*, or a default covering the single-tile, K-tiled and N-tiled paths) into a
+    temp dir under ``temp_space/`` and run each. A package passes iff its self-checking TB
+    reports ``MVAU_PKG PASS`` and cosim finishes ``PASS``."""
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path as _Path
+
+    if shutil.which("vitis-run") is None:
+        print("vitis-run not found on PATH (source the Vitis settings); skipping mvau rtl_test",
+              file=sys.stderr)
+        return 2
+
+    def _run_one(pkg):
+        pkg = _Path(pkg)
+        r = subprocess.run(["vitis-run", "--tcl", "run_vitis.tcl", "--mode", "hls"],
+                           cwd=str(pkg), text=True, capture_output=True)
+        log = (r.stdout or "") + (r.stderr or "")
+        ok = ("MVAU_PKG PASS" in log and "MVAU_PKG FAIL" not in log
+              and "co-simulation finished: PASS" in log and r.returncode == 0)
+        if not ok:
+            print(f"[mvau rtl_test] {pkg.name}: FAIL\n{log[-3000:]}", file=sys.stderr)
+        return ok
+
+    if package is not None:
+        return 0 if _run_one(package) else 1
+
+    # Built-in smoke set: covers single-tile temporal, K-tiled (baked + two-operand,
+    # NF>1 and SF_tile>1) and N-tiled paths. Small shapes keep cosim quick.
+    default = [
+        {"shape": (4, 4, 4), "reuse_factor": 1, "weights_in_core": True},    # single tile
+        {"shape": (4, 6, 8), "reuse_factor": 4, "weights_in_core": False},   # 2op K-tile, NF>1
+        {"shape": (2, 12, 4), "reuse_factor": 8, "weights_in_core": True},   # baked K-tile, SF_tile>1
+        {"shape": (2, 3, 8), "n_tiles": 2, "weights_in_core": True},         # N-tile (K fits one core)
+        {"shape": (4, 6, 8), "reuse_factor": 2, "n_tiles": 2,
+         "weights_in_core": False},                                          # two-operand combined N+K grid
+        {"shape": (2, 6, 8), "reuse_factor": 2, "n_tiles": 2,
+         "weights_in_core": True},                                           # baked combined N+K grid
+    ]
+    smoke = cases or default
+    root = _Path(__file__).resolve().parents[3] / "temp_space" / "mvau_rtl_smoke"
+    root.mkdir(parents=True, exist_ok=True)   # repo-local scratch only (never /tmp)
+    outdir = _Path(tempfile.mkdtemp(dir=str(root)))
+    rc = 0
+    try:
+        for i, c in enumerate(smoke):
+            shp = c["shape"]
+            nm = f"smoke_{i}"
+            opts = {"weight_precision": "fixed<8,4>", "input_precision": "fixed<8,4>",
+                    "output_precision": "fixed<16,6>", "part": "xcve2802-vsvh1760-2MP-e-S",
+                    "clock_period_ns": 5,
+                    **{k: v for k, v in c.items() if k != "shape"}}
+            gen = (generate_two_operand_pkg if not opts.get("weights_in_core", True)
+                   else generate_mvau_pkg)
+            pkg = gen(shp, nm, str(outdir), **opts)
+            if not _run_one(pkg):
+                rc = 1
+    finally:
+        if not keep:
+            shutil.rmtree(outdir, ignore_errors=True)
+    return rc

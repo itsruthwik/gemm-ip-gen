@@ -5,6 +5,7 @@ docs/archive/
 generated/
 output*/
 experiments/
+temp_space/
 
 # HLS project scratch directories
 bb_*/

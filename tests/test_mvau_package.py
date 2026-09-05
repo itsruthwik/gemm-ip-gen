@@ -50,8 +50,8 @@ def test_blackbox_json_contract(tmp_path):
         assert f"ap_ctrl_chain_protocol_{k}" in rcs
     # FIFO port map, not AXIS. Weight-stationary: weights are baked in the memstream,
     # so there is no weight port -- only the activation input and the result output.
-    # resource counts are known-inaccurate hints -- every JSON carries the note
-    assert j["_comment"] == "These resource counts are not accurate, TODO: Fix"
+    # resource counts are rough hints -- every JSON carries the note
+    assert "not synthesis-accurate" in j["_comment"]
     pnames = {p["c_name"]: p["rtl_ports"] for p in j["c_parameters"]}
     assert "w" not in pnames
     assert pnames["a"]["FIFO_data_read_in"] == "a_dout"
