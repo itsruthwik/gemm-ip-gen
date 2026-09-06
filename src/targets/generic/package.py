@@ -20,7 +20,7 @@ DEFAULT_PART = "xcvu13p-flga2577-2-e"
 
 
 def _default_weight_matrix(k, n):
-    """Deterministic B[K][N] matching the TB's b_val formula (weightless standalone)."""
+    """Deterministic B[K][N] matching the TB's b_val formula (const_weights standalone)."""
     return [[((row + 2 * col) % 3) - 1 for col in range(n)] for row in range(k)]
 
 

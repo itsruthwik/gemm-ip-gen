@@ -24,7 +24,7 @@ import weightpack as _wpack
 
 _RTL_STATIC = Path(__file__).resolve().parent / "rtl_static"
 # memstream is the weight-stationary weight ROM (baked from <name>_weights.dat);
-# always vendored -- the weightless path instantiates it, the (future) two-operand
+# always vendored -- the const_weights path instantiates it, the (future) two-operand
 # streamed path simply leaves it uninstantiated.
 _STATIC_SOURCES = ["mvu_vvu_axi.sv", "replay_buffer.sv", "memstream.sv",
                    "mvu_4sx4u.sv", "mvu_8sx8u_dsp48.sv", "mvu_vvu_8sx9_dsp58.sv"]
@@ -293,7 +293,7 @@ def _gemm_ip_header(name, plan, weights_in_core=True):
     runs the blackbox, requant-drains (runtime bias) -> hls4ml C row. The combined
     header routes nnet::gemm_* to this by CONFIG_T::gemm_ip_id (template dispatch).
 
-    io_stream weightless (projections) implemented; two-operand + io_parallel
+    io_stream const_weights (projections) implemented; two-operand + io_parallel
     follow the same pattern.
     """
     t = plan["tile"]
@@ -310,7 +310,7 @@ def _gemm_ip_header(name, plan, weights_in_core=True):
     core_decl = (f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{core_hdr_pad}hls::stream<ap_uint<{PB_TOTAL}> >&);"
                  if weights_in_core else
                  f"void {name}_core(hls::stream<ap_uint<{WB}> >&, hls::stream<ap_uint<{AB}> >&,\n{core_hdr_pad}hls::stream<ap_uint<{PB_TOTAL}> >&);")
-    # weightless (weight-stationary): weights are baked in the RTL memstream, so no
+    # const_weights (weight-stationary): weights are baked in the RTL memstream, so no
     # feed_w / weight stream. Streamed feed_w kept for the future two-operand path.
     if weights_in_core:
         feed_w_tmpl = ""
@@ -414,9 +414,9 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
     }}
 }}
 
-// The dedicated IP: hls4ml io_stream weightless GEMM -> internal MVU blackbox.
+// The dedicated IP: hls4ml io_stream const_weights GEMM -> internal MVU blackbox.
 template <class data_T, class res_T, typename CONFIG_T>
-void {name}_gemm_stream_weightless(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
+void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
 {' ' * (len(name) + 28)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
 #pragma HLS DATAFLOW
 {ws_streams}
@@ -598,9 +598,9 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
     }}
 }}
 
-// The dedicated K-tiled IP: hls4ml io_stream weightless GEMM -> internal MVU blackbox.
+// The dedicated K-tiled IP: hls4ml io_stream const_weights GEMM -> internal MVU blackbox.
 template <class data_T, class res_T, typename CONFIG_T>
-void {name}_gemm_stream_weightless(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
+void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
 {' ' * (len(name) + 28)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
 #pragma HLS DATAFLOW
     hls::stream<ap_uint<{A_TOTAL}> > a_s;
@@ -1210,9 +1210,9 @@ def gen_combined_header(items):
 
     incs = "\n".join(f'#include "{_nm(it)}/{_nm(it)}_gemm_ip.h"' for it in items)
 
-    # weights_in_core True (or missing) -> weightless (baked-B) IP; False -> two-operand
+    # weights_in_core True (or missing) -> const_weights (baked-B) IP; False -> two-operand
     # (runtime-B) IP. A two-operand IP emits <name>_gemm_stream instead of
-    # <name>_gemm_stream_weightless, so it needs the two-operand dispatcher below.
+    # <name>_gemm_stream_const_weights, so it needs the two-operand dispatcher below.
     wl_items = [it for it in items if it.get("weights_in_core", True)]
     two_op_items = [it for it in items if not it.get("weights_in_core", True)]
 
@@ -1224,9 +1224,9 @@ def gen_combined_header(items):
         specs.append(
             f"template <> struct mvau_ip<{i}> {{\n"
             f"    template <class data_T, class res_T, typename CONFIG_T>\n"
-            f"    static void stream_weightless(hls::stream<data_T> &a, hls::stream<res_T> &r,\n"
+            f"    static void stream_const_weights(hls::stream<data_T> &a, hls::stream<res_T> &r,\n"
             f"                                  typename CONFIG_T::bias_t b[CONFIG_T::n_out]) {{\n"
-            f"        {nm}_gemm_stream_weightless<data_T, res_T, CONFIG_T>(a, r, b);\n"
+            f"        {nm}_gemm_stream_const_weights<data_T, res_T, CONFIG_T>(a, r, b);\n"
             f"    }}\n"
             f"}};")
     specs_s = "\n".join(specs)
@@ -1276,11 +1276,11 @@ namespace nnet {{
 template <int ID> struct mvau_ip;
 {specs_s}
 
-// io_stream weightless entry hls4ml calls; routes to the config's IP by id.
+// io_stream const_weights entry hls4ml calls; routes to the config's IP by id.
 template <class data_T, class res_T, typename CONFIG_T>
-void gemm_stream_weightless(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
+void gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
                             typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
-    mvau_ip<CONFIG_T::gemm_ip_id>::template stream_weightless<data_T, res_T, CONFIG_T>(
+    mvau_ip<CONFIG_T::gemm_ip_id>::template stream_const_weights<data_T, res_T, CONFIG_T>(
         a_stream, res_stream, biases);
 }}
 {two_op_block}

@@ -1,8 +1,8 @@
 """generic target: behavioral-HLS GEMM for Vitis, bound to the Target contract.
 
 No RTL blackbox / hardblock — Vitis HLS synthesizes the emitted C++ directly. The
-four func types (stream / array x weighted / weightless) are the hls4ml Vitis seam
-(nnet::gemm_{stream,stream_weightless,array,array_weightless}); weightless weights
+four func types (stream / array x weighted / const_weights) are the hls4ml Vitis seam
+(nnet::gemm_{stream,stream_const_weights,array,array_const_weights}); const_weights weights
 are baked into <name>_weights.h and fed to the IP by the top.
 """
 
@@ -52,7 +52,7 @@ class GenericTarget(Target):
         m, k, n = shape
         # A weight-stationary layer is signalled by a baked weight matrix (the CLI loads
         # it from the layer's .dat). generate_generic_pkg then emits the ROM header and
-        # the weightless standalone top. Drop keys the standalone emitter has no use for
+        # the const_weights standalone top. Drop keys the standalone emitter has no use for
         # (e.g. gemm_k_spatial — a spatial-partition knob for the RTL targets, not the
         # behavioral one) so the config-driven and unit paths share one entry point.
         weight_matrix = cfg.pop("weight_matrix", None)

@@ -69,7 +69,7 @@ def _normalize_mvau_items(cfg):
             "simd": it.get("simd"),
             "k_tiles": it.get("k_tiles"),
             "has_bias": bool(it.get("has_bias", True)),
-            # Two-operand (runtime-B) nodes: B beat order. Absent for weightless items.
+            # Two-operand (runtime-B) nodes: B beat order. Absent for const_weights items.
             "second_operand_row_major": it.get("second_operand_row_major"),
         }
     if isinstance(cfg, list):

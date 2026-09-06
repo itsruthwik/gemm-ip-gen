@@ -4,7 +4,7 @@ Deterministic small-integer stimulus (exactly representable, no overflow for the
 default precisions), a double golden reference, and a 0.5 tolerance compare. The
 top's return code is what Vitis ``csim_design`` checks: 0 = pass.
 
-For weightless packages the golden reads the same baked ROM the IP uses
+For const_weights packages the golden reads the same baked ROM the IP uses
 (``<name>_weight_cols_rom`` from ``<name>_weights.h``), so it matches by
 construction regardless of the baked values.
 """
@@ -27,7 +27,7 @@ def _prototype(name, m, k, n, interface, weights_in_core):
 
 def _call_and_fill(name, m, k, n, interface, weights_in_core):
     """The stimulus/fill + top call, leaving results in `results[M]` (res_row_t)."""
-    # Weighted builds b_cols from b_val; weightless reads the baked ROM for golden.
+    # Weighted builds b_cols from b_val; const_weights reads the baked ROM for golden.
     if interface == "array" and not weights_in_core:
         return f"""    {name}_a_row_t a_rows[{m}];
     {name}_b_col_t b_cols[{n}];
@@ -70,7 +70,7 @@ def _call_and_fill(name, m, k, n, interface, weights_in_core):
     {name}_res_row_t results[{m}];
     for (int mm = 0; mm < {m}; mm++) results[mm] = res_stream.read();
 """
-    # stream + weightless
+    # stream + const_weights
     return f"""    hls::stream<{name}_a_row_t> a_stream("a");
     hls::stream<{name}_res_row_t> res_stream("r");
     {name}_config::bias_t biases[{n}];
@@ -88,10 +88,10 @@ def _call_and_fill(name, m, k, n, interface, weights_in_core):
 
 def tb_cpp(name, m, k, n, interface="array", weights_in_core=False):
     inc_w = f'#include "{name}_weights.h"\n' if weights_in_core else ""
-    # golden's B: weightless reads the baked ROM; weighted uses b_val (same as fill).
+    # golden's B: const_weights reads the baked ROM; weighted uses b_val (same as fill).
     b_ref = (f"(double){name}_weight_cols_rom[nn][kk]"
              if weights_in_core else "b_val(kk, nn)")
-    wl_label = " weightless" if weights_in_core else ""
+    wl_label = " const_weights" if weights_in_core else ""
     return f"""#include <cstdio>
 #include <cmath>
 #include <hls_stream.h>

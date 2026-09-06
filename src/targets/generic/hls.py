@@ -2,7 +2,7 @@
 
 No RTL blackbox / hardblock: these emit plain synthesizable C++ that Vitis HLS
 turns into RTL. The four entry points mirror the hls4ml Vitis seam
-(``nnet::gemm_{stream,stream_weightless,array,array_weightless}``) and are the
+(``nnet::gemm_{stream,stream_const_weights,array,array_const_weights}``) and are the
 behavioral triple-loop from ``nnet_gemm_behavioral.h`` promoted to synthesizable
 form (HLS pragmas, ``ap_fixed`` arithmetic, ``nnet::array`` beats, per-shape
 ``CONFIG_T``). One templated definition covers every shape.
@@ -53,7 +53,7 @@ def _ap_type(precision, default):
 # synthesize the same RTL:
 #   - Latency  (reuse_factor=1): II=1, multiplier_limit=gemm_k*gemm_n -> full array.
 #   - Resource (reuse_factor=R): II=R, multiplier_limit=ceil(gemm_k*gemm_n/R) -> shared.
-# The only difference from the combined funcs is the signature: here the weightless
+# The only difference from the combined funcs is the signature: here the const_weights
 # entries take the weight ROM as an explicit argument (the standalone top feeds it from
 # <name>_weights.h) rather than sourcing it from CONFIG_T::gemm_weight_cols().
 _GEMM_IP_FUNCS = r"""
@@ -82,11 +82,11 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
     }
 }
 
-// gemm_array_weightless — io_parallel, weights baked into the IP. The weight ROM
+// gemm_array_const_weights — io_parallel, weights baked into the IP. The weight ROM
 // is passed in by the top from <name>_weights.h (not an external port, and not
 // routed through CONFIG_T).
 template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_array_weightless(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T weight_cols[CONFIG_T::gemm_n],
+void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T weight_cols[CONFIG_T::gemm_n],
                            res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
     #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     GEMM_AWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
@@ -139,11 +139,11 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
     }
 }
 
-// gemm_stream_weightless — io_stream, weights baked into the IP. The weight ROM is
+// gemm_stream_const_weights — io_stream, weights baked into the IP. The weight ROM is
 // passed in by the top from <name>_weights.h (not a stream, not via CONFIG_T).
 // One K-wide beat per A row (data_T::size == gemm_k).
 template <class data_T, class b_col_T, class res_T, typename CONFIG_T>
-void gemm_stream_weightless(hls::stream<data_T> &data_stream, b_col_T weight_cols[CONFIG_T::gemm_n],
+void gemm_stream_const_weights(hls::stream<data_T> &data_stream, b_col_T weight_cols[CONFIG_T::gemm_n],
                             hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
     static_assert(data_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
@@ -225,9 +225,9 @@ def gemm_ip_header(name):
 # definition that covers every layer, so there is no per-core dispatch: the four
 # entry points below ARE the combined header. Their signatures match the hls4ml
 # contract exactly (the "declaration only" prototypes in nnet_gemm_ip.h /
-# nnet_gemm_stream.h): the weightless entries take NO weight argument and source the
+# nnet_gemm_stream.h): the const_weights entries take NO weight argument and source the
 # constant columns from CONFIG_T::gemm_weight_cols() (the ROM the writer injects into
-# each layer's CONFIG_T), and gemm_stream_weightless unpacks narrow input beats into a
+# each layer's CONFIG_T), and gemm_stream_const_weights unpacks narrow input beats into a
 # gemm_k-wide row. Header-only + synthesizable -> no add_files (see sources tcl).
 #
 # Microarchitecture (mirrors hls4ml's nnet_dense_latency): each streamed/array A row
@@ -265,10 +265,10 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
     }
 }
 
-// gemm_array_weightless — io_parallel, constant operand held by the IP. No weight
+// gemm_array_const_weights — io_parallel, constant operand held by the IP. No weight
 // argument: the columns come from CONFIG_T::gemm_weight_cols() (contract signature).
 template <class a_row_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_array_weightless(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m],
+void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m],
                            bias_T biases[CONFIG_T::gemm_n]) {
     #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     typename CONFIG_T::weight_col_t *weight_cols = CONFIG_T::gemm_weight_cols();
@@ -322,12 +322,12 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
     }
 }
 
-// gemm_stream_weightless — io_stream, constant operand held by the IP. No weight
+// gemm_stream_const_weights — io_stream, constant operand held by the IP. No weight
 // argument (contract signature): columns come from CONFIG_T::gemm_weight_cols(). The
 // input may arrive as several narrower beats (gemm_k / data_T::size) that are packed
 // into a gemm_k-wide row, mirroring the hls4ml behavioral entry.
 template <class data_T, class res_T, typename CONFIG_T>
-void gemm_stream_weightless(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream,
+void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream,
                             typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
     #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
@@ -440,7 +440,7 @@ def weights_header(name, m, k, n, weight_matrix):
 #include "{name}_config.h"
 
 // Weight-stationary ROM: column-major, weight_cols[n][k] == B[k][n]. The top feeds
-// this array into the weightless entry point (weights are the IP's own, baked here).
+// this array into the const_weights entry point (weights are the IP's own, baked here).
 static {name}_b_col_t {name}_weight_cols_rom[{n}] = {{
 {rom}
 }};
@@ -474,7 +474,7 @@ def top_cpp(name, m, k, n, interface="array", weights_in_core=False):
     {name}_res_row_t results[{m}],
     {name}_config::bias_t biases[{n}]
 ) {{
-    nnet::gemm_array_weightless<{name}_a_row_t, {name}_b_col_t, {name}_config::bias_t,
+    nnet::gemm_array_const_weights<{name}_a_row_t, {name}_b_col_t, {name}_config::bias_t,
                                 {name}_res_row_t, {name}_config>(
         a_rows, {name}_weight_cols_rom, results, biases);
 }}
@@ -496,7 +496,7 @@ def top_cpp(name, m, k, n, interface="array", weights_in_core=False):
     hls::stream<{name}_res_row_t> &res_stream,
     {name}_config::bias_t biases[{n}]
 ) {{
-    nnet::gemm_stream_weightless<{name}_a_row_t, {name}_b_col_t, {name}_res_row_t, {name}_config>(
+    nnet::gemm_stream_const_weights<{name}_a_row_t, {name}_b_col_t, {name}_res_row_t, {name}_config>(
         a_stream, {name}_weight_cols_rom, res_stream, biases);
 }}
 """

@@ -216,12 +216,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         bcols_bb_xor = ""
         bcols_run_arg = ""
         bbuf_src = "B_ROM[cc_slot[wr_slot]]"
-        brom_decl = _weightless_brom_cpp(b_bits, grid_cols, total_beats, weight_rom)
+        brom_decl = _const_weights_brom_cpp(b_bits, grid_cols, total_beats, weight_rom)
         stream_bcols_decl = ""
         # Full-K weight-stationary: the IP holds B, so the feed packs no B beat at all.
         stream_bcols_pack_full_k = ""
         stream_bcols_pack = ""
-        # Array feed loop, weightless: no b_cols decl / pack / run-arg (weights in ROM).
+        # Array feed loop, const_weights: no b_cols decl / pack / run-arg (weights in ROM).
         array_bcols_decl = ""
         array_bcols_run_arg = ""
         array_bcols_pack_full_k = ""
@@ -486,9 +486,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
 
     # Merged feed+drain array loop, parameterised over weight-stationarity the same way
     # the stream feed loop is: two-stream packs weight_cols into b_cols_packed and passes
-    # it to run(); weightless drops all three b_cols inserts (decl/pack/run-arg) because
+    # it to run(); const_weights drops all three b_cols inserts (decl/pack/run-arg) because
     # the ccore holds B in its ROM. One loop serves both the _gemm_ip_array (two-stream)
-    # and _gemm_ip_array_weightless entries.
+    # and _gemm_ip_array_const_weights entries.
     if full_k_spatial:
         array_feed_loop = f"""
     // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats} preload then
@@ -561,16 +561,16 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
 """
 
     if weights_in_core:
-        # Weight-stationary: the self-contained weightless STREAM entry plus the
-        # weightless ARRAY entry (io_parallel). Neither references an external b_cols;
+        # Weight-stationary: the self-contained const_weights STREAM entry plus the
+        # const_weights ARRAY entry (io_parallel). Neither references an external b_cols;
         # weights live in the csim B_ROM (baked above) and the RTL wrapper ROM.
         entries_block = f"""\
 // Weight-stationary (const-weight) entry: A only, no weight argument. Synthesis
-// binds gemm.run to the weightless RTL core (weights in the wrapper ROM); csim
+// binds gemm.run to the const_weights RTL core (weights in the wrapper ROM); csim
 // uses the ccore's internal B_ROM (same .dat-sourced beats). No frontend weight
 // accessor is involved.
 template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void {name}_gemm_ip_stream_weightless(
+void {name}_gemm_ip_stream_const_weights(
     ac_channel<a_beat_T> &a_stream,
     bias_T biases[CONFIG_T::gemm_n],
     ac_channel<res_T> &res_stream
@@ -602,10 +602,10 @@ void {name}_gemm_ip_stream_weightless(
 
 // Weight-stationary ARRAY entry (io_parallel): array in / array out, weights in
 // the core. Direct feed — A rows go straight into gemm.run() (no b_cols, weights
-// from the ROM), mirroring the two-stream _gemm_ip_array but weightless. Channel-
+// from the ROM), mirroring the two-stream _gemm_ip_array but const_weights. Channel-
 // free, so it synthesises (a channel bridge to the stream entry hits HIER-11).
 template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void {name}_gemm_ip_array_weightless(
+void {name}_gemm_ip_array_const_weights(
     a_beat_T a_rows[CONFIG_T::gemm_m],
     bias_T biases[CONFIG_T::gemm_n],
     res_T results[CONFIG_T::gemm_m]
@@ -643,11 +643,11 @@ void {name}_gemm_ip_array_weightless(
 }}
 """
     else:
-        # Two-stream: const_weights worker + external-weight stream/array entries
+        # Two-stream: buffered-B worker + external-weight stream/array entries
         # (today's behavior). The ccore run() keeps its b_cols port.
         entries_block = f"""\
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void {name}_gemm_ip_stream_const_weights(
+void {name}_gemm_ip_stream_buffered_b(
     ac_channel<a_beat_T> &a_stream,
     b_beat_T weight_cols[CONFIG_T::gemm_n],
     bias_T biases[CONFIG_T::gemm_n],
@@ -695,7 +695,7 @@ void {name}_gemm_ip_stream(
     READ_B_COLS: for (int col = 0; col < {n}; col++) {{
         weight_cols[col] = b_stream.read();
     }}
-    {name}_gemm_ip_stream_const_weights<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
+    {name}_gemm_ip_stream_buffered_b<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
         a_stream, weight_cols, biases, res_stream);
 }}
 
@@ -963,7 +963,7 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
 #ifdef CCS_SCVERIFY
     CCS_DESIGN({name}_inst)(a_rows, biases, results);
 #else
-    nnet::{name}_gemm_ip_array_weightless<a_beat_t, int, res_t, {name}_config>(
+    nnet::{name}_gemm_ip_array_const_weights<a_beat_t, int, res_t, {name}_config>(
         a_rows, biases, results);
 #endif
 
@@ -974,7 +974,7 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
 """
     elif weights_in_core:
         # Weight-stationary stream tb: no b_stream (weights baked in core); call the
-        # weightless entry. Golden uses the same baked weights (see weights init below).
+        # const_weights entry. Golden uses the same baked weights (see weights init below).
         call_setup = f"""\
     ac_channel<a_beat_t> a_stream;
     ac_channel<res_t> res_stream;
@@ -992,7 +992,7 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
 #ifdef CCS_SCVERIFY
     CCS_DESIGN({name}_inst)(a_stream, biases, res_stream);
 #else
-    nnet::{name}_gemm_ip_stream_weightless<a_beat_t, int, res_t, {name}_config>(
+    nnet::{name}_gemm_ip_stream_const_weights<a_beat_t, int, res_t, {name}_config>(
         a_stream, biases, res_stream);
 #endif
 
@@ -1204,8 +1204,8 @@ int main() {{
 """
 
 
-def _weightless_brom_cpp(b_bits, grid_cols, total_beats, weight_rom):
-    """csim-only internal weight ROM for the weightless ccore #else branch.
+def _const_weights_brom_cpp(b_bits, grid_cols, total_beats, weight_rom):
+    """csim-only internal weight ROM for the const_weights ccore #else branch.
 
     ``weight_rom`` is the list of per-beat b_cols words (each ``b_bits`` wide) from
     ``build_weight_rom`` — the SAME beats the RTL wrapper ROM holds. Big words don't
@@ -1255,7 +1255,7 @@ def gen_inst_cpp(name, m, k, n, interface="stream",
     int biases[{n}],
     res_t results[{m}]
 ) {{
-    nnet::{name}_gemm_ip_array_weightless<a_beat_t, int, res_t, {name}_config>(
+    nnet::{name}_gemm_ip_array_const_weights<a_beat_t, int, res_t, {name}_config>(
         a_rows, biases, results);
 }}"""
     elif weights_in_core:
@@ -1264,7 +1264,7 @@ def gen_inst_cpp(name, m, k, n, interface="stream",
     int biases[{n}],
     ac_channel<res_t> &res_stream
 ) {{
-    nnet::{name}_gemm_ip_stream_weightless<a_beat_t, int, res_t, {name}_config>(
+    nnet::{name}_gemm_ip_stream_const_weights<a_beat_t, int, res_t, {name}_config>(
         a_stream, biases, res_stream);
 }}"""
     elif interface == "array":
@@ -1324,7 +1324,7 @@ void {name}_inst(
 def gen_tcl(name, m, k, n, interface="stream", weights_in_core=False):
     # Map each top-level port to a ccs_ioport resource. The resource name is the
     # top argument's variable name, so the map MUST track the four signatures'
-    # actual ports: the weightless tops carry NO B operand (weights live in the
+    # actual ports: the const_weights tops carry NO B operand (weights live in the
     # core ROM), and the array top's operands are a_rows / weight_cols. A directive
     # on a non-existent port fails the Catapult run, so we emit exactly the ports
     # the standalone top declares.
@@ -1426,30 +1426,30 @@ def _dispatch_condition(item):
 def gen_combined_header(items):
     includes = "\n".join(f'#include "{item["name"]}/{item["name"]}_gemm_ip.h"' for item in items)
     stream_branches = []
-    const_weight_stream_branches = []
+    buffered_b_stream_branches = []
     array_branches = []
-    weightless_branches = []
-    array_weightless_branches = []
+    const_weights_branches = []
+    array_const_weights_branches = []
     for item in items:
         target = item.get("interface", "stream")
-        # Weight-stationary items emit ONLY the weightless entry (A-only; weights in
-        # the core ROM). Their package has no _gemm_ip_stream / _const_weights /
+        # Weight-stationary items emit ONLY the const_weights entry (A-only; weights in
+        # the core ROM). Their package has no _gemm_ip_stream / _buffered_b /
         # _array functions, so referencing those in the other dispatchers would be an
         # undeclared-identifier error (non-dependent name, checked even in a discarded
         # `if constexpr` branch). Route each item to exactly the dispatchers whose
         # per-core function its package actually emits.
         if item.get("weights_in_core"):
-            # Weight-stationary packages emit BOTH the stream and array weightless
+            # Weight-stationary packages emit BOTH the stream and array const_weights
             # entries (shared RTL core), so route each item's shape to both
             # dispatchers — io_stream layers reach the stream one, io_parallel the array.
-            weightless_branches.append(f"""\
+            const_weights_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_stream_weightless<a_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
+        {item["name"]}_gemm_ip_stream_const_weights<a_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
             a_stream, biases, res_stream);
     }}""")
-            array_weightless_branches.append(f"""\
+            array_const_weights_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_array_weightless<a_beat_T, bias_T, res_T, CONFIG_T>(
+        {item["name"]}_gemm_ip_array_const_weights<a_beat_T, bias_T, res_T, CONFIG_T>(
             a_rows, biases, results);
     }}""")
             continue
@@ -1458,13 +1458,13 @@ def gen_combined_header(items):
         {item["name"]}_gemm_ip_{target}<a_beat_T, b_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
             TARGET_ARGS);
     }}"""
-        # The const-weight stream wrapper is emitted by every two-stream package
+        # The buffered-B stream wrapper is emitted by every two-stream package
         # (regardless of its declared interface), so route every such item's shape to
-        # it — the einsum GEMM uses the const-weight stream path for QKt/A.V even
+        # it — the einsum GEMM uses the buffered-B stream path for QKt/A.V even
         # though its package item is registered with interface="array".
-        const_weight_stream_branches.append(f"""\
+        buffered_b_stream_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_stream_const_weights<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
+        {item["name"]}_gemm_ip_stream_buffered_b<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
             a_stream, weight_cols, biases, res_stream);
     }}""")
         # Every two-stream package also emits _gemm_ip_array; the io_stream einsum's
@@ -1478,7 +1478,7 @@ def gen_combined_header(items):
         if target != "array":
             stream_branches.append(branch.replace("TARGET_ARGS", "a_stream, b_stream, biases, res_stream"))
     stream_branches_text = " else ".join(stream_branches)
-    const_weight_stream_branches_text = " else ".join(const_weight_stream_branches)
+    buffered_b_stream_branches_text = " else ".join(buffered_b_stream_branches)
     array_branches_text = " else ".join(array_branches)
     if not stream_branches_text:
         stream_branches_text = """\
@@ -1489,14 +1489,14 @@ def gen_combined_header(items):
         static_assert(CONFIG_T::gemm_m == 0,
                       "No generated stream GEMM IP implementation matches this CONFIG_T.");
     }"""
-    if not const_weight_stream_branches_text:
-        const_weight_stream_branches_text = """\
+    if not buffered_b_stream_branches_text:
+        buffered_b_stream_branches_text = """\
     static_assert(CONFIG_T::gemm_m == 0,
-                  "No generated const-weight stream GEMM IP implementation is present in this package.");"""
+                  "No generated buffered-B stream GEMM IP implementation is present in this package.");"""
     else:
-        const_weight_stream_branches_text += """ else {
+        buffered_b_stream_branches_text += """ else {
         static_assert(CONFIG_T::gemm_m == 0,
-                      "No generated const-weight stream GEMM IP implementation matches this CONFIG_T.");
+                      "No generated buffered-B stream GEMM IP implementation matches this CONFIG_T.");
     }"""
     if not array_branches_text:
         array_branches_text = """\
@@ -1507,23 +1507,23 @@ def gen_combined_header(items):
         static_assert(CONFIG_T::gemm_m == 0,
                       "No generated array GEMM IP implementation matches this CONFIG_T.");
     }"""
-    weightless_branches_text = " else ".join(weightless_branches)
-    if not weightless_branches_text:
-        weightless_branches_text = """\
+    const_weights_branches_text = " else ".join(const_weights_branches)
+    if not const_weights_branches_text:
+        const_weights_branches_text = """\
     static_assert(CONFIG_T::gemm_m == 0,
                   "No generated weight-stationary GEMM IP implementation is present in this package.");"""
     else:
-        weightless_branches_text += """ else {
+        const_weights_branches_text += """ else {
         static_assert(CONFIG_T::gemm_m == 0,
                       "No generated weight-stationary GEMM IP implementation matches this CONFIG_T.");
     }"""
-    array_weightless_branches_text = " else ".join(array_weightless_branches)
-    if not array_weightless_branches_text:
-        array_weightless_branches_text = """\
+    array_const_weights_branches_text = " else ".join(array_const_weights_branches)
+    if not array_const_weights_branches_text:
+        array_const_weights_branches_text = """\
     static_assert(CONFIG_T::gemm_m == 0,
                   "No generated weight-stationary array GEMM IP implementation is present in this package.");"""
     else:
-        array_weightless_branches_text += """ else {
+        array_const_weights_branches_text += """ else {
         static_assert(CONFIG_T::gemm_m == 0,
                       "No generated weight-stationary array GEMM IP implementation matches this CONFIG_T.");
     }"""
@@ -1546,13 +1546,13 @@ void gemm_stream(
 {stream_branches_text}
 }}
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void gemm_ip_stream_const_weights(
+void gemm_ip_stream_buffered_b(
     ac_channel<a_beat_T> &a_stream,
     b_beat_T weight_cols[CONFIG_T::gemm_n],
     bias_T biases[CONFIG_T::gemm_n],
     ac_channel<res_T> &res_stream
 ) {{
-{const_weight_stream_branches_text}
+{buffered_b_stream_branches_text}
 }}
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
 void gemm_array(
@@ -1565,21 +1565,21 @@ void gemm_array(
 }}
 
 template <class a_beat_T, class res_T, typename CONFIG_T>
-void gemm_stream_weightless(
+void gemm_stream_const_weights(
     ac_channel<a_beat_T> &a_stream,
     ac_channel<res_T> &res_stream,
     typename CONFIG_T::bias_t biases[CONFIG_T::n_out]
 ) {{
-{weightless_branches_text}
+{const_weights_branches_text}
 }}
 
 template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
-void gemm_array_weightless(
+void gemm_array_const_weights(
     a_beat_T a_rows[CONFIG_T::gemm_m],
     res_T results[CONFIG_T::gemm_m],
     bias_T biases[CONFIG_T::gemm_n]
 ) {{
-{array_weightless_branches_text}
+{array_const_weights_branches_text}
 }}
 
 template <class data_T, class weight_T, class bias_T, class res_T, typename CONFIG_T>
@@ -1616,7 +1616,7 @@ void gemm_ip_stream_sim(
         }}
     }}
 
-    gemm_ip_stream_const_weights<a_beat_t, b_beat_t, bias_T, res_T, CONFIG_T>(
+    gemm_ip_stream_buffered_b<a_beat_t, b_beat_t, bias_T, res_T, CONFIG_T>(
         a_beat_stream, weight_cols, biases, res_stream);
 }}
 
