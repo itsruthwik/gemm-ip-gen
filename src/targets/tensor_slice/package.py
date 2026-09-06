@@ -322,7 +322,14 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
             captured++;
         }}"""
     stream_capture = _capture_body.replace("%SINK%", "res_stream.write(out_pack);")
-    array_capture = _capture_body.replace("%SINK%", "results[captured] = out_pack;")
+    # Element-wise, unrolled: `results[captured] = out_pack` would call
+    # nnet::array::operator=, whose copy loop is NOT unrolled in Catapult's
+    # nnet_types.h. A rolled loop inside the II=1 run loop is an unschedulable
+    # feedback path (SCHD-3 "feedback path too long") for every io_parallel build.
+    array_capture = _capture_body.replace("%SINK%", f"""#pragma hls_unroll
+                for (int col = 0; col < {n}; col++) {{
+                    results[captured][col] = out_pack[col];
+                }}""")
 
     # Back-to-back capture: identical body but the row budget spans all frames
     # (n_frames * m rows emerge across the run, retiring in frame order).
