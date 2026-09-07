@@ -50,6 +50,9 @@ def main():
                         help="mvau: N tiles (spatial, concatenated).")
     parser.add_argument("--reuse-factor", type=int, default=None,
                         help="mvau: ReuseFactor (per-vector cycle target) when --pe/--simd are unset.")
+    parser.add_argument("--strategy", type=str, default="latency",
+                        help="generic target: GEMM kernel strategy, 'latency' (default) "
+                             "or 'resource' (case-insensitive); validated where consumed.")
     parser.add_argument("--part", type=str, default=None,
                         help="FPGA part (selects the DSP core; e.g. xcve2802... -> DSP58).")
     parser.add_argument("--weight-precision", type=str, default="fixed<8,4>",
@@ -167,6 +170,7 @@ def _run(args):
             "k_tiles": args.k_tiles,
             "n_tiles": args.n_tiles,
             "reuse_factor": args.reuse_factor,
+            "strategy": args.strategy,
             "weights_in_core": not args.two_operand,
             # dual-operand needs B row-major; harmless for the weight-stationary path.
             "second_operand_row_major": True if args.two_operand else None,

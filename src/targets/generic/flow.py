@@ -107,9 +107,9 @@ class GenericTarget(Target):
         return _normalize_config_items(cfg)
 
     def combined_header(self, items):
-        # Shape-generic: one templated definition covers every layer, so the items
-        # only confirm there is work to do — the header content is the same regardless.
-        return _hls.combined_header()
+        # Shape-generic: one templated definition covers every layer. items drives
+        # the compile-time gemm_strategy<id> dispatch (latency vs resource per layer).
+        return _hls.combined_header(items)
 
     def integration_manifest(self, items):
         import json

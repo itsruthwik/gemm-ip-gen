@@ -51,7 +51,7 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
     (pkg_dir / "nnet_types.h").write_text(_hls.nnet_types_header())
-    (pkg_dir / f"{name}_gemm_ip.h").write_text(_hls.gemm_ip_header(name))
+    (pkg_dir / f"{name}_gemm_ip.h").write_text(_hls.gemm_ip_header(name, strategy=strategy))
     (pkg_dir / f"{name}_config.h").write_text(_hls.config_header(
         name, m, k, n,
         input_precision=input_precision, weight_precision=weight_precision,
