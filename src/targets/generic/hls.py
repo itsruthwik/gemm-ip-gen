@@ -198,6 +198,9 @@ void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::
     const int block_factor = (nin * nout + rufactor - 1) / rufactor;
     const int multscale = multiplier_limit / nout;
 
+    #pragma HLS INLINE off
+    #pragma HLS function_instantiate variable=weight_cols,biases
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     typename CONFIG_T::accum_t acc[CONFIG_T::gemm_n];
     #pragma HLS ARRAY_PARTITION variable=acc complete
 
@@ -241,6 +244,9 @@ void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[CONFIG
     const int rufactor = CONFIG_T::reuse_factor < nin * nout ? CONFIG_T::reuse_factor : nin * nout;
     const int block_factor = (nin * nout + CONFIG_T::reuse_factor - 1) / CONFIG_T::reuse_factor;
 
+    #pragma HLS INLINE off
+    #pragma HLS function_instantiate variable=weight_cols,biases
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     typename CONFIG_T::accum_t acc[CONFIG_T::gemm_n];
     #pragma HLS ARRAY_PARTITION variable=acc complete
 
@@ -292,6 +298,9 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::g
     const int multiplier_limit = (nin * nout + multfactor - 1) / multfactor;
     const int block_factor = (nin * nout + rufactor - 1) / rufactor;
 
+    #pragma HLS INLINE off
+    #pragma HLS function_instantiate variable=weight_cols,biases
+    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
     typename CONFIG_T::accum_t acc[CONFIG_T::gemm_n];
     #pragma HLS ARRAY_PARTITION variable=acc complete
 
@@ -359,7 +368,7 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::g
 template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_row_resource(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::gemm_n],
                         bias_T biases[CONFIG_T::gemm_n], res_row_T &c_row) {
-    #pragma HLS INLINE recursive
+    #pragma HLS INLINE off
     if (CONFIG_T::reuse_factor <= CONFIG_T::gemm_k) {
         gemm_row_resource_rf_leq_nin<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T>(
             a_row, weight_cols, biases, c_row);
