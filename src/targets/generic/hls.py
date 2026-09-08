@@ -7,37 +7,34 @@ behavioral triple-loop from ``nnet_gemm_behavioral.h`` promoted to synthesizable
 form (HLS pragmas, ``ap_fixed`` arithmetic, ``nnet::array`` beats, per-shape
 ``CONFIG_T``). One templated definition covers every shape.
 
-Two bias contracts, four kernel bodies
----------------------------------------
-This module carries two families of the same four entry points
-(``gemm_array``, ``gemm_array_const_weights``, ``gemm_stream``,
-``gemm_stream_const_weights``), because the standalone self-test package and the
-hls4ml-facing combined header disagree on how a const-weight layer's bias reaches
-the kernel:
+One bias contract, one kernel body per strategy per entry shape
+-----------------------------------------------------------------
+The four entry points (``gemm_array``, ``gemm_array_const_weights``, ``gemm_stream``,
+``gemm_stream_const_weights``) have exactly one body per strategy
+(``_GEMM_IP_COMBINED_FUNCS`` latency, ``_GEMM_IP_COMBINED_RESOURCE_FUNCS`` resource),
+shared by both callers:
 
-* **Standalone contract** (``_GEMM_IP_FUNCS`` latency, ``_GEMM_IP_RESOURCE_FUNCS``
-  resource): used by ``gemm_ip_header()``/``top_cpp()`` for the unit-test package
-  built by ``generate_generic_pkg``. The const-weight entries take the baked
-  ``bias_T biases[CONFIG_T::gemm_n]`` array the standalone top wires in from
-  ``<name>_bias.h`` as an explicit function argument (there is no per-layer
-  ``CONFIG_T::gemm_ip_id``/``gemm_ip_has_bias`` trait table in this contract — a
-  standalone package is always exactly one layer).
-* **Combined contract** (``_GEMM_IP_COMBINED_FUNCS`` latency,
-  ``_GEMM_IP_COMBINED_RESOURCE_FUNCS`` resource): used by ``combined_header()``
-  for the whole-model hls4ml integration. The const-weight entries take no bias
-  argument at all -- they read ``CONFIG_T::gemm_bias()`` internally (mirroring the
-  weight ROM accessor) and gate the add on the per-``gemm_ip_id``
-  ``gemm_ip_has_bias<>`` trait, so a no-bias layer's const-weight kernel folds the
-  add away entirely. The two-operand entries in both contracts never take a bias
-  at all (a two-operand GEMM never owns one).
+* ``combined_header()`` -- the whole-model hls4ml integration -- embeds them
+  (renamed to ``*_latency_impl`` / ``*_resource_impl``) behind a
+  ``gemm_strategy<CONFIG_T::gemm_ip_id>``-keyed dispatcher, so a mixed-strategy
+  model builds both bodies once and picks per layer.
+* ``gemm_ip_header()`` -- the standalone self-test package built by
+  ``generate_generic_pkg`` -- embeds whichever one body its one active strategy
+  needs, under the entry points' own names (a standalone package never needs the
+  dispatcher: it is always exactly one layer, one strategy).
 
-The four bodies in each family share the ``gemm_row_resource`` regime core
-(``_GEMM_ROW_RESOURCE_CORE``) for the resource strategy; the remaining
-duplication is the per-contract signature/bias-source difference above, which a
-shared body would have to parameterize on a contract policy (bias-as-argument vs.
-bias-from-config) at the cost of the exact contract signatures the two callers
-(the standalone top and hls4ml's generated firmware) need. Kept as two textually
-independent bodies rather than adding that indirection.
+Both callers' ``CONFIG_T`` carry the same accessor contract: the const-weight
+entries take no weight/bias arguments at all, reading
+``CONFIG_T::gemm_weight_beats()`` / ``CONFIG_T::gemm_bias()`` instead (the
+standalone ``config_header()`` backs these with the same baked
+``<name>_weights.h`` / ``<name>_bias.h`` ROMs the old explicit-argument signature
+used to wire in from ``top_cpp()``), and gate the add on the same
+``gemm_ip_has_bias<CONFIG_T::gemm_ip_id>`` trait (``combined_header()`` builds one
+specialization per manifest layer; ``gemm_ip_header()`` builds the single
+specialization its one layer needs). The two-operand entries in both callers
+never take a bias at all (a two-operand GEMM never owns one) and share the
+``gemm_row_resource`` regime core (``_GEMM_ROW_RESOURCE_CORE``) for the resource
+strategy.
 """
 
 import re
@@ -74,133 +71,6 @@ def _ap_type(precision, default):
         return ("ap_uint<" if p.startswith("u") else "ap_int<") + m.group(1) + ">"
     return default
 
-
-# ── The four synthesizable entry points (shape-independent template) ─────────────
-#
-# Identical microarchitecture to the whole-model combined header (see
-# _GEMM_IP_COMBINED_FUNCS): the row (M) loop is pipelined at II=gemm_rf<CONFIG_T>::reuse_factor,
-# the N (output) and K (contraction) loops are fully UNROLLed, and the multiplier count
-# is capped by gemm_rf<CONFIG_T>::multiplier_limit. Strategy/ReuseFactor reach the core purely
-# through CONFIG_T (which config_header emits), so this standalone package and the flow
-# synthesize the same RTL:
-#   - Latency  (reuse_factor=1): II=1, multiplier_limit=gemm_k*gemm_n -> full array.
-#   - Resource (reuse_factor=R): II=R, multiplier_limit=ceil(gemm_k*gemm_n/R) -> shared.
-# The only difference from the combined funcs is the signature: here the const_weights
-# entries take the weight ROM as an explicit argument (the standalone top feeds it from
-# <name>_weights.h) rather than sourcing it from CONFIG_T::gemm_weight_cols().
-_GEMM_IP_FUNCS = r"""
-namespace nnet {
-
-// gemm_array — io_parallel, TWO activation operands (e.g. attention QK^T / A.V).
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
-                res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
-    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
-    GEMM_ARRAY_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
-        GEMM_ARRAY_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS UNROLL
-            typename CONFIG_T::accum_t accum = 0;
-            GEMM_ARRAY_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
-                #pragma HLS UNROLL
-                accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * b_cols[n][k]);
-            }
-            accum += biases[n];
-            // Write the output element directly: the io_parallel caller partitions
-            // results[] complete, and a whole-row nnet::array operator= copy under the
-            // pipelined M loop is not a transformable instruction for Vitis HLS.
-            results[m][n] = accum;
-        }
-    }
-}
-
-// gemm_array_const_weights — io_parallel, weights baked into the IP. The weight ROM
-// is passed in by the top from <name>_weights.h (not an external port, and not
-// routed through CONFIG_T).
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T weight_cols[CONFIG_T::gemm_n],
-                           res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
-    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
-    GEMM_AWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
-        GEMM_AWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS UNROLL
-            typename CONFIG_T::accum_t accum = 0;
-            GEMM_AWL_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
-                #pragma HLS UNROLL
-                accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * weight_cols[n][k]);
-            }
-            accum += biases[n];
-            // Direct element write (see gemm_array): avoids the whole-row operator=
-            // copy that Vitis cannot transform under complete partition + pipelined M.
-            results[m][n] = accum;
-        }
-    }
-}
-
-// gemm_stream — io_stream, TWO activation operands. B is read into local storage
-// (operand residency), then C = A * B streams out. One K-wide beat per A row.
-template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
-void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
-                 hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
-    static_assert(data0_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
-    static_assert(data1_T::size == CONFIG_T::gemm_k, "B column height must equal gemm_k.");
-    static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
-    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
-
-    data1_T b_cols[CONFIG_T::gemm_n];
-    GEMM_STREAM_READB: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-        #pragma HLS PIPELINE II=1
-        b_cols[n] = b_stream.read();
-    }
-    GEMM_STREAM_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
-        data0_T a_row = a_stream.read();
-        res_T c_row;
-        GEMM_STREAM_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS UNROLL
-            typename CONFIG_T::accum_t accum = 0;
-            GEMM_STREAM_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
-                #pragma HLS UNROLL
-                accum += (typename CONFIG_T::accum_t)(a_row[k] * b_cols[n][k]);
-            }
-            accum += biases[n];
-            c_row[n] = accum;
-        }
-        res_stream.write(c_row);
-    }
-}
-
-// gemm_stream_const_weights — io_stream, weights baked into the IP. The weight ROM is
-// passed in by the top from <name>_weights.h (not a stream, not via CONFIG_T).
-// One K-wide beat per A row (data_T::size == gemm_k).
-template <class data_T, class b_col_T, class res_T, typename CONFIG_T>
-void gemm_stream_const_weights(hls::stream<data_T> &data_stream, b_col_T weight_cols[CONFIG_T::gemm_n],
-                            hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
-    static_assert(data_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
-    static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
-    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
-
-    GEMM_SWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
-        data_T a_row = data_stream.read();
-        res_T c_row;
-        GEMM_SWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-            #pragma HLS UNROLL
-            typename CONFIG_T::accum_t accum = 0;
-            GEMM_SWL_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
-                #pragma HLS UNROLL
-                accum += (typename CONFIG_T::accum_t)(a_row[k] * weight_cols[n][k]);
-            }
-            accum += biases[n];
-            c_row[n] = accum;
-        }
-        res_stream.write(c_row);
-    }
-}
-
-} // namespace nnet
-"""
 
 
 # ── Resource-kernel per-row core (mirrors hls4ml's nnet_dense_resource.h) ─────────
@@ -433,95 +303,6 @@ void gemm_row_resource(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ? CONFIG_T:
 """
 
 
-_GEMM_IP_RESOURCE_FUNCS = r"""
-namespace nnet {
-""" + _GEMM_ROW_RESOURCE_CORE + r"""
-
-// gemm_array — io_parallel, TWO activation operands. Baseline (dense_resource) has no
-// two-operand resource kernel -- this is an extrapolation: read B is already resident
-// (b_cols is a plain argument here), so we simply run the shared per-row resource
-// core over it, treating b_cols as the weight_cols argument.
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
-                res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
-    GEMM_ARRAY_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        gemm_row_resource<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T>(
-            a_rows[m], b_cols, biases, results[m]);
-    }
-}
-
-// gemm_array_const_weights — io_parallel, weights baked into the IP (the weight ROM is
-// passed in by the top from <name>_weights.h). Mirrors baseline dense_resource's
-// weights ARRAY_RESHAPE / BIND_STORAGE (the Vitis 2020.2+ spelling of
-// `RESOURCE core=ROM_nP_BRAM`), applied to weight_cols instead of a flat weights[].
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T weight_cols[CONFIG_T::gemm_n],
-                           res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
-    const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + gemm_rf<CONFIG_T>::reuse_factor - 1)
-                              / gemm_rf<CONFIG_T>::reuse_factor;
-    #pragma HLS ARRAY_RESHAPE   variable=weight_cols block factor=block_factor
-    #pragma HLS ARRAY_PARTITION variable=biases complete
-    if (gemm_rf<CONFIG_T>::reuse_factor > 1) {
-        #pragma HLS BIND_STORAGE variable=weight_cols type=rom_np impl=bram
-    }
-    GEMM_AWL_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        gemm_row_resource<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T>(
-            a_rows[m], weight_cols, biases, results[m]);
-    }
-}
-
-// gemm_stream — io_stream, TWO activation operands. B is read into local storage
-// first (operand residency), then the same per-row resource core runs over it -- an
-// extrapolation beyond baseline (dense_resource has no two-operand kernel).
-template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
-void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
-                 hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
-    static_assert(data0_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
-    static_assert(data1_T::size == CONFIG_T::gemm_k, "B column height must equal gemm_k.");
-    static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
-
-    data1_T b_cols[CONFIG_T::gemm_n];
-    GEMM_STREAM_RES_READB: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
-        #pragma HLS PIPELINE II=1
-        b_cols[n] = b_stream.read();
-    }
-    GEMM_STREAM_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        data0_T a_row = a_stream.read();
-        res_T c_row;
-        gemm_row_resource<data0_T, data1_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
-            a_row, b_cols, biases, c_row);
-        res_stream.write(c_row);
-    }
-}
-
-// gemm_stream_const_weights — io_stream, weights baked into the IP (weight ROM passed
-// in by the top from <name>_weights.h). Same weight_cols pragmas as
-// gemm_array_const_weights above.
-template <class data_T, class b_col_T, class res_T, typename CONFIG_T>
-void gemm_stream_const_weights(hls::stream<data_T> &data_stream, b_col_T weight_cols[CONFIG_T::gemm_n],
-                            hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
-    static_assert(data_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
-    static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
-    const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + gemm_rf<CONFIG_T>::reuse_factor - 1)
-                              / gemm_rf<CONFIG_T>::reuse_factor;
-    #pragma HLS ARRAY_RESHAPE   variable=weight_cols block factor=block_factor
-    #pragma HLS ARRAY_PARTITION variable=biases complete
-    if (gemm_rf<CONFIG_T>::reuse_factor > 1) {
-        #pragma HLS BIND_STORAGE variable=weight_cols type=rom_np impl=bram
-    }
-
-    GEMM_SWL_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        data_T a_row = data_stream.read();
-        res_T c_row;
-        gemm_row_resource<data_T, b_col_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
-            a_row, weight_cols, biases, c_row);
-        res_stream.write(c_row);
-    }
-}
-
-} // namespace nnet
-"""
-
 
 def nnet_types_header():
     """Minimal self-contained nnet::array<T,N> (matches hls4ml's interface)."""
@@ -571,22 +352,40 @@ template <typename CONFIG_T> struct gemm_rf {
 '''
 
 
-def gemm_ip_header(name, strategy="latency"):
+def gemm_ip_header(name, strategy="latency", has_bias=True):
     """The four synthesizable entry points (shape-generic).
 
     ``strategy`` (case-insensitive ``"latency"`` | ``"resource"``) picks which kernel
     body is embedded, textually, under the SAME four names -- a standalone package only
     ever has one active strategy, so no runtime dispatch is needed here (contrast
-    ``combined_header``, which must support mixed strategies across layers). Latency
-    text is byte-identical to before phase 2 (embeds ``_GEMM_IP_FUNCS`` unchanged)."""
+    ``combined_header``, which must support mixed strategies across layers).
+
+    Embeds the exact same kernel bodies the whole-model combined header uses
+    (``_GEMM_IP_COMBINED_FUNCS`` / ``_GEMM_IP_COMBINED_RESOURCE_FUNCS``) -- there is
+    only one contract now: bias comes from ``CONFIG_T::gemm_bias()`` (which
+    ``config_header()`` backs with the baked ``<name>_bias_rom``) and, for the
+    const-weight entries, the weight ROM comes from ``CONFIG_T::gemm_weight_beats()``
+    the same way. ``has_bias`` (default True, matching the previous always-add
+    behavior of this standalone self-test path) picks whether the one
+    ``gemm_ip_id`` this package defines gets a ``gemm_ip_has_bias`` specialization
+    of ``false`` -- exactly the trait the combined header's const-weight kernels
+    gate on, so a standalone package generated with ``has_bias=False`` proves the
+    same no-add code path a whole-model build would take for that layer."""
     s = str(strategy).lower()
     if s == "latency":
-        funcs = _GEMM_IP_FUNCS
+        funcs = _GEMM_IP_COMBINED_FUNCS
     elif s == "resource":
-        funcs = _GEMM_IP_RESOURCE_FUNCS
+        funcs = _GEMM_IP_COMBINED_RESOURCE_FUNCS
     else:
         raise ValueError(f"generic target: unsupported strategy '{strategy}' "
                           "(expected 'latency' or 'resource')")
+    has_bias_trait = (
+        "namespace nnet {\n"
+        "template <unsigned id> struct gemm_ip_has_bias { static const bool value = true; };\n"
+        + ("" if has_bias else
+           "template <> struct gemm_ip_has_bias<0> { static const bool value = false; };\n")
+        + "} // namespace nnet\n"
+    )
     return (
         f"#ifndef {name.upper()}_GEMM_IP_H_\n"
         f"#define {name.upper()}_GEMM_IP_H_\n\n"
@@ -595,6 +394,7 @@ def gemm_ip_header(name, strategy="latency"):
         "#include <hls_stream.h>\n"
         '#include "nnet_types.h"\n'
         f"{_GEMM_RF_PASSTHROUGH}\n"
+        f"{has_bias_trait}\n"
         f"{funcs}\n"
         f"#endif // {name.upper()}_GEMM_IP_H_\n"
     )
@@ -1060,7 +860,17 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res
 def config_header(name, m, k, n, input_precision=None, weight_precision=None,
                   output_precision=None, bias_precision=None, accum_precision=None,
                   weights_in_core=False, strategy="latency", reuse_factor=1):
-    """Per-shape config struct + beat typedefs."""
+    """Per-shape config struct + beat typedefs.
+
+    Exposes ``gemm_bias()`` (and, when ``weights_in_core``, ``gemm_weight_beats()``)
+    on the config struct -- the same compile-time-constant accessor contract the
+    whole-model combined header's CONFIG_T carries -- so the single shared kernel
+    body in ``gemm_ip_header()`` can source bias/weights from CONFIG_T exactly like
+    the combined header does. ``{name}_bias.h`` (and ``{name}_weights.h``) are
+    included from inside this header, right after the typedefs they need
+    (``{name}_bias_t`` / ``{name}_b_col_t``); those files also include this one, but
+    the include guard makes the round trip a no-op, so ordering is inconsequential
+    at the call site (``top_cpp`` no longer needs to include them itself)."""
     strat = str(strategy).lower()
     if strat not in ("latency", "resource"):
         raise ValueError(f"generic target: unsupported strategy '{strategy}' "
@@ -1073,6 +883,11 @@ def config_header(name, m, k, n, input_precision=None, weight_precision=None,
     result_t = _ap_type(output_precision, "ap_fixed<16,6>")
     bias_t = _ap_type(bias_precision, result_t)
     accum_t = _ap_type(accum_precision, "ap_fixed<32,12>")
+    weights_inc = f'#include "{name}_weights.h"\n' if weights_in_core else ""
+    weight_accessor = (
+        f"    static weight_beat_t *gemm_weight_beats() {{ return {name}_weight_cols_rom; }}\n"
+        if weights_in_core else ""
+    )
     return f"""#ifndef {name.upper()}_CONFIG_H_
 #define {name.upper()}_CONFIG_H_
 
@@ -1089,6 +904,8 @@ typedef nnet::array<{name}_input_t, {k}> {name}_a_row_t;
 typedef nnet::array<{name}_weight_t, {k}> {name}_b_col_t;
 typedef nnet::array<{name}_result_t, {n}> {name}_res_row_t;
 
+#include "{name}_bias.h"
+{weights_inc}
 struct {name}_config {{
     static const unsigned n_in      = {k};
     static const unsigned n_out     = {n};
@@ -1096,13 +913,23 @@ struct {name}_config {{
     static const unsigned gemm_m    = {m};
     static const unsigned gemm_k    = {k};
     static const unsigned gemm_n    = {n};
+    // A standalone package is always exactly one layer -- gemm_ip_id is fixed at 0
+    // purely so the shared kernel bodies' gemm_ip_has_bias<CONFIG_T::gemm_ip_id>
+    // lookup (see gemm_ip_header()) has something to key on; there is no
+    // multi-layer dispatch here (contrast the combined header's per-layer ids).
+    static const unsigned gemm_ip_id = 0;
     static const bool transpose_weights = true;
+    static const bool weights_row_major = false;
     static const unsigned reuse_factor = {rf};
     static const unsigned multiplier_limit = {mult_limit};
     static const unsigned strategy = {strategy_const};
     typedef {name}_bias_t bias_t;
     typedef {accum_t} accum_t;
-}};
+    typedef {name}_weight_t weight_t;
+    typedef {name}_b_col_t weight_beat_t;
+
+    static bias_t *gemm_bias() {{ return {name}_bias_rom; }}
+{weight_accessor}}};
 
 #endif // {name.upper()}_CONFIG_H_
 """
@@ -1160,16 +987,15 @@ static {name}_b_col_t {name}_weight_cols_rom[{n}] = {{
 def top_cpp(name, m, k, n, interface="array", weights_in_core=False):
     """The Vitis synthesis top (set_top) that calls the chosen entry point.
 
-    Bias is a baked ROM (see ``bias_header``), referenced directly here -- never a
-    function argument -- so it never appears as a top-level port, the same
-    treatment the weight-stationary ROM already gets.
+    Bias and (for a const-weight layer) the weight ROM are baked constants (see
+    ``bias_header`` / ``weights_header``) the kernel itself reads through
+    ``CONFIG_T::gemm_bias()`` / ``CONFIG_T::gemm_weight_beats()`` -- the same
+    accessor contract ``combined_header()`` uses -- so neither is a function
+    argument here, and neither ever appears as a top-level port.
     """
-    inc_w = f'#include "{name}_weights.h"\n' if weights_in_core else ""
     head = (
         f'#include "{name}_config.h"\n'
         f'#include "{name}_gemm_ip.h"\n'
-        f'#include "{name}_bias.h"\n'
-        f"{inc_w}\n"
     )
     if interface == "array" and not weights_in_core:
         return head + f"""void {name}(
@@ -1177,8 +1003,8 @@ def top_cpp(name, m, k, n, interface="array", weights_in_core=False):
     {name}_b_col_t b_cols[{n}],
     {name}_res_row_t results[{m}]
 ) {{
-    nnet::gemm_array<{name}_a_row_t, {name}_b_col_t, {name}_config::bias_t,
-                     {name}_res_row_t, {name}_config>(a_rows, b_cols, results, {name}_bias_rom);
+    nnet::gemm_array<{name}_a_row_t, {name}_b_col_t, {name}_res_row_t, {name}_config>(
+        a_rows, b_cols, results);
 }}
 """
     if interface == "array" and weights_in_core:
@@ -1186,9 +1012,8 @@ def top_cpp(name, m, k, n, interface="array", weights_in_core=False):
     {name}_a_row_t a_rows[{m}],
     {name}_res_row_t results[{m}]
 ) {{
-    nnet::gemm_array_const_weights<{name}_a_row_t, {name}_b_col_t, {name}_config::bias_t,
-                                {name}_res_row_t, {name}_config>(
-        a_rows, {name}_weight_cols_rom, results, {name}_bias_rom);
+    nnet::gemm_array_const_weights<{name}_a_row_t, {name}_res_row_t, {name}_config>(
+        a_rows, results);
 }}
 """
     if interface == "stream" and not weights_in_core:
@@ -1198,7 +1023,7 @@ def top_cpp(name, m, k, n, interface="array", weights_in_core=False):
     hls::stream<{name}_res_row_t> &res_stream
 ) {{
     nnet::gemm_stream<{name}_a_row_t, {name}_b_col_t, {name}_res_row_t, {name}_config>(
-        a_stream, b_stream, res_stream, {name}_bias_rom);
+        a_stream, b_stream, res_stream);
 }}
 """
     # stream + weights_in_core
@@ -1206,7 +1031,7 @@ def top_cpp(name, m, k, n, interface="array", weights_in_core=False):
     hls::stream<{name}_a_row_t> &a_stream,
     hls::stream<{name}_res_row_t> &res_stream
 ) {{
-    nnet::gemm_stream_const_weights<{name}_a_row_t, {name}_b_col_t, {name}_res_row_t, {name}_config>(
-        a_stream, {name}_weight_cols_rom, res_stream, {name}_bias_rom);
+    nnet::gemm_stream_const_weights<{name}_a_row_t, {name}_res_row_t, {name}_config>(
+        a_stream, res_stream);
 }}
 """

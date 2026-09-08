@@ -81,12 +81,16 @@ def _call_and_fill(name, m, k, n, interface, weights_in_core):
 """
 
 
-def tb_cpp(name, m, k, n, interface="array", weights_in_core=False):
+def tb_cpp(name, m, k, n, interface="array", weights_in_core=False, has_bias=True):
     inc_w = f'#include "{name}_weights.h"\n' if weights_in_core else ""
     # golden's B: const_weights reads the baked ROM; weighted uses b_val (same as fill).
     b_ref = (f"(double){name}_weight_cols_rom[nn][kk]"
              if weights_in_core else "b_val(kk, nn)")
     wl_label = " const_weights" if weights_in_core else ""
+    # A two-operand GEMM never owns a bias (the shared kernel body's gemm_array/
+    # gemm_stream never add one, matching the whole-model combined header and mvau);
+    # only a const-weight layer with has_bias can have a real add to check.
+    bias_expr = "bias_val(nn)" if (weights_in_core and has_bias) else "0.0"
     return f"""#include <cstdio>
 #include <cmath>
 #include <hls_stream.h>
@@ -98,7 +102,8 @@ def tb_cpp(name, m, k, n, interface="array", weights_in_core=False):
 
 static double a_val(int mm, int kk) {{ return (double)(((mm + kk) % 3) - 1); }}
 static double b_val(int kk, int nn) {{ return (double)(((kk + 2 * nn) % 3) - 1); }}
-// Golden reads the same baked bias ROM the top references (never a call argument).
+// Golden reads the same baked bias ROM the top references (never a call argument);
+// unused (and the include above may bake all-zero) when bias_expr is the literal 0.0.
 static double bias_val(int nn) {{ return (double){name}_bias_rom[nn]; }}
 
 int main() {{
@@ -108,7 +113,7 @@ int main() {{
         for (int nn = 0; nn < {n}; nn++) {{
             double golden = 0.0;
             for (int kk = 0; kk < {k}; kk++) golden += a_val(mm, kk) * ({b_ref});
-            golden += bias_val(nn);
+            golden += {bias_expr};
             double got = (double)results[mm][nn];
             if (std::fabs(got - golden) > 0.5) {{
                 if (errors < 20)

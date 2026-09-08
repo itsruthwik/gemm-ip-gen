@@ -56,17 +56,6 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
-    (pkg_dir / "nnet_types.h").write_text(_hls.nnet_types_header())
-    (pkg_dir / f"{name}_gemm_ip.h").write_text(_hls.gemm_ip_header(name, strategy=strategy))
-    (pkg_dir / f"{name}_config.h").write_text(_hls.config_header(
-        name, m, k, n,
-        input_precision=input_precision, weight_precision=weight_precision,
-        output_precision=output_precision, bias_precision=bias_precision,
-        accum_precision=accum_precision,
-        strategy=strategy, reuse_factor=reuse_factor))
-    if weights_in_core:
-        B = weight_matrix if weight_matrix is not None else _default_weight_matrix(k, n)
-        (pkg_dir / f"{name}_weights.h").write_text(_hls.weights_header(name, m, k, n, B))
     # Bias is always baked as a compile-time ROM (never a top-level port): the
     # manifest's real per-column values when has_bias is True, else a zero array
     # (standalone/unit generation with no manifest falls back to the TB's own
@@ -77,12 +66,36 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
         bias_values = _default_bias(n)
     else:
         bias_values = None
+    # gemm_ip_header()'s gemm_ip_has_bias<0> trait: false only when has_bias is
+    # explicitly False (the const-weight kernel then folds its bias add away
+    # entirely, matching what the manifest's combined-header path does for the
+    # same layer) -- has_bias=None (no manifest; falls back to _default_bias
+    # above) and has_bias=True both keep the trait true.
+    kernel_has_bias = has_bias is not False
+
+    (pkg_dir / "nnet_types.h").write_text(_hls.nnet_types_header())
+    (pkg_dir / f"{name}_gemm_ip.h").write_text(
+        _hls.gemm_ip_header(name, strategy=strategy, has_bias=kernel_has_bias))
+    if weights_in_core:
+        B = weight_matrix if weight_matrix is not None else _default_weight_matrix(k, n)
+        (pkg_dir / f"{name}_weights.h").write_text(_hls.weights_header(name, m, k, n, B))
     bias_t = _hls._ap_type(bias_precision, _hls._ap_type(output_precision, "ap_fixed<16,6>"))
     (pkg_dir / f"{name}_bias.h").write_text(_hls.bias_header(name, n, bias_t, bias_values))
+    # config.h itself #includes <name>_bias.h (and, when weights_in_core,
+    # <name>_weights.h) right after the typedefs they need, so its CONFIG_T can
+    # expose gemm_bias() / gemm_weight_beats() -- write it after those two files'
+    # *content* is decided above, though on-disk write order doesn't matter to the
+    # preprocessor (see config_header()'s docstring).
+    (pkg_dir / f"{name}_config.h").write_text(_hls.config_header(
+        name, m, k, n,
+        input_precision=input_precision, weight_precision=weight_precision,
+        output_precision=output_precision, bias_precision=bias_precision,
+        accum_precision=accum_precision, weights_in_core=weights_in_core,
+        strategy=strategy, reuse_factor=reuse_factor))
     (pkg_dir / f"{name}_top.cpp").write_text(
         _hls.top_cpp(name, m, k, n, interface, weights_in_core))
     (pkg_dir / f"{name}_tb.cpp").write_text(
-        _golden.tb_cpp(name, m, k, n, interface, weights_in_core))
+        _golden.tb_cpp(name, m, k, n, interface, weights_in_core, has_bias=kernel_has_bias))
     (pkg_dir / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_period_ns))
 
     print(f"Generated {pkg_dir}  (generic vitis: M={m}, K={k}, N={n}, "
