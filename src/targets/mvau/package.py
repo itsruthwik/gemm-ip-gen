@@ -1037,7 +1037,8 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
         _2op_blackbox_json(name, t, plan["n"], t["weight_width"], tiles=kt * nt,
                            resources=plan.get("resources")))
     (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
-        _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan)))
+        _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
+                                n_nodes=cfg.get("n_nodes", 6))))
     bias_in_core = bool(cfg.get("bias_in_core", False))
     (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(
         _2op_gemm_ip_header(name, plan, bias_in_core=bias_in_core)))
@@ -1174,7 +1175,8 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
         name, t, weights_in_core=True, tiles=KT * NT, resources=plan.get("resources")))
     (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
-                            bias_codes=bias_codes, baked_weights=B)))
+                            bias_codes=bias_codes, baked_weights=B,
+                            n_nodes=cfg.get("n_nodes", 6))))
     bias_in_core = bool(cfg.get("bias_in_core", True))
     ip_hdr = (_kt_gemm_ip_header(name, plan, bias_in_core=bias_in_core) if KT > 1
               else _gemm_ip_header(name, plan, weights_in_core=True, bias_in_core=bias_in_core))
@@ -1301,10 +1303,11 @@ void gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T>
 """
 
 
-def _manifest_resources(it):
-    """The cost-model ``{dsp, bram18}`` for a manifest item, or ``None`` if it can't be
-    resolved (missing shape / mapper error). Re-resolves the plan (cheap) so the manifest
-    carries the same estimate the emitted blackbox JSON does."""
+def _resolve_manifest_plan(it):
+    """Resolve the MVU plan for a manifest item, or ``None`` if it can't be resolved
+    (missing shape / mapper error). Re-resolves the plan (cheap) so the manifest carries
+    the same estimate/fold the emitted blackbox JSON does; shared by the resource,
+    reuse-factor and warning reporting below so each item is only resolved once."""
     try:
         m, k, n = int(it["m"]), int(it["k"]), int(it["n"])
     except (KeyError, TypeError, ValueError):
@@ -1315,9 +1318,19 @@ def _manifest_resources(it):
             "parallelization_factor", "n_tiles", "k_tiles", "weights",
             "weights_in_core", "name")}
     try:
-        return _resolve_plan((m, k, n), cfg).get("resources")
+        return _resolve_plan((m, k, n), cfg)
     except Exception:
         return None
+
+
+def _reuse_factor_warning(name, plan):
+    """hls4ml's ReuseFactor-snap warning text (see run_atlas_flow.py's
+    ``_snap_reuse_factor`` for the generic target), extended with what mvau actually
+    achieved for the snapped request."""
+    tile = plan["tile"]
+    return (f'WARNING: Invalid ReuseFactor={plan["requested_reuse_factor"]} in layer "{name}".'
+            f' mvau achieved ReuseFactor={plan["achieved_reuse_factor"]} '
+            f'(PE={tile["pe"]}, SIMD={tile["simd"]}, per-vector II={tile["nf"] * tile["sf"]}).')
 
 
 def gen_integration_manifest(items):
@@ -1345,11 +1358,26 @@ def gen_integration_manifest(items):
                                    for j in range(nt) for i in range(kt)]
         else:
             core["weight_data"] = [f"{nm}/rtl_static/{_dat_name(nm, ti, nt)}" for ti in range(nt)]
-        # Cost-model resource estimate {dsp, bram18} for the node (same mapper decomposition
-        # the package emitted). Best-effort: skip if the node has no resolvable shape.
-        res = _manifest_resources(it)
-        if res is not None:
-            core["resources"] = res
+        # Resolve the plan once for this item: cost-model resource estimate plus the
+        # ReuseFactor reporting (requested/achieved/snapped, PE/SIMD, per-vector II).
+        # Best-effort: skip these fields if the node has no resolvable shape.
+        plan = _resolve_manifest_plan(it)
+        if plan is not None:
+            if plan.get("resources") is not None:
+                core["resources"] = plan["resources"]
+            tile = plan["tile"]
+            core["reuse_factor_requested"] = plan["requested_reuse_factor"]
+            core["reuse_factor_achieved"] = plan["achieved_reuse_factor"]
+            core["reuse_factor_snapped"] = bool(plan["reuse_factor_snapped"])
+            core["pe"] = tile["pe"]
+            core["simd"] = tile["simd"]
+            core["ii_per_vector"] = tile["nf"] * tile["sf"]
+            if "n_tiles" in plan:
+                core["n_tiles"] = plan["n_tiles"]
+            if "k_tiles" in plan:
+                core["k_tiles"] = plan["k_tiles"]
+            if plan["reuse_factor_snapped"]:
+                print(_reuse_factor_warning(nm, plan))
         cores.append(core)
     return json.dumps({"tool": "vitis", "flow": "rtl_blackbox",
                        "header": "gemm_ip_combined.h", "cores": cores}, indent=2) + "\n"

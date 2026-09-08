@@ -183,3 +183,38 @@ def test_no_bias_omits_array(tmp_path):
     top = (pkg / "gnb_top.cpp").read_text()
     assert "gnb_bias" not in top
     assert ")raw;" in top and "(ap_int<64>)raw;" not in top  # narrowed bias-free add path
+
+
+def test_manifest_reuse_factor_snapped(tmp_path, capsys):
+    sys.path.insert(0, str(_SRC / "targets" / "mvau"))
+    import package as pkgmod
+    # (4, 6, 8): reuse_factor=3 is not NF*SF-reachable for this shape -- the fold
+    # search snaps it down to the nearest achievable II (achieved=2, PE=8, SIMD=4).
+    items = [{"name": "gemm_rf3", "m": 4, "k": 6, "n": 8, "reuse_factor": 3,
+              "weights_in_core": True}]
+    man = json.loads(pkgmod.gen_integration_manifest(items))
+    core = man["cores"][0]
+    assert core["reuse_factor_requested"] == 3
+    assert core["reuse_factor_achieved"] == 2
+    assert core["reuse_factor_snapped"] is True
+    assert core["pe"] == 8 and core["simd"] == 4
+    assert core["ii_per_vector"] == 2
+
+    out = capsys.readouterr().out
+    assert 'WARNING: Invalid ReuseFactor=3 in layer "gemm_rf3".' in out
+    assert "mvau achieved ReuseFactor=2 (PE=8, SIMD=4, per-vector II=2)." in out
+
+
+def test_manifest_reuse_factor_not_snapped(tmp_path, capsys):
+    sys.path.insert(0, str(_SRC / "targets" / "mvau"))
+    import package as pkgmod
+    items = [{"name": "gemm_rf1", "m": 4, "k": 4, "n": 4, "reuse_factor": 1,
+              "weights_in_core": True}]
+    man = json.loads(pkgmod.gen_integration_manifest(items))
+    core = man["cores"][0]
+    assert core["reuse_factor_requested"] == 1
+    assert core["reuse_factor_achieved"] == 1
+    assert core["reuse_factor_snapped"] is False
+
+    out = capsys.readouterr().out
+    assert "WARNING" not in out

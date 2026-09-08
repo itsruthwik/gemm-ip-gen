@@ -201,9 +201,15 @@ void {func_name}(hls::stream<ap_uint<{A_TOTAL}> >& a,
 """
 
 
-def _kt_tb(p, t, top_name, seed, bias_codes, B):
+def _kt_tb(p, t, top_name, seed, bias_codes, B, n_nodes=6):
     """K-tiled self-checking TB: baked weights, top ``(a, c)`` with one wide ``KT*AB``
-    activation beat per vector. Independent full-K golden matmul + requant reference."""
+    activation beat per vector. Independent full-K golden matmul + requant reference.
+
+    Weights are baked (shared across nodes); ``n_nodes`` distinct activation sets are
+    queued back-to-back (all writes before any call), then the top is invoked
+    ``n_nodes`` times and all ``n_nodes*M`` output rows are drained and checked --
+    exercising overlapped/pipelined invocations of the blackbox core in cosim."""
+    NN = n_nodes
     PE, SIMD, MW = t["pe"], t["simd"], t["mw"]
     AW = t["activation_width"]
     AB = t["input_stream_width_ba"]
@@ -249,41 +255,46 @@ static long requant_ref(long acc) {{
 // Weights baked (must match the KT memstream inits the RTL loads); only activations fed.
 static const long W[{N}][{K}] = {wlit};
 
+#define NN {NN}
+
 int main() {{
     hls::stream<ap_uint<{A_TOTAL}> > a_in;
     hls::stream<ap_uint<{CB}> > c_out;
 
-    long X[{M}][{K}], golden[{M}][{N}];
-{bias_arr}    for (int v = 0; v < {M}; v++)
-        for (int k = 0; k < {K}; k++) X[v][k] = ((v * 2 + k + {seed}) % {amod}) - {aoff};
-    for (int v = 0; v < {M}; v++)
-        for (int o = 0; o < {N}; o++) {{
-            long acc = 0;
-            for (int k = 0; k < {K}; k++) acc += W[o][k] * X[v][k];
-            golden[v][o] = requant_ref(acc{bias_add_tb});
-        }}
+    static long X[NN][{M}][{K}], golden[NN][{M}][{N}];
+{bias_arr}    for (int n = 0; n < NN; n++) {{
+        for (int v = 0; v < {M}; v++)
+            for (int k = 0; k < {K}; k++) X[n][v][k] = ((v * 2 + k + 3 * n + {seed}) % {amod}) - {aoff};
+        for (int v = 0; v < {M}; v++)
+            for (int o = 0; o < {N}; o++) {{
+                long acc = 0;
+                for (int k = 0; k < {K}; k++) acc += W[o][k] * X[n][v][k];
+                golden[n][v][o] = requant_ref(acc{bias_add_tb});
+            }}
 
-    for (int v = 0; v < {M}; v++)
-        for (int sf = 0; sf < {SFT}; sf++) {{
-            ap_uint<{A_TOTAL}> ab = 0;
-            for (int ti = 0; ti < {KT}; ti++)
-                for (int s = 0; s < {SIMD}; s++)
-                    ab.range(ti * {AB} + s * {AW} + {AW} - 1, ti * {AB} + s * {AW}) =
-                        (ap_uint<{AW}>)(ap_int<{AW}>)X[v][ti * {MW} + sf * {SIMD} + s];
-            a_in.write(ab);
-        }}
+        for (int v = 0; v < {M}; v++)
+            for (int sf = 0; sf < {SFT}; sf++) {{
+                ap_uint<{A_TOTAL}> ab = 0;
+                for (int ti = 0; ti < {KT}; ti++)
+                    for (int s = 0; s < {SIMD}; s++)
+                        ab.range(ti * {AB} + s * {AW} + {AW} - 1, ti * {AB} + s * {AW}) =
+                            (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][ti * {MW} + sf * {SIMD} + s];
+                a_in.write(ab);
+            }}
+    }}
 
-    {top_name}(a_in, c_out);
+    for (int n = 0; n < NN; n++) {top_name}(a_in, c_out);
 
     int errors = 0;
-    for (int v = 0; v < {M}; v++) {{
-        ap_uint<{CB}> crow = c_out.read();
-        for (int o = 0; o < {N}; o++) {{
-            ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
-            long got = (long)y, exp = golden[v][o];
-            if (got != exp) {{ errors++; std::printf("MISMATCH v=%d o=%d got=%ld exp=%ld\\n", v, o, got, exp); }}
+    for (int n = 0; n < NN; n++)
+        for (int v = 0; v < {M}; v++) {{
+            ap_uint<{CB}> crow = c_out.read();
+            for (int o = 0; o < {N}; o++) {{
+                ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
+                long got = (long)y, exp = golden[n][v][o];
+                if (got != exp) {{ errors++; std::printf("MISMATCH n=%d v=%d o=%d got=%ld exp=%ld\\n", n, v, o, got, exp); }}
+            }}
         }}
-    }}
     if (errors == 0) std::printf("MVAU_PKG PASS\\n");
     else             std::printf("MVAU_PKG FAIL errors=%d\\n", errors);
     return errors;
@@ -340,9 +351,15 @@ void {func_name}(hls::stream<ap_uint<{AB}> >& a,
 """
 
 
-def _2op_tb(p, t, top_name, func_name, seed):
+def _2op_tb(p, t, top_name, func_name, seed, n_nodes=6):
     """Two-operand self-checking TB (no bias): feed synthetic A (M×K) and B (K×N, as N-wide
-    K-row beats), golden = integer matmul + affine requant, compare the requantized C rows."""
+    K-row beats), golden = integer matmul + affine requant, compare the requantized C rows.
+
+    ``n_nodes`` distinct (A,B) pairs are queued back-to-back -- all writes (per node, B
+    then A, in the existing per-node order) happen before any call -- then the top is
+    invoked ``n_nodes`` times and all ``n_nodes*M`` output rows are drained and checked,
+    exercising overlapped/pipelined invocations of the blackbox core in cosim."""
+    NN = n_nodes
     PE, SIMD, SF = t["pe"], t["simd"], t["sf"]
     WW, AW = t["weight_width"], t["activation_width"]
     AB = t["input_stream_width_ba"]
@@ -377,51 +394,56 @@ static long requant_ref(long acc) {{
 }}
 
 // two-operand tile: N={N} K={K} PE={PE} SIMD={SIMD} SF={SF} NF=1, M={M} vectors, no bias.
+#define NN {NN}
+
 int main() {{
     hls::stream<ap_uint<{AB}> > a_in;
     hls::stream<ap_uint<{BB}> > b_in;
     hls::stream<ap_uint<{CB}> > c_out;
 
-    long Bm[{K}][{N}], X[{M}][{K}], golden[{M}][{N}];
-    for (int k = 0; k < {K}; k++)
-        for (int o = 0; o < {N}; o++) Bm[k][o] = ((o + k + {seed}) % {wmod}) - {woff};
-    for (int v = 0; v < {M}; v++)
-        for (int k = 0; k < {K}; k++) X[v][k] = ((v * 2 + k + {seed}) % {amod}) - {aoff};
-    for (int v = 0; v < {M}; v++)
-        for (int o = 0; o < {N}; o++) {{
-            long acc = 0;
-            for (int k = 0; k < {K}; k++) acc += Bm[k][o] * X[v][k];
-            golden[v][o] = requant_ref(acc);
-        }}
+    static long Bm[NN][{K}][{N}], X[NN][{M}][{K}], golden[NN][{M}][{N}];
+    for (int n = 0; n < NN; n++) {{
+        for (int k = 0; k < {K}; k++)
+            for (int o = 0; o < {N}; o++) Bm[n][k][o] = ((o + k + 5 * n + {seed}) % {wmod}) - {woff};
+        for (int v = 0; v < {M}; v++)
+            for (int k = 0; k < {K}; k++) X[n][v][k] = ((v * 2 + k + 3 * n + {seed}) % {amod}) - {aoff};
+        for (int v = 0; v < {M}; v++)
+            for (int o = 0; o < {N}; o++) {{
+                long acc = 0;
+                for (int k = 0; k < {K}; k++) acc += Bm[n][k][o] * X[n][v][k];
+                golden[n][v][o] = requant_ref(acc);
+            }}
 
-    // B first: K beats, each an N-wide K-row (b[o] = B[k][o])
-    for (int k = 0; k < {K}; k++) {{
-        ap_uint<{BB}> bb = 0;
-        for (int o = 0; o < {N}; o++)
-            bb.range(o * {WW} + {WW} - 1, o * {WW}) = (ap_uint<{WW}>)(ap_int<{WW}>)Bm[k][o];
-        b_in.write(bb);
+        // B first: K beats, each an N-wide K-row (b[o] = B[k][o])
+        for (int k = 0; k < {K}; k++) {{
+            ap_uint<{BB}> bb = 0;
+            for (int o = 0; o < {N}; o++)
+                bb.range(o * {WW} + {WW} - 1, o * {WW}) = (ap_uint<{WW}>)(ap_int<{WW}>)Bm[n][k][o];
+            b_in.write(bb);
+        }}
+        // then A: M vectors, SF beats of SIMD activations each
+        for (int v = 0; v < {M}; v++)
+            for (int sf = 0; sf < {SF}; sf++) {{
+                ap_uint<{AB}> ab = 0;
+                for (int s = 0; s < {SIMD}; s++)
+                    ab.range(s * {AW} + {AW} - 1, s * {AW}) =
+                        (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][sf * {SIMD} + s];
+                a_in.write(ab);
+            }}
     }}
-    // then A: M vectors, SF beats of SIMD activations each
-    for (int v = 0; v < {M}; v++)
-        for (int sf = 0; sf < {SF}; sf++) {{
-            ap_uint<{AB}> ab = 0;
-            for (int s = 0; s < {SIMD}; s++)
-                ab.range(s * {AW} + {AW} - 1, s * {AW}) =
-                    (ap_uint<{AW}>)(ap_int<{AW}>)X[v][sf * {SIMD} + s];
-            a_in.write(ab);
-        }}
 
-    {top_name}(a_in, b_in, c_out);
+    for (int n = 0; n < NN; n++) {top_name}(a_in, b_in, c_out);
 
     int errors = 0;
-    for (int v = 0; v < {M}; v++) {{
-        ap_uint<{CB}> crow = c_out.read();
-        for (int o = 0; o < {N}; o++) {{
-            ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
-            long got = (long)y, exp = golden[v][o];
-            if (got != exp) {{ errors++; std::printf("MISMATCH v=%d o=%d got=%ld exp=%ld\\n", v, o, got, exp); }}
+    for (int n = 0; n < NN; n++)
+        for (int v = 0; v < {M}; v++) {{
+            ap_uint<{CB}> crow = c_out.read();
+            for (int o = 0; o < {N}; o++) {{
+                ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
+                long got = (long)y, exp = golden[n][v][o];
+                if (got != exp) {{ errors++; std::printf("MISMATCH n=%d v=%d o=%d got=%ld exp=%ld\\n", n, v, o, got, exp); }}
+            }}
         }}
-    }}
     if (errors == 0) std::printf("MVAU_PKG PASS\\n");
     else             std::printf("MVAU_PKG FAIL errors=%d\\n", errors);
     return errors;
@@ -488,9 +510,13 @@ void {func_name}(hls::stream<ap_uint<{A_TOTAL}> >& a,
 """
 
 
-def _2op_kt_tb(p, t, top_name, func_name, seed):
+def _2op_kt_tb(p, t, top_name, func_name, seed, n_nodes=6):
     """K-tiled two-operand self-checking TB: feed A as M wide beats (gk*AB, tile-sliced) and
-    B as K N-wide K-row beats; golden = full-K integer matmul + affine requant (no bias)."""
+    B as K N-wide K-row beats; golden = full-K integer matmul + affine requant (no bias).
+
+    ``n_nodes`` distinct (A,B) pairs are queued back-to-back before any call, then the
+    top is invoked ``n_nodes`` times and all rows drained/checked (overlapped invocations)."""
+    NN = n_nodes
     PE, SIMD, MW = t["pe"], t["simd"], t["mw"]
     WW, AW = t["weight_width"], t["activation_width"]
     AB = t["input_stream_width_ba"]
@@ -528,50 +554,55 @@ static long requant_ref(long acc) {{
 }}
 
 // K-tiled two-operand: N={N} K={K} gk={gk} SIMD={SIMD} PE={PE}, M={M} vectors, no bias.
+#define NN {NN}
+
 int main() {{
     hls::stream<ap_uint<{A_TOTAL}> > a_in;
     hls::stream<ap_uint<{BB}> > b_in;
     hls::stream<ap_uint<{CB}> > c_out;
 
-    long Bm[{K}][{N}], X[{M}][{K}], golden[{M}][{N}];
-    for (int k = 0; k < {K}; k++)
-        for (int o = 0; o < {N}; o++) Bm[k][o] = ((o + k + {seed}) % {wmod}) - {woff};
-    for (int v = 0; v < {M}; v++)
-        for (int k = 0; k < {K}; k++) X[v][k] = ((v * 2 + k + {seed}) % {amod}) - {aoff};
-    for (int v = 0; v < {M}; v++)
-        for (int o = 0; o < {N}; o++) {{
-            long acc = 0;
-            for (int k = 0; k < {K}; k++) acc += Bm[k][o] * X[v][k];
-            golden[v][o] = requant_ref(acc);
-        }}
+    static long Bm[NN][{K}][{N}], X[NN][{M}][{K}], golden[NN][{M}][{N}];
+    for (int n = 0; n < NN; n++) {{
+        for (int k = 0; k < {K}; k++)
+            for (int o = 0; o < {N}; o++) Bm[n][k][o] = ((o + k + 5 * n + {seed}) % {wmod}) - {woff};
+        for (int v = 0; v < {M}; v++)
+            for (int k = 0; k < {K}; k++) X[n][v][k] = ((v * 2 + k + 3 * n + {seed}) % {amod}) - {aoff};
+        for (int v = 0; v < {M}; v++)
+            for (int o = 0; o < {N}; o++) {{
+                long acc = 0;
+                for (int k = 0; k < {K}; k++) acc += Bm[n][k][o] * X[n][v][k];
+                golden[n][v][o] = requant_ref(acc);
+            }}
 
-    for (int k = 0; k < {K}; k++) {{
-        ap_uint<{BB}> bb = 0;
-        for (int o = 0; o < {N}; o++)
-            bb.range(o * {WW} + {WW} - 1, o * {WW}) = (ap_uint<{WW}>)(ap_int<{WW}>)Bm[k][o];
-        b_in.write(bb);
+        for (int k = 0; k < {K}; k++) {{
+            ap_uint<{BB}> bb = 0;
+            for (int o = 0; o < {N}; o++)
+                bb.range(o * {WW} + {WW} - 1, o * {WW}) = (ap_uint<{WW}>)(ap_int<{WW}>)Bm[n][k][o];
+            b_in.write(bb);
+        }}
+        for (int v = 0; v < {M}; v++)
+            for (int sf = 0; sf < {SFT}; sf++) {{
+                ap_uint<{A_TOTAL}> ab = 0;
+                for (int ti = 0; ti < {gk}; ti++)
+                    for (int s = 0; s < {SIMD}; s++)
+                        ab.range(ti * {AB} + s * {AW} + {AW} - 1, ti * {AB} + s * {AW}) =
+                            (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][ti * {MW} + sf * {SIMD} + s];
+                a_in.write(ab);
+            }}
     }}
-    for (int v = 0; v < {M}; v++)
-        for (int sf = 0; sf < {SFT}; sf++) {{
-            ap_uint<{A_TOTAL}> ab = 0;
-            for (int ti = 0; ti < {gk}; ti++)
-                for (int s = 0; s < {SIMD}; s++)
-                    ab.range(ti * {AB} + s * {AW} + {AW} - 1, ti * {AB} + s * {AW}) =
-                        (ap_uint<{AW}>)(ap_int<{AW}>)X[v][ti * {MW} + sf * {SIMD} + s];
-            a_in.write(ab);
-        }}
 
-    {top_name}(a_in, b_in, c_out);
+    for (int n = 0; n < NN; n++) {top_name}(a_in, b_in, c_out);
 
     int errors = 0;
-    for (int v = 0; v < {M}; v++) {{
-        ap_uint<{CB}> crow = c_out.read();
-        for (int o = 0; o < {N}; o++) {{
-            ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
-            long got = (long)y, exp = golden[v][o];
-            if (got != exp) {{ errors++; std::printf("MISMATCH v=%d o=%d got=%ld exp=%ld\\n", v, o, got, exp); }}
+    for (int n = 0; n < NN; n++)
+        for (int v = 0; v < {M}; v++) {{
+            ap_uint<{CB}> crow = c_out.read();
+            for (int o = 0; o < {N}; o++) {{
+                ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
+                long got = (long)y, exp = golden[n][v][o];
+                if (got != exp) {{ errors++; std::printf("MISMATCH n=%d v=%d o=%d got=%ld exp=%ld\\n", n, v, o, got, exp); }}
+            }}
         }}
-    }}
     if (errors == 0) std::printf("MVAU_PKG PASS\\n");
     else             std::printf("MVAU_PKG FAIL errors=%d\\n", errors);
     return errors;
@@ -596,17 +627,26 @@ def generate_2op_core_twin(shape, func_name="mvau_core", plan=None, **kw):
     return _2op_core_twin(p, p["tile"], func_name)
 
 
-def generate_2op_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, plan=None, **kw):
-    """Public entry for the two-operand self-checking TB (grid for tiled, else single-tile)."""
+def generate_2op_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, plan=None,
+                    n_nodes=6, **kw):
+    """Public entry for the two-operand self-checking TB (grid for tiled, else single-tile).
+
+    ``n_nodes`` (default 6) queues that many independent invocations back-to-back with
+    all inputs pre-queued before the first call, so cosim exercises overlapped
+    invocations of the blackbox core."""
     p = _plan(shape, plan=plan, **kw)
     if p.get("n_tiles", 1) > 1 or _2op_use_kt(p):
-        return _2op_kt_tb(p, p["tile"], top_name, func_name, seed)
-    return _2op_tb(p, p["tile"], top_name, func_name, seed)
+        return _2op_kt_tb(p, p["tile"], top_name, func_name, seed, n_nodes=n_nodes)
+    return _2op_tb(p, p["tile"], top_name, func_name, seed, n_nodes=n_nodes)
 
 
-def _ws_tb(p, t, top_name, seed, bias_codes, B):
+def _ws_tb(p, t, top_name, seed, bias_codes, B, n_nodes=6):
     """Weight-stationary self-checking TB: baked weights, top ``(a, c)`` (no ``w``).
-    Independent golden with the same round-half-up + saturate requant reference."""
+    Independent golden with the same round-half-up + saturate requant reference.
+
+    Weights are shared across nodes (baked); ``n_nodes`` distinct activation sets are
+    queued before any call, then the top is invoked ``n_nodes`` times back-to-back."""
+    NN = n_nodes
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     AW = t["activation_width"]
     AB = t["input_stream_width_ba"]
@@ -648,41 +688,45 @@ static long requant_ref(long acc) {{
 // weight-stationary tile: N={N} K={K} PE={PE} SIMD={SIMD} SF={SF} NF={NF}, M={M} vectors.
 // Weights baked (must match the memstream init the RTL loads); only activations fed.
 static const long W[{N}][{K}] = {wlit};
+#define NN {NN}
 
 int main() {{
     hls::stream<ap_uint<{AB}> > a_in;
     hls::stream<ap_uint<{CB}> > c_out;
 
-    long X[{M}][{K}], golden[{M}][{N}];
-{bias_arr}    for (int v = 0; v < {M}; v++)
-        for (int k = 0; k < {K}; k++) X[v][k] = ((v * 2 + k + {seed}) % {amod}) - {aoff};
-    for (int v = 0; v < {M}; v++)
-        for (int o = 0; o < {N}; o++) {{
-            long acc = 0;
-            for (int k = 0; k < {K}; k++) acc += W[o][k] * X[v][k];
-            golden[v][o] = requant_ref(acc{bias_add_tb});
-        }}
+    static long X[NN][{M}][{K}], golden[NN][{M}][{N}];
+{bias_arr}    for (int n = 0; n < NN; n++) {{
+        for (int v = 0; v < {M}; v++)
+            for (int k = 0; k < {K}; k++) X[n][v][k] = ((v * 2 + k + 3 * n + {seed}) % {amod}) - {aoff};
+        for (int v = 0; v < {M}; v++)
+            for (int o = 0; o < {N}; o++) {{
+                long acc = 0;
+                for (int k = 0; k < {K}; k++) acc += W[o][k] * X[n][v][k];
+                golden[n][v][o] = requant_ref(acc{bias_add_tb});
+            }}
 
-    for (int v = 0; v < {M}; v++)
-        for (int sf = 0; sf < {SF}; sf++) {{
-            ap_uint<{AB}> ab = 0;
-            for (int s = 0; s < {SIMD}; s++)
-                ab.range(s * {AW} + {AW} - 1, s * {AW}) =
-                    (ap_uint<{AW}>)(ap_int<{AW}>)X[v][sf * {SIMD} + s];
-            a_in.write(ab);
-        }}
+        for (int v = 0; v < {M}; v++)
+            for (int sf = 0; sf < {SF}; sf++) {{
+                ap_uint<{AB}> ab = 0;
+                for (int s = 0; s < {SIMD}; s++)
+                    ab.range(s * {AW} + {AW} - 1, s * {AW}) =
+                        (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][sf * {SIMD} + s];
+                a_in.write(ab);
+            }}
+    }}
 
-    {top_name}(a_in, c_out);
+    for (int n = 0; n < NN; n++) {top_name}(a_in, c_out);
 
     int errors = 0;
-    for (int v = 0; v < {M}; v++) {{
-        ap_uint<{CB}> crow = c_out.read();
-        for (int o = 0; o < {N}; o++) {{
-            ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
-            long got = (long)y, exp = golden[v][o];
-            if (got != exp) {{ errors++; std::printf("MISMATCH v=%d o=%d got=%ld exp=%ld\\n", v, o, got, exp); }}
+    for (int n = 0; n < NN; n++)
+        for (int v = 0; v < {M}; v++) {{
+            ap_uint<{CB}> crow = c_out.read();
+            for (int o = 0; o < {N}; o++) {{
+                ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
+                long got = (long)y, exp = golden[n][v][o];
+                if (got != exp) {{ errors++; std::printf("MISMATCH n=%d v=%d o=%d got=%ld exp=%ld\\n", n, v, o, got, exp); }}
+            }}
         }}
-    }}
     if (errors == 0) std::printf("MVAU_PKG PASS\\n");
     else             std::printf("MVAU_PKG FAIL errors=%d\\n", errors);
     return errors;
@@ -691,7 +735,7 @@ int main() {{
 
 
 def generate_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, plan=None,
-                bias_codes=None, baked_weights=None, **kw):
+                bias_codes=None, baked_weights=None, n_nodes=6, **kw):
     """Self-checking TB. Independent golden: full-K integer matmul, add per-column
     bias in the accumulator domain, then an independent affine requant (round-half-up
     shift + saturate) to the output ``fixed<outW,outI>`` code -- must equal the drain's
@@ -700,8 +744,8 @@ def generate_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, plan
     t = p["tile"]
     if baked_weights is not None:
         if p.get("k_tiles", 1) > 1:
-            return _kt_tb(p, t, top_name, seed, bias_codes, baked_weights)
-        return _ws_tb(p, t, top_name, seed, bias_codes, baked_weights)
+            return _kt_tb(p, t, top_name, seed, bias_codes, baked_weights, n_nodes=n_nodes)
+        return _ws_tb(p, t, top_name, seed, bias_codes, baked_weights, n_nodes=n_nodes)
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     WW, AW = t["weight_width"], t["activation_width"]
     WB, AB = t["weight_stream_width_ba"], t["input_stream_width_ba"]
