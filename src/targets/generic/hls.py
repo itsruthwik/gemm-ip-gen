@@ -6,6 +6,38 @@ turns into RTL. The four entry points mirror the hls4ml Vitis seam
 behavioral triple-loop from ``nnet_gemm_behavioral.h`` promoted to synthesizable
 form (HLS pragmas, ``ap_fixed`` arithmetic, ``nnet::array`` beats, per-shape
 ``CONFIG_T``). One templated definition covers every shape.
+
+Two bias contracts, four kernel bodies
+---------------------------------------
+This module carries two families of the same four entry points
+(``gemm_array``, ``gemm_array_const_weights``, ``gemm_stream``,
+``gemm_stream_const_weights``), because the standalone self-test package and the
+hls4ml-facing combined header disagree on how a const-weight layer's bias reaches
+the kernel:
+
+* **Standalone contract** (``_GEMM_IP_FUNCS`` latency, ``_GEMM_IP_RESOURCE_FUNCS``
+  resource): used by ``gemm_ip_header()``/``top_cpp()`` for the unit-test package
+  built by ``generate_generic_pkg``. The const-weight entries take the baked
+  ``bias_T biases[CONFIG_T::gemm_n]`` array the standalone top wires in from
+  ``<name>_bias.h`` as an explicit function argument (there is no per-layer
+  ``CONFIG_T::gemm_ip_id``/``gemm_ip_has_bias`` trait table in this contract — a
+  standalone package is always exactly one layer).
+* **Combined contract** (``_GEMM_IP_COMBINED_FUNCS`` latency,
+  ``_GEMM_IP_COMBINED_RESOURCE_FUNCS`` resource): used by ``combined_header()``
+  for the whole-model hls4ml integration. The const-weight entries take no bias
+  argument at all -- they read ``CONFIG_T::gemm_bias()`` internally (mirroring the
+  weight ROM accessor) and gate the add on the per-``gemm_ip_id``
+  ``gemm_ip_has_bias<>`` trait, so a no-bias layer's const-weight kernel folds the
+  add away entirely. The two-operand entries in both contracts never take a bias
+  at all (a two-operand GEMM never owns one).
+
+The four bodies in each family share the ``gemm_row_resource`` regime core
+(``_GEMM_ROW_RESOURCE_CORE``) for the resource strategy; the remaining
+duplication is the per-contract signature/bias-source difference above, which a
+shared body would have to parameterize on a contract policy (bias-as-argument vs.
+bias-from-config) at the cost of the exact contract signatures the two callers
+(the standalone top and hls4ml's generated firmware) need. Kept as two textually
+independent bodies rather than adding that indirection.
 """
 
 import re
@@ -190,9 +222,9 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, b_col_T weight_
 # copy, since the two headers are textually independent) to avoid a 4x duplication of
 # the three regimes.
 _GEMM_ROW_RESOURCE_CORE = r"""
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false>
+template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false, bool HAS_BIAS = true>
 void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ? CONFIG_T::gemm_k : CONFIG_T::gemm_n],
-                                   bias_T biases[CONFIG_T::gemm_n], res_row_T &c_row) {
+                                   bias_T *biases, res_row_T &c_row) {
     const int rufactor = gemm_rf<CONFIG_T>::reuse_factor;
     const int nin = CONFIG_T::gemm_k;
     const int nout = CONFIG_T::gemm_n;
@@ -214,7 +246,7 @@ void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR 
 
     GRR_LEQ_INIT: for (int iacc = 0; iacc < nout; iacc++) {
         #pragma HLS UNROLL
-        acc[iacc] = (typename CONFIG_T::accum_t)biases[iacc];
+        acc[iacc] = HAS_BIAS ? (typename CONFIG_T::accum_t)biases[iacc] : (typename CONFIG_T::accum_t)0;
     }
 
     GRR_LEQ_REUSE: for (int ir = 0; ir < rufactor; ir++) {
@@ -244,9 +276,9 @@ void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR 
     }
 }
 
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false>
+template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false, bool HAS_BIAS = true>
 void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ? CONFIG_T::gemm_k : CONFIG_T::gemm_n],
-                                       bias_T biases[CONFIG_T::gemm_n], res_row_T &c_row) {
+                                       bias_T *biases, res_row_T &c_row) {
     const int nin = CONFIG_T::gemm_k;
     const int nout = CONFIG_T::gemm_n;
     const int rufactor = gemm_rf<CONFIG_T>::reuse_factor < nin * nout ? gemm_rf<CONFIG_T>::reuse_factor : nin * nout;
@@ -265,7 +297,7 @@ void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[ROW_MA
 
     GRR_REM0_INIT: for (int iacc = 0; iacc < nout; iacc++) {
         #pragma HLS UNROLL
-        acc[iacc] = (typename CONFIG_T::accum_t)biases[iacc];
+        acc[iacc] = HAS_BIAS ? (typename CONFIG_T::accum_t)biases[iacc] : (typename CONFIG_T::accum_t)0;
     }
 
     int in_index = 0;
@@ -301,9 +333,9 @@ void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[ROW_MA
     }
 }
 
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false>
+template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false, bool HAS_BIAS = true>
 void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ? CONFIG_T::gemm_k : CONFIG_T::gemm_n],
-                                  bias_T biases[CONFIG_T::gemm_n], res_row_T &c_row) {
+                                  bias_T *biases, res_row_T &c_row) {
     const int rufactor = gemm_rf<CONFIG_T>::reuse_factor;
     const int nin = CONFIG_T::gemm_k;
     const int nout = CONFIG_T::gemm_n;
@@ -324,7 +356,7 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ?
 
     GRR_GT_INIT: for (int iacc = 0; iacc < nout; iacc++) {
         #pragma HLS UNROLL
-        acc[iacc] = (typename CONFIG_T::accum_t)biases[iacc];
+        acc[iacc] = HAS_BIAS ? (typename CONFIG_T::accum_t)biases[iacc] : (typename CONFIG_T::accum_t)0;
     }
 
     GRR_GT_REUSE: for (int ir = 0; ir < rufactor; ir++) {
@@ -383,18 +415,18 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ?
 // gemm_array/_const_weights/gemm_stream/_const_weights below (M loop wraps this once
 // per row; no PIPELINE on the M loop itself -- the II=1 pipelining is on the inner
 // ReuseLoop inside each regime, per hls4ml's own structure).
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false>
+template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false, bool HAS_BIAS = true>
 void gemm_row_resource(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ? CONFIG_T::gemm_k : CONFIG_T::gemm_n],
-                        bias_T biases[CONFIG_T::gemm_n], res_row_T &c_row) {
+                        bias_T *biases, res_row_T &c_row) {
     #pragma HLS INLINE off
     if (gemm_rf<CONFIG_T>::reuse_factor <= CONFIG_T::gemm_k) {
-        gemm_row_resource_rf_leq_nin<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T, ROW_MAJOR>(
+        gemm_row_resource_rf_leq_nin<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T, ROW_MAJOR, HAS_BIAS>(
             a_row, weight_cols, biases, c_row);
     } else if (gemm_rf<CONFIG_T>::reuse_factor % CONFIG_T::gemm_k == 0) {
-        gemm_row_resource_rf_gt_nin_rem0<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T, ROW_MAJOR>(
+        gemm_row_resource_rf_gt_nin_rem0<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T, ROW_MAJOR, HAS_BIAS>(
             a_row, weight_cols, biases, c_row);
     } else {
-        gemm_row_resource_rf_gt_nin<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T, ROW_MAJOR>(
+        gemm_row_resource_rf_gt_nin<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T, ROW_MAJOR, HAS_BIAS>(
             a_row, weight_cols, biases, c_row);
     }
 }
@@ -649,7 +681,9 @@ void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T result
                 #pragma HLS UNROLL
                 accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * gemm_ip_weight_at<CONFIG_T>(weight_cols, k, n));
             }
-            accum += biases[n];
+            if (gemm_ip_has_bias<CONFIG_T::gemm_ip_id>::value) {
+                accum += biases[n];
+            }
             // Direct element write (see gemm_array): avoids the whole-row operator=
             // copy that Vitis cannot transform under complete partition + pipelined M.
             results[m][n] = accum;
@@ -723,7 +757,9 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res
                 #pragma HLS UNROLL
                 accum += (typename CONFIG_T::accum_t)(a_row[k] * gemm_ip_weight_at<CONFIG_T>(weight_cols, k, n));
             }
-            accum += biases[n];
+            if (gemm_ip_has_bias<CONFIG_T::gemm_ip_id>::value) {
+                accum += biases[n];
+            }
             c_row[n] = accum;
         }
         res_stream.write(c_row);
@@ -750,10 +786,10 @@ namespace nnet {
 template <class a_row_T, class b_col_T, class res_row_T, typename CONFIG_T>
 void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
                 res_row_T results[CONFIG_T::gemm_m]) {
-    typename CONFIG_T::accum_t zero_bias[CONFIG_T::gemm_n] = {};
     GEMM_ARRAY_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        gemm_row_resource<a_row_T, b_col_T, typename CONFIG_T::accum_t, res_row_T, CONFIG_T>(
-            a_rows[m], b_cols, zero_bias, results[m]);
+        gemm_row_resource<a_row_T, b_col_T, typename CONFIG_T::accum_t, res_row_T, CONFIG_T,
+                          /*ROW_MAJOR=*/false, /*HAS_BIAS=*/false>(
+            a_rows[m], b_cols, nullptr, results[m]);
     }
 }
 
@@ -775,7 +811,7 @@ void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T result
     }
     GEMM_AWL_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
         gemm_row_resource<a_row_T, typename CONFIG_T::weight_beat_t, typename CONFIG_T::bias_t, res_row_T, CONFIG_T,
-                          CONFIG_T::weights_row_major>(
+                          CONFIG_T::weights_row_major, gemm_ip_has_bias<CONFIG_T::gemm_ip_id>::value>(
             a_rows[m], weight_cols, biases, results[m]);
     }
 }
@@ -790,7 +826,6 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
 
     data1_T b_cols[CONFIG_T::gemm_n];
-    typename CONFIG_T::accum_t zero_bias[CONFIG_T::gemm_n] = {};
     GEMM_STREAM_RES_READB: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
         #pragma HLS PIPELINE II=1
         b_cols[n] = b_stream.read();
@@ -798,8 +833,9 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
     GEMM_STREAM_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
         data0_T a_row = a_stream.read();
         res_T c_row;
-        gemm_row_resource<data0_T, data1_T, typename CONFIG_T::accum_t, res_T, CONFIG_T>(
-            a_row, b_cols, zero_bias, c_row);
+        gemm_row_resource<data0_T, data1_T, typename CONFIG_T::accum_t, res_T, CONFIG_T,
+                          /*ROW_MAJOR=*/false, /*HAS_BIAS=*/false>(
+            a_row, b_cols, nullptr, c_row);
         res_stream.write(c_row);
     }
 }
@@ -835,7 +871,7 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res
         }
         res_T c_row;
         gemm_row_resource<a_row_T, typename CONFIG_T::weight_beat_t, typename CONFIG_T::bias_t, res_T, CONFIG_T,
-                          CONFIG_T::weights_row_major>(
+                          CONFIG_T::weights_row_major, gemm_ip_has_bias<CONFIG_T::gemm_ip_id>::value>(
             a_row, weight_cols, biases, c_row);
         res_stream.write(c_row);
     }
@@ -916,6 +952,33 @@ def _gemm_rf_trait(items):
     )
 
 
+def _gemm_has_bias_trait(items):
+    """Emit the gemm_ip_has_bias<id> compile-time trait: primary = true (has a real
+    bias), with a specialization per const-weight item whose manifest has_bias is
+    False, so that item's const-weights entry folds away its bias add entirely
+    (CONFIG_T::gemm_bias() may still return an all-zero ROM in that case, but the
+    resource/latency kernels never read it when the trait says false)."""
+    specs = []
+    for item in items:
+        idx = item.get("gemm_ip_index")
+        if idx is None:
+            continue
+        if item.get("has_bias") is False:
+            specs.append(
+                f"template <> struct gemm_ip_has_bias<{idx}> {{ "
+                f"static const bool value = false; }};")
+    specs_txt = "\n".join(specs)
+    return (
+        "namespace nnet {\n"
+        "// Per-layer has_bias from the manifest, keyed on CONFIG_T::gemm_ip_id; layers\n"
+        "// with no entry (or has_bias True) default to true (the fallback CONFIG_T::gemm_bias()\n"
+        "// accessor still gets called, but every add of its result is gated by this trait).\n"
+        "template <unsigned id> struct gemm_ip_has_bias { static const bool value = true; };\n"
+        f"{specs_txt}\n"
+        "} // namespace nnet\n"
+    )
+
+
 def combined_header(items=None):
     """The whole-model integration header included by the firmware when
     GEMM_IP_HEADER is set: the four contract entry points, one template each,
@@ -934,6 +997,7 @@ def combined_header(items=None):
     resource_impl = _rename_entry_funcs(_GEMM_IP_COMBINED_RESOURCE_FUNCS, "_resource_impl")
     trait = _gemm_strategy_trait(items)
     rf_trait = _gemm_rf_trait(items)
+    has_bias_trait = _gemm_has_bias_trait(items)
     dispatch = r"""
 namespace nnet {
 
@@ -982,6 +1046,7 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res
         "#define GEMM_IP_COMBINED_H_\n\n"
         "#include <hls_stream.h>\n"
         f"{rf_trait}\n"
+        f"{has_bias_trait}\n"
         f"{latency_impl}\n"
         f"{resource_impl}\n"
         "namespace nnet {\n"

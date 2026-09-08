@@ -314,7 +314,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                     typename CONFIG_T::accum_t value =
                         static_cast<typename CONFIG_T::accum_t>(
                             ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {drain_shift})
-                        + static_cast<typename CONFIG_T::accum_t>(biases[col]);
+                        + (HAS_BIAS
+                               ? static_cast<typename CONFIG_T::accum_t>(biases[col])
+                               : static_cast<typename CONFIG_T::accum_t>(0));
                     out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
                 }}
                 %SINK%
@@ -348,7 +350,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
                     typename CONFIG_T::accum_t value =
                         static_cast<typename CONFIG_T::accum_t>(
                             ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {drain_shift})
-                        + static_cast<typename CONFIG_T::accum_t>(biases[col]);
+                        + (HAS_BIAS
+                               ? static_cast<typename CONFIG_T::accum_t>(biases[col])
+                               : static_cast<typename CONFIG_T::accum_t>(0));
                     out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
                 }}
                 res_stream.write(out_pack);
@@ -569,10 +573,10 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
 // binds gemm.run to the const_weights RTL core (weights in the wrapper ROM); csim
 // uses the ccore's internal B_ROM (same .dat-sourced beats). No frontend weight
 // accessor is involved.
-template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
+template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T, bool HAS_BIAS = true>
 void {name}_gemm_ip_stream_const_weights(
     ac_channel<a_beat_T> &a_stream,
-    bias_T biases[CONFIG_T::gemm_n],
+    bias_T *biases,
     ac_channel<res_T> &res_stream
 ) {{
     static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
@@ -604,10 +608,10 @@ void {name}_gemm_ip_stream_const_weights(
 // the core. Direct feed — A rows go straight into gemm.run() (no b_cols, weights
 // from the ROM), mirroring the two-stream _gemm_ip_array but const_weights. Channel-
 // free, so it synthesises (a channel bridge to the stream entry hits HIER-11).
-template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
+template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T, bool HAS_BIAS = true>
 void {name}_gemm_ip_array_const_weights(
     a_beat_T a_rows[CONFIG_T::gemm_m],
-    bias_T biases[CONFIG_T::gemm_n],
+    bias_T *biases,
     res_T results[CONFIG_T::gemm_m]
 ) {{
     static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
@@ -646,11 +650,11 @@ void {name}_gemm_ip_array_const_weights(
         # Two-stream: buffered-B worker + external-weight stream/array entries
         # (today's behavior). The ccore run() keeps its b_cols port.
         entries_block = f"""\
-template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
+template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T, bool HAS_BIAS = true>
 void {name}_gemm_ip_stream_buffered_b(
     ac_channel<a_beat_T> &a_stream,
     b_beat_T weight_cols[CONFIG_T::gemm_n],
-    bias_T biases[CONFIG_T::gemm_n],
+    bias_T *biases,
     ac_channel<res_T> &res_stream
 ) {{
     static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
@@ -683,11 +687,13 @@ void {name}_gemm_ip_stream_buffered_b(
 {stream_feed_loop}
 }}
 
-template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
+// Two-operand entry: no bias port -- a two-operand GEMM never owns one, so the
+// shared buffered-B worker above is instantiated with HAS_BIAS=false (biases=nullptr),
+// folding away the drain add and leaving no bias array anywhere in this instantiation.
+template <class a_beat_T, class b_beat_T, class res_T, typename CONFIG_T>
 void {name}_gemm_ip_stream(
     ac_channel<a_beat_T> &a_stream,
     ac_channel<b_beat_T> &b_stream,
-    bias_T biases[CONFIG_T::gemm_n],
     ac_channel<res_T> &res_stream
 ) {{
     b_beat_T weight_cols[{n}];
@@ -695,15 +701,17 @@ void {name}_gemm_ip_stream(
     READ_B_COLS: for (int col = 0; col < {n}; col++) {{
         weight_cols[col] = b_stream.read();
     }}
-    {name}_gemm_ip_stream_buffered_b<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
-        a_stream, weight_cols, biases, res_stream);
+    {name}_gemm_ip_stream_buffered_b<a_beat_T, b_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T, false>(
+        a_stream, weight_cols, nullptr, res_stream);
 }}
 
-template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
+// Two-operand entry: no bias port -- a two-operand GEMM never owns one. HAS_BIAS is
+// a local compile-time false (not a template parameter -- nothing else instantiates
+// this entry with a real bias), so the shared drain text below folds away the add.
+template <class a_beat_T, class b_beat_T, class res_T, typename CONFIG_T>
 void {name}_gemm_ip_array(
     a_beat_T a_rows[CONFIG_T::gemm_m],
     b_beat_T weight_cols[CONFIG_T::gemm_n],
-    bias_T biases[CONFIG_T::gemm_n],
     res_T results[CONFIG_T::gemm_m]
 ) {{
     static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
@@ -714,6 +722,8 @@ void {name}_gemm_ip_array(
     ac_int<{a_bits}, false> last_a_rows = 0;
     ac_int<{b_bits}, false> last_b_cols = 0;
     ac_int<{bias_bits}, false> bias_packed = 0;
+    constexpr bool HAS_BIAS = false;
+    typename CONFIG_T::bias_t *biases = nullptr;
 
     #pragma hls_unroll
     BIAS_PACK_ARRAY: for (int col = 0; col < {n}; col++) {{
@@ -1444,20 +1454,21 @@ def gen_combined_header(items):
             # Weight-stationary packages emit BOTH the stream and array const_weights
             # entries (shared RTL core), so route each item's shape to both
             # dispatchers — io_stream layers reach the stream one, io_parallel the array.
+            _has_bias_lit = "true" if item.get("has_bias", True) else "false"
             const_weights_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_stream_const_weights<a_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
+        {item["name"]}_gemm_ip_stream_const_weights<a_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T, {_has_bias_lit}>(
             a_stream, biases, res_stream);
     }}""")
             array_const_weights_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_array_const_weights<a_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
+        {item["name"]}_gemm_ip_array_const_weights<a_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T, {_has_bias_lit}>(
             a_rows, biases, results);
     }}""")
             continue
         branch = f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_{target}<a_beat_T, b_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
+        {item["name"]}_gemm_ip_{target}<a_beat_T, b_beat_T, res_T, CONFIG_T>(
             TARGET_ARGS);
     }}"""
         # The buffered-B stream wrapper is emitted by every two-stream package
@@ -1474,11 +1485,11 @@ def gen_combined_header(items):
         # such item's shape to the array dispatcher too (regardless of interface).
         array_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_array<a_beat_T, b_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
-            a_rows, weight_cols, biases, results);
+        {item["name"]}_gemm_ip_array<a_beat_T, b_beat_T, res_T, CONFIG_T>(
+            a_rows, weight_cols, results);
     }}""")
         if target != "array":
-            stream_branches.append(branch.replace("TARGET_ARGS", "a_stream, b_stream, biases, res_stream"))
+            stream_branches.append(branch.replace("TARGET_ARGS", "a_stream, b_stream, res_stream"))
     stream_branches_text = " else ".join(stream_branches)
     buffered_b_stream_branches_text = " else ".join(buffered_b_stream_branches)
     array_branches_text = " else ".join(array_branches)
@@ -1539,15 +1550,15 @@ def gen_combined_header(items):
 namespace nnet {{
 
 // Two-operand entry (hls4ml call site: nnet::gemm_stream<...>(a, b, res), no bias --
-// a two-operand GEMM never owns one). The per-item core still wants a bias array
-// operand, so a zero constant stands in for it.
+// a two-operand GEMM never owns one). Routes to each item's own no-bias entry
+// (HAS_BIAS=false baked in at the per-item definition), so no bias array is
+// declared and no bias add is synthesized anywhere in this instantiation.
 template <class a_beat_T, class b_beat_T, class res_T, typename CONFIG_T>
 void gemm_stream(
     ac_channel<a_beat_T> &a_stream,
     ac_channel<b_beat_T> &b_stream,
     ac_channel<res_T> &res_stream
 ) {{
-    typename CONFIG_T::bias_t biases[CONFIG_T::n_out] = {{}};
 {stream_branches_text}
 }}
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
@@ -1560,14 +1571,13 @@ void gemm_ip_stream_buffered_b(
 {buffered_b_stream_branches_text}
 }}
 // Two-operand entry (hls4ml call site: nnet::gemm_array<...>(a_rows, b_cols, results),
-// no bias -- see gemm_stream above; same zero-constant stand-in).
+// no bias -- see gemm_stream above; same no-bias routing, no zero array declared).
 template <class a_beat_T, class b_beat_T, class res_T, typename CONFIG_T>
 void gemm_array(
     a_beat_T a_rows[CONFIG_T::gemm_m],
     b_beat_T weight_cols[CONFIG_T::gemm_n],
     res_T results[CONFIG_T::gemm_m]
 ) {{
-    typename CONFIG_T::bias_t biases[CONFIG_T::gemm_n] = {{}};
 {array_branches_text}
 }}
 
