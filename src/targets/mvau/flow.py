@@ -71,16 +71,14 @@ def _normalize_mvau_items(cfg):
             "pe": it.get("pe"),
             "simd": it.get("simd"),
             "k_tiles": it.get("k_tiles"),
+            # has_bias: the single source of truth for whether this IP owns a bias
+            # adder (hls4ml has already folded in the row-varying/weights_in_core
+            # exceptions -- see cli.py). "bias": the raw per-column values to bake
+            # in as a compile-time constant (static array) when has_bias is True.
             "has_bias": bool(it.get("has_bias", True)),
+            "bias": it.get("bias"),
             # Two-operand (runtime-B) nodes: B beat order. Absent for const_weights items.
             "second_operand_row_major": it.get("second_operand_row_major"),
-            # Whether the bias add lives in the requant drain. Defaults to
-            # weights_in_core AND has_bias when the manifest doesn't say.
-            "bias_in_core": (
-                bool(it.get("bias_in_core"))
-                if it.get("bias_in_core") is not None
-                else (bool(it.get("weights_in_core", False)) and bool(it.get("has_bias", True)))
-            ),
         }
     if isinstance(cfg, list):
         return [one(it.get("name"), it) for it in cfg]

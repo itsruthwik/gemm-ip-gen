@@ -39,11 +39,11 @@ def _with_timescale(text):
     return text if "`timescale" in text else _TIMESCALE + text
 
 
-def _rv_width(accu, bias_in_core):
+def _rv_width(accu, has_bias):
     """Just-wide-enough intermediate width for a requant drain's ``rv``. With the
     bias add, ``CONFIG_T::bias_t`` is unknown at generation time, so keep headroom
     (>= 32b) plus a couple guard bits; without it, ACCU + 1 guard bit suffices."""
-    return (max(accu, 32) + 2) if bias_in_core else (accu + 1)
+    return (max(accu, 32) + 2) if has_bias else (accu + 1)
 
 
 def _rv_decl_assign(width, pfrac, raw_expr, indent=""):
@@ -285,11 +285,16 @@ exit
 """
 
 
-def _gemm_ip_header(name, plan, bias_in_core=True):
+def _gemm_ip_header(name, plan, bias_codes=None):
     """The dedicated hls4ml-facing IP for one gemm config: an HLS C++ dataflow IP
     with the internal FINN-MVU blackbox. Repacks hls4ml beats -> FINN beats,
-    runs the blackbox, requant-drains (runtime bias) -> hls4ml C row. The combined
-    header routes nnet::gemm_* to this by CONFIG_T::gemm_ip_id (template dispatch).
+    runs the blackbox, requant-drains -> hls4ml C row. The combined header routes
+    nnet::gemm_* to this by CONFIG_T::gemm_ip_id (template dispatch).
+
+    Bias, like the weight matrix, is a compile-time constant here: when
+    ``bias_codes`` is given (has_bias True) it is baked as a ``static const`` array
+    declared in this header and added directly inside the drain -- never a function
+    argument, so it never becomes a port on this (or any) function.
 
     Weight-stationary only (weights baked in the RTL memstream); two-operand IPs
     use ``_2op_gemm_ip_header``.
@@ -313,7 +318,12 @@ def _gemm_ip_header(name, plan, bias_in_core=True):
                   f"#pragma HLS STREAM variable=p_s depth={NF + 2}")
     ws_calls = (f"    {name}_repack_a<data_T>(a_stream, a_s);\n"
                 f"    {name}_core(a_s, p_s);\n"
-                f"    {name}_drain<res_T, CONFIG_T>(p_s, res_stream, biases);")
+                f"    {name}_drain<res_T, CONFIG_T>(p_s, res_stream);")
+    if bias_codes:
+        bias_decl = (f"static const long {name}_bias[{N}] = {{"
+                     + ", ".join(str(c) for c in bias_codes) + "};\n")
+    else:
+        bias_decl = ""
     return f"""#ifndef {name.upper()}_GEMM_IP_H_
 #define {name.upper()}_GEMM_IP_H_
 #include <hls_stream.h>
@@ -322,6 +332,7 @@ def _gemm_ip_header(name, plan, bias_in_core=True):
 
 // internal FINN-MVU blackbox (shim {name}_core.v; C twin {name}_core.cpp)
 {core_decl}
+{bias_decl}
 
 namespace nnet {{
 
@@ -352,32 +363,10 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > 
     }}
 }}
 
-// requant drain (runtime per-column bias, Keras order): raw ACCU -> fixed -> +bias -> round+sat.
-template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream,
-{' ' * (len(name) + 7)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
-    typedef typename res_T::value_type result_t;
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        res_T crow;
-        for (unsigned nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{PB_TOTAL}> ob = p_s.read();
-            for (unsigned ti = 0; ti < {NT}; ti++)     // tile ti lane pe -> global column
-                for (unsigned pe = 0; pe < {PE}; pe++) {{
-                    unsigned oc = ti * {NTILE} + nf * {PE} + pe;
-                    ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU, bias_in_core), pfrac, "raw", ' ' * 20)}   // code -> fixed (frac={pfrac})
-{('                    rv += biases[oc];                                 // + bias (fixed-point, aligned)' if bias_in_core else '')}
-                    result_t r = rv;                                  // convert per res_T's rounding/overflow modes
-                    crow[oc] = r;
-                }}
-        }}
-        res_stream.write(crow);
-    }}
-}}
-
-// No-bias overload: has_bias is False (no bias tensor, or it is all-zero) for this
-// item, so there is nothing to add -- no bias array, no fill loop, keeping the
-// caller's DATAFLOW region declarations + calls only (canonical form).
+// requant drain: raw ACCU -> fixed -> (+ the baked bias constant, if any) -> round+sat.
+// Bias is baked as the static const array above (declared once per generated IP),
+// never a function argument -- it is the same "compile-time constant" mechanism the
+// baked weight matrix uses, so it never becomes a port on this DATAFLOW function.
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
@@ -389,7 +378,8 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
                 for (unsigned pe = 0; pe < {PE}; pe++) {{
                     unsigned oc = ti * {NTILE} + nf * {PE} + pe;
                     ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU, False), pfrac, "raw", ' ' * 20)}   // code -> fixed (frac={pfrac})
+{_rv_decl_assign(_rv_width(ACCU, bool(bias_codes)), pfrac, "raw", ' ' * 20)}   // code -> fixed (frac={pfrac})
+{('                    rv += ' + name + '_bias[oc];                                 // + bias (baked constant)' if bias_codes else '')}
                     result_t r = rv;                                  // convert per res_T's rounding/overflow modes
                     crow[oc] = r;
                 }}
@@ -399,23 +389,13 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
 }}
 
 // The dedicated IP: hls4ml io_stream const_weights GEMM -> internal MVU blackbox.
-template <class data_T, class res_T, typename CONFIG_T>
-void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
-{' ' * (len(name) + 28)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
-#pragma HLS DATAFLOW
-{ws_streams}
-{ws_calls}
-}}
-
-// No-bias overload: emitted by hls4ml when has_bias is False (no bias tensor, or it
-// is all-zero) for this const-weights item.
+// Bias (when present) is the baked constant above, never a function argument -- this
+// is the only signature; hls4ml's call site never passes a bias parameter.
 template <class data_T, class res_T, typename CONFIG_T>
 void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream) {{
 #pragma HLS DATAFLOW
 {ws_streams}
-    {name}_repack_a<data_T>(a_stream, a_s);
-    {name}_core(a_s, p_s);
-    {name}_drain<res_T, CONFIG_T>(p_s, res_stream);
+{ws_calls}
 }}
 
 }} // namespace nnet
@@ -503,10 +483,12 @@ void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in,
 """
 
 
-def _kt_gemm_ip_header(name, plan, bias_in_core=True):
+def _kt_gemm_ip_header(name, plan, bias_codes=None):
     """hls4ml-facing IP for a K-tiled gemm config (fully-spatial per-tile). Repacks the
     K activations into one wide ``KT*AB`` beat, runs the blackbox, and drains by summing
-    the KT partials per column (runtime bias) -- the K-tiling twin of ``_gemm_ip_header``."""
+    the KT partials per column (+ the baked bias constant, if any) -- the K-tiling twin
+    of ``_gemm_ip_header``. Bias, like the weight matrix, is baked as a ``static const``
+    array in this header, never a function argument."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
     AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
@@ -521,6 +503,11 @@ def _kt_gemm_ip_header(name, plan, bias_in_core=True):
     pfrac = plan["product_frac"]
     core_hdr_pad = ' ' * (len(name) + 6)
     apmax = _apmaxw(PB_TOTAL)
+    if bias_codes:
+        bias_decl = (f"static const long {name}_bias[{N}] = {{"
+                     + ", ".join(str(c) for c in bias_codes) + "};")
+    else:
+        bias_decl = ""
     return f"""#ifndef {name.upper()}_GEMM_IP_H_
 #define {name.upper()}_GEMM_IP_H_
 #ifndef AP_INT_MAX_W
@@ -534,6 +521,7 @@ def _kt_gemm_ip_header(name, plan, bias_in_core=True):
 void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&,
 {core_hdr_pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
 
+{bias_decl}
 namespace nnet {{
 
 // Dedicated K-tiled IP for gemm config M={m} K={K} N={N} (core={t['compute_core']},
@@ -566,10 +554,11 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{A_TOTAL
     }}
 }}
 
-// K-tiled requant drain: sum the KT partials per column, + runtime bias, round+sat.
+// K-tiled requant drain: sum the KT partials per column, + the baked bias constant
+// (if any), round+sat. Bias is never a function argument here (same mechanism as the
+// baked weight matrix), so it never becomes a port on this DATAFLOW function.
 template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream,
-{' ' * (len(name) + 7)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
+void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
     for (unsigned mm = 0; mm < {m}; mm++) {{
         res_T crow;
@@ -581,8 +570,8 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
                 ap_int<{ACCU_SUM}> raw = 0;
                 for (unsigned i = 0; i < {KT}; i++)
                     raw += (ap_int<{ACCU}>)ob.range((j * {KT} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {KT} + i) * {PB} + pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU_SUM, bias_in_core), pfrac, "raw", ' ' * 16)}   // code -> fixed (frac={pfrac})
-{('                rv += biases[oc];                                 // + bias (fixed-point, aligned)' if bias_in_core else '')}
+{_rv_decl_assign(_rv_width(ACCU_SUM, bool(bias_codes)), pfrac, "raw", ' ' * 16)}   // code -> fixed (frac={pfrac})
+{('                rv += ' + name + '_bias[oc];                                 // + bias (baked constant)' if bias_codes else '')}
                 result_t r = rv;                                  // convert per res_T's rounding/overflow modes
                 crow[oc] = r;
             }}
@@ -592,9 +581,10 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
 }}
 
 // The dedicated K-tiled IP: hls4ml io_stream const_weights GEMM -> internal MVU blackbox.
+// Bias (when present) is the baked constant above -- there is only ever this one
+// signature; hls4ml's call site never passes a bias parameter.
 template <class data_T, class res_T, typename CONFIG_T>
-void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
-{' ' * (len(name) + 28)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
+void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream) {{
 #pragma HLS DATAFLOW
     hls::stream<ap_uint<{A_TOTAL}> > a_s;
     hls::stream<ap_uint<{PB_TOTAL}> > p_s;
@@ -602,7 +592,7 @@ void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream
 #pragma HLS STREAM variable=p_s depth=4
     {name}_repack_a<data_T>(a_stream, a_s);
     {name}_core(a_s, p_s);
-    {name}_drain<res_T, CONFIG_T>(p_s, res_stream, biases);
+    {name}_drain<res_T, CONFIG_T>(p_s, res_stream);
 }}
 
 }} // namespace nnet
@@ -757,7 +747,7 @@ void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in, hls::stream<ap_uint<{BB}> >&
 """
 
 
-def _2op_gemm_ip_header(name, plan, bias_in_core=False):
+def _2op_gemm_ip_header(name, plan):
     """hls4ml-facing two-operand IP: ``<name>_gemm_stream<data0_T,data1_T,res_T,CONFIG_T>``
     (repack A -> shim activations, repack B -> shim N-wide K-row beats, internal MVU blackbox,
     requant drain). Requires B streamed **row-major** (data1_T::size == N, one K-row per beat);
@@ -833,6 +823,8 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
 }}"""
 
     # requant drain: kt sums gk partials; nt concatenates; single walks NF beats.
+    # Two-operand GEMM never carries a real bias (has_bias is always False by
+    # construction), so the drain never adds one.
     if kt_form:
         ACCU_SUM = plan["accu_sum"]
         drain_body = f"""        ap_uint<{p_width}> ob = p_s.read();
@@ -840,8 +832,7 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
             ap_int<{ACCU_SUM}> raw = 0;
             for (unsigned ti = 0; ti < {gk}; ti++)
                 raw += (ap_int<{ACCU}>)ob.range(ti * {PB} + oc * {ACCU} + {ACCU} - 1, ti * {PB} + oc * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU_SUM, bias_in_core), pfrac, "raw", ' ' * 12)}
-{('            rv += biases[oc];' if bias_in_core else '')}
+{_rv_decl_assign(_rv_width(ACCU_SUM, False), pfrac, "raw", ' ' * 12)}
             crow[oc] = (result_t)rv;
         }}"""
     elif nt_form:
@@ -850,8 +841,7 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
             for (unsigned pe = 0; pe < {PE}; pe++) {{
                 unsigned oc = ti * {NTILE} + pe;
                 ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU, bias_in_core), pfrac, "raw", ' ' * 16)}
-{('                rv += biases[oc];' if bias_in_core else '')}
+{_rv_decl_assign(_rv_width(ACCU, False), pfrac, "raw", ' ' * 16)}
                 crow[oc] = (result_t)rv;
             }}"""
     else:
@@ -860,8 +850,7 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
             for (unsigned pe = 0; pe < {PE}; pe++) {{
                 unsigned oc = nf * {PE} + pe;
                 ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU, bias_in_core), pfrac, "raw", ' ' * 16)}
-{('                rv += biases[oc];' if bias_in_core else '')}
+{_rv_decl_assign(_rv_width(ACCU, False), pfrac, "raw", ' ' * 16)}
                 crow[oc] = (result_t)rv;
             }}
         }}"""
@@ -895,21 +884,9 @@ void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BB}> >
     for (unsigned k = {K}; k < {KPAD}; k++) b_s.write(0);   // zero-pad K -> K_pad (bit-exact)
 }}
 
-// requant drain (no per-column bias for two-operand; biases[] are zero from hls4ml): raw ACCU
-// -> fixed (frac={pfrac}) -> + bias -> convert per res_T's rounding/overflow modes.
-template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream,
-{' ' * (len(name) + 7)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
-    typedef typename res_T::value_type result_t;
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        res_T crow;
-{drain_body}
-        res_stream.write(crow);
-    }}
-}}
-
-// No-bias overload: two-operand GEMM never has a real bias -- no bias array, no
-// fill loop, keeping the caller's DATAFLOW region declarations + calls only.
+// requant drain: no bias for two-operand GEMM (has_bias is always False by
+// construction) -- raw ACCU -> fixed (frac={pfrac}) -> convert per res_T's
+// rounding/overflow modes.
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
@@ -921,25 +898,8 @@ void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res
 }}
 
 // The dedicated IP: hls4ml io_stream two-operand GEMM -> internal MVU blackbox.
-template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
-void {name}_gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
-{' ' * (len(name) + 17)}hls::stream<res_T> &res_stream,
-{' ' * (len(name) + 17)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
-#pragma HLS DATAFLOW
-    hls::stream<ap_uint<{a_width}> > a_s;
-    hls::stream<ap_uint<{BB}> > b_s;
-    hls::stream<ap_uint<{p_width}> > p_s;
-#pragma HLS STREAM variable=a_s depth={SF + 2}
-#pragma HLS STREAM variable=b_s depth={KPAD + 2}
-#pragma HLS STREAM variable=p_s depth={NF + 2}
-    {name}_repack_a<data0_T>(a_stream, a_s);
-    {name}_repack_b<data1_T>(b_stream, b_s);
-    {name}_core(a_s, b_s, p_s);
-    {name}_drain<res_T, CONFIG_T>(p_s, res_stream, biases);
-}}
-
-// No-bias overload: two-operand GEMM never has a real bias (has_bias is always False
-// by construction), so hls4ml's call site carries no bias parameter at all here.
+// Two-operand GEMM never has a real bias, so hls4ml's call site carries no bias
+// parameter at all -- there is only ever this one signature.
 template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
 void {name}_gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
 {' ' * (len(name) + 17)}hls::stream<res_T> &res_stream) {{
@@ -1052,9 +1012,8 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
                                 n_nodes=cfg.get("n_nodes", 6))))
-    bias_in_core = bool(cfg.get("bias_in_core", False))
     (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(
-        _2op_gemm_ip_header(name, plan, bias_in_core=bias_in_core)))
+        _2op_gemm_ip_header(name, plan)))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 
     for s in _STATIC_SOURCES:
@@ -1190,9 +1149,8 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
         _golden.generate_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
                             bias_codes=bias_codes, baked_weights=B,
                             n_nodes=cfg.get("n_nodes", 6))))
-    bias_in_core = bool(cfg.get("bias_in_core", True))
-    ip_hdr = (_kt_gemm_ip_header(name, plan, bias_in_core=bias_in_core) if KT > 1
-              else _gemm_ip_header(name, plan, bias_in_core=bias_in_core))
+    ip_hdr = (_kt_gemm_ip_header(name, plan, bias_codes=bias_codes) if KT > 1
+              else _gemm_ip_header(name, plan, bias_codes=bias_codes))
     (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(ip_hdr))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 
@@ -1246,13 +1204,9 @@ def gen_combined_header(items):
             continue
         specs.append(
             f"template <> struct mvau_ip<{i}> {{\n"
-            f"    template <class data_T, class res_T, typename CONFIG_T>\n"
-            f"    static void stream_const_weights(hls::stream<data_T> &a, hls::stream<res_T> &r,\n"
-            f"                                  typename CONFIG_T::bias_t b[CONFIG_T::n_out]) {{\n"
-            f"        #pragma HLS INLINE\n"
-            f"        {nm}_gemm_stream_const_weights<data_T, res_T, CONFIG_T>(a, r, b);\n"
-            f"    }}\n"
-            f"    // No-bias overload: has_bias is False for this item.\n"
+            f"    // Bias, when this item has one, is baked as a compile-time constant inside\n"
+            f"    // {nm}_gemm_ip.h -- never a function argument -- so there is only ever this\n"
+            f"    // one signature.\n"
             f"    template <class data_T, class res_T, typename CONFIG_T>\n"
             f"    static void stream_const_weights(hls::stream<data_T> &a, hls::stream<res_T> &r) {{\n"
             f"        #pragma HLS INLINE\n"
@@ -1268,14 +1222,8 @@ def gen_combined_header(items):
             continue
         two_op_specs.append(
             f"template <> struct mvau_ip_stream<{i}> {{\n"
-            f"    template <class data0_T, class data1_T, class res_T, typename CONFIG_T>\n"
-            f"    static void stream(hls::stream<data0_T> &a, hls::stream<data1_T> &b,\n"
-            f"                       hls::stream<res_T> &r,\n"
-            f"                       typename CONFIG_T::bias_t bias[CONFIG_T::n_out]) {{\n"
-            f"        #pragma HLS INLINE\n"
-            f"        {nm}_gemm_stream<data0_T, data1_T, res_T, CONFIG_T>(a, b, r, bias);\n"
-            f"    }}\n"
-            f"    // No-bias overload: two-operand GEMM never has a real bias.\n"
+            f"    // Two-operand GEMM never has a real bias -- there is only ever this one\n"
+            f"    // signature.\n"
             f"    template <class data0_T, class data1_T, class res_T, typename CONFIG_T>\n"
             f"    static void stream(hls::stream<data0_T> &a, hls::stream<data1_T> &b,\n"
             f"                       hls::stream<res_T> &r) {{\n"
@@ -1293,18 +1241,9 @@ def gen_combined_header(items):
 template <int ID> struct mvau_ip_stream;
 {two_op_specs_s}
 
-// io_stream two-operand entry hls4ml calls; routes to the config's IP by id.
-template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
-void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
-                 hls::stream<res_T> &res_stream,
-                 typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
-    #pragma HLS INLINE
-    mvau_ip_stream<CONFIG_T::gemm_ip_id>::template stream<data0_T, data1_T, res_T, CONFIG_T>(
-        a_stream, b_stream, res_stream, biases);
-}}
-
-// No-bias overload: emitted by hls4ml for n_inplace == 1 (two-operand GEMM never has
-// a real bias). n_inplace > 1 keeps calling the biased overload above unchanged.
+// io_stream two-operand entry hls4ml calls; routes to the config's IP by id. Two-operand
+// GEMM never has a real bias, so hls4ml's call site never passes one -- there is only
+// ever this one signature.
 template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
 void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
                  hls::stream<res_T> &res_stream) {{
@@ -1325,16 +1264,10 @@ namespace nnet {{
 template <int ID> struct mvau_ip;
 {specs_s}
 
-// io_stream const_weights entry hls4ml calls; routes to the config's IP by id.
-template <class data_T, class res_T, typename CONFIG_T>
-void gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
-                            typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
-    #pragma HLS INLINE
-    mvau_ip<CONFIG_T::gemm_ip_id>::template stream_const_weights<data_T, res_T, CONFIG_T>(
-        a_stream, res_stream, biases);
-}}
-
-// No-bias overload: emitted by hls4ml when has_bias is False for a const-weights item.
+// io_stream const_weights entry hls4ml calls; routes to the config's IP by id. Bias
+// (when an item has one) is baked as a compile-time constant inside that item's
+// <name>_gemm_ip.h -- never a function argument -- so there is only ever this one
+// signature.
 template <class data_T, class res_T, typename CONFIG_T>
 void gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream) {{
     #pragma HLS INLINE

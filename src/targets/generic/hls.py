@@ -1033,6 +1033,29 @@ struct {name}_config {{
 """
 
 
+def bias_header(name, n, bias_t, bias_values):
+    """Bias ROM: baked as a compile-time constant, like the weight ROM, so it never
+    becomes a top-level port. ``bias_values`` is a list of N reals (or None/empty
+    for "no bias", which bakes an all-zero array -- mathematically identical to
+    omitting the add, so the top signature never needs a has_bias-gated overload)."""
+    vals = list(bias_values) if bias_values else [0] * n
+    if len(vals) != n:
+        raise ValueError(f"bias length {len(vals)} != N {n}")
+    body = ", ".join(str(v) for v in vals)
+    return f"""#ifndef {name.upper()}_BIAS_H_
+#define {name.upper()}_BIAS_H_
+
+#include "{name}_config.h"
+
+// Bias ROM: baked as a compile-time constant (same mechanism as the weight ROM),
+// referenced directly inside the top -- never a function argument, so it never
+// becomes a port.
+static {bias_t} {name}_bias_rom[{n}] = {{ {body} }};
+
+#endif // {name.upper()}_BIAS_H_
+"""
+
+
 def weights_header(name, m, k, n, weight_matrix):
     """Column-major weight ROM + gemm_weight_cols() accessor (weight-stationary).
 
@@ -1060,53 +1083,55 @@ static {name}_b_col_t {name}_weight_cols_rom[{n}] = {{
 
 
 def top_cpp(name, m, k, n, interface="array", weights_in_core=False):
-    """The Vitis synthesis top (set_top) that calls the chosen entry point."""
+    """The Vitis synthesis top (set_top) that calls the chosen entry point.
+
+    Bias is a baked ROM (see ``bias_header``), referenced directly here -- never a
+    function argument -- so it never appears as a top-level port, the same
+    treatment the weight-stationary ROM already gets.
+    """
     inc_w = f'#include "{name}_weights.h"\n' if weights_in_core else ""
     head = (
         f'#include "{name}_config.h"\n'
         f'#include "{name}_gemm_ip.h"\n'
+        f'#include "{name}_bias.h"\n'
         f"{inc_w}\n"
     )
     if interface == "array" and not weights_in_core:
         return head + f"""void {name}(
     {name}_a_row_t a_rows[{m}],
     {name}_b_col_t b_cols[{n}],
-    {name}_res_row_t results[{m}],
-    {name}_config::bias_t biases[{n}]
+    {name}_res_row_t results[{m}]
 ) {{
     nnet::gemm_array<{name}_a_row_t, {name}_b_col_t, {name}_config::bias_t,
-                     {name}_res_row_t, {name}_config>(a_rows, b_cols, results, biases);
+                     {name}_res_row_t, {name}_config>(a_rows, b_cols, results, {name}_bias_rom);
 }}
 """
     if interface == "array" and weights_in_core:
         return head + f"""void {name}(
     {name}_a_row_t a_rows[{m}],
-    {name}_res_row_t results[{m}],
-    {name}_config::bias_t biases[{n}]
+    {name}_res_row_t results[{m}]
 ) {{
     nnet::gemm_array_const_weights<{name}_a_row_t, {name}_b_col_t, {name}_config::bias_t,
                                 {name}_res_row_t, {name}_config>(
-        a_rows, {name}_weight_cols_rom, results, biases);
+        a_rows, {name}_weight_cols_rom, results, {name}_bias_rom);
 }}
 """
     if interface == "stream" and not weights_in_core:
         return head + f"""void {name}(
     hls::stream<{name}_a_row_t> &a_stream,
     hls::stream<{name}_b_col_t> &b_stream,
-    hls::stream<{name}_res_row_t> &res_stream,
-    {name}_config::bias_t biases[{n}]
+    hls::stream<{name}_res_row_t> &res_stream
 ) {{
     nnet::gemm_stream<{name}_a_row_t, {name}_b_col_t, {name}_res_row_t, {name}_config>(
-        a_stream, b_stream, res_stream, biases);
+        a_stream, b_stream, res_stream, {name}_bias_rom);
 }}
 """
     # stream + weights_in_core
     return head + f"""void {name}(
     hls::stream<{name}_a_row_t> &a_stream,
-    hls::stream<{name}_res_row_t> &res_stream,
-    {name}_config::bias_t biases[{n}]
+    hls::stream<{name}_res_row_t> &res_stream
 ) {{
     nnet::gemm_stream_const_weights<{name}_a_row_t, {name}_b_col_t, {name}_res_row_t, {name}_config>(
-        a_stream, {name}_weight_cols_rom, res_stream, biases);
+        a_stream, {name}_weight_cols_rom, res_stream, {name}_bias_rom);
 }}
 """

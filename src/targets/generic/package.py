@@ -24,6 +24,11 @@ def _default_weight_matrix(k, n):
     return [[((row + 2 * col) % 3) - 1 for col in range(n)] for row in range(k)]
 
 
+def _default_bias(n):
+    """Deterministic bias matching the TB's bias_val formula (standalone csim)."""
+    return [(col % 3) - 1 for col in range(n)]
+
+
 def _run_vitis_tcl(name, part, clock_ns):
     return f"""open_project {name}_proj
 set_top {name}
@@ -44,6 +49,7 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
                          output_precision=None, bias_precision=None,
                          accum_precision=None, part=DEFAULT_PART, clock_period_ns=5,
                          strategy="latency", reuse_factor=1,
+                         has_bias=None, bias=None,
                          **_ignored):
     if interface not in ("stream", "array"):
         raise ValueError(f"generic target: unsupported interface '{interface}'")
@@ -61,6 +67,18 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
     if weights_in_core:
         B = weight_matrix if weight_matrix is not None else _default_weight_matrix(k, n)
         (pkg_dir / f"{name}_weights.h").write_text(_hls.weights_header(name, m, k, n, B))
+    # Bias is always baked as a compile-time ROM (never a top-level port): the
+    # manifest's real per-column values when has_bias is True, else a zero array
+    # (standalone/unit generation with no manifest falls back to the TB's own
+    # deterministic bias_val() formula, so the self-check stays meaningful).
+    if bias:
+        bias_values = bias
+    elif has_bias is None:
+        bias_values = _default_bias(n)
+    else:
+        bias_values = None
+    bias_t = _hls._ap_type(bias_precision, _hls._ap_type(output_precision, "ap_fixed<16,6>"))
+    (pkg_dir / f"{name}_bias.h").write_text(_hls.bias_header(name, n, bias_t, bias_values))
     (pkg_dir / f"{name}_top.cpp").write_text(
         _hls.top_cpp(name, m, k, n, interface, weights_in_core))
     (pkg_dir / f"{name}_tb.cpp").write_text(

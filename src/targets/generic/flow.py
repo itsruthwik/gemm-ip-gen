@@ -64,7 +64,6 @@ class GenericTarget(Target):
         # drop both (weights_in_core would also collide with the explicit kwarg below).
         cfg.pop("weights_in_core", None)
         cfg.pop("second_operand_row_major", None)
-        cfg.pop("bias_in_core", None)
         return _package.generate_generic_pkg(
             m, k, n, name, output_dir,
             weights_in_core=weight_matrix is not None,
@@ -73,7 +72,7 @@ class GenericTarget(Target):
     def verify(self, package):
         pkg = Path(package)
         name = pkg.name
-        required = [f"{name}_gemm_ip.h", f"{name}_config.h", f"{name}_top.cpp",
+        required = [f"{name}_gemm_ip.h", f"{name}_config.h", f"{name}_bias.h", f"{name}_top.cpp",
                     f"{name}_tb.cpp", "nnet_types.h", "run_vitis.tcl"]
         missing = [f for f in required
                    if not (pkg / f).is_file() or (pkg / f).stat().st_size == 0]

@@ -143,12 +143,14 @@ def _run(args):
                     # that don't distinguish these pop/ignore them (see generic).
                     "weights_in_core": item.get("weights_in_core"),
                     "second_operand_row_major": item.get("second_operand_row_major"),
-                    # has_bias: derived from the bias tensor itself (non-all-zero) by
-                    # hls4ml; the single source of truth for whether a real bias exists.
-                    # bias_in_core: whether the IP itself should own the bias adder
-                    # (has_bias AND weights_in_core AND not row-varying).
+                    # has_bias: derived from the bias tensor itself (non-all-zero) AND
+                    # not row-varying (a row-varying EinsumDense bias is added in
+                    # hls4ml's generated wrapper instead, so the IP never sees it) by
+                    # hls4ml; the single source of truth for whether this IP owns a
+                    # bias adder. "bias": the raw per-column values to bake in as a
+                    # compile-time constant when has_bias is True.
                     "has_bias": item.get("has_bias"),
-                    "bias_in_core": item.get("bias_in_core"),
+                    "bias": item.get("bias"),
                 },
             )
         output_dir = Path(args.output_dir)
