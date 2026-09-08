@@ -1451,7 +1451,7 @@ def gen_combined_header(items):
     }}""")
             array_const_weights_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_array_const_weights<a_beat_T, bias_T, res_T, CONFIG_T>(
+        {item["name"]}_gemm_ip_array_const_weights<a_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
             a_rows, biases, results);
     }}""")
             continue
@@ -1474,7 +1474,7 @@ def gen_combined_header(items):
         # such item's shape to the array dispatcher too (regardless of interface).
         array_branches.append(f"""\
     if constexpr ({_dispatch_condition(item)}) {{
-        {item["name"]}_gemm_ip_array<a_beat_T, b_beat_T, bias_T, res_T, CONFIG_T>(
+        {item["name"]}_gemm_ip_array<a_beat_T, b_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
             a_rows, weight_cols, biases, results);
     }}""")
         if target != "array":
@@ -1538,13 +1538,16 @@ def gen_combined_header(items):
 
 namespace nnet {{
 
+// Two-operand entry (hls4ml call site: nnet::gemm_stream<...>(a, b, res), no bias --
+// a two-operand GEMM never owns one). The per-item core still wants a bias array
+// operand, so a zero constant stands in for it.
 template <class a_beat_T, class b_beat_T, class res_T, typename CONFIG_T>
 void gemm_stream(
     ac_channel<a_beat_T> &a_stream,
     ac_channel<b_beat_T> &b_stream,
-    ac_channel<res_T> &res_stream,
-    typename CONFIG_T::bias_t biases[CONFIG_T::n_out]
+    ac_channel<res_T> &res_stream
 ) {{
+    typename CONFIG_T::bias_t biases[CONFIG_T::n_out] = {{}};
 {stream_branches_text}
 }}
 template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
@@ -1556,31 +1559,37 @@ void gemm_ip_stream_buffered_b(
 ) {{
 {buffered_b_stream_branches_text}
 }}
-template <class a_beat_T, class b_beat_T, class bias_T, class res_T, typename CONFIG_T>
+// Two-operand entry (hls4ml call site: nnet::gemm_array<...>(a_rows, b_cols, results),
+// no bias -- see gemm_stream above; same zero-constant stand-in).
+template <class a_beat_T, class b_beat_T, class res_T, typename CONFIG_T>
 void gemm_array(
     a_beat_T a_rows[CONFIG_T::gemm_m],
     b_beat_T weight_cols[CONFIG_T::gemm_n],
-    res_T results[CONFIG_T::gemm_m],
-    bias_T biases[CONFIG_T::gemm_n]
+    res_T results[CONFIG_T::gemm_m]
 ) {{
+    typename CONFIG_T::bias_t biases[CONFIG_T::gemm_n] = {{}};
 {array_branches_text}
 }}
 
 template <class a_beat_T, class res_T, typename CONFIG_T>
 void gemm_stream_const_weights(
     ac_channel<a_beat_T> &a_stream,
-    ac_channel<res_T> &res_stream,
-    typename CONFIG_T::bias_t biases[CONFIG_T::n_out]
+    ac_channel<res_T> &res_stream
 ) {{
+    typename CONFIG_T::bias_t *biases = CONFIG_T::gemm_bias();
 {const_weights_branches_text}
 }}
 
-template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T>
+// Weight-stationary entry (hls4ml call site: nnet::gemm_array_const_weights<a_row_t,
+// res_row_t, config>(a_rows, results), no bias -- it is read through the config
+// (CONFIG_T::gemm_bias(), injected alongside the weight ROM) rather than a function
+// argument, so it never becomes a port.
+template <class a_beat_T, class res_T, typename CONFIG_T>
 void gemm_array_const_weights(
     a_beat_T a_rows[CONFIG_T::gemm_m],
-    res_T results[CONFIG_T::gemm_m],
-    bias_T biases[CONFIG_T::gemm_n]
+    res_T results[CONFIG_T::gemm_m]
 ) {{
+    typename CONFIG_T::bias_t *biases = CONFIG_T::gemm_bias();
 {array_const_weights_branches_text}
 }}
 

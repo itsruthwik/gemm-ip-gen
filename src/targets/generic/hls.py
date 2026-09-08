@@ -606,10 +606,11 @@ inline typename CONFIG_T::weight_t gemm_ip_weight_at(typename CONFIG_T::weight_b
     return beats[n][k];
 }
 
-// gemm_array — io_parallel, TWO activation operands (attention QK^T / A.V).
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
+// gemm_array — io_parallel, TWO activation operands (attention QK^T / A.V). No bias
+// (contract signature): a two-operand GEMM never owns one.
+template <class a_row_T, class b_col_T, class res_row_T, typename CONFIG_T>
 void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
-                res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
+                res_row_T results[CONFIG_T::gemm_m]) {
     #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     GEMM_ARRAY_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
         #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
@@ -620,7 +621,6 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
                 #pragma HLS UNROLL
                 accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * b_cols[n][k]);
             }
-            accum += biases[n];
             // Write the output element directly: the io_parallel caller partitions
             // results[] complete, and a whole-row nnet::array operator= copy under the
             // pipelined M loop is not a transformable instruction for Vitis HLS.
@@ -631,12 +631,15 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
 
 // gemm_array_const_weights — io_parallel, constant operand held by the IP. No weight
 // argument: the weights come from CONFIG_T::gemm_weight_beats() (contract signature;
-// either beat layout, see gemm_ip_weight_at).
-template <class a_row_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m],
-                           bias_T biases[CONFIG_T::gemm_n]) {
+// either beat layout, see gemm_ip_weight_at). Bias, like the weight ROM, is read
+// through the config (CONFIG_T::gemm_bias(), injected by the writer alongside
+// gemm_weight_beats()) rather than a function parameter, so it stays a compile-time
+// constant and is never part of hls4ml's call-site signature.
+template <class a_row_T, class res_row_T, typename CONFIG_T>
+void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m]) {
     #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     typename CONFIG_T::weight_beat_t *weight_cols = CONFIG_T::gemm_weight_beats();
+    typename CONFIG_T::bias_t *biases = CONFIG_T::gemm_bias();
     GEMM_AWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
         #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
         GEMM_AWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
@@ -655,10 +658,11 @@ void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T result
 }
 
 // gemm_stream — io_stream, TWO activation operands. B is read into local storage
-// (operand residency), then C = A * B streams out.
+// (operand residency), then C = A * B streams out. No bias (contract signature; see
+// gemm_array above).
 template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
 void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
-                 hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
+                 hls::stream<res_T> &res_stream) {
     static_assert(data0_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
     static_assert(data1_T::size == CONFIG_T::gemm_k, "B column height must equal gemm_k.");
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
@@ -680,7 +684,6 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
                 #pragma HLS UNROLL
                 accum += (typename CONFIG_T::accum_t)(a_row[k] * b_cols[n][k]);
             }
-            accum += biases[n];
             c_row[n] = accum;
         }
         res_stream.write(c_row);
@@ -689,16 +692,17 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
 
 // gemm_stream_const_weights — io_stream, constant operand held by the IP. No weight
 // argument (contract signature): weights come from CONFIG_T::gemm_weight_beats() (either
-// beat layout, see gemm_ip_weight_at). The
+// beat layout, see gemm_ip_weight_at). Bias, like the weight ROM, is read through the
+// config (CONFIG_T::gemm_bias()) rather than a function parameter. The
 // input may arrive as several narrower beats (gemm_k / data_T::size) that are packed
 // into a gemm_k-wide row, mirroring the hls4ml behavioral entry.
 template <class data_T, class res_T, typename CONFIG_T>
-void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream,
-                            typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
+void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream) {
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
     #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     typedef nnet::array<typename data_T::value_type, CONFIG_T::gemm_k> a_row_T;
     typename CONFIG_T::weight_beat_t *weight_cols = CONFIG_T::gemm_weight_beats();
+    typename CONFIG_T::bias_t *biases = CONFIG_T::gemm_bias();
 
     GEMM_SWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
         #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
@@ -740,23 +744,28 @@ namespace nnet {
 
 // gemm_array — io_parallel, TWO activation operands. Extrapolation beyond baseline
 // (dense_resource has no two-operand kernel): b_cols is already resident, so the
-// per-row resource core runs over it directly, treating b_cols as weight_cols.
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
+// per-row resource core runs over it directly, treating b_cols as weight_cols. No bias
+// (contract signature; a two-operand GEMM never owns one) — gemm_row_resource still
+// wants a bias operand, so a zero constant stands in for it.
+template <class a_row_T, class b_col_T, class res_row_T, typename CONFIG_T>
 void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
-                res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
+                res_row_T results[CONFIG_T::gemm_m]) {
+    typename CONFIG_T::accum_t zero_bias[CONFIG_T::gemm_n] = {};
     GEMM_ARRAY_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        gemm_row_resource<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T>(
-            a_rows[m], b_cols, biases, results[m]);
+        gemm_row_resource<a_row_T, b_col_T, typename CONFIG_T::accum_t, res_row_T, CONFIG_T>(
+            a_rows[m], b_cols, zero_bias, results[m]);
     }
 }
 
 // gemm_array_const_weights — io_parallel, constant operand from CONFIG_T::gemm_weight_beats()
 // (contract signature: no weight argument; beat layout per CONFIG_T::weights_row_major).
-// Same ARRAY_RESHAPE / BIND_STORAGE pragmas as baseline dense_resource, applied to weight_cols.
-template <class a_row_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m],
-                           bias_T biases[CONFIG_T::gemm_n]) {
+// Bias, like the weight ROM, is read through the config (CONFIG_T::gemm_bias()) rather
+// than a function parameter. Same ARRAY_RESHAPE / BIND_STORAGE pragmas as baseline
+// dense_resource, applied to weight_cols.
+template <class a_row_T, class res_row_T, typename CONFIG_T>
+void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m]) {
     typename CONFIG_T::weight_beat_t *weight_cols = CONFIG_T::gemm_weight_beats();
+    typename CONFIG_T::bias_t *biases = CONFIG_T::gemm_bias();
     const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + gemm_rf<CONFIG_T>::reuse_factor - 1)
                               / gemm_rf<CONFIG_T>::reuse_factor;
     #pragma HLS ARRAY_RESHAPE   variable=weight_cols block factor=block_factor
@@ -765,21 +774,23 @@ void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T result
         #pragma HLS BIND_STORAGE variable=weight_cols type=rom_np impl=bram
     }
     GEMM_AWL_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        gemm_row_resource<a_row_T, typename CONFIG_T::weight_beat_t, bias_T, res_row_T, CONFIG_T,
+        gemm_row_resource<a_row_T, typename CONFIG_T::weight_beat_t, typename CONFIG_T::bias_t, res_row_T, CONFIG_T,
                           CONFIG_T::weights_row_major>(
             a_rows[m], weight_cols, biases, results[m]);
     }
 }
 
 // gemm_stream — io_stream, TWO activation operands (extrapolation, see gemm_array above).
+// No bias (contract signature) — same zero-constant stand-in as gemm_array.
 template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
 void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
-                 hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
+                 hls::stream<res_T> &res_stream) {
     static_assert(data0_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
     static_assert(data1_T::size == CONFIG_T::gemm_k, "B column height must equal gemm_k.");
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
 
     data1_T b_cols[CONFIG_T::gemm_n];
+    typename CONFIG_T::accum_t zero_bias[CONFIG_T::gemm_n] = {};
     GEMM_STREAM_RES_READB: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
         #pragma HLS PIPELINE II=1
         b_cols[n] = b_stream.read();
@@ -787,22 +798,23 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
     GEMM_STREAM_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
         data0_T a_row = a_stream.read();
         res_T c_row;
-        gemm_row_resource<data0_T, data1_T, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
-            a_row, b_cols, biases, c_row);
+        gemm_row_resource<data0_T, data1_T, typename CONFIG_T::accum_t, res_T, CONFIG_T>(
+            a_row, b_cols, zero_bias, c_row);
         res_stream.write(c_row);
     }
 }
 
 // gemm_stream_const_weights — io_stream, constant operand from CONFIG_T::gemm_weight_beats()
 // (beat layout per CONFIG_T::weights_row_major)
-// (contract signature). Input may arrive as several narrower beats packed into a
+// (contract signature). Bias is read through the config (CONFIG_T::gemm_bias()) rather
+// than a function parameter. Input may arrive as several narrower beats packed into a
 // gemm_k-wide row, mirroring the latency combined entry.
 template <class data_T, class res_T, typename CONFIG_T>
-void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream,
-                            typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
+void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream) {
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
     typedef nnet::array<typename data_T::value_type, CONFIG_T::gemm_k> a_row_T;
     typename CONFIG_T::weight_beat_t *weight_cols = CONFIG_T::gemm_weight_beats();
+    typename CONFIG_T::bias_t *biases = CONFIG_T::gemm_bias();
     const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + gemm_rf<CONFIG_T>::reuse_factor - 1)
                               / gemm_rf<CONFIG_T>::reuse_factor;
     #pragma HLS ARRAY_RESHAPE   variable=weight_cols block factor=block_factor
@@ -925,43 +937,41 @@ def combined_header(items=None):
     dispatch = r"""
 namespace nnet {
 
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
+template <class a_row_T, class b_col_T, class res_row_T, typename CONFIG_T>
 void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
-                res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
+                res_row_T results[CONFIG_T::gemm_m]) {
     if (gemm_strategy<CONFIG_T::gemm_ip_id>::value == gemm_resource) {
-        gemm_array_resource_impl<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T>(a_rows, b_cols, results, biases);
+        gemm_array_resource_impl<a_row_T, b_col_T, res_row_T, CONFIG_T>(a_rows, b_cols, results);
     } else {
-        gemm_array_latency_impl<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T>(a_rows, b_cols, results, biases);
+        gemm_array_latency_impl<a_row_T, b_col_T, res_row_T, CONFIG_T>(a_rows, b_cols, results);
     }
 }
 
-template <class a_row_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m],
-                           bias_T biases[CONFIG_T::gemm_n]) {
+template <class a_row_T, class res_row_T, typename CONFIG_T>
+void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m]) {
     if (gemm_strategy<CONFIG_T::gemm_ip_id>::value == gemm_resource) {
-        gemm_array_const_weights_resource_impl<a_row_T, bias_T, res_row_T, CONFIG_T>(a_rows, results, biases);
+        gemm_array_const_weights_resource_impl<a_row_T, res_row_T, CONFIG_T>(a_rows, results);
     } else {
-        gemm_array_const_weights_latency_impl<a_row_T, bias_T, res_row_T, CONFIG_T>(a_rows, results, biases);
+        gemm_array_const_weights_latency_impl<a_row_T, res_row_T, CONFIG_T>(a_rows, results);
     }
 }
 
 template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
 void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
-                 hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
+                 hls::stream<res_T> &res_stream) {
     if (gemm_strategy<CONFIG_T::gemm_ip_id>::value == gemm_resource) {
-        gemm_stream_resource_impl<data0_T, data1_T, res_T, CONFIG_T>(a_stream, b_stream, res_stream, biases);
+        gemm_stream_resource_impl<data0_T, data1_T, res_T, CONFIG_T>(a_stream, b_stream, res_stream);
     } else {
-        gemm_stream_latency_impl<data0_T, data1_T, res_T, CONFIG_T>(a_stream, b_stream, res_stream, biases);
+        gemm_stream_latency_impl<data0_T, data1_T, res_T, CONFIG_T>(a_stream, b_stream, res_stream);
     }
 }
 
 template <class data_T, class res_T, typename CONFIG_T>
-void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream,
-                            typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
+void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream) {
     if (gemm_strategy<CONFIG_T::gemm_ip_id>::value == gemm_resource) {
-        gemm_stream_const_weights_resource_impl<data_T, res_T, CONFIG_T>(data_stream, res_stream, biases);
+        gemm_stream_const_weights_resource_impl<data_T, res_T, CONFIG_T>(data_stream, res_stream);
     } else {
-        gemm_stream_const_weights_latency_impl<data_T, res_T, CONFIG_T>(data_stream, res_stream, biases);
+        gemm_stream_const_weights_latency_impl<data_T, res_T, CONFIG_T>(data_stream, res_stream);
     }
 }
 
