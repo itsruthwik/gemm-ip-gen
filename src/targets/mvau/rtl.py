@@ -101,7 +101,7 @@ module {module_name} (
     assign in_tvalid  = ap_ce & a_empty_n;
     assign a_read     = ap_ce & in_tready;
     assign out_tready = ap_ce & p_full_n;
-    assign p_write    = ap_ce & out_tvalid;
+    assign p_write    = ap_ce & out_tvalid & p_full_n;   // count only real transfers
     assign p_din      = out_tdata;
 
     mvu_vvu_axi #(
@@ -235,7 +235,7 @@ module {module_name} (
     wire [{ntiles - 1}:0] in_tready;
     wire [{ntiles - 1}:0] out_tvalid;
     assign a_read  = ap_ce & (&in_tready);
-    assign p_write = ap_ce & (&out_tvalid);
+    assign p_write = ap_ce & (&out_tvalid) & p_full_n;   // count only real transfers
 
 {blocks}endmodule
 """
@@ -329,6 +329,7 @@ module {module_name} (
     reg  [{_w(NF) - 1}:0]  nfc = 0;     // column block within band (0..NF-1)
     reg  [1:0]            dcnt = 0;     // drain counter
     reg  [{_w(run_total) - 1}:0]  ocnt = 0;   // output beats seen this node
+    reg  [{_w(M * SF + 1) - 1}:0]  icnt = 0;       // A beats accepted this node (M*SF)
 {wa_decl}
     // band buffer: SIMD consecutive N-wide K-rows (all columns), refilled per band
     reg  [{BB - 1}:0]  band [0:{SIMD - 1}];
@@ -352,7 +353,7 @@ module {module_name} (
 
     always @(posedge ap_clk) begin
         if (ap_rst) begin
-            state <= FILL; sc <= 0; sfc <= 0; nfc <= 0; dcnt <= 0; ocnt <= 0;
+            state <= FILL; sc <= 0; sfc <= 0; nfc <= 0; dcnt <= 0; ocnt <= 0; icnt <= 0;
         end else if (ap_ce) begin
             case (state)
                 FILL: if (b_read) begin
@@ -363,11 +364,14 @@ module {module_name} (
 {write_body}
                 DRAIN: begin
                     dcnt <= dcnt + 1'b1;
-                    if (dcnt == 2'd1) begin state <= RUN; ocnt <= 0; end
+                    if (dcnt == 2'd1) begin state <= RUN; ocnt <= 0; icnt <= 0; end
                 end
-                RUN: if (p_write) begin
-                    if (ocnt == {run_total - 1}) begin state <= FILL; ocnt <= 0; end
-                    else ocnt <= ocnt + 1'b1;
+                RUN: begin
+                    if (in_tvalid & in_tready) icnt <= icnt + 1'b1;
+                    if (p_write) begin
+                        if (ocnt == {run_total - 1}) begin state <= FILL; ocnt <= 0; icnt <= 0; end
+                        else ocnt <= ocnt + 1'b1;
+                    end
                 end
             endcase
         end
@@ -390,12 +394,15 @@ module {module_name} (
 
     // RUN-phase AXIS binding (frozen during LOAD/DRAIN so the core stays idle)
     wire run = (state == RUN);
+    // gate the A handshake on icnt too: stop pulling A beats once this node's M*SF
+    // beats are accepted, even if the next node's rows are already queued in the FIFO.
+    wire in_open = run & (icnt != {M * SF});
     assign wgt_tvalid = ap_ce & run & w_ovld;
     assign w_ordy     = ap_ce & run & wgt_tready;
-    assign in_tvalid  = ap_ce & run & a_empty_n;
-    assign a_read     = ap_ce & run & in_tready;
+    assign in_tvalid  = ap_ce & in_open & a_empty_n;
+    assign a_read     = ap_ce & in_open & in_tready;
     assign out_tready = ap_ce & p_full_n;
-    assign p_write    = ap_ce & out_tvalid;
+    assign p_write    = ap_ce & out_tvalid & p_full_n;   // count only real transfers
     assign p_din      = out_tdata;
 
     mvu_vvu_axi #(
@@ -528,6 +535,7 @@ module {module_name} (
     reg  [{_w(gk) - 1}:0]  tic = 0;      // K-slice being loaded (0..gk-1)
     reg  [1:0]            dcnt = 0;
     reg  [{_w(run_total) - 1}:0]  ocnt = 0;
+    reg  [{_w(M * sf_tile + 1) - 1}:0]  icnt = 0;  // A beats accepted this node (M*SF_tile)
 
     reg  [{BB - 1}:0]  band [0:{SIMD - 1}];   // SIMD N-wide K-rows of the current band
 
@@ -536,16 +544,19 @@ module {module_name} (
 {wwords}
 
     wire run = (state == RUN);
-    wire in_tvalid  = ap_ce & run & a_empty_n;
+    // gate on icnt too: stop pulling A beats once this node's M*SF_tile beats are
+    // accepted, so a queued next-node row isn't fed to the MVU against the current B.
+    wire in_open = run & (icnt != {M * sf_tile});
+    wire in_tvalid  = ap_ce & in_open & a_empty_n;
     wire out_tready = ap_ce & p_full_n;
     wire [{NTILES - 1}:0] in_tready;
     wire [{NTILES - 1}:0] out_tvalid;
-    assign a_read  = ap_ce & run & (&in_tready);
-    assign p_write = ap_ce & (&out_tvalid);
+    assign a_read  = ap_ce & in_open & (&in_tready);
+    assign p_write = ap_ce & (&out_tvalid) & p_full_n;   // count only real transfers
 
     always @(posedge ap_clk) begin
         if (ap_rst) begin
-            state <= FILL; sc <= 0; sfc <= 0; nfc <= 0; tic <= 0; dcnt <= 0; ocnt <= 0;
+            state <= FILL; sc <= 0; sfc <= 0; nfc <= 0; tic <= 0; dcnt <= 0; ocnt <= 0; icnt <= 0;
         end else if (ap_ce) begin
             case (state)
                 FILL: if (b_read) begin
@@ -565,11 +576,14 @@ module {module_name} (
                 end
                 DRAIN: begin
                     dcnt <= dcnt + 1'b1;
-                    if (dcnt == 2'd1) begin state <= RUN; ocnt <= 0; end
+                    if (dcnt == 2'd1) begin state <= RUN; ocnt <= 0; icnt <= 0; end
                 end
-                RUN: if (p_write) begin
-                    if (ocnt == {run_total - 1}) begin state <= FILL; ocnt <= 0; end
-                    else ocnt <= ocnt + 1'b1;
+                RUN: begin
+                    if (in_tvalid & (&in_tready)) icnt <= icnt + 1'b1;
+                    if (p_write) begin
+                        if (ocnt == {run_total - 1}) begin state <= FILL; ocnt <= 0; icnt <= 0; end
+                        else ocnt <= ocnt + 1'b1;
+                    end
                 end
             endcase
         end
@@ -661,6 +675,7 @@ module {module_name} (
     reg  [{_w(SIMD) - 1}:0]  sc = 0;    // lane within band (0..SIMD-1)
     reg  [{_w(gk) - 1}:0]  ti = 0;      // K-slice being loaded (0..gk-1)
     reg  [{_w(M) - 1}:0]  ocnt = 0;     // output beats seen this node (NF=1 -> M)
+    reg  [{_w(M + 1) - 1}:0]  icnt = 0;     // A beats accepted this node (NF=1 -> M)
 
     reg  [{BB - 1}:0]  band [0:{SIMD - 1}];   // SIMD N-wide K-rows of the current K-slice
     reg  [{WB - 1}:0]  wreg [0:{NTILES - 1}]; // per-tile latched weight word
@@ -669,16 +684,19 @@ module {module_name} (
 {wwords}
 
     wire        run = (state == RUN);
-    wire in_tvalid  = ap_ce & run & a_empty_n;
+    // gate on icnt too: stop pulling A beats once this node's M beats are accepted, so
+    // a queued next-node row isn't fed to the MVU against the current B.
+    wire in_open = run & (icnt != {M});
+    wire in_tvalid  = ap_ce & in_open & a_empty_n;
     wire out_tready = ap_ce & p_full_n;
     wire [{NTILES - 1}:0] in_tready;
     wire [{NTILES - 1}:0] out_tvalid;
-    assign a_read  = ap_ce & run & (&in_tready);
-    assign p_write = ap_ce & (&out_tvalid);
+    assign a_read  = ap_ce & in_open & (&in_tready);
+    assign p_write = ap_ce & (&out_tvalid) & p_full_n;   // count only real transfers
 
     always @(posedge ap_clk) begin
         if (ap_rst) begin
-            state <= FILL; sc <= 0; ti <= 0; ocnt <= 0;
+            state <= FILL; sc <= 0; ti <= 0; ocnt <= 0; icnt <= 0;
         end else if (ap_ce) begin
             case (state)
                 FILL: if (b_read) begin
@@ -688,12 +706,15 @@ module {module_name} (
                 end
                 LATCH: begin      // K-slice band complete -> latch all nt N-slice words
 {latch}
-                    if (ti == {gk - 1}) begin ti <= 0; state <= RUN; ocnt <= 0; end
+                    if (ti == {gk - 1}) begin ti <= 0; state <= RUN; ocnt <= 0; icnt <= 0; end
                     else begin ti <= ti + 1'b1; state <= FILL; end
                 end
-                RUN: if (p_write) begin
-                    if (ocnt == {M - 1}) begin state <= FILL; ocnt <= 0; end
-                    else ocnt <= ocnt + 1'b1;
+                RUN: begin
+                    if (in_tvalid & (&in_tready)) icnt <= icnt + 1'b1;
+                    if (p_write) begin
+                        if (ocnt == {M - 1}) begin state <= FILL; ocnt <= 0; icnt <= 0; end
+                        else ocnt <= ocnt + 1'b1;
+                    end
                 end
             endcase
         end
@@ -804,7 +825,7 @@ module {module_name} (
     wire [{n_tiles - 1}:0] in_tready;
     wire [{n_tiles - 1}:0] out_tvalid;
     assign a_read  = ap_ce & (&in_tready);
-    assign p_write = ap_ce & (&out_tvalid);
+    assign p_write = ap_ce & (&out_tvalid) & p_full_n;   // count only real transfers
 
 {blocks}endmodule
 """

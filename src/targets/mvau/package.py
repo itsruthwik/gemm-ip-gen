@@ -1234,6 +1234,7 @@ def gen_combined_header(items):
             f"    template <class data_T, class res_T, typename CONFIG_T>\n"
             f"    static void stream_const_weights(hls::stream<data_T> &a, hls::stream<res_T> &r,\n"
             f"                                  typename CONFIG_T::bias_t b[CONFIG_T::n_out]) {{\n"
+            f"        #pragma HLS INLINE\n"
             f"        {nm}_gemm_stream_const_weights<data_T, res_T, CONFIG_T>(a, r, b);\n"
             f"    }}\n"
             f"}};")
@@ -1250,6 +1251,7 @@ def gen_combined_header(items):
             f"    static void stream(hls::stream<data0_T> &a, hls::stream<data1_T> &b,\n"
             f"                       hls::stream<res_T> &r,\n"
             f"                       typename CONFIG_T::bias_t bias[CONFIG_T::n_out]) {{\n"
+            f"        #pragma HLS INLINE\n"
             f"        {nm}_gemm_stream<data0_T, data1_T, res_T, CONFIG_T>(a, b, r, bias);\n"
             f"    }}\n"
             f"}};")
@@ -1268,6 +1270,7 @@ template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
 void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
                  hls::stream<res_T> &res_stream,
                  typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
+    #pragma HLS INLINE
     mvau_ip_stream<CONFIG_T::gemm_ip_id>::template stream<data0_T, data1_T, res_T, CONFIG_T>(
         a_stream, b_stream, res_stream, biases);
 }}
@@ -1288,6 +1291,7 @@ template <int ID> struct mvau_ip;
 template <class data_T, class res_T, typename CONFIG_T>
 void gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream,
                             typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
+    #pragma HLS INLINE
     mvau_ip<CONFIG_T::gemm_ip_id>::template stream_const_weights<data_T, res_T, CONFIG_T>(
         a_stream, res_stream, biases);
 }}
