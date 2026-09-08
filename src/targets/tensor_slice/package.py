@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from gemm_ip.common import _is_ac_integer_type
-from gemm_ip.quant import _frac_bits, _output_bits
+from gemm_ip.quant import _frac_bits, _operand_bits, _output_bits
 
 # geometry is a sibling target module; put this dir on the path and import by
 # name (the same idiom the RTL loaders below use).
@@ -876,6 +876,8 @@ ac_int<8, true> {name}_to_gemm_int8(const src_T &value) {{
     // stored bits — NOT value.to_int(), which would truncate the fractional part
     // of an ac_fixed operand and destroy it. slc<8>(0) reinterprets the low 8
     // mantissa bits as a signed int8 code; the drain rescales by 2^-(fa+fb).
+    static_assert(src_T::width <= 8, "tensor_slice int8 core: operand wider than 8 bits");
+    static_assert(src_T::sign || src_T::width <= 7, "tensor_slice int8 core: unsigned operand needs width <= 7 (bit 7 would be read as the sign)");
     return static_cast<ac_int<8, true> >(value.template slc<8>(0));
 }}
 
@@ -1710,11 +1712,35 @@ def _assert_core_first_out(name, m, k, n, gemm_k_spatial, grid_v):
         )
 
 
+def _check_operand_fits_int8_core(name, operand_label, precision):
+    """Raise ValueError if `precision` cannot be losslessly read as the
+    tensor_slice int8 core's ac_int<8,true> operand.
+
+    A signed operand fits with width <= 8 (sign bit is bit 7). An unsigned
+    operand only fits with width <= 7, because the {name}_to_gemm_int8
+    conversion reinterprets bit 7 as the sign bit; an unsigned value with bit
+    7 set (e.g. 2.0 in ufixed<8,2>) would silently become negative.
+    """
+    bits = _operand_bits(precision)
+    if bits is None:
+        return
+    width, signed = bits
+    fits = width <= 8 if signed else width <= 7
+    if not fits:
+        raise ValueError(
+            f"{name}: {operand_label} precision '{precision}' does not fit the "
+            "tensor_slice int8 core: signed operands need width <= 8, unsigned "
+            "<= 7; bit 7 of an unsigned 8-bit code would be read as the sign"
+        )
+
+
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
                           gemm_k_spatial=None, input_precision=None, weight_precision=None,
                           clock_period_ns=None, n_frames=1, weight_matrix=None, **_ignored):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
+    _check_operand_fits_int8_core(name, "input_precision", input_precision)
+    _check_operand_fits_int8_core(name, "weight_precision", weight_precision)
     gemm_k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
     # Weight-stationary (const-weight) variant: weights (B, shape [K, N]) baked into
     # the core ROM AND the csim header; the wrapper takes no external weight port and

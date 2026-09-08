@@ -28,6 +28,23 @@ def _frac_bits(precision):
     return width - integer_bits
 
 
+def _operand_bits(precision):
+    """(width, signed) parsed from a precision like 'ufixed<8,2,TRN,WRAP,0>'.
+
+    signed is False iff the precision string starts with 'u' (unsigned
+    fixed-point). Returns None for an unset/unparseable precision.
+    """
+    if not precision:
+        return None
+    s = str(precision)
+    m = re.search(r"(u?)fixed<\s*(\d+)", s)
+    if not m:
+        return None
+    signed = not m.group(1)
+    width = int(m.group(2))
+    return (width, signed)
+
+
 def _output_bits(output_precision):
     """Result-lane width (bits) from an output_precision like 'fixed<16,6,…>'.
 
