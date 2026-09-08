@@ -46,9 +46,9 @@ def _ap_type(precision, default):
 # ── The four synthesizable entry points (shape-independent template) ─────────────
 #
 # Identical microarchitecture to the whole-model combined header (see
-# _GEMM_IP_COMBINED_FUNCS): the row (M) loop is pipelined at II=CONFIG_T::reuse_factor,
+# _GEMM_IP_COMBINED_FUNCS): the row (M) loop is pipelined at II=gemm_rf<CONFIG_T>::reuse_factor,
 # the N (output) and K (contraction) loops are fully UNROLLed, and the multiplier count
-# is capped by CONFIG_T::multiplier_limit. Strategy/ReuseFactor reach the core purely
+# is capped by gemm_rf<CONFIG_T>::multiplier_limit. Strategy/ReuseFactor reach the core purely
 # through CONFIG_T (which config_header emits), so this standalone package and the flow
 # synthesize the same RTL:
 #   - Latency  (reuse_factor=1): II=1, multiplier_limit=gemm_k*gemm_n -> full array.
@@ -63,9 +63,9 @@ namespace nnet {
 template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
                 res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     GEMM_ARRAY_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
         GEMM_ARRAY_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
             #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
@@ -88,9 +88,9 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
 template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T weight_cols[CONFIG_T::gemm_n],
                            res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     GEMM_AWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
         GEMM_AWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
             #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
@@ -114,7 +114,7 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
     static_assert(data0_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
     static_assert(data1_T::size == CONFIG_T::gemm_k, "B column height must equal gemm_k.");
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
 
     data1_T b_cols[CONFIG_T::gemm_n];
     GEMM_STREAM_READB: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
@@ -122,7 +122,7 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
         b_cols[n] = b_stream.read();
     }
     GEMM_STREAM_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
         data0_T a_row = a_stream.read();
         res_T c_row;
         GEMM_STREAM_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
@@ -147,10 +147,10 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, b_col_T weight_
                             hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
     static_assert(data_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
 
     GEMM_SWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
         data_T a_row = data_stream.read();
         res_T c_row;
         GEMM_SWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
@@ -178,19 +178,22 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, b_col_T weight_
 # unrolls `block_factor = ceil(n_in*n_out/rf)` multipliers per ReuseLoop iteration (rf
 # iterations, PIPELINE II=1). This is the same recurrence, transliterated variable-for-
 # variable (n_in->gemm_k, n_out->gemm_n, data->a_row, res->c_row) with ONE change: the
-# baseline's flat row-major `weights[index]` (index = k*n_out + n) becomes our
-# column-major `weight_cols[n][k]` (== B[k][n]): wherever baseline reads weights[index],
-# here we do `k = index / gemm_n; n = index % gemm_n; value = weight_cols[n][k];`.
+# baseline's flat row-major `weights[index]` (index = k*n_out + n) becomes a beat array:
+# column-major `weight_cols[n][k]` (== B[k][n], the default) or, when the layer's ROM was
+# packed under SecondOperandRowMajor (ROW_MAJOR template flag == CONFIG_T::weights_row_major
+# in the combined header), row-major `weight_cols[k][n]`. Wherever baseline reads
+# weights[index], here we do `k = index / gemm_n; n = index % gemm_n;` and pick the
+# beat index order by ROW_MAJOR.
 #
 # One core (three regime functions + a compile-time dispatcher) is shared by all four
 # resource entry points in each header (standalone and combined each get their own
 # copy, since the two headers are textually independent) to avoid a 4x duplication of
 # the three regimes.
 _GEMM_ROW_RESOURCE_CORE = r"""
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::gemm_n],
+template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false>
+void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ? CONFIG_T::gemm_k : CONFIG_T::gemm_n],
                                    bias_T biases[CONFIG_T::gemm_n], res_row_T &c_row) {
-    const int rufactor = CONFIG_T::reuse_factor;
+    const int rufactor = gemm_rf<CONFIG_T>::reuse_factor;
     const int nin = CONFIG_T::gemm_k;
     const int nout = CONFIG_T::gemm_n;
     const int multfactor = rufactor < nin ? rufactor : nin;
@@ -200,7 +203,12 @@ void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::
 
     #pragma HLS INLINE off
     #pragma HLS function_instantiate variable=weight_cols,biases
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
+    // The caller's row buffers are nnet::array structs; partition their element arrays
+    // here (dim=0) so the unrolled result/operand accesses are registers, not a RAM port
+    // bound (at N=128 a 2-port RAM c_row capped the reuse loop at II=64).
+    #pragma HLS ARRAY_PARTITION variable=c_row complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=a_row complete dim=0
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     typename CONFIG_T::accum_t acc[CONFIG_T::gemm_n];
     #pragma HLS ARRAY_PARTITION variable=acc complete
 
@@ -221,7 +229,7 @@ void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::
             // recurrence already tracks (in_index, out_index) == (k, n) for the
             // pair weights[w_index] semantically belongs to, so no decode of
             // w_index itself is needed (only used here for its own recurrence).
-            acc[out_index] += (typename CONFIG_T::accum_t)(a_row[in_index] * weight_cols[out_index][in_index]);
+            acc[out_index] += (typename CONFIG_T::accum_t)(a_row[in_index] * (ROW_MAJOR ? weight_cols[in_index][out_index] : weight_cols[out_index][in_index]));
             w_index += rufactor;
             in_index += rufactor;
             if (in_index >= nin) in_index = ir;
@@ -236,17 +244,22 @@ void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::
     }
 }
 
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::gemm_n],
+template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false>
+void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ? CONFIG_T::gemm_k : CONFIG_T::gemm_n],
                                        bias_T biases[CONFIG_T::gemm_n], res_row_T &c_row) {
     const int nin = CONFIG_T::gemm_k;
     const int nout = CONFIG_T::gemm_n;
-    const int rufactor = CONFIG_T::reuse_factor < nin * nout ? CONFIG_T::reuse_factor : nin * nout;
-    const int block_factor = (nin * nout + CONFIG_T::reuse_factor - 1) / CONFIG_T::reuse_factor;
+    const int rufactor = gemm_rf<CONFIG_T>::reuse_factor < nin * nout ? gemm_rf<CONFIG_T>::reuse_factor : nin * nout;
+    const int block_factor = (nin * nout + gemm_rf<CONFIG_T>::reuse_factor - 1) / gemm_rf<CONFIG_T>::reuse_factor;
 
     #pragma HLS INLINE off
     #pragma HLS function_instantiate variable=weight_cols,biases
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
+    // The caller's row buffers are nnet::array structs; partition their element arrays
+    // here (dim=0) so the unrolled result/operand accesses are registers, not a RAM port
+    // bound (at N=128 a 2-port RAM c_row capped the reuse loop at II=64).
+    #pragma HLS ARRAY_PARTITION variable=c_row complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=a_row complete dim=0
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     typename CONFIG_T::accum_t acc[CONFIG_T::gemm_n];
     #pragma HLS ARRAY_PARTITION variable=acc complete
 
@@ -259,7 +272,7 @@ void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[CONFIG
     int outstep = 0;
     const int outscale = rufactor / nin;
 
-    int outidx[/*rufactor*/ CONFIG_T::reuse_factor];
+    int outidx[/*rufactor*/ gemm_rf<CONFIG_T>::reuse_factor];
     GRR_REM0_INDEX: for (int ir = 0; ir < rufactor; ir++) {
         outidx[ir] = outstep;
         if ((ir + 1) % nin == 0) outstep++;
@@ -273,7 +286,7 @@ void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[CONFIG
             #pragma HLS UNROLL
             // in_index is fixed for the whole MultLoop (one k per ir); out_index
             // is the tracked n. weights[w_index] -> weight_cols[out_index][in_index].
-            acc[out_index] += (typename CONFIG_T::accum_t)(a_row[in_index] * weight_cols[out_index][in_index]);
+            acc[out_index] += (typename CONFIG_T::accum_t)(a_row[in_index] * (ROW_MAJOR ? weight_cols[in_index][out_index] : weight_cols[out_index][in_index]));
             w_index += rufactor;
             if (w_index >= nin * nout) break;
             out_index += outscale;
@@ -288,10 +301,10 @@ void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[CONFIG
     }
 }
 
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::gemm_n],
+template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false>
+void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ? CONFIG_T::gemm_k : CONFIG_T::gemm_n],
                                   bias_T biases[CONFIG_T::gemm_n], res_row_T &c_row) {
-    const int rufactor = CONFIG_T::reuse_factor;
+    const int rufactor = gemm_rf<CONFIG_T>::reuse_factor;
     const int nin = CONFIG_T::gemm_k;
     const int nout = CONFIG_T::gemm_n;
     const int multfactor = rufactor < nin ? rufactor : nin;
@@ -300,7 +313,12 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::g
 
     #pragma HLS INLINE off
     #pragma HLS function_instantiate variable=weight_cols,biases
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
+    // The caller's row buffers are nnet::array structs; partition their element arrays
+    // here (dim=0) so the unrolled result/operand accesses are registers, not a RAM port
+    // bound (at N=128 a 2-port RAM c_row capped the reuse loop at II=64).
+    #pragma HLS ARRAY_PARTITION variable=c_row complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=a_row complete dim=0
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     typename CONFIG_T::accum_t acc[CONFIG_T::gemm_n];
     #pragma HLS ARRAY_PARTITION variable=acc complete
 
@@ -312,8 +330,8 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::g
     GRR_GT_REUSE: for (int ir = 0; ir < rufactor; ir++) {
         #pragma HLS PIPELINE II=1 rewind
         typename CONFIG_T::accum_t tmpmult[/*block_factor*/ (CONFIG_T::gemm_k * CONFIG_T::gemm_n
-                                                               + CONFIG_T::reuse_factor - 1)
-                                                              / CONFIG_T::reuse_factor];
+                                                               + gemm_rf<CONFIG_T>::reuse_factor - 1)
+                                                              / gemm_rf<CONFIG_T>::reuse_factor];
         #pragma HLS ARRAY_PARTITION variable=tmpmult complete
 
         GRR_GT_MULT: for (int im = 0; im < block_factor; im++) {
@@ -324,14 +342,14 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::g
             // multfactor == nin here (rufactor > nin), so w_index/multfactor == the
             // output index n (matches out_index below, which uses the same divisor).
             int n = w_index / multfactor;
-            tmpmult[im] = (typename CONFIG_T::accum_t)(a_row[in_index] * weight_cols[n][in_index]);
+            tmpmult[im] = (typename CONFIG_T::accum_t)(a_row[in_index] * (ROW_MAJOR ? weight_cols[in_index][n] : weight_cols[n][in_index]));
         }
 
         typename CONFIG_T::accum_t mult[/*multiplier_limit*/ (CONFIG_T::gemm_k * CONFIG_T::gemm_n
-                                                                + ((CONFIG_T::reuse_factor < CONFIG_T::gemm_k)
-                                                                   ? CONFIG_T::reuse_factor : CONFIG_T::gemm_k) - 1)
-                                                               / ((CONFIG_T::reuse_factor < CONFIG_T::gemm_k)
-                                                                  ? CONFIG_T::reuse_factor : CONFIG_T::gemm_k)];
+                                                                + ((gemm_rf<CONFIG_T>::reuse_factor < CONFIG_T::gemm_k)
+                                                                   ? gemm_rf<CONFIG_T>::reuse_factor : CONFIG_T::gemm_k) - 1)
+                                                               / ((gemm_rf<CONFIG_T>::reuse_factor < CONFIG_T::gemm_k)
+                                                                  ? gemm_rf<CONFIG_T>::reuse_factor : CONFIG_T::gemm_k)];
         #pragma HLS ARRAY_PARTITION variable=mult complete
 
         GRR_GT_RESETMULT: for (int imult = 0; imult < multiplier_limit; imult++) {
@@ -360,23 +378,23 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::g
     }
 }
 
-// gemm_row_resource — dispatches to the regime matching CONFIG_T::reuse_factor vs
+// gemm_row_resource — dispatches to the regime matching gemm_rf<CONFIG_T>::reuse_factor vs
 // CONFIG_T::gemm_k, exactly as hls4ml's dense_resource dispatches on n_in. Reused by
 // gemm_array/_const_weights/gemm_stream/_const_weights below (M loop wraps this once
 // per row; no PIPELINE on the M loop itself -- the II=1 pipelining is on the inner
 // ReuseLoop inside each regime, per hls4ml's own structure).
-template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
-void gemm_row_resource(a_row_T &a_row, b_col_T weight_cols[CONFIG_T::gemm_n],
+template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T, bool ROW_MAJOR = false>
+void gemm_row_resource(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ? CONFIG_T::gemm_k : CONFIG_T::gemm_n],
                         bias_T biases[CONFIG_T::gemm_n], res_row_T &c_row) {
     #pragma HLS INLINE off
-    if (CONFIG_T::reuse_factor <= CONFIG_T::gemm_k) {
-        gemm_row_resource_rf_leq_nin<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T>(
+    if (gemm_rf<CONFIG_T>::reuse_factor <= CONFIG_T::gemm_k) {
+        gemm_row_resource_rf_leq_nin<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T, ROW_MAJOR>(
             a_row, weight_cols, biases, c_row);
-    } else if (CONFIG_T::reuse_factor % CONFIG_T::gemm_k == 0) {
-        gemm_row_resource_rf_gt_nin_rem0<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T>(
+    } else if (gemm_rf<CONFIG_T>::reuse_factor % CONFIG_T::gemm_k == 0) {
+        gemm_row_resource_rf_gt_nin_rem0<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T, ROW_MAJOR>(
             a_row, weight_cols, biases, c_row);
     } else {
-        gemm_row_resource_rf_gt_nin<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T>(
+        gemm_row_resource_rf_gt_nin<a_row_T, b_col_T, bias_T, res_row_T, CONFIG_T, ROW_MAJOR>(
             a_row, weight_cols, biases, c_row);
     }
 }
@@ -407,11 +425,11 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
 template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T weight_cols[CONFIG_T::gemm_n],
                            res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
-    const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + CONFIG_T::reuse_factor - 1)
-                              / CONFIG_T::reuse_factor;
+    const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + gemm_rf<CONFIG_T>::reuse_factor - 1)
+                              / gemm_rf<CONFIG_T>::reuse_factor;
     #pragma HLS ARRAY_RESHAPE   variable=weight_cols block factor=block_factor
     #pragma HLS ARRAY_PARTITION variable=biases complete
-    if (CONFIG_T::reuse_factor > 1) {
+    if (gemm_rf<CONFIG_T>::reuse_factor > 1) {
         #pragma HLS BIND_STORAGE variable=weight_cols type=rom_np impl=bram
     }
     GEMM_AWL_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
@@ -452,11 +470,11 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, b_col_T weight_
                             hls::stream<res_T> &res_stream, typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
     static_assert(data_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
-    const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + CONFIG_T::reuse_factor - 1)
-                              / CONFIG_T::reuse_factor;
+    const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + gemm_rf<CONFIG_T>::reuse_factor - 1)
+                              / gemm_rf<CONFIG_T>::reuse_factor;
     #pragma HLS ARRAY_RESHAPE   variable=weight_cols block factor=block_factor
     #pragma HLS ARRAY_PARTITION variable=biases complete
-    if (CONFIG_T::reuse_factor > 1) {
+    if (gemm_rf<CONFIG_T>::reuse_factor > 1) {
         #pragma HLS BIND_STORAGE variable=weight_cols type=rom_np impl=bram
     }
 
@@ -508,6 +526,19 @@ template <typename T, unsigned N> struct array {
 """
 
 
+_GEMM_RF_PASSTHROUGH = r'''namespace nnet {
+// gemm_rf<CONFIG_T>: the reuse factor / multiplier cap the kernels schedule against.
+// Standalone packages have one config per package, so this is a plain pass-through of
+// CONFIG_T; the whole-model combined header overrides it per layer (see
+// _gemm_rf_trait) with the value the runner validated/snapped in the manifest.
+template <typename CONFIG_T> struct gemm_rf {
+    static const unsigned reuse_factor = CONFIG_T::reuse_factor;
+    static const unsigned multiplier_limit = CONFIG_T::multiplier_limit;
+};
+} // namespace nnet
+'''
+
+
 def gemm_ip_header(name, strategy="latency"):
     """The four synthesizable entry points (shape-generic).
 
@@ -531,6 +562,7 @@ def gemm_ip_header(name, strategy="latency"):
         "#include <ap_int.h>\n"
         "#include <hls_stream.h>\n"
         '#include "nnet_types.h"\n'
+        f"{_GEMM_RF_PASSTHROUGH}\n"
         f"{funcs}\n"
         f"#endif // {name.upper()}_GEMM_IP_H_\n"
     )
@@ -543,14 +575,14 @@ def gemm_ip_header(name, strategy="latency"):
 # entry points below ARE the combined header. Their signatures match the hls4ml
 # contract exactly (the "declaration only" prototypes in nnet_gemm_ip.h /
 # nnet_gemm_stream.h): the const_weights entries take NO weight argument and source the
-# constant columns from CONFIG_T::gemm_weight_cols() (the ROM the writer injects into
-# each layer's CONFIG_T), and gemm_stream_const_weights unpacks narrow input beats into a
+# constant operand from CONFIG_T::gemm_weight_beats() (the ROM the writer injects into
+# each layer's CONFIG_T, column- or row-major per SecondOperandRowMajor), and gemm_stream_const_weights unpacks narrow input beats into a
 # gemm_k-wide row. Header-only + synthesizable -> no add_files (see sources tcl).
 #
 # Microarchitecture (mirrors hls4ml's nnet_dense_latency): each streamed/array A row
 # is one pipelined region — the N (output) and K (contraction) loops are fully
-# UNROLLed, the row (M) loop is pipelined at II=CONFIG_T::reuse_factor, and the
-# multiplier count is capped by CONFIG_T::multiplier_limit. So Strategy/ReuseFactor
+# UNROLLed, the row (M) loop is pipelined at II=gemm_rf<CONFIG_T>::reuse_factor, and the
+# multiplier count is capped by gemm_rf<CONFIG_T>::multiplier_limit. So Strategy/ReuseFactor
 # reach the core through CONFIG_T (hls4ml injects both into each layer's gemm config):
 #   - Latency  (reuse_factor=1): II=1, multiplier_limit=gemm_k*gemm_n -> the full
 #     K*N multiplier array fires per row, one row/cycle (the DenseLatency point).
@@ -559,13 +591,28 @@ def gemm_ip_header(name, strategy="latency"):
 _GEMM_IP_COMBINED_FUNCS = r"""
 namespace nnet {
 
+// Constant-operand ROM access, layout-agnostic (mirrors nnet::gemm_weight_at in hls4ml's
+// nnet_gemm_ip.h, which is declared AFTER this header is included, so it is restated
+// here). The writer packs a weight-stationary layer's ROM per SecondOperandRowMajor:
+//   CONFIG_T::weights_row_major == false: gemm_weight_beats()[n][k] == W[k][n]
+//   CONFIG_T::weights_row_major == true : gemm_weight_beats()[k][n] == W[k][n]
+template <typename CONFIG_T>
+inline typename CONFIG_T::weight_t gemm_ip_weight_at(typename CONFIG_T::weight_beat_t *beats,
+                                                     unsigned k, unsigned n) {
+    #pragma HLS INLINE
+    if (CONFIG_T::weights_row_major) {
+        return beats[k][n];
+    }
+    return beats[n][k];
+}
+
 // gemm_array — io_parallel, TWO activation operands (attention QK^T / A.V).
 template <class a_row_T, class b_col_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_n],
                 res_row_T results[CONFIG_T::gemm_m], bias_T biases[CONFIG_T::gemm_n]) {
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     GEMM_ARRAY_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
         GEMM_ARRAY_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
             #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
@@ -583,20 +630,21 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
 }
 
 // gemm_array_const_weights — io_parallel, constant operand held by the IP. No weight
-// argument: the columns come from CONFIG_T::gemm_weight_cols() (contract signature).
+// argument: the weights come from CONFIG_T::gemm_weight_beats() (contract signature;
+// either beat layout, see gemm_ip_weight_at).
 template <class a_row_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m],
                            bias_T biases[CONFIG_T::gemm_n]) {
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
-    typename CONFIG_T::weight_col_t *weight_cols = CONFIG_T::gemm_weight_cols();
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
+    typename CONFIG_T::weight_beat_t *weight_cols = CONFIG_T::gemm_weight_beats();
     GEMM_AWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
         GEMM_AWL_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
             #pragma HLS UNROLL
             typename CONFIG_T::accum_t accum = 0;
             GEMM_AWL_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
                 #pragma HLS UNROLL
-                accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * weight_cols[n][k]);
+                accum += (typename CONFIG_T::accum_t)(a_rows[m][k] * gemm_ip_weight_at<CONFIG_T>(weight_cols, k, n));
             }
             accum += biases[n];
             // Direct element write (see gemm_array): avoids the whole-row operator=
@@ -614,7 +662,7 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
     static_assert(data0_T::size == CONFIG_T::gemm_k, "A row width must equal gemm_k.");
     static_assert(data1_T::size == CONFIG_T::gemm_k, "B column height must equal gemm_k.");
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
 
     data1_T b_cols[CONFIG_T::gemm_n];
     GEMM_STREAM_READB: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
@@ -622,7 +670,7 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
         b_cols[n] = b_stream.read();
     }
     GEMM_STREAM_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
         data0_T a_row = a_stream.read();
         res_T c_row;
         GEMM_STREAM_N: for (unsigned n = 0; n < CONFIG_T::gemm_n; n++) {
@@ -640,19 +688,20 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
 }
 
 // gemm_stream_const_weights — io_stream, constant operand held by the IP. No weight
-// argument (contract signature): columns come from CONFIG_T::gemm_weight_cols(). The
+// argument (contract signature): weights come from CONFIG_T::gemm_weight_beats() (either
+// beat layout, see gemm_ip_weight_at). The
 // input may arrive as several narrower beats (gemm_k / data_T::size) that are packed
 // into a gemm_k-wide row, mirroring the hls4ml behavioral entry.
 template <class data_T, class res_T, typename CONFIG_T>
 void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res_T> &res_stream,
                             typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
-    #pragma HLS ALLOCATION operation instances=mul limit=CONFIG_T::multiplier_limit
+    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     typedef nnet::array<typename data_T::value_type, CONFIG_T::gemm_k> a_row_T;
-    typename CONFIG_T::weight_col_t *weight_cols = CONFIG_T::gemm_weight_cols();
+    typename CONFIG_T::weight_beat_t *weight_cols = CONFIG_T::gemm_weight_beats();
 
     GEMM_SWL_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+        #pragma HLS PIPELINE II=gemm_rf<CONFIG_T>::reuse_factor
         a_row_T a_row;
         GEMM_SWL_READA: for (unsigned kp = 0; kp < CONFIG_T::gemm_k / data_T::size; kp++) {
             #pragma HLS UNROLL
@@ -668,7 +717,7 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res
             typename CONFIG_T::accum_t accum = 0;
             GEMM_SWL_K: for (unsigned k = 0; k < CONFIG_T::gemm_k; k++) {
                 #pragma HLS UNROLL
-                accum += (typename CONFIG_T::accum_t)(a_row[k] * weight_cols[n][k]);
+                accum += (typename CONFIG_T::accum_t)(a_row[k] * gemm_ip_weight_at<CONFIG_T>(weight_cols, k, n));
             }
             accum += biases[n];
             c_row[n] = accum;
@@ -701,22 +750,23 @@ void gemm_array(a_row_T a_rows[CONFIG_T::gemm_m], b_col_T b_cols[CONFIG_T::gemm_
     }
 }
 
-// gemm_array_const_weights — io_parallel, constant operand from CONFIG_T::gemm_weight_cols()
-// (contract signature: no weight argument). Same ARRAY_RESHAPE / BIND_STORAGE pragmas
-// as baseline dense_resource, applied to weight_cols.
+// gemm_array_const_weights — io_parallel, constant operand from CONFIG_T::gemm_weight_beats()
+// (contract signature: no weight argument; beat layout per CONFIG_T::weights_row_major).
+// Same ARRAY_RESHAPE / BIND_STORAGE pragmas as baseline dense_resource, applied to weight_cols.
 template <class a_row_T, class bias_T, class res_row_T, typename CONFIG_T>
 void gemm_array_const_weights(a_row_T a_rows[CONFIG_T::gemm_m], res_row_T results[CONFIG_T::gemm_m],
                            bias_T biases[CONFIG_T::gemm_n]) {
-    typename CONFIG_T::weight_col_t *weight_cols = CONFIG_T::gemm_weight_cols();
-    const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + CONFIG_T::reuse_factor - 1)
-                              / CONFIG_T::reuse_factor;
+    typename CONFIG_T::weight_beat_t *weight_cols = CONFIG_T::gemm_weight_beats();
+    const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + gemm_rf<CONFIG_T>::reuse_factor - 1)
+                              / gemm_rf<CONFIG_T>::reuse_factor;
     #pragma HLS ARRAY_RESHAPE   variable=weight_cols block factor=block_factor
     #pragma HLS ARRAY_PARTITION variable=biases complete
-    if (CONFIG_T::reuse_factor > 1) {
+    if (gemm_rf<CONFIG_T>::reuse_factor > 1) {
         #pragma HLS BIND_STORAGE variable=weight_cols type=rom_np impl=bram
     }
     GEMM_AWL_RES_M: for (unsigned m = 0; m < CONFIG_T::gemm_m; m++) {
-        gemm_row_resource<a_row_T, typename CONFIG_T::weight_col_t, bias_T, res_row_T, CONFIG_T>(
+        gemm_row_resource<a_row_T, typename CONFIG_T::weight_beat_t, bias_T, res_row_T, CONFIG_T,
+                          CONFIG_T::weights_row_major>(
             a_rows[m], weight_cols, biases, results[m]);
     }
 }
@@ -743,7 +793,8 @@ void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
     }
 }
 
-// gemm_stream_const_weights — io_stream, constant operand from CONFIG_T::gemm_weight_cols()
+// gemm_stream_const_weights — io_stream, constant operand from CONFIG_T::gemm_weight_beats()
+// (beat layout per CONFIG_T::weights_row_major)
 // (contract signature). Input may arrive as several narrower beats packed into a
 // gemm_k-wide row, mirroring the latency combined entry.
 template <class data_T, class res_T, typename CONFIG_T>
@@ -751,12 +802,12 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res
                             typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {
     static_assert(res_T::size == CONFIG_T::gemm_n, "C row width must equal gemm_n.");
     typedef nnet::array<typename data_T::value_type, CONFIG_T::gemm_k> a_row_T;
-    typename CONFIG_T::weight_col_t *weight_cols = CONFIG_T::gemm_weight_cols();
-    const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + CONFIG_T::reuse_factor - 1)
-                              / CONFIG_T::reuse_factor;
+    typename CONFIG_T::weight_beat_t *weight_cols = CONFIG_T::gemm_weight_beats();
+    const int block_factor = (CONFIG_T::gemm_k * CONFIG_T::gemm_n + gemm_rf<CONFIG_T>::reuse_factor - 1)
+                              / gemm_rf<CONFIG_T>::reuse_factor;
     #pragma HLS ARRAY_RESHAPE   variable=weight_cols block factor=block_factor
     #pragma HLS ARRAY_PARTITION variable=biases complete
-    if (CONFIG_T::reuse_factor > 1) {
+    if (gemm_rf<CONFIG_T>::reuse_factor > 1) {
         #pragma HLS BIND_STORAGE variable=weight_cols type=rom_np impl=bram
     }
 
@@ -771,7 +822,8 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res
             }
         }
         res_T c_row;
-        gemm_row_resource<a_row_T, typename CONFIG_T::weight_col_t, typename CONFIG_T::bias_t, res_T, CONFIG_T>(
+        gemm_row_resource<a_row_T, typename CONFIG_T::weight_beat_t, typename CONFIG_T::bias_t, res_T, CONFIG_T,
+                          CONFIG_T::weights_row_major>(
             a_row, weight_cols, biases, c_row);
         res_stream.write(c_row);
     }
@@ -815,6 +867,43 @@ def _gemm_strategy_trait(items):
     )
 
 
+def _gemm_rf_trait(items):
+    """Emit gemm_rf<CONFIG_T> for the combined header: per-layer reuse factor and
+    multiplier cap taken from the manifest (which run_atlas_flow has validated/snapped
+    against hls4ml's reuse-factor rules), overriding the raw value hls4ml baked into
+    CONFIG_T. Items with no gemm_ip_index or no reuse_factor fall through to CONFIG_T."""
+    specs = []
+    for item in items:
+        idx = item.get("gemm_ip_index")
+        rf = item.get("reuse_factor")
+        if idx is None or rf is None:
+            continue
+        rf = max(1, int(rf))
+        k = int(item.get("k", item.get("gemm_k", item.get("n_in", 0))))
+        n = int(item.get("n", item.get("gemm_n", item.get("n_out", 0))))
+        mult_limit = -(-(k * n) // rf)
+        specs.append(
+            f"template <> struct gemm_rf_override<{idx}> {{ static const bool set = true; "
+            f"static const unsigned reuse_factor = {rf}; "
+            f"static const unsigned multiplier_limit = {mult_limit}; }};")
+    specs_txt = "\n".join(specs)
+    return (
+        "namespace nnet {\n"
+        "// Per-layer reuse factor from the manifest (validated/snapped by the runner),\n"
+        "// keyed on CONFIG_T::gemm_ip_id; layers without an entry use CONFIG_T's own.\n"
+        "template <unsigned id> struct gemm_rf_override { static const bool set = false; "
+        "static const unsigned reuse_factor = 1; static const unsigned multiplier_limit = 1; };\n"
+        f"{specs_txt}\n"
+        "template <typename CONFIG_T> struct gemm_rf {\n"
+        "    static const unsigned reuse_factor = gemm_rf_override<CONFIG_T::gemm_ip_id>::set\n"
+        "        ? gemm_rf_override<CONFIG_T::gemm_ip_id>::reuse_factor : CONFIG_T::reuse_factor;\n"
+        "    static const unsigned multiplier_limit = gemm_rf_override<CONFIG_T::gemm_ip_id>::set\n"
+        "        ? gemm_rf_override<CONFIG_T::gemm_ip_id>::multiplier_limit : CONFIG_T::multiplier_limit;\n"
+        "};\n"
+        "} // namespace nnet\n"
+    )
+
+
 def combined_header(items=None):
     """The whole-model integration header included by the firmware when
     GEMM_IP_HEADER is set: the four contract entry points, one template each,
@@ -832,6 +921,7 @@ def combined_header(items=None):
     latency_impl = _rename_entry_funcs(_GEMM_IP_COMBINED_FUNCS, "_latency_impl")
     resource_impl = _rename_entry_funcs(_GEMM_IP_COMBINED_RESOURCE_FUNCS, "_resource_impl")
     trait = _gemm_strategy_trait(items)
+    rf_trait = _gemm_rf_trait(items)
     dispatch = r"""
 namespace nnet {
 
@@ -881,6 +971,7 @@ void gemm_stream_const_weights(hls::stream<data_T> &data_stream, hls::stream<res
         "#ifndef GEMM_IP_COMBINED_H_\n"
         "#define GEMM_IP_COMBINED_H_\n\n"
         "#include <hls_stream.h>\n"
+        f"{rf_trait}\n"
         f"{latency_impl}\n"
         f"{resource_impl}\n"
         "namespace nnet {\n"

@@ -26,6 +26,8 @@ import package as _package  # noqa: E402
 class GenericTarget(Target):
     name = "generic"
     tool = "vitis"
+    # The combined header reads either ROM order straight from CONFIG_T (weights_row_major).
+    weight_layouts = ("column_major", "row_major")
 
     def geometry(self, shape):
         m, k, n = shape

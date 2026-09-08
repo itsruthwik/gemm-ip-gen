@@ -19,6 +19,10 @@ class Target(ABC):
     name = None
     #: the single HLS tool this hardblock is welded to, e.g. "catapult"
     tool = None
+    #: weight-stationary ROM layouts (manifest ``weight_layout``) this target consumes
+    #: as-is. The CLI refuses anything else -- gemm-ip-gen never re-orders a layout the
+    #: frontend chose (SecondOperandRowMajor); a target either reads it or errors.
+    weight_layouts = ("column_major",)
 
     @abstractmethod
     def geometry(self, shape):

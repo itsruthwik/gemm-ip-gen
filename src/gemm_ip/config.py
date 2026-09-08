@@ -78,9 +78,11 @@ def _normalize_item(item):
     # Weight-stationary (const-weight) variant: the wrapper bakes the weights into
     # an internal ROM (from weight_file) and takes no external weight port; the csim
     # header takes A only (no weight argument). Selected solely by weights_in_core;
-    # weight_file is the column-major [n][k] raw-int .dat hls4ml emits.
+    # weight_file is the raw-int .dat hls4ml emits, packed per weight_layout
+    # (column_major [n][k] default; row_major [k][n] under SecondOperandRowMajor).
     item["weights_in_core"] = bool(item.get("weights_in_core", False))
     item.setdefault("weight_file", item.get("weight_file"))
+    item.setdefault("weight_layout", item.get("weight_layout") or "column_major")
     return item
 
 
@@ -142,6 +144,7 @@ def _normalize_config_items(cfg):
                 # Weight-stationary (const-weight) selection + weights source.
                 "weights_in_core": bool(item.get("weights_in_core", False)),
                 "weight_file": item.get("weight_file"),
+                "weight_layout": item.get("weight_layout") or "column_major",
                 "gemm_k_spatial": _validate_gemm_k_spatial(
                     int(item.get("gemm_k", item.get("n_in", 8))),
                     item.get("gemm_k_spatial"),

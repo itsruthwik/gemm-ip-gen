@@ -95,12 +95,21 @@ def _run(args):
         items = target.normalize_config(cfg)
         for item in items:
             # Weight-stationary (const-weight): bake weights into the core ROM + csim
-            # header. The .dat is column-major [n][k] raw ints emitted by hls4ml, path
-            # relative to the config file; load_weight_dat returns B as [K, N].
+            # header. The .dat is raw ints emitted by hls4ml in the manifest's
+            # weight_layout (column-major [n][k] default, row-major [k][n] under
+            # SecondOperandRowMajor), path relative to the config file. The layout is
+            # the frontend's choice: a target that does not consume it is an error
+            # here, never a silent re-order (Target.weight_layouts).
             weight_matrix = None
             if item.get("weights_in_core") and item.get("weight_file"):
+                layout = (item.get("weight_layout") or "column_major").lower()
+                if layout not in target.weight_layouts:
+                    raise SystemExit(
+                        f"gemm_ip: layer '{item['name']}' has weight_layout '{layout}' "
+                        f"(HLSConfig SecondOperandRowMajor) but target '{target.name}' only "
+                        f"consumes {', '.join(target.weight_layouts)}.")
                 dat = (cfg_path.parent / item["weight_file"]).resolve()
-                weight_matrix = _weights.load_weight_dat(str(dat), item["n"], item["k"])
+                weight_matrix = _weights.load_weight_dat(str(dat), item["n"], item["k"], layout)
             target.package(
                 (item["m"], item["k"], item["n"]),
                 {

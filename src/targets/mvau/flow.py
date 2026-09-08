@@ -62,6 +62,9 @@ def _normalize_mvau_items(cfg):
             "part": it.get("part"),
             "weights_in_core": bool(it.get("weights_in_core", False)),
             "weight_file": it.get("weight_file"),
+            # ROM layout hls4ml wrote the .dat in; the CLI refuses anything the target
+            # does not consume (Target.weight_layouts).
+            "weight_layout": it.get("weight_layout") or "column_major",
             "n_tiles": int(it.get("n_tiles", 1) or 1),
             # DEBUG: mvau user-directed fold knobs injected via ATLASConfig (bypassing
             # hls4ml's gemm_config). TODO: Ruthwik change this.

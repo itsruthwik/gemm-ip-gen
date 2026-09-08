@@ -4,9 +4,11 @@ The weight-stationary GEMM IP variant bakes the constant weights into an interna
 ROM in the RTL wrapper (no external weight port) and streams one weight beat per
 cycle into the tensor slice — exactly as the external ``b_cols`` port does today.
 
-hls4ml emits the weights as a column-major ``[gemm_n][gemm_k]`` raw fixed-point
-integer ``.dat`` (``hls4ml/writer/gemm_ip_weights.py``). The tensor slice's B feed
-expects ``B`` shaped ``[K, N]``, so we load the ``.dat`` and transpose.
+hls4ml emits the weights as a raw fixed-point integer ``.dat``
+(``hls4ml/writer/gemm_ip_weights.py``), column-major ``[gemm_n][gemm_k]`` by default
+or row-major ``[gemm_k][gemm_n]`` under ``SecondOperandRowMajor``; the manifest's
+``weight_layout`` says which. The file is read as written; a target that does not
+consume that layout (``Target.weight_layouts``) is refused by the CLI, not adapted.
 
 The ROM contents are produced by reusing the SAME per-beat packer the verified
 testbench uses (``pack_b_chunk``), so the baked ROM is byte-identical to the beat
@@ -25,11 +27,17 @@ def _ts_dir_on_path():
         _sys.path.insert(0, ts_dir)
 
 
-def load_weight_dat(path, n, k):
-    """Load an hls4ml column-major ``[n][k]`` raw-int ``.dat`` as ``B`` shaped ``[K, N]``.
+def load_weight_dat(path, n, k, layout="column_major"):
+    """Load an hls4ml raw-int weight ``.dat`` as ``B`` shaped ``[K, N]``.
 
-    Each line is one output column (n) with ``k`` space-separated signed integers.
-    Returns an ``int64`` array of shape ``(k, n)`` (the [K, N] the B feed expects).
+    ``layout`` is the manifest's ``weight_layout``, i.e. how hls4ml wrote the file
+    (``SecondOperandRowMajor``); it is read as written, never re-ordered:
+      - ``column_major``: one output column per line, ``k`` integers (``[n][k]``),
+        which is B transposed;
+      - ``row_major``: one contraction row per line, ``n`` integers (``[k][n]``),
+        which is B itself.
+    Whether a target can consume a layout is decided by the CLI against
+    ``Target.weight_layouts`` before this is called.
     """
     rows = []
     for line in Path(path).read_text().splitlines():
@@ -37,10 +45,17 @@ def load_weight_dat(path, n, k):
         if not line:
             continue
         rows.append([int(x) for x in line.split()])
-    dat = np.asarray(rows, dtype=np.int64)  # [n][k]
+    dat = np.asarray(rows, dtype=np.int64)
+    layout = (layout or "column_major").lower()
+    if layout == "row_major":
+        if dat.shape != (k, n):
+            raise ValueError(f"weight .dat {path} (row_major): shape {dat.shape} != expected ({k}, {n})")
+        return dat.copy()  # [k][n] == B
+    if layout != "column_major":
+        raise ValueError(f"weight .dat {path}: unknown weight_layout {layout!r}")
     if dat.shape != (n, k):
-        raise ValueError(f"weight .dat {path}: shape {dat.shape} != expected ({n}, {k})")
-    return dat.T.copy()  # -> [k][n]
+        raise ValueError(f"weight .dat {path} (column_major): shape {dat.shape} != expected ({n}, {k})")
+    return dat.T.copy()  # [n][k] -> [k][n]
 
 
 def build_weight_rom(B, m, n, k):
@@ -89,9 +104,9 @@ def build_weight_rom_full_k(B, m, n, k):
     return [int(pack_b_full_k_spatial_narrow(B, t, n, k)) for t in range(input_beats)]
 
 
-def weight_rom_from_dat(path, m, n, k, full_k_spatial=False):
+def weight_rom_from_dat(path, m, n, k, full_k_spatial=False, layout="column_major"):
     """Convenience: load a ``.dat`` and build the ROM beats in one call."""
-    B = load_weight_dat(path, n, k)
+    B = load_weight_dat(path, n, k, layout)
     if full_k_spatial:
         return build_weight_rom_full_k(B, m, n, k)
     return build_weight_rom(B, m, n, k)
