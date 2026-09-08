@@ -74,6 +74,13 @@ def _normalize_mvau_items(cfg):
             "has_bias": bool(it.get("has_bias", True)),
             # Two-operand (runtime-B) nodes: B beat order. Absent for const_weights items.
             "second_operand_row_major": it.get("second_operand_row_major"),
+            # Whether the bias add lives in the requant drain. Defaults to
+            # weights_in_core AND has_bias when the manifest doesn't say.
+            "bias_in_core": (
+                bool(it.get("bias_in_core"))
+                if it.get("bias_in_core") is not None
+                else (bool(it.get("weights_in_core", False)) and bool(it.get("has_bias", True)))
+            ),
         }
     if isinstance(cfg, list):
         return [one(it.get("name"), it) for it in cfg]

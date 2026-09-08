@@ -39,6 +39,20 @@ def _with_timescale(text):
     return text if "`timescale" in text else _TIMESCALE + text
 
 
+def _rv_width(accu, bias_in_core):
+    """Just-wide-enough intermediate width for a requant drain's ``rv``. With the
+    bias add, ``CONFIG_T::bias_t`` is unknown at generation time, so keep headroom
+    (>= 32b) plus a couple guard bits; without it, ACCU + 1 guard bit suffices."""
+    return (max(accu, 32) + 2) if bias_in_core else (accu + 1)
+
+
+def _rv_decl_assign(width, pfrac, raw_expr, indent=""):
+    """``ap_fixed`` decl + range-assign for a requant drain's ``rv``, narrowed to
+    *width* bits (was a fixed 64-bit intermediate)."""
+    return (f"{indent}ap_fixed<{width}, {width - pfrac}> rv;\n"
+            f"{indent}rv.range({width - 1}, 0) = (ap_uint<{width}>)(ap_int<{width}>){raw_expr};")
+
+
 def _apmaxw(bits):
     """AP_INT_MAX_W setting for a design whose widest ap_uint is ``bits`` wide.
     The default cap is 1024; K-tiled result beats (KT*PB) blow past it. Round up to
@@ -200,9 +214,8 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
                 for (int pe = 0; pe < {PE}; pe++) {{
                     int oc = ti * {NTILE} + nf * {PE} + pe;
                     ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
-                    ap_int<64> v = (ap_int<64>)raw{bias_add};         // matmul + bias, accum domain
-                    ap_fixed<64, {64 - pfrac}> rv;
-                    rv.range(63, 0) = (ap_uint<64>)v;                 // code -> fixed (frac={pfrac})
+                    ap_int<{_rv_width(ACCU, bool(bias_codes))}> v = (ap_int<{_rv_width(ACCU, bool(bias_codes))}>)raw{bias_add};         // matmul + bias, accum domain
+{_rv_decl_assign(_rv_width(ACCU, bool(bias_codes)), pfrac, "v", ' ' * 20)}   // code -> fixed (frac={pfrac})
                     {name}_result_t r = rv;                           // rescale + round + saturate
                     crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
                 }}
@@ -287,7 +300,7 @@ exit
 """
 
 
-def _gemm_ip_header(name, plan, weights_in_core=True):
+def _gemm_ip_header(name, plan, weights_in_core=True, bias_in_core=True):
     """The dedicated hls4ml-facing IP for one gemm config: an HLS C++ dataflow IP
     with the internal FINN-MVU blackbox. Repacks hls4ml beats -> FINN beats,
     runs the blackbox, requant-drains (runtime bias) -> hls4ml C row. The combined
@@ -304,7 +317,7 @@ def _gemm_ip_header(name, plan, weights_in_core=True):
     PB_TOTAL = NT * PB   # concatenated result beat: the n_tiles tiles side by side
     WW, AW, K, N = t["weight_width"], t["activation_width"], plan["k"], plan["n"]
     KPAD = plan["k_pad"]   # K padded to a multiple of SIMD; arow is KPAD-wide, pad lanes 0
-    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
+    pfrac = plan["product_frac"]
     guard = ' ' * 6
     core_hdr_pad = ' ' * (len(name) + 6)
     core_decl = (f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{core_hdr_pad}hls::stream<ap_uint<{PB_TOTAL}> >&);"
@@ -394,7 +407,7 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > 
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream,
 {' ' * (len(name) + 7)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
-    typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> result_t;
+    typedef typename res_T::value_type result_t;
     for (unsigned mm = 0; mm < {m}; mm++) {{
         res_T crow;
         for (unsigned nf = 0; nf < {NF}; nf++) {{
@@ -403,10 +416,9 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
                 for (unsigned pe = 0; pe < {PE}; pe++) {{
                     unsigned oc = ti * {NTILE} + nf * {PE} + pe;
                     ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
-                    ap_fixed<64, {64 - pfrac}> rv;
-                    rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;   // code -> fixed (frac={pfrac})
-                    rv += biases[oc];                                 // + bias (fixed-point, aligned)
-                    result_t r = rv;                                  // rescale + round + saturate
+{_rv_decl_assign(_rv_width(ACCU, bias_in_core), pfrac, "raw", ' ' * 20)}   // code -> fixed (frac={pfrac})
+{('                    rv += biases[oc];                                 // + bias (fixed-point, aligned)' if bias_in_core else '')}
+                    result_t r = rv;                                  // convert per res_T's rounding/overflow modes
                     crow[oc] = r;
                 }}
         }}
@@ -484,9 +496,8 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
                 ap_int<{ACCU_SUM}> raw = 0;
                 for (int i = 0; i < {KT}; i++)
                     raw += (ap_int<{ACCU}>)ob.range((j * {KT} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {KT} + i) * {PB} + pe * {ACCU});
-                ap_int<64> v = (ap_int<64>)raw{bias_add};         // Σ partials + bias, accum domain
-                ap_fixed<64, {64 - pfrac}> rv;
-                rv.range(63, 0) = (ap_uint<64>)v;                 // code -> fixed (frac={pfrac})
+                ap_int<{_rv_width(ACCU_SUM, bool(bias_codes))}> v = (ap_int<{_rv_width(ACCU_SUM, bool(bias_codes))}>)raw{bias_add};         // Σ partials + bias, accum domain
+{_rv_decl_assign(_rv_width(ACCU_SUM, bool(bias_codes)), pfrac, "v", ' ' * 16)}   // code -> fixed (frac={pfrac})
                 {name}_result_t r = rv;                           // rescale + round + saturate
                 crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
             }}
@@ -509,7 +520,7 @@ void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in,
 """
 
 
-def _kt_gemm_ip_header(name, plan):
+def _kt_gemm_ip_header(name, plan, bias_in_core=True):
     """hls4ml-facing IP for a K-tiled gemm config (fully-spatial per-tile). Repacks the
     K activations into one wide ``KT*AB`` beat, runs the blackbox, and drains by summing
     the KT partials per column (runtime bias) -- the K-tiling twin of ``_gemm_ip_header``."""
@@ -524,7 +535,7 @@ def _kt_gemm_ip_header(name, plan):
     AW, K, N = t["activation_width"], plan["k"], plan["n"]
     NTILE = N // NT
     KPAD = plan["k_pad"]
-    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
+    pfrac = plan["product_frac"]
     core_hdr_pad = ' ' * (len(name) + 6)
     apmax = _apmaxw(PB_TOTAL)
     return f"""#ifndef {name.upper()}_GEMM_IP_H_
@@ -576,7 +587,7 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{A_TOTAL
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream,
 {' ' * (len(name) + 7)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
-    typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> result_t;
+    typedef typename res_T::value_type result_t;
     for (unsigned mm = 0; mm < {m}; mm++) {{
         res_T crow;
         for (unsigned nf = 0; nf < {NF}; nf++) {{     // NF partial beats/vector, PE columns each
@@ -587,10 +598,9 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
                 ap_int<{ACCU_SUM}> raw = 0;
                 for (unsigned i = 0; i < {KT}; i++)
                     raw += (ap_int<{ACCU}>)ob.range((j * {KT} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {KT} + i) * {PB} + pe * {ACCU});
-                ap_fixed<64, {64 - pfrac}> rv;
-                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;   // code -> fixed (frac={pfrac})
-                rv += biases[oc];                                 // + bias (fixed-point, aligned)
-                result_t r = rv;                                  // rescale + round + saturate
+{_rv_decl_assign(_rv_width(ACCU_SUM, bias_in_core), pfrac, "raw", ' ' * 16)}   // code -> fixed (frac={pfrac})
+{('                rv += biases[oc];                                 // + bias (fixed-point, aligned)' if bias_in_core else '')}
+                result_t r = rv;                                  // convert per res_T's rounding/overflow modes
                 crow[oc] = r;
             }}
         }}
@@ -660,8 +670,7 @@ static void requant(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >
             for (int pe = 0; pe < {PE}; pe++) {{
                 int oc = nf * {PE} + pe;
                 ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
-                ap_fixed<64, {64 - pfrac}> rv;
-                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;   // code -> fixed (frac={pfrac})
+{_rv_decl_assign(_rv_width(ACCU, False), pfrac, "raw", ' ' * 16)}   // code -> fixed (frac={pfrac})
                 {name}_result_t r = rv;                           // rescale + round + saturate
                 crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
             }}
@@ -739,8 +748,7 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
                 ap_int<{ACCU_SUM}> raw = 0;
                 for (int i = 0; i < {gk}; i++)
                     raw += (ap_int<{ACCU}>)ob.range((j * {gk} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {gk} + i) * {PB} + pe * {ACCU});
-                ap_fixed<64, {64 - pfrac}> rv;
-                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
+{_rv_decl_assign(_rv_width(ACCU_SUM, False), pfrac, "raw", ' ' * 16)}
                 {name}_result_t r = rv;
                 crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
             }}
@@ -766,7 +774,7 @@ void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in, hls::stream<ap_uint<{BB}> >&
 """
 
 
-def _2op_gemm_ip_header(name, plan):
+def _2op_gemm_ip_header(name, plan, bias_in_core=False):
     """hls4ml-facing two-operand IP: ``<name>_gemm_stream<data0_T,data1_T,res_T,CONFIG_T>``
     (repack A -> shim activations, repack B -> shim N-wide K-row beats, internal MVU blackbox,
     requant drain). Requires B streamed **row-major** (data1_T::size == N, one K-row per beat);
@@ -782,7 +790,7 @@ def _2op_gemm_ip_header(name, plan):
     BB = ((N * WW) + 7) // 8 * 8
     NT_, NTILE = plan["n_tiles"], plan["n_tile"]
     KT_ = plan.get("k_tiles", 1)
-    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
+    pfrac = plan["product_frac"]
     nt_form = NT_ > 1
     kt_form = (not nt_form) and (KT_ > 1 or (SF == 1 and NF == 1))
     gk = KT_ if kt_form else 1
@@ -849,9 +857,8 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
             ap_int<{ACCU_SUM}> raw = 0;
             for (unsigned ti = 0; ti < {gk}; ti++)
                 raw += (ap_int<{ACCU}>)ob.range(ti * {PB} + oc * {ACCU} + {ACCU} - 1, ti * {PB} + oc * {ACCU});
-            ap_fixed<64, {64 - pfrac}> rv;
-            rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
-            rv += biases[oc];
+{_rv_decl_assign(_rv_width(ACCU_SUM, bias_in_core), pfrac, "raw", ' ' * 12)}
+{('            rv += biases[oc];' if bias_in_core else '')}
             crow[oc] = (result_t)rv;
         }}"""
     elif nt_form:
@@ -860,9 +867,8 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
             for (unsigned pe = 0; pe < {PE}; pe++) {{
                 unsigned oc = ti * {NTILE} + pe;
                 ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
-                ap_fixed<64, {64 - pfrac}> rv;
-                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
-                rv += biases[oc];
+{_rv_decl_assign(_rv_width(ACCU, bias_in_core), pfrac, "raw", ' ' * 16)}
+{('                rv += biases[oc];' if bias_in_core else '')}
                 crow[oc] = (result_t)rv;
             }}"""
     else:
@@ -871,9 +877,8 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
             for (unsigned pe = 0; pe < {PE}; pe++) {{
                 unsigned oc = nf * {PE} + pe;
                 ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
-                ap_fixed<64, {64 - pfrac}> rv;
-                rv.range(63, 0) = (ap_uint<64>)(ap_int<64>)raw;
-                rv += biases[oc];
+{_rv_decl_assign(_rv_width(ACCU, bias_in_core), pfrac, "raw", ' ' * 16)}
+{('                rv += biases[oc];' if bias_in_core else '')}
                 crow[oc] = (result_t)rv;
             }}
         }}"""
@@ -908,11 +913,11 @@ void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BB}> >
 }}
 
 // requant drain (no per-column bias for two-operand; biases[] are zero from hls4ml): raw ACCU
-// -> fixed (frac={pfrac}) -> + bias -> round + saturate to the output precision.
+// -> fixed (frac={pfrac}) -> + bias -> convert per res_T's rounding/overflow modes.
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream,
 {' ' * (len(name) + 7)}typename CONFIG_T::bias_t biases[CONFIG_T::n_out]) {{
-    typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> result_t;
+    typedef typename res_T::value_type result_t;
     for (unsigned mm = 0; mm < {m}; mm++) {{
         res_T crow;
 {drain_body}
@@ -1033,7 +1038,9 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
                            resources=plan.get("resources")))
     (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan)))
-    (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(_2op_gemm_ip_header(name, plan)))
+    bias_in_core = bool(cfg.get("bias_in_core", False))
+    (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(
+        _2op_gemm_ip_header(name, plan, bias_in_core=bias_in_core)))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 
     for s in _STATIC_SOURCES:
@@ -1168,8 +1175,9 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
     (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
                             bias_codes=bias_codes, baked_weights=B)))
-    ip_hdr = (_kt_gemm_ip_header(name, plan) if KT > 1
-              else _gemm_ip_header(name, plan, weights_in_core=True))
+    bias_in_core = bool(cfg.get("bias_in_core", True))
+    ip_hdr = (_kt_gemm_ip_header(name, plan, bias_in_core=bias_in_core) if KT > 1
+              else _gemm_ip_header(name, plan, weights_in_core=True, bias_in_core=bias_in_core))
     (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(ip_hdr))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 

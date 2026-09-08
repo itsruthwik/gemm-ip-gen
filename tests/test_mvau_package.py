@@ -182,4 +182,4 @@ def test_no_bias_omits_array(tmp_path):
     pkg = _gen(tmp_path, (2, 8, 8), "gnb")           # no bias
     top = (pkg / "gnb_top.cpp").read_text()
     assert "gnb_bias" not in top
-    assert "(ap_int<64>)raw;" in top                 # bias-free add path
+    assert ")raw;" in top and "(ap_int<64>)raw;" not in top  # narrowed bias-free add path

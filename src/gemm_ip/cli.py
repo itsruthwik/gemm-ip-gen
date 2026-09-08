@@ -143,6 +143,7 @@ def _run(args):
                     # that don't distinguish these pop/ignore them (see generic).
                     "weights_in_core": item.get("weights_in_core"),
                     "second_operand_row_major": item.get("second_operand_row_major"),
+                    "bias_in_core": item.get("bias_in_core"),
                 },
             )
         output_dir = Path(args.output_dir)

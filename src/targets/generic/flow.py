@@ -64,6 +64,7 @@ class GenericTarget(Target):
         # drop both (weights_in_core would also collide with the explicit kwarg below).
         cfg.pop("weights_in_core", None)
         cfg.pop("second_operand_row_major", None)
+        cfg.pop("bias_in_core", None)
         return _package.generate_generic_pkg(
             m, k, n, name, output_dir,
             weights_in_core=weight_matrix is not None,
