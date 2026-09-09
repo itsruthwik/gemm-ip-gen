@@ -179,10 +179,40 @@ def test_bias_scaled_and_added(tmp_path):
 
 
 def test_no_bias_omits_array(tmp_path):
-    pkg = _gen(tmp_path, (2, 8, 8), "gnb")           # no bias
+    # has_bias=False (the manifest's own field) is the gate for "no bias" -- not
+    # whether a bias value happens to be given.
+    pkg = _gen(tmp_path, (2, 8, 8), "gnb", has_bias=False)
     top = (pkg / "gnb_top.cpp").read_text()
     assert "gnb_bias" not in top
     assert ")raw;" in top and "(ap_int<64>)raw;" not in top  # narrowed bias-free add path
+
+
+def test_has_bias_false_ignores_nonzero_bias_values(tmp_path):
+    # has_bias is the single source of truth: even a real, non-zero bias array
+    # must not be baked (and no add emitted) when the manifest says has_bias=False.
+    bias = [0.5, -0.25, 0.0, 0.25, 1.0, -1.0, 0.75, -0.5]
+    pkg = _gen(tmp_path, (2, 8, 8), "gfb", has_bias=False, bias=bias)
+    top = (pkg / "gfb_top.cpp").read_text()
+    assert "gfb_bias" not in top
+    assert ")raw;" in top and "(ap_int<64>)raw;" not in top
+
+
+def test_has_bias_true_bakes_sublsb_bias(tmp_path):
+    # A bias that scales to all-zero codes at this fixed-point precision must
+    # still be baked and added when has_bias is True -- hardware has to match the
+    # manifest (and hls4ml's csim expectation), not silently re-derive presence
+    # from the (here, sub-LSB) scaled values.
+    tiny = 1.0 / (1 << 20)   # far below the 2^8 accumulator scale -> rounds to 0
+    bias = [tiny] * 8
+    pkg = _gen(tmp_path, (2, 8, 8), "gsl", reuse_factor=1, has_bias=True, bias=bias)
+    top = (pkg / "gsl_top.cpp").read_text()
+    assert "static const long gsl_bias[8] = {0, 0, 0, 0, 0, 0, 0, 0}" in top
+    assert "+ gsl_bias[oc]" in top
+
+
+def test_has_bias_true_without_bias_raises(tmp_path):
+    with pytest.raises(ValueError):
+        _gen(tmp_path, (2, 8, 8), "gmissing", has_bias=True)
 
 
 def test_manifest_reuse_factor_snapped(tmp_path, capsys):

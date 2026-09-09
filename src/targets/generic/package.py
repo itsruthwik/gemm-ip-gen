@@ -60,6 +60,10 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
     # manifest's real per-column values when has_bias is True, else a zero array
     # (standalone/unit generation with no manifest falls back to the TB's own
     # deterministic bias_val() formula, so the self-check stays meaningful).
+    if has_bias is True and not bias:
+        raise ValueError(
+            "has_bias is True but the manifest has no bias values to bake "
+            "(bias is missing/empty)")
     if bias:
         bias_values = bias
     elif has_bias is None:

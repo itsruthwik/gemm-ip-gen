@@ -75,7 +75,10 @@ def _normalize_mvau_items(cfg):
             # adder (hls4ml has already folded in the row-varying/weights_in_core
             # exceptions -- see cli.py). "bias": the raw per-column values to bake
             # in as a compile-time constant (static array) when has_bias is True.
-            "has_bias": bool(it.get("has_bias", True)),
+            # Pre-has_bias manifests (field absent entirely) fall back to "does the
+            # given bias look real" rather than a hardcoded True -- see package.py's
+            # generate_mvau_pkg and status.md (has_bias-from-tensor).
+            "has_bias": bool(it.get("has_bias", it.get("bias") is not None and any(it.get("bias")))),
             "bias": it.get("bias"),
             # Two-operand (runtime-B) nodes: B beat order. Absent for const_weights items.
             "second_operand_row_major": it.get("second_operand_row_major"),

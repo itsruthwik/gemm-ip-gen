@@ -129,15 +129,27 @@ def cbits(plan):
     return ((plan["n"] * plan["output_width"]) + 7) // 8 * 8
 
 
-def bias_acc_codes(bias, product_frac, n):
+def bias_acc_codes(bias, product_frac, n, has_bias):
     """Scale per-column real bias to the accumulator (2^product_frac) domain.
-    Returns a list of N ints, or None if no (or all-zero) bias."""
-    if not bias:
+
+    ``has_bias`` (the manifest's own field, computed by hls4ml from the real bias
+    tensor) is the *only* gate for whether a bias is baked: when True this always
+    returns an N-long list of codes -- even if every one of them rounds to zero at
+    this fixed-point scale -- so the generated hardware matches what hls4ml's own
+    csim expects (an add is present) rather than silently disagreeing with the
+    manifest for a sub-LSB bias. When False, returns None (bake nothing) regardless
+    of what ``bias`` holds. Raises if ``has_bias`` is True but ``bias`` is absent --
+    that combination means the manifest is internally inconsistent, not "no bias"."""
+    if not has_bias:
         return None
+    if not bias:
+        raise ValueError(
+            "has_bias is True but the manifest has no bias values to bake "
+            "(cfg['bias'] is missing/empty)")
     codes = [int(round(float(b) * (1 << product_frac))) for b in bias]
     if len(codes) != n:
         raise ValueError(f"bias length {len(codes)} != N {n}")
-    return codes if any(codes) else None
+    return codes
 
 
 def _dataflow_top(name, plan, bias_codes=None):
@@ -1139,7 +1151,14 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
                            n_tiles=NT, k_tiles=KT)))
     (pkg / f"{name}_core.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_core_twin(shape, func_name=f"{name}_core", plan=plan, baked_weights=B)))
-    bias_codes = bias_acc_codes(cfg.get("bias"), plan["product_frac"], plan["n"])
+    # has_bias is the single gate. Pre-has_bias manifests (the field absent from
+    # cfg entirely) fall back to "does the given bias look real" -- not a hardcoded
+    # True -- so an old caller that never supplied a bias keeps its old "no bias"
+    # behavior instead of newly raising (see status.md, has_bias-from-tensor).
+    _bias = cfg.get("bias")
+    _has_bias_default = _bias is not None and any(_bias)
+    bias_codes = bias_acc_codes(_bias, plan["product_frac"], plan["n"],
+                                 bool(cfg.get("has_bias", _has_bias_default)))
     top_src = (_kt_dataflow_top(name, plan, bias_codes=bias_codes) if KT > 1
                else _dataflow_top(name, plan, bias_codes=bias_codes))
     (pkg / f"{name}_top.cpp").write_text(_with_ap_int_max_w(top_src))
