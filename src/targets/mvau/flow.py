@@ -1,12 +1,13 @@
-"""mvau target: FINN's RTL MVU (mvu_vvu_axi + DSP-packing cores) blackboxed into
+"""mvau target: FINN's RTL MVU (mvu_vvu_axi + mvu_vvu_8sx9_dsp58) blackboxed into
 a Vitis HLS dataflow top.
 
-Tool: Vitis HLS. The DSP-dense (2-4 MACs/DSP) counterpart to the soft-logic
-``generic`` Vitis target, and the Vitis analogue of Catapult's ``tensor_slice``.
-Delegates the Target contract to sibling modules: ``geometry`` (folding search),
-``rtl`` (wrapper fill + shim), ``golden`` (C twin + testbench), ``package`` (the
-blackbox package: JSON + dataflow top + drain + run_vitis.tcl). The vendored FINN
-RTL lives in ``rtl_static/`` (see FINN_COMMIT.txt).
+Tool: Vitis HLS. The DSP-dense counterpart to the soft-logic ``generic`` Vitis
+target, and the Vitis analogue of Catapult's ``tensor_slice``. Delegates the
+Target contract to sibling modules: ``geometry`` (ReuseFactor/fold_axis ->
+(PE, SIMD) resolution), ``rtl`` (wrapper fill + shim), ``golden`` (C twin +
+testbench), ``package`` (the blackbox package: JSON + dataflow top + drain +
+run_vitis.tcl). The vendored FINN RTL lives in ``rtl_static/`` (see
+FINN_COMMIT.txt).
 
 Interface, shim and packaging are validated end-to-end on Vitis 2025.2 -- see
 jojo-track/open/mvau-vitis-target and temp_space/mvau-spike (cosim PASS).
@@ -49,10 +50,8 @@ def _normalize_mvau_items(cfg):
             "protocol": it.get("protocol", {}),
             "gemm_ip_id": it.get("gemm_ip_id", name),
             "gemm_ip_index": it.get("gemm_ip_index"),
-            "strategy": it.get("strategy", "latency"),
             "reuse_factor": it.get("reuse_factor", 1),
-            "parallelization_factor": it.get("parallelization_factor", 1),
-            "target_cycles": it.get("target_cycles"),
+            "fold_axis": it.get("fold_axis", "n"),
             "input_precision": it.get("input_precision"),
             "weight_precision": it.get("weight_precision"),
             "output_precision": it.get("output_precision"),
@@ -112,12 +111,29 @@ class MvauTarget(Target):
     name = "mvau"
     tool = "vitis"
 
+    knobs = [
+        {"name": "ReuseFactor", "key": "reuse_factor", "type": "int", "default": 1,
+         "description": "how many times each MAC is used per input vector "
+                         "(RF = K*N/(PE*SIMD))"},
+        {"name": "FoldAxis", "key": "fold_axis", "type": "enum",
+         "choices": ("n", "k", "kn"), "default": "n",
+         "description": "which dimension ReuseFactor folds"},
+        {"name": "NTiles", "key": "n_tiles", "type": "int", "default": 1,
+         "description": "N tiles (spatial, concatenated)"},
+        {"name": "KTiles", "key": "k_tiles", "type": "int", "default": 1,
+         "description": "K-partial tiles (spatial, summed)"},
+        {"name": "PE", "key": "pe", "type": "int", "default": None,
+         "description": "DEBUG: N-parallelism, direct fold override"},
+        {"name": "SIMD", "key": "simd", "type": "int", "default": None,
+         "description": "DEBUG: K-parallelism, direct fold override"},
+    ]
+
     def geometry(self, shape, **kwargs):
         """Full folding/geometry plan for *shape* ``(m, k, n)``.
 
         Accepts the same knobs as :func:`geometry.fold_plan`
-        (precisions, part, clock_period_ns, reuse_factor, strategy,
-        target_cycles, parallelization_factor, n_tiles, weights).
+        (precisions, part, clock_period_ns, reuse_factor, fold_axis, n_tiles,
+        k_tiles, weights).
         """
         m, k, n = shape
         return _geom.fold_plan(m, k, n, **kwargs)
@@ -137,6 +153,7 @@ class MvauTarget(Target):
     def package(self, shape, cfg):
         cfg = dict(cfg)
         name = cfg.pop("name")
+        self.validate_knobs(cfg, name)
         output_dir = cfg.pop("output_dir")
         # weights_in_core True (or absent) => weight-stationary (baked-B) IP; False =>
         # two-operand (runtime-B) IP fed both operands as streams. The QK^T / A.V

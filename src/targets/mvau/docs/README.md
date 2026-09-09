@@ -10,12 +10,17 @@ knobs and how they compose, in two layers:
    timing. This is the *contract* the generator must satisfy.
 
 2. **[`config-mapping.md`](config-mapping.md)** — how a gemm-ip-gen config (and the
-   hls4ml config it comes from) maps onto those RTL parameters: the folding search,
-   the precision/envelope rules, the spatial-vs-temporal treatment of K and N,
-   N-tiling, the weight-stationary weight packing, and the requant drain.
+   hls4ml config it comes from) maps onto those RTL parameters: `ReuseFactor` /
+   `fold_axis` resolution to `(PE, SIMD)`, the precision/envelope rules, N-tiling,
+   the weight-stationary weight packing, and the requant drain.
 
 Read (1) to understand what the RTL expects; read (2) to understand what a user
 knob actually does to the generated hardware.
+
+This target supports Versal parts only, with a single compute core
+(`mvu_vvu_8sx9_dsp58`). For the compute core's internal structure (the DSP58
+PCOUT cascade, `SEGMENTLEN`), see `finn_space/MVU_space/03_compute_cores.md` at
+the repo root.
 
 Source of truth for anything ambiguous, in order: the vendored RTL under
 `../rtl_static/`, then `../geometry.py` (folding + derivations), then

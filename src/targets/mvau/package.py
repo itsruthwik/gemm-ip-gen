@@ -109,8 +109,8 @@ def _core_rtl_files(name, prefix=""):
             + [f"{prefix}rtl_static/{s}" for s in _STATIC_SOURCES])
 
 _PLAN_KEYS = ("weight_precision", "input_precision", "output_precision", "part",
-              "clock_period_ns", "reuse_factor", "strategy", "target_cycles",
-              "parallelization_factor", "n_tiles", "k_tiles", "weights")
+              "clock_period_ns", "reuse_factor", "fold_axis", "n_tiles", "k_tiles",
+              "weights")
 
 
 def _plan_kwargs(cfg):
@@ -172,6 +172,7 @@ def _dataflow_top(name, plan, bias_codes=None):
     NT, NTILE = plan["n_tiles"], plan["n_tile"]
     PB_TOTAL = NT * PB   # concatenated result beat: the n_tiles tiles side by side
     N, outW, outI = plan["n"], plan["output_width"], plan["output_int"]
+    NTILE_REAL = N // NT   # unpadded per-tile column count; the interface presents only these
     pfrac = plan["product_frac"]
     CB = cbits(plan)
     abeats = m * SF
@@ -211,12 +212,15 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
             ap_uint<{PB_TOTAL}> ob = in.read();
             for (int ti = 0; ti < {NT}; ti++)
                 for (int pe = 0; pe < {PE}; pe++) {{
-                    int oc = ti * {NTILE} + nf * {PE} + pe;
+                    int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
+                    if (local_oc < {NTILE_REAL}) {{   // drop the N-pad tail columns
+                    int oc = ti * {NTILE_REAL} + local_oc;
                     ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
                     ap_int<{_rv_width(ACCU, bool(bias_codes))}> v = (ap_int<{_rv_width(ACCU, bool(bias_codes))}>)raw{bias_add};         // matmul + bias, accum domain
 {_rv_decl_assign(_rv_width(ACCU, bool(bias_codes)), pfrac, "v", ' ' * 20)}   // code -> fixed (frac={pfrac})
                     {name}_result_t r = rv;                           // rescale + round + saturate
                     crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+                    }}
                 }}
         }}
         out.write(crow);
@@ -319,6 +323,7 @@ def _gemm_ip_header(name, plan, bias_codes=None):
     PB_TOTAL = NT * PB   # concatenated result beat: the n_tiles tiles side by side
     AW, K, N = t["activation_width"], plan["k"], plan["n"]
     KPAD = plan["k_pad"]   # K padded to a multiple of SIMD; arow is KPAD-wide, pad lanes 0
+    NTILE_REAL = N // NT   # unpadded per-tile column count; the interface presents only these
     pfrac = plan["product_frac"]
     core_hdr_pad = ' ' * (len(name) + 6)
     core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{core_hdr_pad}hls::stream<ap_uint<{PB_TOTAL}> >&);"
@@ -388,12 +393,15 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
             ap_uint<{PB_TOTAL}> ob = p_s.read();
             for (unsigned ti = 0; ti < {NT}; ti++)     // tile ti lane pe -> global column
                 for (unsigned pe = 0; pe < {PE}; pe++) {{
-                    unsigned oc = ti * {NTILE} + nf * {PE} + pe;
+                    unsigned local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
+                    if (local_oc < {NTILE_REAL}) {{        // drop the N-pad tail columns
+                    unsigned oc = ti * {NTILE_REAL} + local_oc;
                     ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
 {_rv_decl_assign(_rv_width(ACCU, bool(bias_codes)), pfrac, "raw", ' ' * 20)}   // code -> fixed (frac={pfrac})
 {('                    rv += ' + name + '_bias[oc];                                 // + bias (baked constant)' if bias_codes else '')}
                     result_t r = rv;                                  // convert per res_T's rounding/overflow modes
                     crow[oc] = r;
+                    }}
                 }}
         }}
         res_stream.write(crow);
@@ -430,7 +438,7 @@ def _kt_dataflow_top(name, plan, bias_codes=None):
     A_TOTAL, PB_TOTAL = KT * AB, NT * KT * PB
     ACCU_SUM = plan["accu_sum"]
     N, outW, outI = plan["n"], plan["output_width"], plan["output_int"]
-    NTILE = N // NT
+    NTILE = N // NT   # unpadded per-tile column count; the interface presents only these
     pfrac = plan["product_frac"]
     CB = cbits(plan)
     pad = ' ' * (len(name) + 6)
@@ -467,7 +475,9 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
             ap_uint<{PB_TOTAL}> ob = in.read();
             for (int j = 0; j < {NT}; j++)
             for (int pe = 0; pe < {PE}; pe++) {{
-                int oc = j * {NTILE} + nf * {PE} + pe;
+                int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
+                if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
+                int oc = j * {NTILE} + local_oc;
                 ap_int<{ACCU_SUM}> raw = 0;
                 for (int i = 0; i < {KT}; i++)
                     raw += (ap_int<{ACCU}>)ob.range((j * {KT} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {KT} + i) * {PB} + pe * {ACCU});
@@ -475,6 +485,7 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
 {_rv_decl_assign(_rv_width(ACCU_SUM, bool(bias_codes)), pfrac, "v", ' ' * 16)}   // code -> fixed (frac={pfrac})
                 {name}_result_t r = rv;                           // rescale + round + saturate
                 crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+                }}
             }}
         }}
         out.write(crow);
@@ -578,7 +589,9 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
             ap_uint<{PB_TOTAL}> ob = p_s.read();
             for (unsigned j = 0; j < {NT}; j++)
             for (unsigned pe = 0; pe < {PE}; pe++) {{
-                unsigned oc = j * {NTILE} + nf * {PE} + pe;
+                unsigned local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
+                if (local_oc < {NTILE}) {{             // drop the N-pad tail columns
+                unsigned oc = j * {NTILE} + local_oc;
                 ap_int<{ACCU_SUM}> raw = 0;
                 for (unsigned i = 0; i < {KT}; i++)
                     raw += (ap_int<{ACCU}>)ob.range((j * {KT} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {KT} + i) * {PB} + pe * {ACCU});
@@ -586,6 +599,7 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
 {('                rv += ' + name + '_bias[oc];                                 // + bias (baked constant)' if bias_codes else '')}
                 result_t r = rv;                                  // convert per res_T's rounding/overflow modes
                 crow[oc] = r;
+                }}
             }}
         }}
         res_stream.write(crow);
@@ -654,10 +668,12 @@ static void requant(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >
             ap_uint<{PB}> ob = in.read();
             for (int pe = 0; pe < {PE}; pe++) {{
                 int oc = nf * {PE} + pe;
+                if (oc < {N}) {{   // drop the N-pad tail columns (untiled: n_tile == n)
                 ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
 {_rv_decl_assign(_rv_width(ACCU, False), pfrac, "raw", ' ' * 16)}   // code -> fixed (frac={pfrac})
                 {name}_result_t r = rv;                           // rescale + round + saturate
                 crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+                }}
             }}
         }}
         out.write(crow);
@@ -729,13 +745,16 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
             ap_uint<{PB_TOTAL}> ob = in.read();
             for (int j = 0; j < {nt}; j++)
             for (int pe = 0; pe < {PE}; pe++) {{
-                int oc = j * {NTILE} + nf * {PE} + pe;
+                int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
+                if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
+                int oc = j * {NTILE} + local_oc;
                 ap_int<{ACCU_SUM}> raw = 0;
                 for (int i = 0; i < {gk}; i++)
                     raw += (ap_int<{ACCU}>)ob.range((j * {gk} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {gk} + i) * {PB} + pe * {ACCU});
 {_rv_decl_assign(_rv_width(ACCU_SUM, False), pfrac, "raw", ' ' * 16)}
                 {name}_result_t r = rv;
                 crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+                }}
             }}
         }}
         out.write(crow);
@@ -848,22 +867,28 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
             crow[oc] = (result_t)rv;
         }}"""
     elif nt_form:
+        NTILE_REAL = N // NT_   # unpadded per-tile column count; the interface presents only these
         drain_body = f"""        ap_uint<{p_width}> ob = p_s.read();
         for (unsigned ti = 0; ti < {NT_}; ti++)
             for (unsigned pe = 0; pe < {PE}; pe++) {{
-                unsigned oc = ti * {NTILE} + pe;
+                if (pe < {NTILE_REAL}) {{   // drop the N-pad tail columns
+                unsigned oc = ti * {NTILE_REAL} + pe;
                 ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
 {_rv_decl_assign(_rv_width(ACCU, False), pfrac, "raw", ' ' * 16)}
                 crow[oc] = (result_t)rv;
+                }}
             }}"""
     else:
         drain_body = f"""        for (unsigned nf = 0; nf < {NF}; nf++) {{
             ap_uint<{p_width}> ob = p_s.read();
             for (unsigned pe = 0; pe < {PE}; pe++) {{
-                unsigned oc = nf * {PE} + pe;
+                unsigned local_oc = nf * {PE} + pe;
+                if (local_oc < {N}) {{   // drop the N-pad tail columns (n_tiles==1 here)
+                unsigned oc = local_oc;
                 ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
 {_rv_decl_assign(_rv_width(ACCU, False), pfrac, "raw", ' ' * 16)}
                 crow[oc] = (result_t)rv;
+                }}
             }}
         }}"""
 
@@ -991,9 +1016,6 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     t = plan["tile"]
     kt = plan.get("k_tiles", 1)
     nt = plan["n_tiles"]
-    if t["compute_core"] == "mvu_4sx4u_dsp48e1":
-        raise ValueError("two-operand cannot use mvu_4sx4u/DSP48E1 (requires NARROW_WEIGHTS, "
-                         "which a runtime B operand cannot guarantee); target DSP48E2/DSP58.")
     # Shim selection:
     #   grid shim (nt>1 or gk>1): an nt×gk grid of MVU cores (memstream per tile, DEPTH>=2),
     #     activation K-sliced + broadcast over N-slices, partials summed over K + concatenated
@@ -1120,11 +1142,16 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
     #   N-tiling only: one memstream per N-column slice ([K][NTILE]).
     B = _weight_matrix_as_B(cfg, N, K, WW)
     MW = t["mw"]                       # per-tile K rows (= K_pad/KT = SF_tile*SIMD)
+    NTILE_REAL = N // NT                # unpadded per-tile column count
     init_files = []
+    # N-pad columns (oo >= NTILE_REAL, only when NTILE > NTILE_REAL) get an all-zero
+    # weight lane: the drain never reads that lane's result (see the local_oc guards
+    # in the emitters), but the memstream word must still exist and be well-formed.
     if KT > 1:
         for j in range(NT):
             for i in range(KT):
-                B_ji = [[B[i * MW + kk][j * NTILE + oo] for oo in range(NTILE)]
+                B_ji = [[(B[i * MW + kk][j * NTILE_REAL + oo] if oo < NTILE_REAL else 0)
+                         for oo in range(NTILE)]
                         for kk in range(MW)]
                 dat_path = pkg / "rtl_static" / _kdat_name(name, j * KT + i)
                 dat_path.write_text(_wpack.pack_memstream_hex(
@@ -1132,7 +1159,8 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
                 init_files.append(str(dat_path.resolve()))
     else:
         for ti in range(NT):
-            B_ti = [[B[kk][ti * NTILE + oo] for oo in range(NTILE)] for kk in range(K)]
+            B_ti = [[(B[kk][ti * NTILE_REAL + oo] if oo < NTILE_REAL else 0)
+                     for oo in range(NTILE)] for kk in range(K)]
             dat_path = pkg / "rtl_static" / _dat_name(name, ti, NT)
             dat_path.write_text(_wpack.pack_memstream_hex(
                 B_ti, NTILE, K, PE, SIMD, WW, word_bits=t["weight_stream_width_ba"]))
@@ -1310,23 +1338,19 @@ def _resolve_manifest_plan(it):
         return None
     cfg = {key: it.get(key) for key in
            ("input_precision", "weight_precision", "output_precision", "part",
-            "clock_period_ns", "reuse_factor", "strategy", "target_cycles",
-            "parallelization_factor", "n_tiles", "k_tiles", "weights",
-            "weights_in_core", "name")}
+            "clock_period_ns", "reuse_factor", "fold_axis", "n_tiles", "k_tiles",
+            "weights", "weights_in_core", "name")}
     try:
         return _resolve_plan((m, k, n), cfg)
     except Exception:
         return None
 
 
-def _reuse_factor_warning(name, plan):
-    """hls4ml's ReuseFactor-snap warning text (see run_atlas_flow.py's
-    ``_snap_reuse_factor`` for the generic target), extended with what mvau actually
-    achieved for the snapped request."""
-    tile = plan["tile"]
-    return (f'WARNING: Invalid ReuseFactor={plan["requested_reuse_factor"]} in layer "{name}".'
-            f' mvau achieved ReuseFactor={plan["achieved_reuse_factor"]} '
-            f'(PE={tile["pe"]}, SIMD={tile["simd"]}, per-vector II={tile["nf"] * tile["sf"]}).')
+def _reuse_factor_warnings(plan):
+    """hls4ml's ReuseFactor-legalization warning text (see run_atlas_flow.py's
+    ``_snap_reuse_factor`` for the generic target); ``resolve_fold`` already renders
+    the warning strings (with the layer name baked in via the ``name`` config key)."""
+    return plan.get("fold_warnings", [])
 
 
 def gen_integration_manifest(items):
@@ -1354,17 +1378,19 @@ def gen_integration_manifest(items):
                                    for j in range(nt) for i in range(kt)]
         else:
             core["weight_data"] = [f"{nm}/rtl_static/{_dat_name(nm, ti, nt)}" for ti in range(nt)]
-        # Resolve the plan once for this item: cost-model resource estimate plus the
-        # ReuseFactor reporting (requested/achieved/snapped, PE/SIMD, per-vector II).
-        # Best-effort: skip these fields if the node has no resolvable shape.
+        # Resolve the plan once for this item: DSP estimate plus ReuseFactor reporting
+        # (requested/legalized/effective reuse, PE/SIMD, padded N). Best-effort: skip
+        # these fields if the node has no resolvable shape.
         plan = _resolve_manifest_plan(it)
         if plan is not None:
             if plan.get("resources") is not None:
                 core["resources"] = plan["resources"]
             tile = plan["tile"]
             core["reuse_factor_requested"] = plan["requested_reuse_factor"]
-            core["reuse_factor_achieved"] = plan["achieved_reuse_factor"]
-            core["reuse_factor_snapped"] = bool(plan["reuse_factor_snapped"])
+            core["reuse_factor"] = plan["reuse_factor"]
+            core["effective_reuse"] = plan["effective_reuse"]
+            core["n_pad"] = plan["n_pad"]
+            core["fold_axis"] = plan["fold_axis"]
             core["pe"] = tile["pe"]
             core["simd"] = tile["simd"]
             core["ii_per_vector"] = tile["nf"] * tile["sf"]
@@ -1372,8 +1398,8 @@ def gen_integration_manifest(items):
                 core["n_tiles"] = plan["n_tiles"]
             if "k_tiles" in plan:
                 core["k_tiles"] = plan["k_tiles"]
-            if plan["reuse_factor_snapped"]:
-                print(_reuse_factor_warning(nm, plan))
+            for w in _reuse_factor_warnings(plan):
+                print(w)
         cores.append(core)
     return json.dumps({"tool": "vitis", "flow": "rtl_blackbox",
                        "header": "gemm_ip_combined.h", "cores": cores}, indent=2) + "\n"

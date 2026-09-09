@@ -1,30 +1,48 @@
-"""mvau target geometry: folding search, core/ACCU/SEGMENTLEN/NARROW resolution,
-and the hls4ml-knob -> FINN-fold mapping.
+"""mvau target geometry: ReuseFactor -> (PE, SIMD) resolution, and the geometry
+derived from it (accumulator width, stream widths, DSP/latency estimates).
 
 Self-contained (no ``gemm_ip`` imports) so ``rtl.py`` / ``golden.py`` / ``package.py``
 can import it with only the target directory on ``sys.path`` -- mirrors the
 convention of ``targets/tensor_slice/geometry.py``.
 
-The compute is FINN's RTL MVU (``mvu_vvu_axi`` + the DSP-packing cores). A GEMM
-``C[M,N] = A[M,K] . B[K,N]`` maps to one MVU as ``W := B^T`` (MH=N, MW=K), rows of
-A streamed as activations (numInputVectors = M), rows of C collected. Folding
-``(PE, SIMD)`` picks the physical array; ``NF=MH/PE`` and ``SF=MW/SIMD`` are the
-sequential fold counts, so one input vector costs ``SF*NF`` cycles (II=1).
+The compute is FINN's RTL MVU (``mvu_vvu_axi`` + ``mvu_vvu_8sx9_dsp58``, the only
+core this target supports -- see ``finn_space/MVU_space/03_compute_cores.md`` for
+the core's internal structure). A GEMM ``C[M,N] = A[M,K] . B[K,N]`` maps to one MVU
+as ``W := B^T`` (MH=N, MW=K), rows of A streamed as activations (numInputVectors =
+M), rows of C collected.
+
+ReuseFactor is hls4ml's *MACs per multiplier per input vector*:
+``RF = K*N / (PE*SIMD)``. It is a resource knob, not a cycle knob -- see
+:func:`resolve_fold` for how RF picks (PE, SIMD).
+
+Fold-N (the default) and fold-K cost the same DSPs on this core: fold-N spends
+``PE*ceil(K/3)`` DSPs (``PE = N/RF``), fold-K spends ``N*ceil(K/(3*RF))``, both
+``~= K*N/(3*RF)`` when divisible. Fold-N wins on two counts: the whole K reduction
+runs inside one DSP58 PCOUT cascade (no fabric adders, no SF-beat accumulation),
+and the ``ceil`` waste of a partially filled cascade is paid once per PE, of which
+fold-N has RF times fewer than fold-K.
 """
 
 import math
 import re
-import warnings
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-#: FINN's ``mvau_wwidth_max``: the per-PE weight-stream width cap that bounds the
-#: SIMD search (weight_bitwidth * SIMD <= this). Keeps the weight beat routable.
-WWIDTH_MAX = 36
-
 #: Accumulator guard bits added on top of ceil(log2 K) + w + a.
 ACCU_GUARD = 1
+
+#: The only compute core this target supports.
+CORE = "mvu_vvu_8sx9_dsp58"
+DSP_BLOCK = "DSP58"
+
+#: Vitis HLS C-simulation's default max width for a single ``ap_int``/``ap_uint``.
+#: This is a property of the hls4ml-side translation unit that includes the
+#: generated ``_gemm_ip.h`` header, not of gemm-ip-gen's own sources -- that TU
+#: cannot have ``AP_INT_MAX_W`` raised (see ``package.py``'s ``_with_ap_int_max_w``,
+#: which only patches gemm-ip-gen's own C++/header TUs). Any beat this target
+#: declares as one ``ap_uint`` in that header must fit under this cap.
+AP_UINT_MAX_BITS = 1024
 
 
 # ── Precision parsing (local; geometry stays import-free of the core) ─────────
@@ -75,51 +93,24 @@ def divisors(num):
     return [x for x in range(1, int(num) + 1) if num % x == 0]
 
 
-# ── Device -> DSP block -> compute core ───────────────────────────────────────
+# ── Part gate ──────────────────────────────────────────────────────────────────
 
-def dsp_block_for_part(part):
-    """Map an FPGA part string to its DSP generation.
-
-    Heuristic (mirrors the intent of FINN's ``get_dsp_block``): Versal -> DSP58,
-    UltraScale/UltraScale+ -> DSP48E2, 7-series -> DSP48E1. Defaults to DSP48E2
-    (the ATLAS default part is ``xcvu13p``) when unknown.
-    """
-    if not part:
-        return "DSP48E2"
-    p = str(part).lower()
-    # Versal families: xcvc / xcvp / xcvm / xcve / xcvh (but NOT xcvu = US+ Virtex)
-    if re.match(r"^xcv[cpmeh]", p):
-        return "DSP58"
-    # UltraScale / UltraScale+ : xcvu, xcku, xczu, xcau, xcu...
-    if re.match(r"^xc(vu|ku|zu|au|u)", p):
-        return "DSP48E2"
-    # 7-series and older
-    if re.match(r"^xc7", p):
-        return "DSP48E1"
-    return "DSP48E2"
-
-
-def select_core(dsp_block, weight_width, act_width):
-    """Pick the FINN COMPUTE_CORE string for a device + operand widths.
-
-    Mirrors FINN's ``_resolve_impl_style``: DSP58 covers the whole <=9b/<=8b
-    envelope with one core; on DSP48 the 4-bit path packs 4 MACs/DSP, else the
-    8-bit path packs 2.
-    """
-    if dsp_block == "DSP58":
-        return "mvu_vvu_8sx9_dsp58"
-    if weight_width <= 4 and act_width <= 4:
-        return "mvu_4sx4u_dsp48e1" if dsp_block == "DSP48E1" else "mvu_4sx4u_dsp48e2"
-    return "mvu_8sx8u_dsp48"
+def require_versal(part):
+    """Raise unless *part* is a Versal device -- the only family this target
+    supports (single compute core ``mvu_vvu_8sx9_dsp58``, DSP58 only)."""
+    if not part or not re.match(r"^xcv[cpmeh]", str(part), re.IGNORECASE):
+        raise ValueError(
+            f"mvau requires a Versal part (xcv[cpmeh]...), got {part!r}; "
+            "pass a Versal part via --part")
 
 
 # ── Envelope validation ───────────────────────────────────────────────────────
 
-def check_envelope(dsp_block, weight_width, act_width, signed_act):
+def check_envelope(weight_width, act_width, signed_act):
     """Reject operand widths outside the native MVU envelope (integer only).
 
     Raises ``ValueError`` for >8b weights, or >8b activations (>9b even when
-    signed on DSP58). These cores have no path for wider or floating operands;
+    signed). These cores have no path for wider or floating operands;
     bit-plane decomposition is a documented, out-of-scope extension.
     """
     if weight_width > 8:
@@ -127,11 +118,11 @@ def check_envelope(dsp_block, weight_width, act_width, signed_act):
             f"weight width {weight_width}b exceeds the MVU envelope (<=8b); "
             "reject or bit-plane decompose (out of scope)")
     if act_width > 8:
-        ok = signed_act and act_width == 9 and dsp_block == "DSP58"
+        ok = signed_act and act_width == 9
         if not ok:
             raise ValueError(
                 f"activation width {act_width}b exceeds the MVU envelope "
-                "(<=8b, or <=9b signed on DSP58)")
+                "(<=8b, or <=9b signed)")
 
 
 # ── Accumulator / segment / narrow ────────────────────────────────────────────
@@ -145,32 +136,23 @@ def accu_width(k, weight_width, act_width, guard=ACCU_GUARD):
     return int(math.ceil(math.log2(max(1, int(k))))) + int(weight_width) + int(act_width) + int(guard)
 
 
-def dsp_estimate(core, pe, simd):
-    """FINN cost-model DSP count for one MVU tile (doc 04.5): DSP58 packs 3
-    MACs/DSP (PE·ceil(SIMD/3)), the 4-bit DSP48 core 4 (ceil(PE/4)·SIMD), the
-    8-bit DSP48 core 2 (ceil(PE/2)·SIMD)."""
-    if core == "mvu_vvu_8sx9_dsp58":
-        return pe * math.ceil(simd / 3)
-    if core in ("mvu_4sx4u_dsp48e1", "mvu_4sx4u_dsp48e2"):
-        return math.ceil(pe / 4) * simd
-    return math.ceil(pe / 2) * simd   # mvu_8sx8u_dsp48
+def dsp_estimate(pe, simd):
+    """DSP58 packs 3 K-lanes per DSP (``mvu_vvu_8sx9_dsp58``): ``PE*ceil(SIMD/3)``."""
+    return pe * math.ceil(simd / 3)
 
 
-def latency_cycles(core, sf, simd, segmentlen):
+def latency_cycles(sf, simd, segmentlen):
     """Deterministic fill latency (first input beat -> first output beat) of one
     MVU tile. RTL is a fixed pipeline, so this is exact, not an estimate --
     calibrated against standalone XSIM runs (temp_space/mvau-lat):
 
-      DSP58: SF + ceil(CHAINLEN/SEGMENTLEN) + 2   (CHAINLEN = ceil(SIMD/3))
-      DSP48 (8sx8u / 4sx4u): SF + 5               (5 fixed core stages)
+      SF + ceil(CHAINLEN/SEGMENTLEN) + 2   (CHAINLEN = ceil(SIMD/3))
 
-    Verified: DSP58 SF=2/4 -> 5/7; 8sx8u SF=2/4 -> 7/9.
+    Verified: SF=2/4 -> 5/7.
     """
-    if core == "mvu_vvu_8sx9_dsp58":
-        chainlen = math.ceil(simd / 3)
-        max_pipe = math.ceil(chainlen / max(1, segmentlen))
-        return sf + max_pipe + 2
-    return sf + 5
+    chainlen = math.ceil(simd / 3)
+    max_pipe = math.ceil(chainlen / max(1, segmentlen))
+    return sf + max_pipe + 2
 
 
 def output_ii(sf):
@@ -180,14 +162,12 @@ def output_ii(sf):
     return sf
 
 
-def segment_len(simd, clock_ns, dsp_block):
+def segment_len(simd, clock_ns):
     """DSP58 cascade segment length from the target clock (FINN's model).
 
     ``critical_path_dsps = floor((clk - 0.741)/0.605 + 1)`` then clamp to the
-    chain length ``ceil(SIMD/3)``. Returns 0 (unused) for non-DSP58 cores.
+    chain length ``ceil(SIMD/3)``.
     """
-    if dsp_block != "DSP58":
-        return 0
     if clock_ns is None or clock_ns <= 0.741:
         # Can't meet the first-DSP delay; fall back to full chain length.
         return int(math.ceil(simd / 3))
@@ -198,9 +178,7 @@ def segment_len(simd, clock_ns, dsp_block):
 def narrow_weights(weights, weight_width, signed=True):
     """FINN ``NARROW_WEIGHTS``: 1 iff the weights never use the most-negative code.
 
-    With weights unknown (None) returns 0. Mandatory 1 for the 4-bit core on
-    DSP48E1 -- callers targeting that core with unknown weights must constrain
-    the range or target DSP48E2/DSP58 (validated in :func:`fold_plan`).
+    With weights unknown (None) returns 0.
     """
     if weights is None:
         return 0
@@ -224,62 +202,108 @@ def _flatten(x):
     return out
 
 
-# ── Folding search (FINN SetFolding, MVAU branch) ─────────────────────────────
+# ── ReuseFactor -> (PE, SIMD) ──────────────────────────────────────────────────
 
-def exp_cycles(k, n, pe, simd):
-    """Per-input-vector cycle cost = SF*NF = (K/SIMD)*(N/PE)."""
-    return (k // simd) * (n // pe)
+def _warn(req, legal, hi_desc, name=None):
+    where = f' in layer "{name}"' if name else ""
+    return (f"WARNING: Invalid ReuseFactor={req}{where}. Using ReuseFactor={legal} "
+            f"instead. Valid ReuseFactor(s): {hi_desc}.")
 
 
-def fold(k, n, weight_width, target_cycles, wwidth_max=WWIDTH_MAX, simd_cap=None):
-    """Choose ``(PE, SIMD)`` for one MVU instance over ``(K=MW, N=MH)``.
+def resolve_fold(k, n, reuse_factor, fold_axis="n", name=None):
+    """Resolve ``ReuseFactor`` to ``(PE, SIMD)`` for a GEMM ``(K, N)``.
 
-    Mirrors FINN ``SetFolding`` (``set_folding.py:129-152``): reset PE=SIMD=1;
-    ramp SIMD over divisors of K until the per-vector cycle target is met or the
-    weight-stream width cap is hit; then ramp PE over divisors of N until the
-    target is met. Divisor-only, so ``K%SIMD==0`` / ``N%PE==0`` by construction.
+    ReuseFactor is *how many times each MAC is used per input vector*:
+    ``RF = K*N / (PE*SIMD)``. The fold axis decides which dimension pads to
+    honor the request exactly (rather than snapping RF itself):
 
-    ``simd_cap`` (optional) additionally bounds SIMD — used to hold SIMD at the
-    DSP-packing-optimal value (e.g. a multiple of 3 on DSP58, where each DSP packs 3
-    K-lanes; SIMD=4 would spill into a 2-DSP cascade at 33% waste).
+    - ``"n"`` (default): SIMD=K (the whole K reduction stays inside one DSP58
+      cascade per PE), N pads up to a multiple of RF, PE = n_pad/RF. RF > N
+      cannot be honored (PE would be < 1); legalizes to RF=N (PE=1).
+    - ``"k"``: PE=N, K pads up to a multiple of RF, SIMD = k_pad/RF. SIMD is
+      never folded below 3 (the DSP58 packs 3 K-lanes/DSP) unless K itself is
+      below 3, in which case SIMD=K and K never folds. RF beyond ``K/3``
+      legalizes to the SIMD=3 floor.
+    - ``"kn"``: both rules applied independently, each with its own padding
+      and bound/warning. The multiplier count is then ``K*N/RF**2`` -- each
+      MAC is reused ``RF**2`` times per input vector, not RF; callers should
+      report the effective reuse (``k_pad*n_pad/(pe*simd)``) alongside the
+      requested knob so the two are never confused.
+
+    Returns a dict: ``pe``, ``simd``, ``k_pad``, ``n_pad``, ``reuse_factor``
+    (legalized -- for "kn" this is the common per-axis RF, not the effective
+    reuse), ``warnings`` (list of str, empty if the request needed no
+    legalization).
     """
-    target = max(1, int(target_cycles))
-    simd = 1
-    for s in divisors(k):
-        prev = simd
-        simd = s
-        if exp_cycles(k, n, 1, simd) < target:
-            break
-        if weight_width * simd > wwidth_max or (simd_cap and simd > simd_cap):
-            simd = prev
-            break
-    pe = 1
-    for p in divisors(n):
-        pe = p
-        if exp_cycles(k, n, pe, simd) < target:
-            break
-    return pe, simd
+    k, n = int(k), int(n)
+    rf = max(1, int(reuse_factor or 1))
+    warns = []
 
+    fold_n = fold_axis in ("n", "kn")
+    fold_k = fold_axis in ("k", "kn")
 
-def target_from_knobs(m, reuse_factor=1, strategy="latency", target_cycles=None):
-    """Map hls4ml knobs to the per-vector cycle target the fold search stops at.
+    if fold_axis not in ("n", "k", "kn"):
+        raise ValueError(f"fold_axis={fold_axis!r} must be one of 'n', 'k', 'kn'")
 
-    Knob contract (mvau): **ReuseFactor only**. Strategy answers "*how* is the MAC
-    computed?" (which soft kernel) — but the MVAU is one hardened FINN DSP MVU, there is
-    no kernel to select, so **Strategy is read-but-inert** for mvau (as is
-    ParallelizationFactor). RF answers "*how many* / what II?", which is exactly the fold
-    the MVAU exposes. So:
-    - ``target = RF`` (per-vector II = NF*SF*... ). RF=1 (the default) => maximum
-      parallelism / minimum II; reaching II=1 on K when SIMD is capped needs K-tiling
-      (see fold_plan's ``k_tiles_full_spatial``).
-    - ``TargetCycles`` (whole-frame budget) -> per-vector = ceil(target/M), overrides RF.
-    ``strategy`` is accepted for signature compatibility but ignored.
+    # N side (fold-N and fold-KN): SIMD=K, PE=n_pad/RF.
+    if fold_n:
+        rf_n = rf
+        if rf_n > n:
+            warns.append(_warn(rf_n, n, f"1..{n}", name))
+            rf_n = n
+        n_pad = math.ceil(n / rf_n) * rf_n
+        pe = n_pad // rf_n
+        simd_n = k
+    else:
+        rf_n = rf
+        n_pad = n
+        pe = n
+        simd_n = None
 
-    Returns ``(target, source)`` where source names which knob drove it.
-    """
-    if target_cycles is not None:
-        return max(1, int(math.ceil(int(target_cycles) / max(1, int(m))))), "target_cycles"
-    return max(1, int(reuse_factor or 1)), "reuse_factor"
+    # K side (fold-K and fold-KN): PE=N, SIMD=k_pad/RF, SIMD floor 3.
+    if fold_k:
+        rf_k = rf
+        if k < 3:
+            # K never folds below 3; SIMD=K is the only legal point.
+            if rf_k != 1:
+                warns.append(_warn(rf_k, 1, "1", name))
+            rf_k = 1
+            k_pad = k
+            simd_k = k
+        else:
+            simd_floor_rf = math.ceil(k / 3)
+            if rf_k > simd_floor_rf:
+                warns.append(_warn(rf_k, simd_floor_rf, f"1..{simd_floor_rf}", name))
+                rf_k = simd_floor_rf
+            k_pad = math.ceil(k / rf_k) * rf_k
+            simd_k = k_pad // rf_k
+        if not fold_n:
+            pe = n
+    else:
+        rf_k = rf
+        k_pad = k
+        simd_k = k
+
+    if fold_axis == "n":
+        simd = simd_n
+        legal_rf = rf_n
+    elif fold_axis == "k":
+        simd = simd_k
+        legal_rf = rf_k
+        n_pad = n
+    else:  # kn
+        simd = simd_k
+        pe = pe  # already n_pad // rf_n from the N-side branch
+        legal_rf = rf_n if rf_n == rf_k else rf_n  # report the N-side RF; see effective reuse
+
+    return {
+        "pe": pe,
+        "simd": simd,
+        "k_pad": k_pad,
+        "n_pad": n_pad,
+        "reuse_factor": legal_rf,
+        "warnings": warns,
+    }
 
 
 # ── Byte-aligned stream widths (match mvu_vvu_axi) ────────────────────────────
@@ -299,23 +323,64 @@ def stream_widths(pe, simd, weight_width, act_width, accu):
     }
 
 
+def check_beat_limits(pe, simd, weight_width, act_width, output_ba, n_tiles=1,
+                       k_tiles=1, weights_in_core=True, name=None):
+    """Reject a fold whose hls4ml-facing stream beats would need an ``ap_uint``
+    wider than :data:`AP_UINT_MAX_BITS`.
+
+    Checks every beat ``_gemm_ip.h`` (see ``package.py``) declares as a single
+    ``ap_uint``: the weight beat (``PE*SIMD*weight_width`` -- only when
+    ``weights_in_core`` is False, i.e. the weight matrix is a C++ stream
+    rather than baked into the RTL memstream), the input beat
+    (``SIMD*act_width``), the per-tile output beat (``PE*accu_width``,
+    byte-aligned), and the concatenated output beat that N-tiling and
+    K-tiling glue side by side (``n_tiles*k_tiles*`` the per-tile output
+    beat). This is independent of gemm-ip-gen's own ``_with_ap_int_max_w``
+    machinery, which only raises ``AP_INT_MAX_W`` for gemm-ip-gen's own
+    C++/header translation units -- it cannot help the hls4ml-side TU that
+    includes the generated header.
+    """
+    where = f' in layer "{name}"' if name else ""
+    beats = []
+    if not weights_in_core:
+        beats.append(("weight beat (PE*SIMD*weight_width)",
+                       pe * simd * weight_width))
+    beats += [
+        ("input beat (SIMD*act_width)", simd * act_width),
+        ("output beat (PE*accu_width)", output_ba),
+        ("concatenated output beat (n_tiles*k_tiles*PE*accu_width)",
+         n_tiles * k_tiles * output_ba),
+    ]
+    for label, width in beats:
+        if width > AP_UINT_MAX_BITS:
+            raise ValueError(
+                f"{label} is {width} bits{where}, exceeding the "
+                f"{AP_UINT_MAX_BITS}-bit ap_uint limit of Vitis HLS C "
+                "simulation. Reduce the parallelism on that beat: a larger "
+                "ReuseFactor or FoldAxis kn shrinks PE and SIMD, KTiles splits "
+                "the input beat across cores, NTiles splits the output beat")
+
+
 # ── Top-level plan ────────────────────────────────────────────────────────────
 
 def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
               output_precision=None, part=None, clock_period_ns=5.0,
-              reuse_factor=1, strategy="latency", target_cycles=None,
-              parallelization_factor=1, n_tiles=1, k_tiles=1, weights=None,
-              pe=None, simd=None):
+              reuse_factor=1, fold_axis="n", n_tiles=1, k_tiles=1, weights=None,
+              pe=None, simd=None, weights_in_core=True, name=None, **_ignored):
     """Resolve the full folding/geometry plan for a GEMM ``(m, k, n)``.
 
     N-tiling splits N into ``n_tiles`` equal column blocks, each an independent
     MVU instance (shared A, own B^T slice; outputs concatenated).
 
     K-tiling splits K into ``k_tiles`` equal row blocks (each MVU reduces its K-slice
-    for ALL outputs; the partial results are SUMMED). ``k_tiles="auto"`` chooses the
-    smallest divisor of SF that meets the RF/II target (RF=1 -> full spatial, SF_tile=1).
+    for ALL outputs; the partial results are SUMMED). ``k_tiles="auto"`` is treated as
+    1 (K-tiling is a physical/BRAM-shape choice, not something ``resolve_fold`` derives).
     ``k_tiles=1`` (default) is the single-K-core path. The summed accumulator is widened
     by ceil(log2 k_tiles).
+
+    ``**_ignored`` swallows legacy config keys (``strategy``, ``target_cycles``,
+    ``parallelization_factor``, ``simd_cap``) so older callers/manifests don't break;
+    they are not consulted.
 
     Returns a dict with the per-tile MVU parameters and the aggregate view.
     """
@@ -335,94 +400,59 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         raise ValueError(f"n_tiles={n_tiles} must be >=1 and divide N={n}")
     n_tile = n // n_tiles
 
-    dsp_block = dsp_block_for_part(part)
-    check_envelope(dsp_block, weight_width, act_width, signed_act)
-    core = select_core(dsp_block, weight_width, act_width)
+    require_versal(part)
+    check_envelope(weight_width, act_width, signed_act)
+    core = CORE
+    dsp_block = DSP_BLOCK
 
-    # K-padding so SIMD can reach the DSP-packing-optimal value. SIMD is bounded by
-    # weight_width*SIMD <= WWIDTH_MAX (routability), but the *packing* granularity is the
-    # DSP's K-lanes-per-DSP: DSP58 packs 3 (mvu_vvu_8sx9_dsp58), so SIMD should be a
-    # multiple of 3 (SIMD=3 -> 1 DSP, no waste; SIMD=4 -> 2 DSPs at 33% waste). DSP48
-    # cores pack along PE, not SIMD, so no SIMD granularity preference there.
-    # simd_target = largest DSP-optimal SIMD within the cap; pad K to a multiple of it
-    # (zero rows -> bit-exact) so the divisor-only fold can actually use it. A tiny K
-    # (< simd_target) keeps SIMD=K, no pad.
-    simd_cap = max(1, WWIDTH_MAX // weight_width)
-    pack = 3 if core == "mvu_vvu_8sx9_dsp58" else 1        # DSP58 K-lanes per DSP
-    simd_target = (simd_cap // pack) * pack if simd_cap >= pack else simd_cap
-    simd_target = max(1, simd_target)
+    requested_rf = int(reuse_factor or 1)
+    fold_warnings = []
+
     if pe is not None and simd is not None:
-        # ── user-directed fold: use (pe, simd) verbatim, no search ──
+        # ── user-directed fold: use (pe, simd) verbatim, no resolution ──
         pe, simd = int(pe), int(simd)
-        if weight_width * simd > WWIDTH_MAX:
-            raise ValueError(f"weight_width*simd = {weight_width * simd} exceeds the weight-stream "
-                             f"cap WWIDTH_MAX={WWIDTH_MAX}; reduce simd")
-        if pack and simd % pack:
-            warnings.warn(f"mvau: simd={simd} is not a multiple of the {core} DSP-packing factor "
-                          f"{pack}; the DSP cascade is under-utilized.", stacklevel=2)
         # K-pad to a multiple of simd*k_tiles so SF_full/k_tiles is integral.
         kt_int = 1 if k_tiles in (None, "auto") else max(1, int(k_tiles))
         unit = simd * kt_int
         k_pad = math.ceil(k / unit) * unit if k > 0 else unit
         if n_tile % pe:
             raise ValueError(f"pe={pe} must divide n_tile (= N/n_tiles = {n_tile})")
-        target, target_src = (k_pad // simd) * (n_tile // pe), "manual"
+        n_pad = n_tile
+        legal_rf = requested_rf
     else:
-        k_pad = k if k < simd_target else math.ceil(k / simd_target) * simd_target
-        target, target_src = target_from_knobs(
-            m, reuse_factor=reuse_factor, strategy=strategy, target_cycles=target_cycles)
-        pe, simd = fold(k_pad, n_tile, weight_width, target, simd_cap=simd_target)
-
-    # DSP48 cores pack MACs along PE (8sx8u: 2/DSP, 4sx4u: 4/DSP). When PE is not a
-    # multiple of that factor the DSP estimate's ceil() rounds up -> wasted DSP. This
-    # bites N-tiling with a small PE_tile and single cores on prime-ish N. DSP58 packs
-    # along SIMD, so PE alignment is irrelevant there. Warn only -- no guard/snap.
-    _pack_pe = {"mvu_8sx8u_dsp48": 2,
-                "mvu_4sx4u_dsp48e1": 4, "mvu_4sx4u_dsp48e2": 4}.get(core)
-    if _pack_pe and pe % _pack_pe:
-        warnings.warn(
-            f"mvau: PE={pe} is not a multiple of the {core} DSP-packing factor "
-            f"{_pack_pe}; DSP packing is under-utilized (rounds up as if "
-            f"PE={math.ceil(pe / _pack_pe) * _pack_pe}). Consider an aligned "
-            f"reuse_factor or n_tiles for better DSP efficiency.",
-            stacklevel=2)
+        resolved = resolve_fold(k, n_tile, requested_rf, fold_axis=fold_axis, name=name)
+        pe, simd = resolved["pe"], resolved["simd"]
+        k_pad, n_pad = resolved["k_pad"], resolved["n_pad"]
+        legal_rf = resolved["reuse_factor"]
+        fold_warnings = resolved["warnings"]
 
     accu = accu_width(k_pad, weight_width, act_width)
-    seg = segment_len(simd, clock_period_ns, dsp_block)
+    seg = segment_len(simd, clock_period_ns)
     narrow = narrow_weights(weights, weight_width, signed_act)
 
-    if core == "mvu_4sx4u_dsp48e1" and narrow == 0:
-        raise ValueError(
-            "mvu_4sx4u on DSP48E1 requires NARROW_WEIGHTS=1 (weights must exclude "
-            "the most-negative code); constrain the range or target DSP48E2/DSP58")
-
-    sf_full, nf = k_pad // simd, n_tile // pe
+    sf_full, nf = k_pad // simd, n_pad // pe
 
     # K-tiling: split the SF_full K-folds across k_tiles MVU cores, each reducing a
     # K_pad/k_tiles slice for ALL outputs; the partials are summed downstream. Each tile
     # is folded identically (MW = K_pad/k_tiles), so SF drops to SF_full/k_tiles.
-    if k_tiles == "auto":
-        want = max(1, int(math.ceil((sf_full * nf) / max(1, target))))
-        gk = next((d for d in divisors(sf_full) if d >= want), sf_full)
-    else:
-        gk = max(1, int(k_tiles))
-        if sf_full % gk != 0:
-            raise ValueError(f"k_tiles={gk} must divide SF={sf_full} (K_pad/SIMD)")
+    gk = 1 if k_tiles in (None, "auto") else max(1, int(k_tiles))
+    if sf_full % gk != 0:
+        raise ValueError(f"k_tiles={gk} must divide SF={sf_full} (K_pad/SIMD)")
     k_per_tile = k_pad // gk
     sf = sf_full // gk                     # per-tile SF
     accu_sum = accu + (math.ceil(math.log2(gk)) if gk > 1 else 0)  # summed-partials width
 
     widths = stream_widths(pe, simd, weight_width, act_width, accu)
+    check_beat_limits(pe, simd, weight_width, act_width, widths["output_ba"],
+                       n_tiles=n_tiles, k_tiles=gk,
+                       weights_in_core=weights_in_core, name=name)
 
-    # per-vector II and the RF it corresponds to (after divisor snapping + K-tiling)
-    ii_per_vector = sf * nf
-    achieved_rf = ii_per_vector  # RF == NF*SF per vector
-    requested_rf = int(reuse_factor or 1)
+    effective_reuse = (k_pad * n_pad) // (pe * simd)
 
     tile = {
         "is_mvu": 1,
         "compute_core": core,
-        "mw": k_per_tile, "mh": n_tile,
+        "mw": k_per_tile, "mh": n_pad,
         "pe": pe, "simd": simd, "sf": sf, "nf": nf,
         "activation_width": act_width,
         "weight_width": weight_width,
@@ -433,14 +463,14 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         "weight_stream_width_ba": widths["weight_ba"],
         "input_stream_width_ba": widths["input_ba"],
         "output_stream_width_ba": widths["output_ba"],
-        "wmem": (k_per_tile * n_tile) // (pe * simd),  # weight beats per input vector
-        "dsp_estimate": dsp_estimate(core, pe, simd),   # FINN cost model, per tile
-        "latency_cycles": latency_cycles(core, sf, simd, seg),  # deterministic fill latency
+        "wmem": (k_per_tile * n_pad) // (pe * simd),  # weight beats per input vector
+        "dsp_estimate": dsp_estimate(pe, simd),         # FINN cost model, per tile
+        "latency_cycles": latency_cycles(sf, simd, seg),  # deterministic fill latency
         "ii": output_ii(sf),                            # deterministic output II (= SF)
     }
 
     return {
-        "m": m, "k": k, "k_pad": k_pad, "n": n,
+        "m": m, "k": k, "k_pad": k_pad, "n": n, "n_pad": n_pad,
         "dsp_block": dsp_block,
         "output_width": out_width,
         "output_int": output_int,
@@ -449,18 +479,16 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         "weight_frac": weight_frac,
         "product_frac": input_frac + weight_frac,   # raw dot-product carries 2^this
         "n_tiles": n_tiles,
-        "n_tile": n_tile,
+        "n_tile": n_pad,
         "num_input_vectors": m,
         "tile": tile,             # tiles are identical; instantiate n_tiles of these
-        "target_cycles": target,
-        "target_source": target_src,
-        "achieved_reuse_factor": achieved_rf,
+        "fold_axis": fold_axis,
         "requested_reuse_factor": requested_rf,
-        "reuse_factor_snapped": achieved_rf != requested_rf and target_src == "reuse_factor",
-        "parallelization_factor": int(parallelization_factor or 1),
+        "reuse_factor": legal_rf,
+        "effective_reuse": effective_reuse,
+        "fold_warnings": fold_warnings,
         # K-tiling: k_tiles MVU cores each reduce K_pad/k_tiles for all outputs; partials
         # summed (accumulator widened to accu_sum). k_tiles=1 => single K-core (default).
-        "simd_pack": pack,                 # DSP K-lanes/DSP (3 on DSP58) -> SIMD granularity
         "k_tiles": gk,                     # number of K-tiles (MVU cores summed along K)
         "k_per_tile": k_per_tile,          # each tile's MW (K slice), a multiple of SIMD
         "sf_full": sf_full,                # pre-tiling SF; k_tiles=SF_full => SF_tile=1
@@ -471,8 +499,8 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
 #: config keys fold_plan accepts (resolve_plan filters the config down to these).
 _FOLD_PLAN_KEYS = (
     "weight_precision", "input_precision", "output_precision", "part",
-    "clock_period_ns", "reuse_factor", "strategy", "target_cycles",
-    "parallelization_factor", "n_tiles", "k_tiles", "weights", "pe", "simd",
+    "clock_period_ns", "reuse_factor", "fold_axis", "n_tiles", "k_tiles",
+    "weights", "pe", "simd", "weights_in_core", "name",
 )
 
 

@@ -29,6 +29,14 @@ class GenericTarget(Target):
     # The combined header reads either ROM order straight from CONFIG_T (weights_row_major).
     weight_layouts = ("column_major", "row_major")
 
+    knobs = [
+        {"name": "ReuseFactor", "key": "reuse_factor", "type": "int", "default": 1,
+         "description": "II applied to the row loop (II=1 latency, II=R resource)"},
+        {"name": "Strategy", "key": "strategy", "type": "enum",
+         "choices": ("latency", "resource"), "default": "latency",
+         "description": "which generic kernel body to emit"},
+    ]
+
     def geometry(self, shape):
         m, k, n = shape
         return {"gemm_m": m, "gemm_k": k, "gemm_n": n, "n_in": k, "n_out": n}
@@ -50,6 +58,7 @@ class GenericTarget(Target):
     def package(self, shape, cfg):
         cfg = dict(cfg)
         name = cfg.pop("name")
+        self.validate_knobs(cfg, name)
         output_dir = cfg.pop("output_dir")
         m, k, n = shape
         # A weight-stationary layer is signalled by a baked weight matrix (the CLI loads

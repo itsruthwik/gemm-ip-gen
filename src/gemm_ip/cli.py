@@ -49,7 +49,12 @@ def main():
     parser.add_argument("--n-tiles", type=int, default=None,
                         help="mvau: N tiles (spatial, concatenated).")
     parser.add_argument("--reuse-factor", type=int, default=None,
-                        help="mvau: ReuseFactor (per-vector cycle target) when --pe/--simd are unset.")
+                        help="mvau: ReuseFactor, how many times each MAC is used per "
+                             "input vector (RF = K*N/(PE*SIMD)), when --pe/--simd are unset.")
+    parser.add_argument("--fold-axis", type=str, choices=("n", "k", "kn"), default=None,
+                        help="mvau: which dimension ReuseFactor folds -- 'n' (default) "
+                             "pads N and sets SIMD=K, PE=N_pad/RF; 'k' pads K and sets "
+                             "PE=N, SIMD=K_pad/RF (floored at 3); 'kn' folds both.")
     parser.add_argument("--strategy", type=str, default="latency",
                         help="generic target: GEMM kernel strategy, 'latency' (default) "
                              "or 'resource' (case-insensitive); validated where consumed.")
@@ -77,7 +82,7 @@ def main():
     if args.describe:
         from gemm_ip.registry import load_target
         t = load_target(args.describe)
-        print(json.dumps({"name": t.name, "tool": t.tool}))
+        print(json.dumps({"name": t.name, "tool": t.tool, "knobs": t.knobs}))
         return
 
     _run(args)
@@ -110,49 +115,40 @@ def _run(args):
                         f"consumes {', '.join(target.weight_layouts)}.")
                 dat = (cfg_path.parent / item["weight_file"]).resolve()
                 weight_matrix = _weights.load_weight_dat(str(dat), item["n"], item["k"], layout)
-            target.package(
-                (item["m"], item["k"], item["n"]),
-                {
-                    "name": item["name"],
-                    "output_dir": args.output_dir,
-                    "interface": item.get("interface", "stream"),
-                    "output_precision": item.get("output_precision"),
-                    "gemm_k_spatial": item.get("gemm_k_spatial"),
-                    "input_precision": item.get("input_precision"),
-                    "weight_precision": item.get("weight_precision"),
-                    "clock_period_ns": item.get("clock_period_ns"),
-                    "weight_matrix": weight_matrix,
-                    # Forwarded for targets that select core / fold from them (mvau).
-                    # tensor_slice tolerates unknowns via **_ignored; generic accepts
-                    # part/strategy/reuse_factor as params. (weights_in_core is NOT
-                    # forwarded — generic's flow.package sets it explicitly.)
-                    "part": item.get("part"),
-                    "reuse_factor": item.get("reuse_factor"),
-                    "strategy": item.get("strategy"),
-                    "parallelization_factor": item.get("parallelization_factor"),
-                    "target_cycles": item.get("target_cycles"),
-                    "n_tiles": item.get("n_tiles"),
-                    # DEBUG: direct mvau fold knobs injected via ATLASConfig (bypassing
-                    # hls4ml's gemm_config). TODO: Ruthwik change this.
-                    "pe": item.get("pe"),
-                    "simd": item.get("simd"),
-                    "k_tiles": item.get("k_tiles"),
-                    # Two-operand routing: weights_in_core False selects a target's
-                    # runtime-B (gemm_stream) generator over the weight-stationary one;
-                    # second_operand_row_major is the B beat order it expects. Targets
-                    # that don't distinguish these pop/ignore them (see generic).
-                    "weights_in_core": item.get("weights_in_core"),
-                    "second_operand_row_major": item.get("second_operand_row_major"),
-                    # has_bias: derived from the bias tensor itself (non-all-zero) AND
-                    # not row-varying (a row-varying EinsumDense bias is added in
-                    # hls4ml's generated wrapper instead, so the IP never sees it) by
-                    # hls4ml; the single source of truth for whether this IP owns a
-                    # bias adder. "bias": the raw per-column values to bake in as a
-                    # compile-time constant when has_bias is True.
-                    "has_bias": item.get("has_bias"),
-                    "bias": item.get("bias"),
-                },
-            )
+            pkg_cfg = {
+                "name": item["name"],
+                "output_dir": args.output_dir,
+                "interface": item.get("interface", "stream"),
+                "output_precision": item.get("output_precision"),
+                "gemm_k_spatial": item.get("gemm_k_spatial"),
+                "input_precision": item.get("input_precision"),
+                "weight_precision": item.get("weight_precision"),
+                "clock_period_ns": item.get("clock_period_ns"),
+                "weight_matrix": weight_matrix,
+                "part": item.get("part"),
+                "parallelization_factor": item.get("parallelization_factor"),
+                "target_cycles": item.get("target_cycles"),
+                # Two-operand routing: weights_in_core False selects a target's
+                # runtime-B (gemm_stream) generator over the weight-stationary one;
+                # second_operand_row_major is the B beat order it expects. Targets
+                # that don't distinguish these pop/ignore them (see generic).
+                "weights_in_core": item.get("weights_in_core"),
+                "second_operand_row_major": item.get("second_operand_row_major"),
+                # has_bias: derived from the bias tensor itself (non-all-zero) AND
+                # not row-varying (a row-varying EinsumDense bias is added in
+                # hls4ml's generated wrapper instead, so the IP never sees it) by
+                # hls4ml; the single source of truth for whether this IP owns a
+                # bias adder. "bias": the raw per-column values to bake in as a
+                # compile-time constant when has_bias is True.
+                "has_bias": item.get("has_bias"),
+                "bias": item.get("bias"),
+            }
+            # Forward every knob the target itself declares (see targets/base.py
+            # Target.knobs) instead of a target-specific key list here -- a target
+            # adding a knob never requires a CLI change.
+            for knob in target.knobs:
+                pkg_cfg[knob["key"]] = item.get(knob["key"])
+            target.package((item["m"], item["k"], item["n"]), pkg_cfg)
         output_dir = Path(args.output_dir)
         (output_dir / "gemm_ip_combined.h").write_text(target.combined_header(items))
         (output_dir / "integration_manifest.json").write_text(target.integration_manifest(items) + "\n")
@@ -177,21 +173,18 @@ def _run(args):
             # to the int16 output lane (the real hls4ml flow passes ac_fixed here).
             "output_precision": "ac_int<16, true>",
             "n_frames": args.n_frames,
-            # mvau user-directed fold/tiling knobs (ignored by targets that don't fold).
             "weight_precision": args.weight_precision,
             "input_precision": args.input_precision,
             "clock_period_ns": args.clock_period_ns,
             "part": args.part,
-            "pe": args.pe,
-            "simd": args.simd,
-            "k_tiles": args.k_tiles,
-            "n_tiles": args.n_tiles,
-            "reuse_factor": args.reuse_factor,
-            "strategy": args.strategy,
             "weights_in_core": not args.two_operand,
             # dual-operand needs B row-major; harmless for the weight-stationary path.
             "second_operand_row_major": True if args.two_operand else None,
         }
+        # Forward only the knobs this target declares (see targets/base.py
+        # Target.knobs), reading each off the CLI flag of the same name.
+        for knob in target.knobs:
+            cfg[knob["key"]] = getattr(args, knob["key"], None)
         target.package((args.m, args.k, args.n), cfg)
 
 

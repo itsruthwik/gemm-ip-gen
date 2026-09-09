@@ -3,7 +3,10 @@
 This file explains what each user knob actually does to the generated hardware:
 how a gemm config maps onto the `mvu_vvu_axi` / `memstream` parameters documented
 in [`mvau-rtl-parameters.md`](mvau-rtl-parameters.md). The authoritative code is
-`../geometry.py` (`fold_plan` and helpers); this is the narrative.
+`../geometry.py` (`resolve_fold`, `fold_plan`); this is the narrative. For the
+compute core's internal structure (why DSP58 packs 3 K-lanes per DSP, the PCOUT
+cascade, `SEGMENTLEN`), see `finn_space/MVU_space/03_compute_cores.md` at the repo
+root rather than this file.
 
 ## Config path
 
@@ -21,6 +24,12 @@ Each GEMM in a model is normalized and folded **independently** by its own knobs
 producing its own single blackbox IP; the combined header + manifest stitch them
 into the dataflow. Nothing is shared or auto-balanced across layers.
 
+## Part and core
+
+This target supports **Versal parts only** (`xcv[cpmeh]...`); any other part
+raises, naming `--part`. There is a single compute core,
+`mvu_vvu_8sx9_dsp58` (DSP58), so there is no part-to-core selection to document.
+
 ---
 
 ## 1. Knob reference
@@ -31,19 +40,21 @@ Recall the mapping: **`MW = K`, `MH = N`, `numInputVectors = M`**.
 | hls4ml / config field | mvau effect | notes |
 |---|---|---|
 | `input_precision`  | `ACTIVATION_WIDTH`, `SIGNED_ACTIVATIONS`, activation frac | `u?fixed<W,I>`; frac = `W−I` |
-| `weight_precision` | `WEIGHT_WIDTH`, weight frac | selects 4-bit vs 8-bit core |
+| `weight_precision` | `WEIGHT_WIDTH`, weight frac | |
 | `output_precision` | drain output type `ap_fixed<W,I,AP_RND,AP_SAT>` | frac = `W−I` |
-| `part` | DSP generation → `COMPUTE_CORE`, `SEGMENTLEN` | see §3 |
-| `clock_period_ns` | DSP58 `SEGMENTLEN` (cascade split) | ignored on DSP48 |
-| `strategy` | fold target: `latency` ⇒ full unroll | see §4 |
-| `reuse_factor` | fold target = RF (per-vector II) | the throughput/area dial |
-| `target_cycles` | fold target = `⌈target_cycles / M⌉` | whole-frame budget |
+| `part` | must be Versal | see above |
+| `clock_period_ns` | DSP58 `SEGMENTLEN` (cascade split) | |
+| `reuse_factor` | how many times each MAC is used per input vector; picks `(PE, SIMD)` | see §4 |
+| `fold_axis` | which dimension `reuse_factor` folds: `n` (default), `k`, or `kn` | see §4 |
 | `n_tiles` | split **N** into `n_tiles` stitched MVU cores | see §6 |
 | `weights_in_core` + `weight_file` | bake weights into the `memstream` ROM | see §7 |
 | `bias` (+ `has_bias`) | per-column bias added in the accumulator domain | see §8 |
-| `parallelization_factor` | **currently inert** — carried but not used by the fold | use `reuse_factor` instead |
 | `accum_precision` | **currently inert** — `ACCU_WIDTH` is always auto-sized (§5) | — |
 | `interface` | `stream` only; `array` (io_parallel) is rejected | MVU is a streaming core |
+
+`strategy`, `pe`/`simd` (manual bypass), and `k_tiles` also exist; `pe`/`simd` skip
+`resolve_fold` entirely (the caller states the fold directly), and `k_tiles` is a
+physical/BRAM-shape choice, not something the fold derives.
 
 ---
 
@@ -57,136 +68,100 @@ Precisions are `ac_fixed`/`ap_fixed`-style strings, `u?fixed<W,I>`:
 
 **Envelope (`geometry.check_envelope`) — rejected outright, no fallback:**
 - `WEIGHT_WIDTH > 8` → error.
-- `ACTIVATION_WIDTH > 8` → error, unless `= 9` **and** signed **and** DSP58.
+- `ACTIVATION_WIDTH > 8` → error, unless `= 9` **and** signed.
 
 There is no bit-plane decomposition and no float path. "Larger GEMM" only ever
 means larger `M/K/N`, never wider precision.
 
 ---
 
-## 3. Part → DSP generation → core
+## 3. ReuseFactor and the fold
 
-`geometry.dsp_block_for_part` then `select_core`:
+`ReuseFactor` (RF) is *how many times each MAC (each `(PE, SIMD)` lane) is used
+per input vector*: `RF = K*N / (PE*SIMD)`. It is a resource knob, not a cycle
+budget — `resolve_fold` (`../geometry.py`) turns it into `(PE, SIMD)` directly by
+picking which dimension pads to honor the request, rather than searching for a
+fold that hits a cycle target.
 
-| Part prefix | DSP block | 8-bit core | 4-bit core |
-|---|---|---|---|
-| `xcv[cpmeh]…` (Versal) | DSP58 | `mvu_vvu_8sx9_dsp58` | `mvu_vvu_8sx9_dsp58` |
-| `xc{vu,ku,zu,au,u}…` (US/US+) | DSP48E2 | `mvu_8sx8u_dsp48` | `mvu_4sx4u_dsp48e2` |
-| `xc7…` (7-series) | DSP48E1 | `mvu_8sx8u_dsp48` | `mvu_4sx4u_dsp48e1` |
-| otherwise | DSP48E2 (default) | — | — |
+`fold_axis` selects the dimension:
 
-`NARROW_WEIGHTS` is derived from the actual weights when known; the 4-bit core on
-DSP48**E1** *requires* `NARROW_WEIGHTS=1` (fold_plan errors otherwise).
+- **`n` (default).** `SIMD = K` — the whole K reduction runs inside one DSP58
+  cascade per PE. `N` pads up to the next multiple of RF (`n_pad = ceil(N/RF)*RF`,
+  zero-weight output columns, dropped downstream); `PE = n_pad / RF`. RF above `N`
+  cannot be honored (`PE` would be below 1) and legalizes to `RF = N` (`PE = 1`),
+  with a warning naming the layer.
+- **`k`.** `PE = N`; `K` pads up to the next multiple of RF (`k_pad =
+  ceil(K/RF)*RF`, zero rows); `SIMD = k_pad / RF`. `SIMD` is never folded below 3
+  (the DSP58 core packs 3 K-lanes per DSP) unless `K` itself is below 3, in which
+  case `SIMD = K` and `K` never folds. RF beyond `K/3` legalizes to the `SIMD = 3`
+  floor, with a warning.
+- **`kn`.** Both rules applied independently and simultaneously: `SIMD = K/RF`
+  (K-side padding and floor, as above) and `PE = N/RF` (N-side padding and bound,
+  as above). Each side is checked and, if needed, legalized on its own. The
+  multiplier count under `kn` is `K*N/RF**2` — each MAC is reused `RF**2` times
+  per input vector, not `RF` — so the manifest reports the effective reuse
+  (`K_pad*N_pad/(PE*SIMD)`) alongside the requested `reuse_factor` so the two are
+  never confused.
+
+Padding is the default legalization for an in-range request (a non-dividing RF
+pads rather than snapping to a nearby divisor); a warning is only printed at the
+bounds above (RF exceeding what the axis can express), never for an in-range,
+non-dividing RF.
+
+`RF = 1` is always legal (`SIMD = K`, `PE = N`, no folding) and needs no special
+handling; its DSP cost is the caller's responsibility, as with hls4ml.
+
+### Why fold-N is the default
+
+On this core both axes cost the same DSPs for a given RF: fold-N spends
+`(N/RF)*ceil(K/3)`, fold-K spends `N*ceil(K/(3*RF))` — both `~= K*N/(3*RF)` when
+the division is exact. Fold-N is still the default for two reasons: the whole K
+reduction stays inside one DSP58 PCOUT cascade per PE (no fabric adders, no
+extra accumulation passes), and the `ceil` rounding waste of a partially filled
+cascade is paid once per PE — of which fold-N has RF times fewer than fold-K. See
+`finn_space/MVU_space/03_compute_cores.md` for the cascade structure itself.
 
 ---
 
-## 4. The folding search (PE, SIMD)
+## 4. Manual `(pe, simd)` bypass
 
-`fold(k, n_tile, weight_width, target)` mirrors FINN's `SetFolding`:
-
-1. **Fold target** (`target_from_knobs`):
-   - `strategy=latency` / `reuse_factor=1` → `target=1` → full unroll.
-   - `reuse_factor=R` → `target=R` (per-vector II ≈ R).
-   - `target_cycles=T` → `target=⌈T/M⌉`.
-2. **Ramp SIMD** over divisors of `K`, stopping when the cycle target is met **or**
-   the weight-stream-width cap is hit: `WEIGHT_WIDTH · SIMD ≤ WWIDTH_MAX (36)`.
-3. **Ramp PE** over divisors of `n_tile` (= N when untiled) until the cycle target
-   is met.
-
-Folding is **divisor-exact** (`K % SIMD == 0`, `N % PE == 0`) by construction, so
-the RTL sanity checks always pass.
-
-### SIMD is hard-capped (spatial K is bounded)
-
-`WEIGHT_WIDTH · SIMD ≤ 36` caps the spatial reduction:
-
-| weight width | max SIMD |
-|---|---|
-| 8-bit | **4** |
-| 4-bit | 9 |
-| 2-bit | 18 |
-
-`SIMD` is then the largest **divisor of K** at or below that cap. This is why
-K is largely a *temporal* dimension — see §5.
-
-### PE is the throughput/area dial
-
-With `target=1` (latency) PE ramps to the largest divisor of `n_tile` → full
-unroll (`PE = n_tile`, `NF = 1`). Higher `reuse_factor` stops PE earlier → smaller
-PE, larger `NF`, fewer DSPs, more cycles.
-
-### Divisor snapping (a real sharp edge)
-
-Because PE must divide N and SIMD must divide K, awkward dims collapse. `N` prime
-⇒ `PE ∈ {1, N}` only: either full unroll (huge DSP) or fully serial. `plan
-["reuse_factor_snapped"]` flags when the achieved II ≠ the requested RF.
+Passing both `pe` and `simd` skips `resolve_fold`: the values are used verbatim
+(K still pads to a multiple of `simd * k_tiles` so `SF/k_tiles` is integral, and
+`pe` must divide `n_tile`). This is a debug path, not part of the `ReuseFactor` /
+`fold_axis` contract above.
 
 ---
 
 ## 5. Derived quantities
 
 ```
-SF   = K / SIMD                      # synapse (K) folds — temporal K
-NF   = n_tile / PE                   # neuron  (N) folds
+SF   = K_pad / SIMD                  # K-folds (per input vector)
+NF   = n_pad / PE                    # N-folds
 WMEM = SF · NF                       # weight beats / vector = memstream DEPTH (per tile)
-ACCU = ⌈log2 K⌉ + WEIGHT_WIDTH + ACTIVATION_WIDTH + 1     # auto-sized (guard=1)
+ACCU = ⌈log2 K_pad⌉ + WEIGHT_WIDTH + ACTIVATION_WIDTH + 1     # auto-sized (guard=1)
 
 weight_stream_width_ba = ceil(PE·SIMD·WEIGHT_WIDTH / 8)·8
 input_stream_width_ba  = ceil(SIMD·ACTIVATION_WIDTH / 8)·8
-output_stream_width_ba = ceil(PE·ACCU / 8)·8              # per tile (PB)
+output_stream_width_ba = ceil(PE·ACCU / 8)·8              # per tile
 
-II   = SF                            # one output every SF cycles
-lat  = SF + 5                        # DSP48;  SF + ⌈⌈SIMD/3⌉/SEGMENTLEN⌉ + 2 on DSP58
+DSP estimate = PE · ceil(SIMD/3)     # DSP58 packs 3 K-lanes per DSP
 ```
 
 `ACCU_WIDTH` is always computed here (any `accum_precision` knob is ignored), so
-the accumulator never overflows for a length-K dot product.
+the accumulator never overflows for a length-`K_pad` dot product. Fill latency and
+output cadence are deterministic RTL properties, not resource knobs; see
+`../geometry.py` (`latency_cycles`, `output_ii`) and
+`finn_space/MVU_space/03_compute_cores.md` for their derivation.
 
 ---
 
-## 6. K vs N — spatial and temporal
-
-The two GEMM dimensions are treated asymmetrically, because K is a **reduction**
-and N is a **map**:
-
-| | spatial (parallel) | temporal (sequential) | can it be fully spatial? |
-|---|---|---|---|
-| **K** (reduction) | `SIMD` lanes, capped at `36/WW` (≤4 for 8-bit) | `SF = K/SIMD` beats | **No** — SIMD is width-capped; the rest is time. No K-tiling exists. |
-| **N** (map) | `PE` lanes, up to `N` (full unroll) | `NF = N/PE` beats | **Yes** — `PE=N` in one core, *or* fan out across `n_tiles` cores. |
-
-So for any 8-bit K > 4 the bulk of K is temporal (`SF = K/4`). The only ways to add
-spatial K are narrower weights (raises the SIMD cap) or DSP58; there is **no
-K-tiling** (multiple cores summing partial-K products) today — it is the missing
-dual of N-tiling.
-
-### N: larger-PE vs N-tiling (same `P_total = n_tiles · PE_tile`)
-
-Reaching a given output parallelism as one big-PE core vs. several tiles is
-throughput- and total-DSP-equivalent, but structurally different:
-
-| | larger PE (1 core) | N-tiling (`n_tiles` cores) |
-|---|---|---|
-| replay_buffer (activation) | 1 | `n_tiles` (activation broadcast + re-buffered) |
-| weight ROM | 1 memstream | `n_tiles` memstreams (same bits, split) |
-| DSP packing (DSP48) | best | preserved **only if `PE_tile ≥` packing factor** (2 for 8-bit, 4 for 4-bit) |
-| control overhead | 1 FSM | `n_tiles` FSMs |
-| timing / floorplan at scale | wide fanout, harder | small local cores + trivial 1-bit stitch — easier, SLR-friendly |
-| composability | monolithic | independent N-blocks (attention heads, two-operand scaffold) |
-
-**Default to larger PE for a plain dense layer** (what FINN does). **Reach for
-N-tiling when you have a reason to partition N** — a semantic block structure, a
-layer too big to place/time as one core, or the two-operand path — and keep
-`PE_tile` at the packing granularity. There is currently **no guard** enforcing
-that, so an odd/`=1` `PE_tile` on a DSP48 part silently loses packing.
-
----
-
-## 7. N-tiling (`n_tiles`) — the RTL stitch
+## 6. N-tiling (`n_tiles`) — the RTL stitch
 
 `n_tiles` splits N into equal column blocks (`n_tile = N/n_tiles`, must divide N),
-each an independent `mvu_vvu_axi` folded over `(K, n_tile)`. The stitch lives
-entirely in the shim (`../rtl.py`), so from Vitis's view it is still **one**
-blackbox: one activation FIFO in, one result FIFO out.
+each an independent `mvu_vvu_axi` folded over `(K, n_tile)` by the same
+`reuse_factor` / `fold_axis`. The stitch lives entirely in the shim (`../rtl.py`),
+so from Vitis's view it is still **one** blackbox: one activation FIFO in, one
+result FIFO out.
 
 - **activation broadcast** — one shared activation stream fans out to every tile;
   `a_read` advances only when all tiles accept (`&in_tready`).
@@ -208,7 +183,7 @@ flow defaults every GEMM to `n_tiles=1` (single core) until the field is plumbed
 
 ---
 
-## 8. Weight-stationary path & the drain
+## 7. Weight-stationary path & the drain
 
 ### Weight baking (`weights_in_core` + `weight_file`)
 
@@ -224,7 +199,8 @@ within word :  W[nf·PE+pe][sf·SIMD+s]  at bit (pe·SIMD + s)·WEIGHT_WIDTH   #
 
 This is byte-exact-validated against FINN's own flip-based packer. Without a
 `weight_file` the generator bakes a deterministic synthetic matrix (tests /
-standalone).
+standalone). Under `fold_axis="n"` the padded N columns are zero-weight; the drain
+discards the padded output columns before they reach the caller.
 
 ### Requant drain (Keras order: matmul → bias → quantize)
 
@@ -242,33 +218,30 @@ auto-sized and bias lives in the accumulator domain.
 
 ---
 
-## 9. Worked examples
+## 8. Worked example
 
-Single-core folds for `fixed<8,4>` weights & activations on `xcvu13p`
-(`⌈PE/2⌉·SIMD` DSP), from `geometry.fold_plan`:
+`fixed<8,4>` weights & activations on a Versal part, `(M,K,N) = (1, 27, 8)`:
 
-| shape (M,K,N) | knob | PE | SIMD | SF | NF | DSP | fill lat | note |
-|---|---|---|---|---|---|---|---|---|
-| (1, 8, 8)     | latency | 8 | 4 | 2 | 1 | 16 | 7 | SIMD capped at 4 |
-| (1, 256, 512) | latency | 512 | 4 | 64 | 1 | 1024 | 69 | full unroll (DSP heavy) |
-| (1, 256, 512) | `reuse_factor=1024` | 64 | 4 | 64 | 8 | 128 | 69 | folded → 8× fewer DSP |
-| (1, 1024, 1024) | latency | 1024 | 4 | 256 | 1 | 2048 | 261 | |
-| (1, 254, 257) | latency | 257 | 2 | 127 | 1 | 258 | 132 | N,K prime-ish → stuck at full unroll; SIMD=2 |
-| (1, 1024, 1024) | `n_tiles=4`, latency | 256 (×4) | 4 | 256 | 1 | 512 ×4 = 2048 | 261 | same compute as full unroll, 4 placeable cores |
-
-Note SIMD is pinned to 4 wherever `4 | K` (the 8-bit cap), and `n_tiles=4` gives
-the same total DSP as the single big-PE core — the difference is floorplan/timing
-and modularity, not throughput.
+| `fold_axis` | `reuse_factor` | PE | SIMD | K_pad | N_pad | DSP (`PE·ceil(SIMD/3)`) | note |
+|---|---|---|---|---|---|---|---|
+| `n` | 1 | 8 | 27 | 27 | 8 | 72 | full unroll, no padding |
+| `n` | 3 | 3 | 27 | 27 | 9 | 27 | `N=8` doesn't divide by 3; pads to 9 |
+| `n` | 16 | 1 | 27 | 27 | 16 | 9 | `RF > N`; legalizes to `RF=8` (`PE=1`), warning |
+| `k` | 10 | 8 | 3 | 30 | 8 | 24 | `K/3 = 9`; `RF=10` legalizes to `SIMD=3`, warning |
 
 ---
 
-## 10. Cheat-sheet
+## 9. Cheat-sheet
 
-- **Make it fit / go slower:** raise `reuse_factor` (folds PE down, fewer DSP).
-- **Go fast (small layer):** `strategy=latency` (full unroll, `PE=N`).
-- **Big layer that won't place/time as one core:** set `n_tiles` (direct invoke)
-  to spread the same compute across cores — keep `PE_tile` even (8-bit) / ×4 (4-bit).
+- **Fewer DSPs / more cycles:** raise `reuse_factor`.
+- **Full throughput:** `reuse_factor=1` (`SIMD=K`, `PE=N`, no folding).
+- **Big layer that won't place/time as one core:** set `n_tiles` to spread the
+  same compute across cores.
+- **Fold K instead of N:** `fold_axis="k"` (e.g. when `N` is small/prime and `K`
+  has useful divisors).
+- **Both axes at once:** `fold_axis="kn"` — remember the multiplier count is
+  `RF**2`, not `RF`; check `effective_reuse` in the manifest.
 - **Constant weights:** `weights_in_core=true` + `weight_file` → baked ROM.
-- **Awkward dims:** expect divisor snapping; check `plan["reuse_factor_snapped"]`.
-- **Don't reach for:** `parallelization_factor` / `accum_precision` (inert today),
-  `interface=array` (rejected), >8b precision (rejected).
+- **Non-Versal part:** rejected outright — pass a Versal `--part`.
+- **Don't reach for:** `accum_precision` (inert), `interface=array` (rejected),
+  >8b precision (rejected).

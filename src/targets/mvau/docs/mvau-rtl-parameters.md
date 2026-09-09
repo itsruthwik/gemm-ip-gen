@@ -118,18 +118,15 @@ fill latency       = SF + 5                    // DSP48 (8sx8u / 4sx4u): 5 fixed
 
 ---
 
-## 4. Compute cores (`COMPUTE_CORE`)
+## 4. Compute core (`COMPUTE_CORE`)
 
-| Core | Device / operands | DSP packing (MACs/DSP) | DSP estimate (per instance) |
-|---|---|---|---|
-| `mvu_4sx4u_dsp48e1` / `…e2` | DSP48, ≤4b weight & act | 4 (packed along **PE**) | `⌈PE/4⌉ · SIMD` |
-| `mvu_8sx8u_dsp48` | DSP48, (4,8]b | 2 (packed along **PE**) | `⌈PE/2⌉ · SIMD` |
-| `mvu_vvu_8sx9_dsp58` | DSP58 (Versal), [4,9]b | 3 (packed along **SIMD**) | `PE · ⌈SIMD/3⌉` |
-
-Which one is selected from the FPGA part + operand widths is `geometry.select_core`
-(see the mapping doc). **The packing dimension matters for tiling:** DSP48 packs
-along PE, so splitting PE (N-tiling) can break packing unless each tile keeps
-`PE ≥ packing factor`; DSP58 packs along SIMD, so it is tiling-neutral.
+This target instantiates a single core, `mvu_vvu_8sx9_dsp58` (DSP58, Versal
+only), for every generated IP — there is no part/width-based core selection.
+It packs 3 K-lanes per DSP58 (along **SIMD**): `DSP estimate = PE · ⌈SIMD/3⌉`.
+Because the packing dimension is SIMD, not PE, splitting PE (N-tiling) never
+breaks packing. The vendored RTL also contains DSP48 cores
+(`mvu_4sx4u_dsp48e1`/`…e2`, `mvu_8sx8u_dsp48`) for other FINN deployments; this
+target does not instantiate them.
 
 ---
 
@@ -186,8 +183,8 @@ existence/replay-count the N-fold `NF`.
 **N-tiling cost.** Each tile is its own `mvu_vvu_axi`, hence its own
 `replay_buffer`, so the activation vector is buffered `n_tiles` times (one copy per
 tile), all fed by the shim's activation broadcast. This is the concrete reason a
-single large-PE core is more activation-efficient than `n_tiles` tiles (see the
-larger-PE-vs-N-tiling table in `config-mapping.md` §6).
+single large-PE core is more activation-efficient than `n_tiles` tiles (see
+`config-mapping.md` §6 for the N-tiling stitch).
 
 > The only other activation storage is the HLS wrapper's dataflow FIFOs (`a_s`,
 > depth 4) — streaming plumbing between `feed_a` and the core, not a vector buffer.

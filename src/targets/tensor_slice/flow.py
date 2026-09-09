@@ -64,6 +64,7 @@ class TensorSliceTarget(Target):
     def package(self, shape, cfg):
         cfg = dict(cfg)
         name = cfg.pop("name")
+        self.validate_knobs(cfg, name)
         output_dir = cfg.pop("output_dir")
         return _package().generate_catapult_pkg(*shape, name, output_dir, **cfg)
 

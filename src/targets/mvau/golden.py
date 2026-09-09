@@ -101,6 +101,7 @@ def _ws_core_twin(p, t, func_name, B):
     NT, NTILE = p["n_tiles"], p["n_tile"]
     PB_TOTAL = NT * PB
     M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
+    NTILE_REAL = N // NT   # unpadded per-tile column count; the interface presents only these
     actt = _act_ctype(t["signed_activations"], AW)
     wlit = _w_matrix_literal(B, N, K)
     pad = ' ' * (len(func_name) + 6)
@@ -125,7 +126,9 @@ void {func_name}(hls::stream<ap_uint<{AB}> >& a,
             ap_uint<{PB_TOTAL}> ob = 0;
             for (int ti = 0; ti < {NT}; ti++)
                 for (int pe = 0; pe < {PE}; pe++) {{
-                    int oc = ti * {NTILE} + nf * {PE} + pe;   // global output column
+                    int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
+                    if (local_oc < {NTILE_REAL}) {{   // drop the N-pad tail columns
+                    int oc = ti * {NTILE_REAL} + local_oc;   // global output column
                     ap_int<{ACCU}> acc = 0;
                     for (int sf = 0; sf < {SF}; sf++)
                         for (int s = 0; s < {SIMD}; s++)
@@ -133,6 +136,7 @@ void {func_name}(hls::stream<ap_uint<{AB}> >& a,
                                  * (ap_int<64>)x[sf][s];
                     ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU})
                         = (ap_uint<{ACCU}>)acc;
+                    }}
                 }}
             p.write(ob);
         }}
@@ -185,7 +189,9 @@ void {func_name}(hls::stream<ap_uint<{A_TOTAL}> >& a,
             for (int j = 0; j < {NT}; j++)
             for (int i = 0; i < {KT}; i++)
                 for (int pe = 0; pe < {PE}; pe++) {{
-                    int oc = j * {NTILE} + nf * {PE} + pe;
+                    int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
+                    if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
+                    int oc = j * {NTILE} + local_oc;
                     int idx = j * {KT} + i;
                     ap_int<{ACCU}> acc = 0;
                     for (int kk = 0; kk < {MW}; kk++)
@@ -193,6 +199,7 @@ void {func_name}(hls::stream<ap_uint<{A_TOTAL}> >& a,
                              * (ap_int<64>)x[i * {MW} + kk];
                     ob.range(idx * {PB} + pe * {ACCU} + {ACCU} - 1, idx * {PB} + pe * {ACCU})
                         = (ap_uint<{ACCU}>)acc;
+                    }}
                 }}
             p.write(ob);
         }}
@@ -339,10 +346,13 @@ void {func_name}(hls::stream<ap_uint<{AB}> >& a,
         for (int nf = 0; nf < {NF}; nf++) {{        // one output beat per column block
             ap_uint<{PB}> ob = 0;
             for (int pe = 0; pe < {PE}; pe++) {{
+                int oc = nf * {PE} + pe;
+                if (oc < {N}) {{   // drop the N-pad tail columns (untiled: n_tile == n)
                 ap_int<{ACCU}> acc = 0;
                 for (int k = 0; k < {K}; k++)
-                    acc += (ap_int<64>)W[nf * {PE} + pe][k] * (ap_int<64>)x[k];
+                    acc += (ap_int<64>)W[oc][k] * (ap_int<64>)x[k];
                 ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU}) = (ap_uint<{ACCU}>)acc;
+                }}
             }}
             p.write(ob);
         }}
@@ -496,12 +506,15 @@ void {func_name}(hls::stream<ap_uint<{A_TOTAL}> >& a,
             for (int j = 0; j < {nt}; j++)
                 for (int i = 0; i < {gk}; i++)
                     for (int pe = 0; pe < {PE}; pe++) {{
-                        int oc = j * {NTILE} + nf * {PE} + pe;
+                        int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
+                        if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
+                        int oc = j * {NTILE} + local_oc;
                         int idx = j * {gk} + i;
                         ap_int<{ACCU}> acc = 0;
                         for (int kk = 0; kk < {MW}; kk++)
                             acc += (ap_int<64>)W[oc][i * {MW} + kk] * (ap_int<64>)x[i * {MW} + kk];
                         ob.range(idx * {PB} + pe * {ACCU} + {ACCU} - 1, idx * {PB} + pe * {ACCU}) = (ap_uint<{ACCU}>)acc;
+                        }}
                     }}
             p.write(ob);
         }}

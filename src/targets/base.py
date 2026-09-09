@@ -24,6 +24,48 @@ class Target(ABC):
     #: frontend chose (SecondOperandRowMajor); a target either reads it or errors.
     weight_layouts = ("column_major",)
 
+    #: Per-layer knobs this target consumes out of an ATLASConfig/manifest item,
+    #: declared so callers (run_atlas_flow, `--describe`) never need target-specific
+    #: knowledge. Each entry is a dict:
+    #:   name        ATLASConfig CamelCase key, e.g. "FoldAxis"
+    #:   key         manifest/package-cfg snake_case key, e.g. "fold_axis"
+    #:   type        "int" | "str" | "enum"
+    #:   choices     tuple of valid values, only for type "enum"
+    #:   default     the value this target uses when the knob is absent
+    #:   description short human-readable description
+    #: A target with no knobs (the default) leaves this empty.
+    knobs = []
+
+    def validate_knobs(self, item, layer_name):
+        """Type/enum-check this target's declared knobs that are present in *item*.
+
+        Raises ValueError naming *layer_name* and the offending knob. Knobs absent
+        from *item* are left alone (the target's own default applies downstream).
+        Called by each target's flow before packaging.
+        """
+        for knob in self.knobs:
+            key = knob["key"]
+            if key not in item or item.get(key) is None:
+                continue
+            value = item[key]
+            ktype = knob.get("type")
+            if ktype == "int":
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(
+                        f"layer '{layer_name}': knob '{knob['name']}' must be an int, "
+                        f"got {value!r}")
+            elif ktype == "enum":
+                choices = knob.get("choices") or ()
+                if str(value).lower() not in choices:
+                    raise ValueError(
+                        f"layer '{layer_name}': knob '{knob['name']}' value {value!r} "
+                        f"is invalid: must be one of {', '.join(choices)}")
+            elif ktype == "str":
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"layer '{layer_name}': knob '{knob['name']}' must be a str, "
+                        f"got {value!r}")
+
     @abstractmethod
     def geometry(self, shape):
         """Tile geometry for *shape* (grid rows/cols, k chunks, stream widths, latency)."""
