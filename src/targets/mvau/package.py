@@ -39,20 +39,6 @@ def _with_timescale(text):
     return text if "`timescale" in text else _TIMESCALE + text
 
 
-def _rv_width(accu, has_bias):
-    """Just-wide-enough intermediate width for a requant drain's ``rv``. With the
-    bias add, ``CONFIG_T::bias_t`` is unknown at generation time, so keep headroom
-    (>= 32b) plus a couple guard bits; without it, ACCU + 1 guard bit suffices."""
-    return (max(accu, 32) + 2) if has_bias else (accu + 1)
-
-
-def _rv_decl_assign(width, pfrac, raw_expr, indent=""):
-    """``ap_fixed`` decl + range-assign for a requant drain's ``rv``, narrowed to
-    *width* bits (was a fixed 64-bit intermediate)."""
-    return (f"{indent}ap_fixed<{width}, {width - pfrac}> rv;\n"
-            f"{indent}rv.range({width - 1}, 0) = (ap_uint<{width}>)(ap_int<{width}>){raw_expr};")
-
-
 def _apmaxw(bits):
     """AP_INT_MAX_W setting for a design whose widest ap_uint is ``bits`` wide.
     The default cap is 1024; K-tiled result beats (KT*PB) blow past it. Round up to
@@ -129,83 +115,49 @@ def cbits(plan):
     return ((plan["n"] * plan["output_width"]) + 7) // 8 * 8
 
 
-def bias_acc_codes(bias, product_frac, n, has_bias):
-    """Scale per-column real bias to the accumulator (2^product_frac) domain.
+def _dataflow_top(name, plan):
+    """The DUT: feed -> blackbox -> pure unpack, in a dataflow region. Per vector:
+    NF beats in, one N-wide C-row beat out.
 
-    ``has_bias`` (the manifest's own field, computed by hls4ml from the real bias
-    tensor) is the *only* gate for whether a bias is baked: when True this always
-    returns an N-long list of codes -- even if every one of them rounds to zero at
-    this fixed-point scale -- so the generated hardware matches what hls4ml's own
-    csim expects (an add is present) rather than silently disagreeing with the
-    manifest for a sub-LSB bias. When False, returns None (bake nothing) regardless
-    of what ``bias`` holds. Raises if ``has_bias`` is True but ``bias`` is absent --
-    that combination means the manifest is internally inconsistent, not "no bias"."""
-    if not has_bias:
-        return None
-    if not bias:
-        raise ValueError(
-            "has_bias is True but the manifest has no bias values to bake "
-            "(cfg['bias'] is missing/empty)")
-    codes = [int(round(float(b) * (1 << product_frac))) for b in bias]
-    if len(codes) != n:
-        raise ValueError(f"bias length {len(codes)} != N {n}")
-    return codes
+    Bias and the shift/round/wrap to the output precision now happen inside
+    ``{name}_core`` (the RTL requant stage and its C twin, ``golden.py``), so the
+    beat this top reads is already the final, narrow, out_width-bit-per-lane code
+    -- this drain only slices lanes and drops the N-pad tail columns; no
+    arithmetic. bias_codes has moved with the arithmetic into the core twin.
 
-
-def _dataflow_top(name, plan, bias_codes=None):
-    """The DUT: feed -> blackbox (raw integer matmul) -> affine requant drain, in
-    a dataflow region. Per vector: NF raw beats in, one N-wide C-row beat out.
-
-    Drain (Keras order: matmul, bias, quantize): add per-column bias in the
-    accumulator (2^(fa+fb)) domain, reinterpret as fixed-point, cast to the output
-    ap_fixed with AP_RND (round-half-up) + AP_SAT. bias_codes is the bias already
-    scaled to that domain (None => no bias; the two-operand GEMMs have none).
-
-    Weight-stationary: the blackbox bakes its weights in the memstream, so the top
-    has no weight input -- only activations flow in. Two-operand IPs have their own
-    top emitter (``_2op_dataflow_top``).
+    Weight-stationary: the blackbox bakes its weights (and bias) in the memstream,
+    so the top has no weight input -- only activations flow in. Two-operand IPs
+    have their own top emitter (``_2op_dataflow_top``).
     """
     t = plan["tile"]
     m = plan["num_input_vectors"]
-    WB, AB, PB = t["weight_stream_width_ba"], t["input_stream_width_ba"], t["output_stream_width_ba"]
-    PE, SF, NF, ACCU = t["pe"], t["sf"], t["nf"], t["accu_width"]
+    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
+    PE, SF, NF = t["pe"], t["sf"], t["nf"]
     NT, NTILE = plan["n_tiles"], plan["n_tile"]
     PB_TOTAL = NT * PB   # concatenated result beat: the n_tiles tiles side by side
-    N, outW, outI = plan["n"], plan["output_width"], plan["output_int"]
+    N, outW = plan["n"], plan["output_width"]
     NTILE_REAL = N // NT   # unpadded per-tile column count; the interface presents only these
-    pfrac = plan["product_frac"]
     CB = cbits(plan)
     abeats = m * SF
     pad = ' ' * (len(name) + 6)
-    if bias_codes:
-        bias_decl = (f"static const long {name}_bias[{N}] = {{"
-                     + ", ".join(str(c) for c in bias_codes) + "};\n")
-        bias_add = f" + {name}_bias[oc]"
-    else:
-        bias_decl, bias_add = "", ""
     core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{pad}hls::stream<ap_uint<{PB_TOTAL}> >&);"
     indent = ' ' * (len(name) + 1)
     top_sig = f"void {name}(hls::stream<ap_uint<{AB}> >& a_in,\n{indent}hls::stream<ap_uint<{CB}> >& c_out)"
-    w_stream_decl, w_stream_pragma = "", ""
     feed_calls = (f"    feed_a(a_in, a_s);\n"
-                  f"    {name}_core(a_s, p_s);   // <-- FINN MVU RTL blackbox (weights baked in memstream)")
+                  f"    {name}_core(a_s, p_s);   // <-- FINN MVU RTL blackbox (weights + bias baked; already requantized)")
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
-#include <ap_fixed.h>
 
-// output precision: fixed<{outW},{outI}> with round-half-up + saturate
-typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> {name}_result_t;
-{bias_decl}
 {core_decl}
 
 static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
     for (int i = 0; i < {abeats}; i++) out.write(in.read());
 }}
 
-// Affine requant drain: raw ACCU codes (+bias) -> N-wide requantized C row. The
-// input beat concatenates the n_tiles tiles; tile ti lane pe (bits ti*PB+pe*ACCU)
-// is global column ti*n_tile + nf*PE + pe.
-static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
+// Pure unpack: {name}_core already emits requantized out_width-bit-per-lane codes
+// (bias + shift + round-half-up + wrap all happened inside it). Slice one lane per
+// column and drop the N-pad tail columns; no arithmetic here.
+static void unpack(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
     for (int vec = 0; vec < {m}; vec++) {{
         ap_uint<{CB}> crow = 0;
         for (int nf = 0; nf < {NF}; nf++) {{
@@ -215,11 +167,8 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
                     int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
                     if (local_oc < {NTILE_REAL}) {{   // drop the N-pad tail columns
                     int oc = ti * {NTILE_REAL} + local_oc;
-                    ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
-                    ap_int<{_rv_width(ACCU, bool(bias_codes))}> v = (ap_int<{_rv_width(ACCU, bool(bias_codes))}>)raw{bias_add};         // matmul + bias, accum domain
-{_rv_decl_assign(_rv_width(ACCU, bool(bias_codes)), pfrac, "v", ' ' * 20)}   // code -> fixed (frac={pfrac})
-                    {name}_result_t r = rv;                           // rescale + round + saturate
-                    crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+                    crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
+                        ob.range(ti * {PB} + pe * {outW} + {outW} - 1, ti * {PB} + pe * {outW});
                     }}
                 }}
         }}
@@ -229,12 +178,12 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
 
 {top_sig} {{
 #pragma HLS DATAFLOW
-{w_stream_decl}    hls::stream<ap_uint<{AB}> > a_s;
+    hls::stream<ap_uint<{AB}> > a_s;
     hls::stream<ap_uint<{PB_TOTAL}> > p_s;
-{w_stream_pragma}#pragma HLS STREAM variable=a_s depth=4
+#pragma HLS STREAM variable=a_s depth=4
 #pragma HLS STREAM variable=p_s depth=4
 {feed_calls}
-    requant(p_s, c_out);
+    unpack(p_s, c_out);
 }}
 """
 
@@ -301,30 +250,27 @@ exit
 """
 
 
-def _gemm_ip_header(name, plan, bias_codes=None):
+def _gemm_ip_header(name, plan):
     """The dedicated hls4ml-facing IP for one gemm config: an HLS C++ dataflow IP
-    with the internal FINN-MVU blackbox. Repacks hls4ml beats -> FINN beats,
-    runs the blackbox, requant-drains -> hls4ml C row. The combined header routes
+    with the internal FINN-MVU blackbox. Repacks hls4ml beats -> FINN beats, runs
+    the blackbox (which now bakes bias and does the shift/round/wrap to
+    ``out_width`` internally, matching the RTL requant stage), and pure-unpacks
+    its already-narrow beat -> hls4ml C row. The combined header routes
     nnet::gemm_* to this by CONFIG_T::gemm_ip_id (template dispatch).
 
-    Bias, like the weight matrix, is a compile-time constant here: when
-    ``bias_codes`` is given (has_bias True) it is baked as a ``static const`` array
-    declared in this header and added directly inside the drain -- never a function
-    argument, so it never becomes a port on this (or any) function.
-
-    Weight-stationary only (weights baked in the RTL memstream); two-operand IPs
-    use ``_2op_gemm_ip_header``.
+    Weight-stationary only (weights + bias baked in the RTL memstream / bias ROM);
+    two-operand IPs use ``_2op_gemm_ip_header``.
     """
     t = plan["tile"]
     m = plan["num_input_vectors"]
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    PE, SF, NF, ACCU = t["pe"], t["sf"], t["nf"], t["accu_width"]
+    PE, SF, NF = t["pe"], t["sf"], t["nf"]
     NT, NTILE = plan["n_tiles"], plan["n_tile"]
     PB_TOTAL = NT * PB   # concatenated result beat: the n_tiles tiles side by side
     AW, K, N = t["activation_width"], plan["k"], plan["n"]
     KPAD = plan["k_pad"]   # K padded to a multiple of SIMD; arow is KPAD-wide, pad lanes 0
     NTILE_REAL = N // NT   # unpadded per-tile column count; the interface presents only these
-    pfrac = plan["product_frac"]
+    outW = plan["output_width"]
     core_hdr_pad = ' ' * (len(name) + 6)
     core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{core_hdr_pad}hls::stream<ap_uint<{PB_TOTAL}> >&);"
     # const_weights (weight-stationary): weights are baked in the RTL memstream, so no
@@ -336,20 +282,14 @@ def _gemm_ip_header(name, plan, bias_codes=None):
     ws_calls = (f"    {name}_repack_a<data_T>(a_stream, a_s);\n"
                 f"    {name}_core(a_s, p_s);\n"
                 f"    {name}_drain<res_T, CONFIG_T>(p_s, res_stream);")
-    if bias_codes:
-        bias_decl = (f"static const long {name}_bias[{N}] = {{"
-                     + ", ".join(str(c) for c in bias_codes) + "};\n")
-    else:
-        bias_decl = ""
     return f"""#ifndef {name.upper()}_GEMM_IP_H_
 #define {name.upper()}_GEMM_IP_H_
 #include <hls_stream.h>
 #include <ap_int.h>
-#include <ap_fixed.h>
 
-// internal FINN-MVU blackbox (shim {name}_core.v; C twin {name}_core.cpp)
+// internal FINN-MVU blackbox (shim {name}_core.v; C twin {name}_core.cpp) -- bias (if
+// any) and the shift/round-half-up/wrap to out_width are baked/performed inside it.
 {core_decl}
-{bias_decl}
 
 namespace nnet {{
 
@@ -380,10 +320,12 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > 
     }}
 }}
 
-// requant drain: raw ACCU -> fixed -> (+ the baked bias constant, if any) -> round+sat.
-// Bias is baked as the static const array above (declared once per generated IP),
-// never a function argument -- it is the same "compile-time constant" mechanism the
-// baked weight matrix uses, so it never becomes a port on this DATAFLOW function.
+// Pure unpack: {name}_core already emits requantized out_width-bit-per-lane codes
+// (bias, if any, and the shift/round-half-up/wrap to out_width all happened inside
+// it -- see golden.py's core twin and the RTL requant stage). This drain only
+// slices one out_width lane per column and drops the N-pad tail columns; the code
+// is loaded via .range() (raw bit pattern), never a value-preserving conversion,
+// since the value is already rounded/wrapped and re-converting would corrupt it.
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
@@ -396,11 +338,10 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
                     unsigned local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
                     if (local_oc < {NTILE_REAL}) {{        // drop the N-pad tail columns
                     unsigned oc = ti * {NTILE_REAL} + local_oc;
-                    ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU, bool(bias_codes)), pfrac, "raw", ' ' * 20)}   // code -> fixed (frac={pfrac})
-{('                    rv += ' + name + '_bias[oc];                                 // + bias (baked constant)' if bias_codes else '')}
-                    result_t r = rv;                                  // convert per res_T's rounding/overflow modes
-                    crow[oc] = r;
+                    ap_uint<{outW}> raw = ob.range(ti * {PB} + pe * {outW} + {outW} - 1, ti * {PB} + pe * {outW});
+                    result_t tmp;
+                    tmp.range() = raw;     // load the already-requantized bit pattern as-is
+                    crow[oc] = tmp;
                     }}
                 }}
         }}
@@ -423,41 +364,30 @@ void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream
 """
 
 
-def _kt_dataflow_top(name, plan, bias_codes=None):
+def _kt_dataflow_top(name, plan):
     """DUT for the K-tiled blackbox (fully-spatial per-tile, SF=NF=1). The activation
-    arrives as one wide beat of ``KT*AB`` (all K_pad activations); the blackbox emits
-    one wide beat of ``KT*PB`` holding the ``KT`` per-tile PARTIALS for all N columns.
-    The drain SUMS the partials per column (accumulator widened by ceil(log2 KT)),
-    then adds bias and requantizes -- the K-tiling counterpart of the single-tile drain."""
+    arrives as one wide beat of ``KT*AB`` (all K_pad activations); the blackbox now sums
+    the ``KT`` per-tile partials, bakes bias, and shift/round/wraps to ``out_width``
+    internally, so it emits one beat of ``NT*PB`` (one out_width lane per column,
+    K-tiling summed away). This top is a pure unpack (no arithmetic) -- the K-tiling
+    counterpart of the single-tile top."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
-    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
     PE, NF, MW = t["pe"], t["nf"], t["mw"]
     SFT = MW // t["simd"]
     KT, NT = plan["k_tiles"], plan["n_tiles"]
-    A_TOTAL, PB_TOTAL = KT * AB, NT * KT * PB
-    ACCU_SUM = plan["accu_sum"]
-    N, outW, outI = plan["n"], plan["output_width"], plan["output_int"]
+    A_TOTAL, PB_TOTAL = KT * AB, NT * PB
+    N, outW = plan["n"], plan["output_width"]
     NTILE = N // NT   # unpadded per-tile column count; the interface presents only these
-    pfrac = plan["product_frac"]
     CB = cbits(plan)
     pad = ' ' * (len(name) + 6)
-    if bias_codes:
-        bias_decl = (f"static const long {name}_bias[{N}] = {{"
-                     + ", ".join(str(c) for c in bias_codes) + "};\n")
-        bias_add = f" + {name}_bias[oc]"
-    else:
-        bias_decl, bias_add = "", ""
     indent = ' ' * (len(name) + 1)
-    apmax = _apmaxw(PB_TOTAL)
-    return f"""#define AP_INT_MAX_W {apmax}   // wide K-tiled beats (KT*PB={PB_TOTAL}) exceed the 1024-bit default
+    apmax = _apmaxw(A_TOTAL)
+    return f"""#define AP_INT_MAX_W {apmax}   // wide K-tiled activation beat (KT*AB={A_TOTAL}) may exceed the 1024-bit default
 #include <hls_stream.h>
 #include <ap_int.h>
-#include <ap_fixed.h>
 
-// output precision: fixed<{outW},{outI}> with round-half-up + saturate
-typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> {name}_result_t;
-{bias_decl}
 void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&,
 {pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
 
@@ -465,10 +395,10 @@ static void feed_a(hls::stream<ap_uint<{A_TOTAL}> >& in, hls::stream<ap_uint<{A_
     for (int i = 0; i < {m * SFT}; i++) out.write(in.read());
 }}
 
-// Grid requant drain: each vector emits NF={NF} partial beats; sum the KT K-partials per
-// column (accum widened to {ACCU_SUM} = ACCU + ceil(log2 KT)) and concatenate the NT N-slices
-// (tile (j,i) at [(j*KT+i)*PB]), then + bias and quantize (Keras order).
-static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
+// Pure unpack: {name}_core already summed the {KT} K-tile partials, added bias (if
+// any) and shift/round-half-up/wrapped to out_width. Slice one lane per column and
+// drop the N-pad tail columns; no arithmetic here.
+static void unpack(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
     for (int vec = 0; vec < {m}; vec++) {{
         ap_uint<{CB}> crow = 0;
         for (int nf = 0; nf < {NF}; nf++) {{
@@ -478,13 +408,8 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
                 int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
                 if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
                 int oc = j * {NTILE} + local_oc;
-                ap_int<{ACCU_SUM}> raw = 0;
-                for (int i = 0; i < {KT}; i++)
-                    raw += (ap_int<{ACCU}>)ob.range((j * {KT} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {KT} + i) * {PB} + pe * {ACCU});
-                ap_int<{_rv_width(ACCU_SUM, bool(bias_codes))}> v = (ap_int<{_rv_width(ACCU_SUM, bool(bias_codes))}>)raw{bias_add};         // Σ partials + bias, accum domain
-{_rv_decl_assign(_rv_width(ACCU_SUM, bool(bias_codes)), pfrac, "v", ' ' * 16)}   // code -> fixed (frac={pfrac})
-                {name}_result_t r = rv;                           // rescale + round + saturate
-                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
+                    ob.range(j * {PB} + pe * {outW} + {outW} - 1, j * {PB} + pe * {outW});
                 }}
             }}
         }}
@@ -500,51 +425,44 @@ void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in,
 #pragma HLS STREAM variable=a_s depth=4
 #pragma HLS STREAM variable=p_s depth=4
     feed_a(a_in, a_s);
-    {name}_core(a_s, p_s);   // <-- FINN MVU RTL blackbox ({KT} K-tiles, partials)
-    requant(p_s, c_out);
+    {name}_core(a_s, p_s);   // <-- FINN MVU RTL blackbox ({KT} K-tiles, already summed + requantized)
+    unpack(p_s, c_out);
 }}
 """
 
 
-def _kt_gemm_ip_header(name, plan, bias_codes=None):
+def _kt_gemm_ip_header(name, plan):
     """hls4ml-facing IP for a K-tiled gemm config (fully-spatial per-tile). Repacks the
-    K activations into one wide ``KT*AB`` beat, runs the blackbox, and drains by summing
-    the KT partials per column (+ the baked bias constant, if any) -- the K-tiling twin
-    of ``_gemm_ip_header``. Bias, like the weight matrix, is baked as a ``static const``
-    array in this header, never a function argument."""
+    K activations into one wide ``KT*AB`` beat, runs the blackbox (which sums the KT
+    partials, bakes bias, and requantizes internally), and pure-unpacks its already-
+    narrow ``NT*PB`` beat -- the K-tiling twin of ``_gemm_ip_header``."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
-    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
     PE, NF, MW, SIMD = t["pe"], t["nf"], t["mw"], t["simd"]
     SFT = MW // SIMD
     KT, NT = plan["k_tiles"], plan["n_tiles"]
-    A_TOTAL, PB_TOTAL = KT * AB, NT * KT * PB
-    ACCU_SUM = plan["accu_sum"]
+    A_TOTAL, PB_TOTAL = KT * AB, NT * PB
     AW, K, N = t["activation_width"], plan["k"], plan["n"]
     NTILE = N // NT
     KPAD = plan["k_pad"]
-    pfrac = plan["product_frac"]
+    outW = plan["output_width"]
     core_hdr_pad = ' ' * (len(name) + 6)
-    apmax = _apmaxw(PB_TOTAL)
-    if bias_codes:
-        bias_decl = (f"static const long {name}_bias[{N}] = {{"
-                     + ", ".join(str(c) for c in bias_codes) + "};")
-    else:
-        bias_decl = ""
+    apmax = _apmaxw(A_TOTAL)
     return f"""#ifndef {name.upper()}_GEMM_IP_H_
 #define {name.upper()}_GEMM_IP_H_
 #ifndef AP_INT_MAX_W
-#define AP_INT_MAX_W {apmax}   // wide K-tiled beats (KT*PB={PB_TOTAL}) exceed the 1024-bit default
+#define AP_INT_MAX_W {apmax}   // wide K-tiled activation beat (KT*AB={A_TOTAL}) may exceed the 1024-bit default
 #endif
 #include <hls_stream.h>
 #include <ap_int.h>
-#include <ap_fixed.h>
 
-// internal FINN-MVU blackbox (K-tiled shim {name}_core.v; C twin {name}_core.cpp)
+// internal FINN-MVU blackbox (K-tiled shim {name}_core.v; C twin {name}_core.cpp) -- sums
+// the {KT} K-tile partials, bakes bias (if any), and shift/round-half-up/wraps to
+// out_width internally.
 void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&,
 {core_hdr_pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
 
-{bias_decl}
 namespace nnet {{
 
 // Dedicated K-tiled IP for gemm config M={m} K={K} N={N} (core={t['compute_core']},
@@ -577,9 +495,10 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{A_TOTAL
     }}
 }}
 
-// K-tiled requant drain: sum the KT partials per column, + the baked bias constant
-// (if any), round+sat. Bias is never a function argument here (same mechanism as the
-// baked weight matrix), so it never becomes a port on this DATAFLOW function.
+// Pure unpack: {name}_core already summed the {KT} K-tile partials, added bias (if
+// any), and shift/round-half-up/wrapped to out_width. Slice one out_width lane per
+// column and drop the N-pad tail columns; loaded via .range() (raw bit pattern),
+// never a value-preserving conversion, since it is already rounded/wrapped.
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
@@ -592,13 +511,10 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
                 unsigned local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
                 if (local_oc < {NTILE}) {{             // drop the N-pad tail columns
                 unsigned oc = j * {NTILE} + local_oc;
-                ap_int<{ACCU_SUM}> raw = 0;
-                for (unsigned i = 0; i < {KT}; i++)
-                    raw += (ap_int<{ACCU}>)ob.range((j * {KT} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {KT} + i) * {PB} + pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU_SUM, bool(bias_codes)), pfrac, "raw", ' ' * 16)}   // code -> fixed (frac={pfrac})
-{('                rv += ' + name + '_bias[oc];                                 // + bias (baked constant)' if bias_codes else '')}
-                result_t r = rv;                                  // convert per res_T's rounding/overflow modes
-                crow[oc] = r;
+                ap_uint<{outW}> raw = ob.range(j * {PB} + pe * {outW} + {outW} - 1, j * {PB} + pe * {outW});
+                result_t tmp;
+                tmp.range() = raw;
+                crow[oc] = tmp;
                 }}
             }}
         }}
@@ -632,22 +548,18 @@ def _2op_dataflow_top(name, plan):
     ``fa+fb``). B is buffered/replayed inside the RTL, so the top just forwards its beats."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
-    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
     PE, SF, NF = t["pe"], t["sf"], t["nf"]
     N, WW = plan["n"], t["weight_width"]
     BB = ((N * WW) + 7) // 8 * 8
     K = plan["k_pad"]
-    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
+    outW = plan["output_width"]
     CB = cbits(plan)
     abeats, bbeats = m * SF, K
     pad = ' ' * (len(name) + 6)
     indent = ' ' * (len(name) + 1)
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
-#include <ap_fixed.h>
-
-// output precision: fixed<{outW},{outI}> with round-half-up + saturate
-typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> {name}_result_t;
 
 void {name}_core(hls::stream<ap_uint<{AB}> >&, hls::stream<ap_uint<{BB}> >&,
 {pad}hls::stream<ap_uint<{PB}> >&);
@@ -659,9 +571,10 @@ static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >&
     for (int i = 0; i < {bbeats}; i++) out.write(in.read());
 }}
 
-// Affine requant drain (no bias): NF raw-ACCU beats -> one N-wide requantized C row.
-// Beat nf lane pe holds output column nf*PE+pe.
-static void requant(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
+// Pure unpack (no bias -- two-operand GEMM never has one): {name}_core already
+// shift/round-half-up/wrapped each lane to out_width. Beat nf lane pe holds output
+// column nf*PE+pe.
+static void unpack(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
     for (int vec = 0; vec < {m}; vec++) {{
         ap_uint<{CB}> crow = 0;
         for (int nf = 0; nf < {NF}; nf++) {{
@@ -669,10 +582,8 @@ static void requant(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >
             for (int pe = 0; pe < {PE}; pe++) {{
                 int oc = nf * {PE} + pe;
                 if (oc < {N}) {{   // drop the N-pad tail columns (untiled: n_tile == n)
-                ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU, False), pfrac, "raw", ' ' * 16)}   // code -> fixed (frac={pfrac})
-                {name}_result_t r = rv;                           // rescale + round + saturate
-                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
+                    ob.range(pe * {outW} + {outW} - 1, pe * {outW});
                 }}
             }}
         }}
@@ -691,8 +602,8 @@ void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in
 #pragma HLS STREAM variable=p_s depth=4
     feed_a(a_in, a_s);
     feed_b(b_in, b_s);
-    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU RTL blackbox (B loaded+replayed in-core)
-    requant(p_s, c_out);
+    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU RTL blackbox (B loaded+replayed in-core; already requantized)
+    unpack(p_s, c_out);
 }}
 """
 
@@ -703,27 +614,23 @@ def _2op_kt_dataflow_top(name, plan):
     column, accumulator widened to accu_sum; no bias; act×act scale fa+fb)."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
-    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
     PE, NF, MW = t["pe"], t["nf"], t["mw"]
     SFT = MW // t["simd"]
     gk, nt = plan["k_tiles"], plan["n_tiles"]
-    A_TOTAL, PB_TOTAL = gk * AB, nt * gk * PB
-    ACCU_SUM = plan["accu_sum"]
+    A_TOTAL, PB_TOTAL = gk * AB, nt * PB
     N, WW = plan["n"], t["weight_width"]
     NTILE = N // nt
     BB = ((N * WW) + 7) // 8 * 8
     K = plan["k_pad"]
-    outW, outI, pfrac = plan["output_width"], plan["output_int"], plan["product_frac"]
+    outW = plan["output_width"]
     CB = cbits(plan)
-    apmax = _apmaxw(PB_TOTAL)
+    apmax = _apmaxw(A_TOTAL)
     pad = ' ' * (len(name) + 6)
     indent = ' ' * (len(name) + 1)
-    return f"""#define AP_INT_MAX_W {apmax}   // concatenated partial beat (gk*PB={PB_TOTAL}) exceeds the 1024-bit default
+    return f"""#define AP_INT_MAX_W {apmax}   // wide grid activation beat (gk*AB={A_TOTAL}) may exceed the 1024-bit default
 #include <hls_stream.h>
 #include <ap_int.h>
-#include <ap_fixed.h>
-
-typedef ap_fixed<{outW}, {outI}, AP_RND, AP_SAT> {name}_result_t;
 
 void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&, hls::stream<ap_uint<{BB}> >&,
 {pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
@@ -735,10 +642,9 @@ static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >&
     for (int i = 0; i < {K}; i++) out.write(in.read());
 }}
 
-// Grid requant drain (no bias): each vector emits NF={NF} partial beats; sum the gk K-partials
-// per column (accum widened to {ACCU_SUM} = ACCU + ceil(log2 gk)) and concatenate the nt
-// N-slices (tile (j,i) at [(j*gk+i)*PB]), then quantize.
-static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
+// Pure unpack (no bias): {name}_core already summed the gk K-partials per column and
+// shift/round-half-up/wrapped to out_width. Concatenate the nt N-slices; no arithmetic.
+static void unpack(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
     for (int vec = 0; vec < {m}; vec++) {{
         ap_uint<{CB}> crow = 0;
         for (int nf = 0; nf < {NF}; nf++) {{
@@ -748,12 +654,8 @@ static void requant(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{
                 int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
                 if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
                 int oc = j * {NTILE} + local_oc;
-                ap_int<{ACCU_SUM}> raw = 0;
-                for (int i = 0; i < {gk}; i++)
-                    raw += (ap_int<{ACCU}>)ob.range((j * {gk} + i) * {PB} + pe * {ACCU} + {ACCU} - 1, (j * {gk} + i) * {PB} + pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU_SUM, False), pfrac, "raw", ' ' * 16)}
-                {name}_result_t r = rv;
-                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) = r.range({outW} - 1, 0);
+                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
+                    ob.range(j * {PB} + pe * {outW} + {outW} - 1, j * {PB} + pe * {outW});
                 }}
             }}
         }}
@@ -772,8 +674,8 @@ void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in, hls::stream<ap_uint<{BB}> >&
 #pragma HLS STREAM variable=p_s depth=4
     feed_a(a_in, a_s);
     feed_b(b_in, b_s);
-    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU K-tiled blackbox (gk partials, B in-core)
-    requant(p_s, c_out);
+    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU K-tiled blackbox (gk partials summed, B in-core, already requantized)
+    unpack(p_s, c_out);
 }}
 """
 
@@ -787,26 +689,28 @@ def _2op_gemm_ip_header(name, plan):
     broadcast activation, concatenated), single (temporal memstream)."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
-    AB, PB, ACCU = t["input_stream_width_ba"], t["output_stream_width_ba"], t["accu_width"]
+    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     AW, WW = t["activation_width"], t["weight_width"]
     N, K, KPAD = plan["n"], plan["k"], plan["k_pad"]
     BB = ((N * WW) + 7) // 8 * 8
     NT_, NTILE = plan["n_tiles"], plan["n_tile"]
     KT_ = plan.get("k_tiles", 1)
-    pfrac = plan["product_frac"]
+    outW = plan["output_width"]
     nt_form = NT_ > 1
     kt_form = (not nt_form) and (KT_ > 1 or (SF == 1 and NF == 1))
     gk = KT_ if kt_form else 1
+    # The core now sums any K-tile partials and requantizes internally, so its beat is
+    # always PE*out_width per N-slice -- kt_form no longer multiplies by gk.
     if kt_form:
-        a_width, p_width = gk * AB, gk * PB
+        a_width, p_width = gk * AB, PB
     elif nt_form:
         a_width, p_width = AB, NT_ * PB
     else:
         a_width, p_width = AB, PB
-    apmax = _apmaxw(p_width)
+    apmax = _apmaxw(max(a_width, p_width))
     guard = (f"#ifndef AP_INT_MAX_W\n#define AP_INT_MAX_W {apmax}\n#endif\n"
-             if p_width > 1024 else "")
+             if max(a_width, p_width) > 1024 else "")
     core_pad = ' ' * (len(name) + 6)
 
     # repack A: kt packs one wide K_pad beat/vector; single/nt pack SF SIMD-beats/vector.
@@ -853,18 +757,17 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
     }}
 }}"""
 
-    # requant drain: kt sums gk partials; nt concatenates; single walks NF beats.
-    # Two-operand GEMM never carries a real bias (has_bias is always False by
-    # construction), so the drain never adds one.
+    # Pure unpack (no arithmetic): {name}_core already summed any K-tile partials and
+    # shift/round-half-up/wrapped each lane to out_width. kt sums are gone (already
+    # done in-core); nt concatenates N-slices; the untiled form walks NF beats. Two-
+    # operand GEMM never carries a real bias (has_bias is always False by
+    # construction). Loaded via .range() (raw bit pattern), never a value-preserving
+    # conversion, since the value is already rounded/wrapped.
     if kt_form:
-        ACCU_SUM = plan["accu_sum"]
         drain_body = f"""        ap_uint<{p_width}> ob = p_s.read();
         for (unsigned oc = 0; oc < {N}; oc++) {{
-            ap_int<{ACCU_SUM}> raw = 0;
-            for (unsigned ti = 0; ti < {gk}; ti++)
-                raw += (ap_int<{ACCU}>)ob.range(ti * {PB} + oc * {ACCU} + {ACCU} - 1, ti * {PB} + oc * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU_SUM, False), pfrac, "raw", ' ' * 12)}
-            crow[oc] = (result_t)rv;
+            ap_uint<{outW}> raw = ob.range(oc * {outW} + {outW} - 1, oc * {outW});
+            result_t tmp; tmp.range() = raw; crow[oc] = tmp;
         }}"""
     elif nt_form:
         NTILE_REAL = N // NT_   # unpadded per-tile column count; the interface presents only these
@@ -873,9 +776,8 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
             for (unsigned pe = 0; pe < {PE}; pe++) {{
                 if (pe < {NTILE_REAL}) {{   // drop the N-pad tail columns
                 unsigned oc = ti * {NTILE_REAL} + pe;
-                ap_int<{ACCU}> raw = ob.range(ti * {PB} + pe * {ACCU} + {ACCU} - 1, ti * {PB} + pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU, False), pfrac, "raw", ' ' * 16)}
-                crow[oc] = (result_t)rv;
+                ap_uint<{outW}> raw = ob.range(ti * {PB} + pe * {outW} + {outW} - 1, ti * {PB} + pe * {outW});
+                result_t tmp; tmp.range() = raw; crow[oc] = tmp;
                 }}
             }}"""
     else:
@@ -885,9 +787,8 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
                 unsigned local_oc = nf * {PE} + pe;
                 if (local_oc < {N}) {{   // drop the N-pad tail columns (n_tiles==1 here)
                 unsigned oc = local_oc;
-                ap_int<{ACCU}> raw = ob.range(pe * {ACCU} + {ACCU} - 1, pe * {ACCU});
-{_rv_decl_assign(_rv_width(ACCU, False), pfrac, "raw", ' ' * 16)}
-                crow[oc] = (result_t)rv;
+                ap_uint<{outW}> raw = ob.range(pe * {outW} + {outW} - 1, pe * {outW});
+                result_t tmp; tmp.range() = raw; crow[oc] = tmp;
                 }}
             }}
         }}"""
@@ -896,9 +797,9 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
 #define {name.upper()}_GEMM_IP_H_
 {guard}#include <hls_stream.h>
 #include <ap_int.h>
-#include <ap_fixed.h>
 
-// internal FINN-MVU blackbox (two-operand shim {name}_core.v; C twin {name}_core.cpp)
+// internal FINN-MVU blackbox (two-operand shim {name}_core.v; C twin {name}_core.cpp) --
+// sums any K-tile partials and shift/round-half-up/wraps to out_width internally.
 void {name}_core(hls::stream<ap_uint<{a_width}> >&, hls::stream<ap_uint<{BB}> >&,
 {core_pad}hls::stream<ap_uint<{p_width}> >&);
 
@@ -921,9 +822,9 @@ void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BB}> >
     for (unsigned k = {K}; k < {KPAD}; k++) b_s.write(0);   // zero-pad K -> K_pad (bit-exact)
 }}
 
-// requant drain: no bias for two-operand GEMM (has_bias is always False by
-// construction) -- raw ACCU -> fixed (frac={pfrac}) -> convert per res_T's
-// rounding/overflow modes.
+// pure unpack drain: no bias for two-operand GEMM (has_bias is always False by
+// construction) -- {name}_core already requantized each lane to out_width; this
+// only slices lanes and loads them via .range() (raw bit pattern).
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
@@ -1169,6 +1070,17 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
             # absolute path computed here stays valid for csim/cosim/impl.
             init_files.append(str(dat_path.resolve()))
 
+    # has_bias is the single gate. Pre-has_bias manifests (the field absent from
+    # cfg entirely) fall back to "does the given bias look real" -- not a hardcoded
+    # True -- so an old caller that never supplied a bias keeps its old "no bias"
+    # behavior instead of newly raising (see status.md, has_bias-from-tensor). The
+    # bias is now baked into the RTL requant stage (bias ROM) and its C twin, not
+    # the downstream drain -- computed here so both get the same codes.
+    _bias = cfg.get("bias")
+    _has_bias_default = _bias is not None and any(_bias)
+    bias_codes = _wpack.bias_acc_codes(_bias, plan["product_frac"], plan["n"],
+                                       bool(cfg.get("has_bias", _has_bias_default)))
+
     # FORCE_BEHAVIORAL=0 -> real DSP48/DSP58 primitives (impl-ready; cosim runs them via
     # XSIM unisim models). Set force_behavioral=True in cfg for unisim-free behavioral cosim.
     force_behavioral = bool(cfg.get("force_behavioral", False))
@@ -1176,19 +1088,12 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
         _rtl.generate_shim(shape, module_name=f"{name}_core",
                            force_behavioral=force_behavioral, tile=t,
                            weights_in_core=True, init_files=init_files,
-                           n_tiles=NT, k_tiles=KT)))
+                           n_tiles=NT, k_tiles=KT, bias_codes=bias_codes)))
     (pkg / f"{name}_core.cpp").write_text(_with_ap_int_max_w(
-        _golden.generate_core_twin(shape, func_name=f"{name}_core", plan=plan, baked_weights=B)))
-    # has_bias is the single gate. Pre-has_bias manifests (the field absent from
-    # cfg entirely) fall back to "does the given bias look real" -- not a hardcoded
-    # True -- so an old caller that never supplied a bias keeps its old "no bias"
-    # behavior instead of newly raising (see status.md, has_bias-from-tensor).
-    _bias = cfg.get("bias")
-    _has_bias_default = _bias is not None and any(_bias)
-    bias_codes = bias_acc_codes(_bias, plan["product_frac"], plan["n"],
-                                 bool(cfg.get("has_bias", _has_bias_default)))
-    top_src = (_kt_dataflow_top(name, plan, bias_codes=bias_codes) if KT > 1
-               else _dataflow_top(name, plan, bias_codes=bias_codes))
+        _golden.generate_core_twin(shape, func_name=f"{name}_core", plan=plan,
+                                   baked_weights=B, bias_codes=bias_codes)))
+    top_src = (_kt_dataflow_top(name, plan) if KT > 1
+               else _dataflow_top(name, plan))
     (pkg / f"{name}_top.cpp").write_text(_with_ap_int_max_w(top_src))
     (pkg / f"{name}.json").write_text(_blackbox_json(
         name, t, tiles=KT * NT, resources=plan.get("resources")))
@@ -1196,8 +1101,8 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
         _golden.generate_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
                             bias_codes=bias_codes, baked_weights=B,
                             n_nodes=cfg.get("n_nodes", 6))))
-    ip_hdr = (_kt_gemm_ip_header(name, plan, bias_codes=bias_codes) if KT > 1
-              else _gemm_ip_header(name, plan, bias_codes=bias_codes))
+    ip_hdr = (_kt_gemm_ip_header(name, plan) if KT > 1
+              else _gemm_ip_header(name, plan))
     (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(ip_hdr))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 

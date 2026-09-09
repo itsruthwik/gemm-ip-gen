@@ -313,14 +313,27 @@ def _ba(bits):
     return (int(bits) + 7) // 8 * 8
 
 
-def stream_widths(pe, simd, weight_width, act_width, accu):
+def stream_widths(pe, simd, weight_width, act_width, accu, out_width=None):
     """Byte-aligned (weight, input, output) AXIS beat widths for one instance
-    in MVU mode (IS_MVU=1)."""
+    in MVU mode (IS_MVU=1). ``output_ba`` is the shim's post-requant output
+    beat (``PE*out_width``); when *out_width* is omitted it falls back to the
+    pre-requant raw accumulator beat (``PE*accu``) for callers that only need
+    the internal core width."""
+    ow = accu if out_width is None else out_width
     return {
         "weight_ba": _ba(pe * simd * weight_width),
         "input_ba": _ba(simd * act_width),
-        "output_ba": _ba(pe * accu),
+        "output_ba": _ba(pe * ow),
     }
+
+
+def rv_width(accu, has_bias):
+    """Just-wide-enough intermediate width for the requant stage's biased
+    accumulator value (shared by the C twin and the RTL requant stage so the
+    two never drift). With a bias add, headroom is kept wide (>= 32b) plus a
+    couple guard bits; without one, one guard bit above the accumulator
+    suffices."""
+    return (max(int(accu), 32) + 2) if has_bias else (int(accu) + 1)
 
 
 def check_beat_limits(pe, simd, weight_width, act_width, output_ba, n_tiles=1,
@@ -332,13 +345,14 @@ def check_beat_limits(pe, simd, weight_width, act_width, output_ba, n_tiles=1,
     ``ap_uint``: the weight beat (``PE*SIMD*weight_width`` -- only when
     ``weights_in_core`` is False, i.e. the weight matrix is a C++ stream
     rather than baked into the RTL memstream), the input beat
-    (``SIMD*act_width``), the per-tile output beat (``PE*accu_width``,
-    byte-aligned), and the concatenated output beat that N-tiling and
-    K-tiling glue side by side (``n_tiles*k_tiles*`` the per-tile output
-    beat). This is independent of gemm-ip-gen's own ``_with_ap_int_max_w``
-    machinery, which only raises ``AP_INT_MAX_W`` for gemm-ip-gen's own
-    C++/header translation units -- it cannot help the hls4ml-side TU that
-    includes the generated header.
+    (``SIMD*act_width``), the per-tile output beat (post-requant,
+    ``PE*out_width``, byte-aligned -- *output_ba* must already be computed
+    with ``out_width``, not the raw accumulator width), and the concatenated
+    output beat that N-tiling and K-tiling glue side by side
+    (``n_tiles*k_tiles*`` the per-tile output beat). This is independent of
+    gemm-ip-gen's own ``_with_ap_int_max_w`` machinery, which only raises
+    ``AP_INT_MAX_W`` for gemm-ip-gen's own C++/header translation units -- it
+    cannot help the hls4ml-side TU that includes the generated header.
     """
     where = f' in layer "{name}"' if name else ""
     beats = []
@@ -347,8 +361,8 @@ def check_beat_limits(pe, simd, weight_width, act_width, output_ba, n_tiles=1,
                        pe * simd * weight_width))
     beats += [
         ("input beat (SIMD*act_width)", simd * act_width),
-        ("output beat (PE*accu_width)", output_ba),
-        ("concatenated output beat (n_tiles*k_tiles*PE*accu_width)",
+        ("output beat (PE*out_width)", output_ba),
+        ("concatenated output beat (n_tiles*k_tiles*PE*out_width)",
          n_tiles * k_tiles * output_ba),
     ]
     for label, width in beats:
@@ -442,7 +456,9 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
     sf = sf_full // gk                     # per-tile SF
     accu_sum = accu + (math.ceil(math.log2(gk)) if gk > 1 else 0)  # summed-partials width
 
-    widths = stream_widths(pe, simd, weight_width, act_width, accu)
+    # Post-requant per-tile output beat (PE*out_width): the beat the shim now emits
+    # after the requantize stage, not the raw pre-drain accumulator beat.
+    widths = stream_widths(pe, simd, weight_width, act_width, accu, out_width=out_width)
     check_beat_limits(pe, simd, weight_width, act_width, widths["output_ba"],
                        n_tiles=n_tiles, k_tiles=gk,
                        weights_in_core=weights_in_core, name=name)
@@ -460,6 +476,14 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         "signed_activations": 1 if signed_act else 0,
         "narrow_weights": narrow,
         "segmentlen": seg,
+        # requant scale/width, duplicated onto the tile dict so rtl.py (which is
+        # only ever handed the tile, not the full plan) can size its requant
+        # stage without a second geometry call.
+        "output_width": out_width,
+        "output_int": output_int,
+        "output_frac": output_frac,
+        "product_frac": input_frac + weight_frac,
+        "accu_sum": accu_sum,
         "weight_stream_width_ba": widths["weight_ba"],
         "input_stream_width_ba": widths["input_ba"],
         "output_stream_width_ba": widths["output_ba"],

@@ -207,9 +207,10 @@ def test_fold_plan_kn_effective_reuse_is_squared():
 # ── ap_uint beat-width limit ────────────────────────────────────────────────────
 
 def test_fold_plan_rejects_output_beat_over_ap_uint_limit():
-    # fc1-like (K=784, N=128), fold-K RF=262: PE=128, accu=23b -> a 2944b output
-    # beat, well past the 1024b ap_uint cap the hls4ml-facing header must fit.
-    with pytest.raises(ValueError, match="2944"):
+    # fc1-like (K=784, N=128), fold-K RF=262: PE=128, out_width=16b (post-requant,
+    # not the raw 23b accumulator) -> a 2048b output beat, still past the 1024b
+    # ap_uint cap the hls4ml-facing header must fit.
+    with pytest.raises(ValueError, match="2048"):
         g.fold_plan(1, 784, 128, weight_precision="fixed<8,4>",
                     input_precision="fixed<4,2>", output_precision="fixed<16,6>",
                     part=VERSAL, reuse_factor=262, fold_axis="k", name="gemm_fc1")

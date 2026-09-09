@@ -71,6 +71,14 @@ OUTPUT_STREAM_WIDTH    = PE * ACCU_WIDTH
 `gemm-ip-gen` recomputes these identically in `geometry.stream_widths` /
 `geometry._ba`; the shim and C twin must agree with them bit-for-bit.
 
+`OUTPUT_STREAM_WIDTH` above is the vendored core's own `m_axis_output` port --
+unaffected by this target's requant stage. The gemm-ip-gen *shim*'s own external
+output port (`p_din`) is narrower: a per-lane requantize stage (bias add, shift +
+round-half-up + wrap) sits between the core's raw `m_axis_output` and `p_din`,
+so the shim's beat is `PE*out_width` (or `NT*PE*out_width` under N-tiling) --
+see `geometry.fold_plan`'s `output_width`/`output_frac` and `rtl.py`'s
+`_requant_lanes`.
+
 ### AXIS ports
 
 | Port group | Signals | Width |

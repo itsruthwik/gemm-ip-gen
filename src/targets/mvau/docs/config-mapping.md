@@ -41,7 +41,7 @@ Recall the mapping: **`MW = K`, `MH = N`, `numInputVectors = M`**.
 |---|---|---|
 | `input_precision`  | `ACTIVATION_WIDTH`, `SIGNED_ACTIVATIONS`, activation frac | `u?fixed<W,I>`; frac = `W−I` |
 | `weight_precision` | `WEIGHT_WIDTH`, weight frac | |
-| `output_precision` | drain output type `ap_fixed<W,I,AP_RND,AP_SAT>` | frac = `W−I` |
+| `output_precision` | shim requant output type `ap_fixed<W,I,AP_RND,AP_WRAP>` | frac = `W−I` |
 | `part` | must be Versal | see above |
 | `clock_period_ns` | DSP58 `SEGMENTLEN` (cascade split) | |
 | `reuse_factor` | how many times each MAC is used per input vector; picks `(PE, SIMD)` | see §4 |
@@ -142,13 +142,16 @@ ACCU = ⌈log2 K_pad⌉ + WEIGHT_WIDTH + ACTIVATION_WIDTH + 1     # auto-sized (
 
 weight_stream_width_ba = ceil(PE·SIMD·WEIGHT_WIDTH / 8)·8
 input_stream_width_ba  = ceil(SIMD·ACTIVATION_WIDTH / 8)·8
-output_stream_width_ba = ceil(PE·ACCU / 8)·8              # per tile
+output_stream_width_ba = ceil(PE·ACCU / 8)·8              # per tile — the core's raw beat
 
 DSP estimate = PE · ceil(SIMD/3)     # DSP58 packs 3 K-lanes per DSP
 ```
 
 `ACCU_WIDTH` is always computed here (any `accum_precision` knob is ignored), so
-the accumulator never overflows for a length-`K_pad` dot product. Fill latency and
+the accumulator never overflows for a length-`K_pad` dot product. `output_stream_width_ba`
+is the vendored core's own raw beat, upstream of the shim's per-lane requantize stage; the
+beat the shim actually presents (and the one the 1024-bit beat-width check bounds) is the
+narrower `PE·out_width` (or `NT·PE·out_width` under N-tiling) — see §7. Fill latency and
 output cadence are deterministic RTL properties, not resource knobs; see
 `../geometry.py` (`latency_cycles`, `output_ii`) and
 `finn_space/MVU_space/03_compute_cores.md` for their derivation.
@@ -165,11 +168,16 @@ result FIFO out.
 
 - **activation broadcast** — one shared activation stream fans out to every tile;
   `a_read` advances only when all tiles accept (`&in_tready`).
-- **output fan-in** — tile outputs concatenate into one wide beat, tile `ti` at
-  `[ti·PB +: PB]`; `p_write = &out_tvalid`.
-- **bit contract** — in beat `nf`, tile `ti` lane `pe` (bits `ti·PB + pe·ACCU`) is
-  **global** output column `oc = ti·n_tile + nf·PE + pe`. The C twin, both drains,
-  and the per-tile weight packer all key off this.
+- **output fan-in** — each tile's raw `PE*ACCU_WIDTH` beat goes through a per-lane
+  requantize stage (bias add, shift + round-half-up + wrap) narrowing it to
+  `PE*out_width` before the tiles concatenate into one beat, tile `ti` at
+  `[ti·PB +: PB]` (`PB` now the narrow, post-requant per-tile width);
+  `p_write = &out_tvalid`.
+- **bit contract** — in beat `nf`, tile `ti` lane `pe` (bits `ti·PB + pe·out_width`)
+  is the already-requantized code for **global** output column
+  `oc = ti·n_tile + nf·PE + pe`. The C twin and the per-tile weight packer key off
+  this; the drain (both hls4ml-facing and standalone) is a pure unpack of these
+  narrow lanes, no arithmetic.
 - **weights** — one `.dat` per column slice (`_dat_name`), each packed from
   `B[:, ti·n_tile : (ti+1)·n_tile]`.
 
@@ -183,7 +191,7 @@ flow defaults every GEMM to `n_tiles=1` (single core) until the field is plumbed
 
 ---
 
-## 7. Weight-stationary path & the drain
+## 7. Weight-stationary path & the requant stage
 
 ### Weight baking (`weights_in_core` + `weight_file`)
 
@@ -199,22 +207,31 @@ within word :  W[nf·PE+pe][sf·SIMD+s]  at bit (pe·SIMD + s)·WEIGHT_WIDTH   #
 
 This is byte-exact-validated against FINN's own flip-based packer. Without a
 `weight_file` the generator bakes a deterministic synthetic matrix (tests /
-standalone). Under `fold_axis="n"` the padded N columns are zero-weight; the drain
-discards the padded output columns before they reach the caller.
+standalone). Under `fold_axis="n"` the padded N columns are zero-weight; those
+lanes are never computed by the requant stage or read by the drain, so they never
+reach the caller.
 
-### Requant drain (Keras order: matmul → bias → quantize)
+### Requant stage (Keras order: matmul → bias → quantize), in the shim, not the drain
 
 The raw accumulator code carries `2^product_frac` where
-`product_frac = input_frac + weight_frac`. The drain:
+`product_frac = input_frac + weight_frac`. This whole step now runs per-lane in
+the RTL shim (`../rtl.py`), upstream of `p_din`, not in the HLS drain — the drain
+(both hls4ml-facing and standalone) is a pure unpack of the already-requantized,
+`out_width`-wide lanes:
 
 1. add per-column bias, scaled to the accumulator domain
-   (`bias_code = round(bias · 2^product_frac)`);
+   (`bias_code = round(bias · 2^product_frac)`), from a bias ROM baked by the
+   same helper that produces the C twin's bias constants;
 2. reinterpret the code as fixed-point (`frac = product_frac`);
-3. cast to `ap_fixed<outW, outI, AP_RND, AP_SAT>` — round-half-up + saturate — i.e.
-   an effective right shift of `req_shift = product_frac − output_frac`.
+3. shift to `ap_fixed<outW, outI, AP_RND, AP_WRAP>` — round-half-up + **wrap**
+   (not saturate) — i.e. an effective right shift of
+   `req_shift = product_frac − output_frac`.
 
-`accum_precision` / `bias_precision` are not consumed here: the accumulator is
-auto-sized and bias lives in the accumulator domain.
+Both the hls4ml-facing path and the standalone (`top.cpp`/`golden.py`) path use
+round-half-up + wrap, matching hls4ml's result type; there is no remaining
+saturating mode in this target. `accum_precision` / `bias_precision` are not
+consumed here: the accumulator is auto-sized and bias lives in the accumulator
+domain.
 
 ---
 

@@ -60,3 +60,70 @@ def pack_memstream_hex(B, n, k, pe, simd, weight_width, word_bits=None):
                     word |= (code & mask) << ((i_pe * simd + i_s) * weight_width)
             lines.append(format(word, "x").zfill(ndigits))
     return "\n".join(lines) + "\n"
+
+
+# ── Bias codes: one baking, two renderings (C twin static array + Verilog ROM) ─────
+
+def bias_acc_codes(bias, product_frac, n, has_bias):
+    """Scale per-column real bias to the accumulator (2^product_frac) domain.
+
+    ``has_bias`` (the manifest's own field, computed by hls4ml from the real bias
+    tensor) is the *only* gate for whether a bias is baked: when True this always
+    returns an N-long list of codes -- even if every one of them rounds to zero at
+    this fixed-point scale -- so the generated hardware matches what hls4ml's own
+    csim expects (an add is present) rather than silently disagreeing with the
+    manifest for a sub-LSB bias. When False, returns None (bake nothing) regardless
+    of what ``bias`` holds. Raises if ``has_bias`` is True but ``bias`` is absent --
+    that combination means the manifest is internally inconsistent, not "no bias".
+
+    This is the single source of truth for the baked bias integers: both the C twin's
+    ``static const long`` array and the RTL requant stage's bias ROM render the same
+    ``codes`` list, so the two textual forms can never drift apart.
+    """
+    if not has_bias:
+        return None
+    if not bias:
+        raise ValueError(
+            "has_bias is True but the manifest has no bias values to bake "
+            "(cfg['bias'] is missing/empty)")
+    codes = [int(round(float(b) * (1 << product_frac))) for b in bias]
+    if len(codes) != n:
+        raise ValueError(f"bias length {len(codes)} != N {n}")
+    return codes
+
+
+def bias_c_decl(name, codes):
+    """``static const long <name>_bias[N] = {...};`` C rendering of *codes*."""
+    return (f"static const long {name}_bias[{len(codes)}] = {{"
+            + ", ".join(str(c) for c in codes) + "};\n")
+
+
+def bias_codes_for_tile(bias_codes, ti, ntile_real, ntile_pad):
+    """Slice+zero-pad the N-long baked bias codes to one N-tile's own local lane
+    indexing (``0..ntile_pad-1``, matching ``local_oc = nf*PE+pe``): real columns
+    ``[ti*ntile_real, (ti+1)*ntile_real)`` at their local offset, padded lanes 0.
+    Returns None (no bias) when *bias_codes* is None -- callers bake an all-zero
+    bias in that case (there is nothing to add)."""
+    if bias_codes is None:
+        return [0] * ntile_pad
+    lo = ti * ntile_real
+    real = list(bias_codes[lo:lo + ntile_real])
+    return real + [0] * (ntile_pad - len(real))
+
+
+def bias_verilog_rom(reg_name, codes, width):
+    """Verilog ``reg`` array + ``initial`` block rendering of *codes* (the same
+    integer codes the C twin bakes as a ``static const long[]``), synthesizable as a
+    small ROM indexed combinationally by the shim's per-lane output-column index.
+    ``width`` must be wide enough to hold every code as a signed two's-complement
+    value (the requant stage's biased-accumulator width)."""
+    lines = [f"    reg signed [{width - 1}:0] {reg_name} [0:{len(codes) - 1}];",
+             "    initial begin"]
+    for i, c in enumerate(codes):
+        c = int(c)
+        if c >= 0:
+            lines.append(f"        {reg_name}[{i}] = {width}'sd{c};")
+        else:
+            lines.append(f"        {reg_name}[{i}] = -{width}'sd{-c};")
+    lines.append("    end")
+    return "\n".join(lines) + "\n"

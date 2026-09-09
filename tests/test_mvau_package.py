@@ -157,10 +157,12 @@ def test_n_tiling_manifest_lists_all_weight_files(tmp_path):
 
 def test_affine_drain_present(tmp_path):
     pkg = _gen(tmp_path, (3, 16, 8), "gemm_3x16x8_f", reuse_factor=16, fold_axis="k")
+    # requant (shift + round-half-up + wrap) now lives in the core twin, emitting an
+    # already-narrow beat; the top is a pure unpack.
+    core = (pkg / "gemm_3x16x8_f_core.cpp").read_text()
+    assert "round-half-up" in core and "wrap" in core
     top = (pkg / "gemm_3x16x8_f_top.cpp").read_text()
-    # the drain: ap_fixed output with round-half-up + saturate, and a requant stage
-    assert "ap_fixed<16, 6, AP_RND, AP_SAT>" in top
-    assert "static void requant(" in top and "rescale + round + saturate" in top
+    assert "static void unpack(" in top
 
 
 def test_reject_wide_precision(tmp_path):
@@ -175,20 +177,25 @@ def test_reject_non_versal_part(tmp_path):
 
 def test_bias_scaled_and_added(tmp_path):
     # per-column bias, scaled to the accumulator (2^(fa+fb)=2^8) domain and added.
+    # Bias now lives in the core twin (matches the RTL requant stage's bias ROM),
+    # not the top-level drain.
     bias = [0.5, -0.25, 0.0, 0.25, 1.0, -1.0, 0.75, -0.5]
     pkg = _gen(tmp_path, (2, 8, 8), "gb", reuse_factor=1, bias=bias)
+    core = (pkg / "gb_core.cpp").read_text()
+    assert "static const long gb_core_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in core
+    assert "gb_core_bias[oc]" in core
     top = (pkg / "gb_top.cpp").read_text()
-    assert "static const long gb_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in top
-    assert "+ gb_bias[oc]" in top
+    assert "gb_core_bias" not in top
 
 
 def test_no_bias_omits_array(tmp_path):
     # has_bias=False (the manifest's own field) is the gate for "no bias" -- not
     # whether a bias value happens to be given.
     pkg = _gen(tmp_path, (2, 8, 8), "gnb", reuse_factor=1, has_bias=False)
+    core = (pkg / "gnb_core.cpp").read_text()
+    assert "gnb_bias" not in core
     top = (pkg / "gnb_top.cpp").read_text()
     assert "gnb_bias" not in top
-    assert ")raw;" in top and "(ap_int<64>)raw;" not in top  # narrowed bias-free add path
 
 
 def test_has_bias_false_ignores_nonzero_bias_values(tmp_path):
@@ -196,9 +203,8 @@ def test_has_bias_false_ignores_nonzero_bias_values(tmp_path):
     # must not be baked (and no add emitted) when the manifest says has_bias=False.
     bias = [0.5, -0.25, 0.0, 0.25, 1.0, -1.0, 0.75, -0.5]
     pkg = _gen(tmp_path, (2, 8, 8), "gfb", reuse_factor=1, has_bias=False, bias=bias)
-    top = (pkg / "gfb_top.cpp").read_text()
-    assert "gfb_bias" not in top
-    assert ")raw;" in top and "(ap_int<64>)raw;" not in top
+    core = (pkg / "gfb_core.cpp").read_text()
+    assert "gfb_bias" not in core
 
 
 def test_has_bias_true_bakes_sublsb_bias(tmp_path):
@@ -209,9 +215,9 @@ def test_has_bias_true_bakes_sublsb_bias(tmp_path):
     tiny = 1.0 / (1 << 20)   # far below the 2^8 accumulator scale -> rounds to 0
     bias = [tiny] * 8
     pkg = _gen(tmp_path, (2, 8, 8), "gsl", reuse_factor=1, has_bias=True, bias=bias)
-    top = (pkg / "gsl_top.cpp").read_text()
-    assert "static const long gsl_bias[8] = {0, 0, 0, 0, 0, 0, 0, 0}" in top
-    assert "+ gsl_bias[oc]" in top
+    core = (pkg / "gsl_core.cpp").read_text()
+    assert "static const long gsl_core_bias[8] = {0, 0, 0, 0, 0, 0, 0, 0}" in core
+    assert "gsl_core_bias[oc]" in core
 
 
 def test_has_bias_true_without_bias_raises(tmp_path):
