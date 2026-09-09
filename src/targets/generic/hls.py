@@ -717,9 +717,10 @@ def _gemm_strategy_trait(items):
 
 def _gemm_rf_trait(items):
     """Emit gemm_rf<CONFIG_T> for the combined header: per-layer reuse factor and
-    multiplier cap taken from the manifest (which run_atlas_flow has validated/snapped
-    against hls4ml's reuse-factor rules), overriding the raw value hls4ml baked into
-    CONFIG_T. Items with no gemm_ip_index or no reuse_factor fall through to CONFIG_T."""
+    multiplier cap taken from the manifest (which the generic target itself has
+    validated/snapped against hls4ml's reuse-factor rules), overriding the raw value
+    hls4ml baked into CONFIG_T. Items with no gemm_ip_index or no reuse_factor fall
+    through to CONFIG_T."""
     specs = []
     for item in items:
         idx = item.get("gemm_ip_index")
@@ -737,8 +738,9 @@ def _gemm_rf_trait(items):
     specs_txt = "\n".join(specs)
     return (
         "namespace nnet {\n"
-        "// Per-layer reuse factor from the manifest (validated/snapped by the runner),\n"
-        "// keyed on CONFIG_T::gemm_ip_id; layers without an entry use CONFIG_T's own.\n"
+        "// Per-layer reuse factor from the manifest (validated/snapped by the generic\n"
+        "// target itself), keyed on CONFIG_T::gemm_ip_id; layers without an entry use\n"
+        "// CONFIG_T's own.\n"
         "template <unsigned id> struct gemm_rf_override { static const bool set = false; "
         "static const unsigned reuse_factor = 1; static const unsigned multiplier_limit = 1; };\n"
         f"{specs_txt}\n"

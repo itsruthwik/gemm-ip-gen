@@ -23,6 +23,65 @@ import golden as _golden  # noqa: E402
 import package as _package  # noqa: E402
 
 
+def _valid_reuse_factors(n_in, n_out):
+    """hls4ml's reuse-factor rules (fpga_backend._validate_reuse_factor), verbatim:
+    rf must divide n_in*n_out; below n_in the multiplier count must be a multiple of
+    n_out; above n_in, rf must be a multiple of n_in."""
+    import math
+    valid = []
+    for rf in range(1, n_in * n_out + 1):
+        multfactor = min(n_in, rf)
+        multiplier_limit = int(math.ceil((n_in * n_out) / float(multfactor)))
+        ok = ((multiplier_limit % n_out) == 0) or (rf >= n_in)
+        ok = ok and (((rf % n_in) == 0) or (rf < n_in))
+        ok = ok and (((n_in * n_out) % rf) == 0)
+        if ok:
+            valid.append(rf)
+    return valid
+
+
+def _closest_reuse_factor(valid_rf, chosen_rf):
+    """hls4ml's get_closest_reuse_factor: nearest valid value, smaller on ties."""
+    from bisect import bisect_left
+    pos = bisect_left(valid_rf, chosen_rf)
+    if pos == 0:
+        return valid_rf[0]
+    if pos == len(valid_rf):
+        return valid_rf[-1]
+    before, after = valid_rf[pos - 1], valid_rf[pos]
+    return before if (after - chosen_rf) >= (chosen_rf - before) else after
+
+
+def _snap_reuse_factor(item):
+    """Legalize a manifest item's ReuseFactor against hls4ml's validation rules.
+
+    ReuseFactor is a pure pass-through from hls4ml's HLSConfig into the manifest
+    (no ATLASConfig knob for it) -- but hls4ml's init_dense skips
+    set_closest_reuse_factor for Strategy=GEMM layers, so the raw HLSConfig value
+    reaches this manifest unvalidated; the generic resource core then builds the
+    remainder regime with a non-dividing block factor (several x the area of the
+    snapped point). So the generic target legalizes it itself here: snap, print
+    hls4ml's own warning, keep the request as reuse_factor_requested. The combined
+    header reads the snapped value from the manifest (gemm_rf<CONFIG_T>) instead of
+    hls4ml's CONFIG_T::reuse_factor.
+    """
+    name = item.get("name", "?")
+    n_in = int(item.get("gemm_k", item.get("k", item.get("n_in", 0))) or 0)
+    n_out = int(item.get("gemm_n", item.get("n", item.get("n_out", 0))) or 0)
+    chosen = int(item.get("reuse_factor", 1) or 1)
+    item["reuse_factor_requested"] = chosen
+    if n_in <= 0 or n_out <= 0:
+        return
+    valid = _valid_reuse_factors(n_in, n_out)
+    if chosen in valid:
+        return
+    closest = _closest_reuse_factor(valid, chosen)
+    print(f'WARNING: Invalid ReuseFactor={chosen} in layer "{name}".'
+          f'Using ReuseFactor={closest} instead. Valid ReuseFactor(s): '
+          f'{",".join(map(str, valid))}.')
+    item["reuse_factor"] = closest
+
+
 class GenericTarget(Target):
     name = "generic"
     tool = "vitis"
@@ -30,8 +89,6 @@ class GenericTarget(Target):
     weight_layouts = ("column_major", "row_major")
 
     knobs = [
-        {"name": "ReuseFactor", "key": "reuse_factor", "type": "int", "default": 1,
-         "description": "II applied to the row loop (II=1 latency, II=R resource)"},
         {"name": "Strategy", "key": "strategy", "type": "enum",
          "choices": ("latency", "resource"), "default": "latency",
          "description": "which generic kernel body to emit"},
@@ -115,7 +172,13 @@ class GenericTarget(Target):
     def normalize_config(self, cfg):
         # Target-independent: same item schema every target consumes.
         from gemm_ip.config import _normalize_config_items
-        return _normalize_config_items(cfg)
+        items = _normalize_config_items(cfg)
+        # ReuseFactor is a pure pass-through from hls4ml's HLSConfig (no ATLASConfig
+        # knob for it) -- legalize it here, before both the per-item package() calls
+        # and combined_header() see the manifest.
+        for item in items:
+            _snap_reuse_factor(item)
+        return items
 
     def combined_header(self, items):
         # Shape-generic: one templated definition covers every layer. items drives

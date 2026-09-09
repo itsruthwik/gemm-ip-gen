@@ -112,9 +112,6 @@ class MvauTarget(Target):
     tool = "vitis"
 
     knobs = [
-        {"name": "ReuseFactor", "key": "reuse_factor", "type": "int", "default": 1,
-         "description": "how many times each MAC is used per input vector "
-                         "(RF = K*N/(PE*SIMD))"},
         {"name": "FoldAxis", "key": "fold_axis", "type": "enum",
          "choices": ("n", "k", "kn"), "default": "n",
          "description": "which dimension ReuseFactor folds"},
