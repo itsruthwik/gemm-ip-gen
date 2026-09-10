@@ -14,7 +14,7 @@ from gemm_ip.common import _safe_name
 _ts_dir = str(_Path(__file__).resolve().parent.parent / "targets" / "tensor_slice")
 if _ts_dir not in _sys.path:
     _sys.path.insert(0, _ts_dir)
-from geometry import grid_rows, grid_cols, _validate_gemm_k_spatial  # noqa: E402
+from geometry import grid_rows, grid_cols  # noqa: E402
 
 
 def normalize_gemm_config(cfg):
@@ -97,10 +97,6 @@ def _normalize_config_items(cfg):
             # generic/behavioral target; the RTL targets have their own tiling).
             item.setdefault("strategy", "latency")
             item.setdefault("reuse_factor", 1)
-            item["gemm_k_spatial"] = _validate_gemm_k_spatial(
-                int(item.get("gemm_k", item.get("k", item.get("n_in", 8)))),
-                item.get("gemm_k_spatial"),
-            )
         return cfg
     if isinstance(cfg, dict):
         if "m" in cfg and "k" in cfg and "n" in cfg and "name" in cfg:
@@ -110,10 +106,6 @@ def _normalize_config_items(cfg):
             cfg.setdefault("gemm_ip_index", None)
             cfg.setdefault("strategy", "latency")
             cfg.setdefault("reuse_factor", 1)
-            cfg["gemm_k_spatial"] = _validate_gemm_k_spatial(
-                int(cfg.get("gemm_k", cfg.get("k", cfg.get("n_in", 8)))),
-                cfg.get("gemm_k_spatial"),
-            )
             return [cfg]
         items = []
         for name, item in cfg.items():
@@ -145,10 +137,6 @@ def _normalize_config_items(cfg):
                 "weights_in_core": bool(item.get("weights_in_core", False)),
                 "weight_file": item.get("weight_file"),
                 "weight_layout": item.get("weight_layout") or "column_major",
-                "gemm_k_spatial": _validate_gemm_k_spatial(
-                    int(item.get("gemm_k", item.get("n_in", 8))),
-                    item.get("gemm_k_spatial"),
-                ),
             })
         return items
     raise TypeError("Unsupported config format")

@@ -39,17 +39,28 @@ class TensorSliceTarget(Target):
     name = "tensor_slice"
     tool = "catapult"
 
-    def geometry(self, shape):
+    def geometry(self, shape, reuse_factor=1):
         m, k, n = shape
         gr, gc = _geom.grid_rows(m), _geom.grid_cols(n)
+        resolved = _geom.resolve_reuse_factor(k, reuse_factor)
+        for w in resolved["warnings"]:
+            print(w, file=sys.stderr)
+        ks = resolved["k_spatial"]
         return {
             "grid_rows": gr,
             "grid_cols": gc,
-            "k_chunks": _geom.k_chunks(k),
-            "a_stream_width": _geom.a_stream_width(m),
-            "b_stream_width": _geom.b_stream_width(n),
+            "k_chunks": resolved["k_chunks"],
+            "k_chunks_pad": resolved["k_chunks_pad"],
+            "k_spatial": ks,
+            "k_passes": resolved["passes"],
+            "reuse_factor_requested": resolved["reuse_factor_requested"],
+            "reuse_factor": resolved["reuse_factor"],
+            "effective_reuse": resolved["effective_reuse"],
+            "multipliers": _geom.multipliers(m, n, ks),
+            "a_stream_width": _geom.a_stream_width(m, ks),
+            "b_stream_width": _geom.b_stream_width(n, ks),
             "c_stream_width": _geom.c_stream_width(n),
-            "latency_cycles": _geom.latency_cycles(k, gr, gc, m=m, n=n, k=k),
+            "latency_cycles": _geom.latency_first_out(m, k, n, ks),
         }
 
     def emit_rtl(self, shape, **kwargs):
@@ -90,7 +101,20 @@ class TensorSliceTarget(Target):
     # ── batch orchestration (multi-package; used by the CLI) ─────────────────
     def normalize_config(self, cfg):
         from gemm_ip.config import _normalize_config_items
-        return _normalize_config_items(cfg)
+        items = _normalize_config_items(cfg)
+        for item in items:
+            resolved = _geom.resolve_reuse_factor(
+                item["k"], item.get("reuse_factor", 1), item.get("name"))
+            for w in resolved["warnings"]:
+                print(w, file=sys.stderr)
+            item["k_spatial"] = resolved["k_spatial"]
+            item["k_passes"] = resolved["passes"]
+            item["k_chunks_pad"] = resolved["k_chunks_pad"]
+            item["reuse_factor_requested"] = resolved["reuse_factor_requested"]
+            item["reuse_factor"] = resolved["reuse_factor"]
+            item["effective_reuse"] = resolved["effective_reuse"]
+            item["multipliers"] = _geom.multipliers(item["m"], item["n"], resolved["k_spatial"])
+        return items
 
     def combined_header(self, items):
         return _package().gen_combined_header(items)

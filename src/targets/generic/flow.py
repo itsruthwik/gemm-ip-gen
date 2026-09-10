@@ -120,11 +120,9 @@ class GenericTarget(Target):
         m, k, n = shape
         # A weight-stationary layer is signalled by a baked weight matrix (the CLI loads
         # it from the layer's .dat). generate_generic_pkg then emits the ROM header and
-        # the const_weights standalone top. Drop keys the standalone emitter has no use for
-        # (e.g. gemm_k_spatial — a spatial-partition knob for the RTL targets, not the
-        # behavioral one) so the config-driven and unit paths share one entry point.
+        # the const_weights standalone top. Drop keys the standalone emitter has no use
+        # for so the config-driven and unit paths share one entry point.
         weight_matrix = cfg.pop("weight_matrix", None)
-        cfg.pop("gemm_k_spatial", None)
         # Two-operand routing hints the CLI forwards for the RTL targets: generic derives
         # weights_in_core from the baked weight matrix and has no runtime-B variant, so
         # drop both (weights_in_core would also collide with the explicit kwarg below).

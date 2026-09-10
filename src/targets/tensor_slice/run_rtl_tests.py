@@ -31,24 +31,38 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from rtl import generate_combined_core_verilog
+from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
 from golden import generate_tb
+from geometry import k_chunks as _k_chunks, resolve_reuse_factor
 
 GEN_DIR = HERE / "tb" / "generated"
 
 # A spread of shapes: single-tile, multi-row-tile, multi-col-tile, multi-tile,
-# multi-K-chunk, and non-8-multiple tails.
+# multi-K-chunk, and non-8-multiple tails. Each case is (m, k, n, rf); rf=None
+# means "rf = k_chunks", i.e. today's chunked endpoint (k_spatial=1) -- the
+# original 10 shapes, unchanged generator path. The extra cases below exercise
+# the general ReuseFactor fold: (8,24,8,2)/(9,17,10,2)/(16,40,16,2) are
+# multi-pass K-spatial (9x17x10 pads its last pass); (8,16,8,1) and
+# (24,16,8,1) legalize to full-K (rf=1 -> k_spatial=k_chunks); (16,40,16,5)
+# legalizes to chunked (rf=k_chunks -> k_spatial=1), same generator path as
+# the default cases.
 DEFAULT_CASES = [
-    (8, 8, 8),
-    (16, 8, 8),
-    (8, 8, 16),
-    (16, 16, 16),
-    (8, 16, 8),
-    (24, 16, 8),
-    (14, 6, 6),
-    (9, 17, 10),
-    (5, 5, 5),
-    (12, 10, 10),
+    (8, 8, 8, None),
+    (16, 8, 8, None),
+    (8, 8, 16, None),
+    (16, 16, 16, None),
+    (8, 16, 8, None),
+    (24, 16, 8, None),
+    (14, 6, 6, None),
+    (9, 17, 10, None),
+    (5, 5, 5, None),
+    (12, 10, 10, None),
+    (8, 24, 8, 2),
+    (9, 17, 10, 2),
+    (16, 40, 16, 2),
+    (8, 16, 8, 1),
+    (16, 40, 16, 5),
+    (24, 16, 8, 1),
 ]
 DEFAULT_SEEDS = [1, 7, 42]
 
@@ -57,16 +71,26 @@ def _run(cmd):
     return subprocess.run(cmd, text=True, capture_output=True)
 
 
-def run_case(m, k, n, seed):
-    """Generate wrapper RTL + TB for one shape/seed, simulate, return (ok, log)."""
-    stem = f"gemm_{m}x{k}x{n}_s{seed}"
+def run_case(m, k, n, seed, rf=None):
+    """Generate wrapper RTL + TB for one shape/seed/ReuseFactor, simulate, return (ok, log)."""
+    rf_use = rf if rf is not None else _k_chunks(k)
+    resolved = resolve_reuse_factor(k, rf_use)
+    for w in resolved["warnings"]:
+        print(w, file=sys.stderr)
+    k_spatial = resolved["k_spatial"]
+
+    stem = f"gemm_{m}x{k}x{n}_rf{rf_use}_s{seed}"
     mod = f"{stem}_wrapper"
     rtl = GEN_DIR / f"{stem}.v"
     tb = GEN_DIR / f"tb_{stem}.v"
     out = GEN_DIR / f"{stem}.out"
 
-    rtl.write_text(generate_combined_core_verilog(m, k, n, module_name=mod))
-    tb.write_text(generate_tb(m, k, n, module_name=mod, seed=seed))
+    if k_spatial == 1:
+        rtl.write_text(generate_combined_core_verilog(m, k, n, module_name=mod))
+    else:
+        rtl.write_text(generate_k_spatial_combined_core_verilog(
+            m, k, n, module_name=mod, k_spatial=k_spatial, out_bits=8))
+    tb.write_text(generate_tb(m, k, n, module_name=mod, seed=seed, k_spatial=k_spatial))
 
     # No -DSYNTHESIS: the behavioral branch is compiled, so no external slice IP.
     comp = _run(["iverilog", "-g2012", "-o", str(out), str(tb), str(rtl)])
@@ -97,10 +121,12 @@ def run(cases=None, seeds=None, keep=False):
 
     GEN_DIR.mkdir(parents=True, exist_ok=True)
     failures = []
-    for (m, k, n) in cases:
+    for case in cases:
+        m, k, n, rf = case if len(case) == 4 else (*case, None)
         for seed in seeds:
-            ok, log = run_case(m, k, n, seed)
-            tag = f"{m}x{k}x{n} seed={seed}"
+            ok, log = run_case(m, k, n, seed, rf=rf)
+            rf_tag = f" rf={rf}" if rf is not None else ""
+            tag = f"{m}x{k}x{n}{rf_tag} seed={seed}"
             print(f"{'PASS' if ok else 'FAIL'} {tag}")
             if not ok:
                 print(log)

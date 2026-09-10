@@ -74,17 +74,20 @@ in one call — simulation only, see `wrapper_timing_model.md`.)
 - `weight_cols` holds `N` K-wide transposed weight columns.
 - `res_stream` receives `M` beats, one N-wide result row per beat.
 
-How those beats reach the blackbox depends on the K mode:
+How those beats reach the blackbox depends on the legalized ReuseFactor
+(`k_spatial` parallel K chunks, `passes = ceil(k_chunks / k_spatial)`):
 
-- *Chunked* (`gemm_k_spatial == 1`): the feed makes `k_chunks` passes of
-  `max(M,N)` beats. On pass 0 each A row is read and its later K chunks are
-  pre-packed into `a_replay[k_chunks][max(M,N)]` for replay on subsequent
-  passes. B columns are re-packed from `weight_cols` every pass.
-- *Full-K-spatial* (`gemm_k_spatial == k_chunks > 1`): a single `max(M,N)`-beat
+- *Chunked* (`k_spatial == 1`, `passes == k_chunks`): the feed makes
+  `k_chunks` passes of `max(M,N)` beats. On pass 0 each A row is read and its
+  later passes are pre-packed into `a_replay[passes][max(M,N)]` for replay on
+  subsequent passes. B columns are re-packed from `weight_cols` every pass.
+- *Full-K* (`k_spatial == k_chunks`, `passes == 1`): a single `max(M,N)`-beat
   pass; each beat carries one A row / B column with **all** K chunks packed
-  into a widened `64 * k_chunks`-bit word. No replay storage.
+  into a widened `64 * k_spatial`-bit word. No replay storage.
+- Any legal ReuseFactor in between uses the same replay mechanism as
+  Chunked, just with `k_spatial` K chunks packed per beat instead of one.
 
-See `rtl_contract.md` for the exact wire-level layout of both modes.
+See `rtl_contract.md` for the exact wire-level layout.
 
 Static checks enforce:
 

@@ -59,6 +59,31 @@ Validated results (RTL sim):
 | 16×16×16|  49 |     53 |     33 |
 | 9×17×10 |  40 |     44 |     31 |
 
+## ReuseFactor
+
+ReuseFactor (RF) is the number of sequential passes each input vector's K
+reduction takes over the array -- never a cycle count or an initiation
+interval. `resolve_reuse_factor(k, reuse_factor)` legalizes a requested RF
+into a K-partition count:
+
+- `k_chunks = ceil(K / 8)`; the legal RF range is `1..k_chunks`.
+- `k_spatial = ceil(k_chunks / rf)` parallel K partitions cover `k_chunks` in
+  `passes = ceil(k_chunks / k_spatial)` sequential sweeps; the legalized RF is
+  `passes`, which may land lower than requested (silently -- an in-range
+  request lands on the nearest legal `k_spatial`, not necessarily the exact
+  value asked for).
+- Out-of-range requests (`RF > k_chunks`) clamp to `k_chunks` (today's
+  chunked, `k_spatial == 1`) with a bound warning. `RF == 1` legalizes to
+  `k_spatial == k_chunks` (today's full-K, `passes == 1`).
+- K is padded to `k_chunks_pad = passes * k_spatial` chunks; the pad chunks
+  are masked to zero.
+- INT8 multiplier count for a given shape and `k_spatial`:
+  `multipliers(m, n, k_spatial) = 64 * grid_rows(m) * grid_cols(n) * k_spatial`.
+
+The batch manifest (`gen_integration_manifest`) carries `reuse_factor_requested`,
+`reuse_factor` (legalized), `effective_reuse`, `k_spatial`, `k_passes`,
+`k_chunks_pad`, and `multipliers` for every core.
+
 ## Verification
 
 Standalone slice regressions live in `tb/`.

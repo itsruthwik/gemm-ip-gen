@@ -113,26 +113,56 @@ def pack_b_full_k_spatial(B, col_idx, grid_cols, n, k):
     return val
 
 
-def pack_a_full_k_spatial_narrow(A, t, m, k):
-    """Narrow full-K spatial A beat (64*k_chunks bits): one row tile at position 0,
-    K chunk c at bits [c*64 : c*64+64], no tile-row offset."""
+def pack_a_k_spatial_narrow(A, t, pass_idx, m, k, k_spatial):
+    """Narrow K-spatial A beat (64*k_spatial bits) for pass ``pass_idx``.
+
+    Partition ``p`` carries K chunk ``pass_idx*k_spatial + p`` at bits
+    ``[p*64 : p*64+64)``; ``k_spatial == k_chunks`` (``pass_idx`` always 0)
+    reproduces today's full-K narrow beat exactly.
+    """
     val = 0
     if t < m:
-        for kk in range(k):
-            byte = int(A[t, kk]) & 0xFF
-            val |= byte << ((kk // 8) * 64 + (kk % 8) * 8)
+        for p in range(k_spatial):
+            chunk = pass_idx * k_spatial + p
+            k_start = chunk * 8
+            for lane in range(8):
+                kk = k_start + lane
+                if kk < k:
+                    byte = int(A[t, kk]) & 0xFF
+                    val |= byte << (p * 64 + lane * 8)
     return val
+
+
+def pack_b_k_spatial_narrow(B, col_idx, pass_idx, n, k, k_spatial):
+    """Narrow K-spatial B beat (64*k_spatial bits) for pass ``pass_idx``.
+
+    See :func:`pack_a_k_spatial_narrow` for the partition/chunk layout.
+    """
+    val = 0
+    if col_idx < n:
+        for p in range(k_spatial):
+            chunk = pass_idx * k_spatial + p
+            k_start = chunk * 8
+            for lane in range(8):
+                kk = k_start + lane
+                if kk < k:
+                    byte = int(B[kk, col_idx]) & 0xFF
+                    val |= byte << (p * 64 + lane * 8)
+    return val
+
+
+def pack_a_full_k_spatial_narrow(A, t, m, k):
+    """Narrow full-K spatial A beat (64*k_chunks bits): today's ``ks=k_chunks``
+    endpoint of :func:`pack_a_k_spatial_narrow` (single pass)."""
+    k_chunks = (k + 7) // 8
+    return pack_a_k_spatial_narrow(A, t, 0, m, k, k_chunks)
 
 
 def pack_b_full_k_spatial_narrow(B, col_idx, n, k):
-    """Narrow full-K spatial B beat (64*k_chunks bits): one col tile at position 0,
-    K chunk c at bits [c*64 : c*64+64], no tile-col offset."""
-    val = 0
-    if col_idx < n:
-        for kk in range(k):
-            byte = int(B[kk, col_idx]) & 0xFF
-            val |= byte << ((kk // 8) * 64 + (kk % 8) * 8)
-    return val
+    """Narrow full-K spatial B beat (64*k_chunks bits): today's ``ks=k_chunks``
+    endpoint of :func:`pack_b_k_spatial_narrow` (single pass)."""
+    k_chunks = (k + 7) // 8
+    return pack_b_k_spatial_narrow(B, col_idx, 0, n, k, k_chunks)
 
 
 def pack_bias(biases, grid_cols, n):
@@ -233,11 +263,13 @@ def _gen_all_stimulus(m, k, n, num_vectors, base_seed, fixed_B=None):
     return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols
 
 
-def _gen_all_stimulus_catapult_full_k_spatial(m, k, n, num_vectors, base_seed, fixed_B=None):
-    """Generate widened full-K spatial Catapult stimulus.
+def _gen_all_stimulus_catapult_k_spatial(m, k, n, num_vectors, base_seed, k_spatial, fixed_B=None):
+    """Generate widened K-spatial Catapult stimulus for ``k_spatial`` partitions.
 
-    Each beat carries one logical A row and one logical B column, with all
-    K chunks packed spatially into widened A/B words.
+    Each pass' beat carries one logical A row and one logical B column, with
+    ``k_spatial`` K chunks packed spatially into a narrow A/B word;
+    ``k_spatial == k_chunks`` (one pass) reproduces today's full-K spatial
+    stimulus exactly.
 
     ``fixed_B`` pins B across every vector, as the chunked generator does. It is
     required for weight-stationary, where the DUT's baked ROM holds one B for the
@@ -247,6 +279,8 @@ def _gen_all_stimulus_catapult_full_k_spatial(m, k, n, num_vectors, base_seed, f
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     input_beats = max(m, n)
+    k_chunks = (k + 7) // 8
+    passes = -(-k_chunks // k_spatial)
 
     all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
 
@@ -255,9 +289,10 @@ def _gen_all_stimulus_catapult_full_k_spatial(m, k, n, num_vectors, base_seed, f
         A, B, biases, C_sat = _random_matrices(m, k, n, seed, fixed_B=fixed_B)
 
         a_stim, b_stim = [], []
-        for t in range(input_beats):
-            a_stim.append(pack_a_full_k_spatial_narrow(A, t, m, k))
-            b_stim.append(pack_b_full_k_spatial_narrow(B, t, n, k))
+        for pass_idx in range(passes):
+            for t in range(input_beats):
+                a_stim.append(pack_a_k_spatial_narrow(A, t, pass_idx, m, k, k_spatial))
+                b_stim.append(pack_b_k_spatial_narrow(B, t, pass_idx, n, k, k_spatial))
         all_a_stim.append(a_stim)
         all_b_stim.append(b_stim)
         all_bias.append(pack_bias(biases, grid_cols, n))
@@ -272,7 +307,7 @@ def _gen_all_stimulus_catapult_full_k_spatial(m, k, n, num_vectors, base_seed, f
 
 
 
-def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, full_k_spatial=False, weights_in_core=False):
+def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, k_spatial=1, weights_in_core=False):
     """Generate a multi-vector Catapult testbench.
 
     back2back=False (default): Reset between every vector; check each vector
@@ -286,15 +321,17 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
     grid_cols = (n + 7) // 8
     input_beats = max(m, n)  # row/col: one A row + one B col per cycle
     k_chunks = (k + 7) // 8
-    total_input_beats = input_beats if full_k_spatial else k_chunks * input_beats
+    passes = -(-k_chunks // k_spatial)
+    total_input_beats = passes * input_beats
     a_bytes = grid_rows * 8
     b_bytes = grid_cols * 8
     bias_bytes = b_bytes
-    if full_k_spatial:
-        # Narrow word: 64*k_chunks bits = 8*k_chunks bytes (one tile, all K chunks);
-        # the wrapper RTL routes the tile by beat index.  Bias stays grid_cols*64.
-        a_bytes = 8 * k_chunks
-        b_bytes = 8 * k_chunks
+    if k_spatial > 1:
+        # Narrow word: 64*k_spatial bits = 8*k_spatial bytes (one tile, k_spatial
+        # K chunks per pass); the wrapper RTL routes the tile by beat index.
+        # Bias stays grid_cols*64.
+        a_bytes = 8 * k_spatial
+        b_bytes = 8 * k_spatial
     c_bytes = grid_cols * 16
     aw = a_bytes * 8
     bw = b_bytes * 8
@@ -320,7 +357,7 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
     t_first_out = '                if (out_row_idx == 0) $display("T:first_output=%0d", $realtime);' if timing else ""
     t_last_out  = '            $display("T:last_output=%0d", $realtime);' if timing else ""
 
-    mode_tag = "full-k-spatial " if full_k_spatial else ""
+    mode_tag = "full-k-spatial " if k_spatial > 1 else ""
     mode_tag += "back2back" if back2back else "sequential"
     if back2back:
         # ── Back-to-back initial block ──
@@ -572,7 +609,7 @@ endmodule
 
 
 def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="catapult",
-                num_vectors=10, timing=False, back2back=False, full_k_spatial=False,
+                num_vectors=10, timing=False, back2back=False, k_spatial=1,
                 weights_in_core=False, fixed_B=None):
     """Generate a self-checking multi-vector Verilog testbench.
 
@@ -586,17 +623,21 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
         back2back: If True, feed vectors in quick succession without waiting
             for output before starting the next vector (tests double-buffer
             pipelining). Outputs are checked sequentially by out_last count.
+        k_spatial: Number of parallel K partitions (passes over K =
+            ceil(k_chunks/k_spatial)); 1 is today's chunked layout,
+            k_chunks is today's full-K layout, values in between are the
+            general pass-sequenced K-spatial layout.
 
     Returns:
         Verilog source as a string.
     """
-    if full_k_spatial:
-        all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_catapult_full_k_spatial(
-            m, k, n, num_vectors, seed, fixed_B=fixed_B)
+    if k_spatial > 1:
+        all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_catapult_k_spatial(
+            m, k, n, num_vectors, seed, k_spatial, fixed_B=fixed_B)
     else:
         all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus(
             m, k, n, num_vectors, seed, fixed_B=fixed_B)
-    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back, full_k_spatial=full_k_spatial, weights_in_core=weights_in_core)
+    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back, k_spatial=k_spatial, weights_in_core=weights_in_core)
 
 
 def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_sat, timing=False):

@@ -78,35 +78,51 @@ def build_weight_rom(B, m, n, k):
     return rom
 
 
-def build_weight_rom_full_k(B, m, n, k):
-    """Per-beat ROM values for the full-K-spatial feed. ``B`` is ``[K, N]``.
+def build_weight_rom_k_spatial(B, m, n, k, k_spatial):
+    """Per-beat ROM values for the general K-spatial feed. ``B`` is ``[K, N]``.
 
-    Full-K feeds every K chunk in ONE ``max(M, N)``-beat pass, so the ROM holds
-    ``input_beats`` entries of ``64*k_chunks`` bits — the transpose of the chunked
-    layout's ``k_chunks*input_beats`` entries of ``grid_cols*64`` bits. Widening the
-    word rather than adding beats is deliberate: serialising the baked weights would
-    cost the very latency full-K exists to avoid.
+    ``k_spatial`` parallel K partitions cover ``k_chunks = ceil(k/8)`` chunks in
+    ``passes = ceil(k_chunks/k_spatial)`` passes; each pass feeds ONE
+    ``max(M, N)``-beat sweep, so the ROM holds ``passes*input_beats`` entries of
+    ``64*k_spatial`` bits. ``k_spatial == 1`` is today's chunked endpoint
+    (``build_weight_rom``); ``k_spatial == k_chunks`` (one pass) is today's
+    full-K endpoint (``build_weight_rom_full_k``). Widening the word rather
+    than adding beats per chunk is deliberate: serialising the baked weights
+    would cost the very latency K-spatial folding exists to avoid.
 
-    Uses the NARROW packer (one tile at position 0, K chunk ``c`` at bits
-    ``[c*64, c*64+64)``, no grid tile offset) because the full-K wrapper RTL
-    re-inserts the tile offset by beat index — see the ``a_bits``/``b_bits``
-    derivation in ``catapult.gen_public_header``. Same packer the verified
-    testbench stimulus uses, so the baked ROM matches the beats the external
-    ``b_cols`` port would have received.
+    Uses the NARROW packer (partition p at bits ``[p*64, p*64+64)``, no grid
+    tile offset) because the K-spatial wrapper RTL re-inserts the tile offset
+    by beat index — see the ``a_bits``/``b_bits`` derivation in
+    ``catapult.gen_public_header``. Same packer the verified testbench
+    stimulus uses, so the baked ROM matches the beats the external ``b_cols``
+    port would have received.
 
     K need not be a multiple of 8: the packer walks only real K bytes, leaving
-    tail lanes zero, which is the masking the RTL contract requires.
+    tail lanes (and fully-padded chunks beyond ``k_chunks``) zero, which is
+    the masking the RTL contract requires.
     """
+    if k_spatial == 1:
+        return build_weight_rom(B, m, n, k)
     _ts_dir_on_path()
-    from golden import pack_b_full_k_spatial_narrow  # noqa: F401
+    from golden import pack_b_k_spatial_narrow  # noqa: F401
 
     input_beats = max(m, n)
-    return [int(pack_b_full_k_spatial_narrow(B, t, n, k)) for t in range(input_beats)]
+    k_chunks = (k + 7) // 8
+    passes = -(-k_chunks // k_spatial)
+    rom = []
+    for pass_idx in range(passes):
+        for t in range(input_beats):
+            rom.append(int(pack_b_k_spatial_narrow(B, t, pass_idx, n, k, k_spatial)))
+    return rom
 
 
-def weight_rom_from_dat(path, m, n, k, full_k_spatial=False, layout="column_major"):
+def build_weight_rom_full_k(B, m, n, k):
+    """Today's full-K endpoint of :func:`build_weight_rom_k_spatial` (one pass)."""
+    k_chunks = (k + 7) // 8
+    return build_weight_rom_k_spatial(B, m, n, k, k_chunks)
+
+
+def weight_rom_from_dat(path, m, n, k, k_spatial=1, layout="column_major"):
     """Convenience: load a ``.dat`` and build the ROM beats in one call."""
     B = load_weight_dat(path, n, k, layout)
-    if full_k_spatial:
-        return build_weight_rom_full_k(B, m, n, k)
-    return build_weight_rom(B, m, n, k)
+    return build_weight_rom_k_spatial(B, m, n, k, k_spatial)

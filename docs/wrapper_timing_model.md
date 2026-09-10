@@ -55,23 +55,22 @@ cycle because it is the same idle beat that separates consecutive frames.
 ## Dead-Cycle Formula
 
 Matches the behavioral grid timing — feed beats plus the systolic K+N wave
-remainder. Full-K-spatial mode (`gemm_k_spatial == k_chunks > 1`) feeds every
-K chunk spatially in one `max(M,N)`-beat pass, so its first output arrives
-correspondingly earlier; chunked mode serializes the chunks:
+remainder. A ReuseFactor legalizes to `passes` sweeps of K over `k_spatial`
+parallel chunks (`passes == 1` is full-K: every K chunk fed spatially in one
+`max(M,N)`-beat pass, so its first output arrives earliest; `k_spatial == 1`
+is chunked: `k_chunks` serialized passes). `latency_cycles` delegates to
+`geometry.latency_first_out(m, k, n, k_spatial)`:
 
 ```python
-def latency_cycles(m, k, n, grid_rows, grid_cols, full_k_spatial=False):
-    k_chunks = ceil(k / 8)
-    input_beats = max(m, n)
-    total_beats = input_beats if full_k_spatial else k_chunks * input_beats
-    return total_beats + max(0, k + n - total_beats)
+def latency_cycles(m, k, n, grid_rows, grid_cols, k_spatial=1):
+    return latency_first_out(m, k, n, k_spatial)   # total_beats = passes * max(m, n) + wave remainder
 
-def dead_cycles_raw(m, k, n, grid_cols, full_k_spatial=False):
+def dead_cycles_raw(m, k, n, grid_cols, k_spatial=1):
     return latency_cycles(m, k, n, grid_rows=1, grid_cols=grid_cols,
-                          full_k_spatial=full_k_spatial) + 1
+                          k_spatial=k_spatial) + 1
 
-def dead_cycles(m, k, n, grid_cols, full_k_spatial=False):
-    return dead_cycles_raw(m, k, n, grid_cols, full_k_spatial) + 1
+def dead_cycles(m, k, n, grid_cols, k_spatial=1):
+    return dead_cycles_raw(m, k, n, grid_cols, k_spatial) + 1
 ```
 
 By construction `first_out >= total feed beats`, so the first output row

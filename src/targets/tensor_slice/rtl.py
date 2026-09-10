@@ -18,7 +18,7 @@ from pathlib import Path
 from geometry import tail_mask_hex, vm, total_cycles as _total_cycles
 
 
-def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatial=False,
+def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
                          requant_shift=0, requant_bits=None, weight_rom=None, emit_rom=True):
     # Body of requant_acc(): applied ONCE to the fully-accumulated dot product.
     # Emit requant_acc() ONLY when it is used. A declared-but-unused function is
@@ -55,25 +55,39 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
     c_width = grid_cols * 128
     input_beats = max(m, n)
     k_chunks = (k + 7) // 8
-    if full_k_spatial:
-        # Narrow per-beat word: one tile, 64 bits per K-chunk, no grid padding.
-        a_width = 64 * k_chunks
-        b_width = 64 * k_chunks
+    passes = -(-k_chunks // k_spatial)
+    full_k_spatial = k_spatial > 1 and passes == 1
+    general_k_spatial = k_spatial > 1 and passes > 1
+    if k_spatial > 1:
+        # Narrow per-beat word: k_spatial partitions, 64 bits per K-chunk each
+        # pass, no grid padding.
+        a_width = 64 * k_spatial
+        b_width = 64 * k_spatial
     bias_width = grid_cols * 64
-    total_input_beats = input_beats if full_k_spatial else k_chunks * input_beats
+    total_input_beats = passes * input_beats
     total_output_rows = m
-    latency = max(0, k + n - total_input_beats)
-    # First-output offset == catapult.latency_cycles(full_k_spatial=...): feed
-    # beats + the systolic K+N wave remainder. Full-K mode feeds every K chunk
-    # spatially in one max(M,N)-beat pass, so its first_out drops accordingly;
-    # the C++ core and the wrapper's DRAIN capture window use the same formula.
+    # Wave-latency term: use k directly whenever there is no K-chunk padding
+    # (chunked, full-K, or any other passes==1 case); the padded partial-pass
+    # endpoint uses 8*k_chunks_pad instead (see geometry.latency_first_out,
+    # which this mirrors).
+    k_chunks_pad = passes * k_spatial
+    k_term = k if (k_spatial == 1 or k_chunks_pad == k_chunks) else 8 * k_chunks_pad
+    latency = max(0, k_term + n - total_input_beats)
+    # First-output offset == geometry.latency_first_out(): feed beats + the
+    # systolic K+N wave remainder. K-spatial folding feeds K_SPATIAL chunks per
+    # pass, so its first_out drops accordingly; the C++ core and the wrapper's
+    # DRAIN capture window use the same formula.
     first_out = total_input_beats + latency
     behav_name = f"{module_name}_behav_grid"
-    mode_comment = (
-        "Full K-spatial behavioral MxKxN GEMM. Not intended for synthesis."
-        if full_k_spatial
-        else "Chunked behavioral MxKxN GEMM. Not intended for synthesis."
-    )
+    if full_k_spatial:
+        mode_comment = "Full K-spatial behavioral MxKxN GEMM. Not intended for synthesis."
+    elif general_k_spatial:
+        mode_comment = (
+            f"K-spatial (K_SPATIAL={k_spatial}, PASSES={passes}) behavioral MxKxN GEMM. "
+            "Not intended for synthesis."
+        )
+    else:
+        mode_comment = "Chunked behavioral MxKxN GEMM. Not intended for synthesis."
     # Frames in flight: the feed of frame t+1 overlaps the compute/drain of
     # frame t, so back-to-back frames sustain a frame II of total_beats+1
     # (the preload step plus the data beats). Slot count covers the deepest
@@ -118,6 +132,33 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
                             bmat[ws * {k} + kk][cc_beat] = b_cols[cc_chunk * 64 + lane * 8 +: 8];
                         end
                     end"""
+    elif general_k_spatial:
+        # General pass-sequenced unpack: pass q, beat t carries chunk
+        # q*k_spatial+p on partition p (bits [p*64, p*64+64)); cc counts
+        # beats across ALL passes (cc_pass = cc / INPUT_BEATS).
+        single_unpack = f"""\
+                    cc_pass = cc / INPUT_BEATS;
+                    cc_beat = cc % INPUT_BEATS;
+                    if (cc_beat < {m}) begin
+                        for (p_idx = 0; p_idx < {k_spatial}; p_idx = p_idx + 1) begin
+                            cc_chunk = cc_pass * {k_spatial} + p_idx;
+                            for (lane = 0; lane < 8; lane = lane + 1) begin
+                                kk = cc_chunk * 8 + lane;
+                                if (kk < {k})
+                                    amat[ws * {m} + cc_beat][kk] = a_rows[p_idx * 64 + lane * 8 +: 8];
+                            end
+                        end
+                    end
+                    if (cc_beat < {n}) begin
+                        for (p_idx = 0; p_idx < {k_spatial}; p_idx = p_idx + 1) begin
+                            cc_chunk = cc_pass * {k_spatial} + p_idx;
+                            for (lane = 0; lane < 8; lane = lane + 1) begin
+                                kk = cc_chunk * 8 + lane;
+                                if (kk < {k})
+                                    bmat[ws * {k} + kk][cc_beat] = b_cols[p_idx * 64 + lane * 8 +: 8];
+                            end
+                        end
+                    end"""
 
     # Weight-stationary (const-weight): the top sim wrapper drops its external b_cols
     # port and feeds the inner behav_grid from the shared ROM (w_rom_out). The behav_grid
@@ -127,6 +168,8 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", full_k_spatia
     # input_beats under full-K), so the widened word carries every K chunk without
     # adding beats. The ROM must be built with the matching narrow full-K packer —
     # gemm_ip.weights.build_weight_rom_full_k.
+    extra_int_decls = "    integer p_idx, cc_pass;\n" if general_k_spatial else ""
+
     _sim_ws = weight_rom is not None
     if _sim_ws:
         sim_b_cols_port = ""
@@ -223,7 +266,7 @@ module {behav_name}(
 
     integer i, j, kk, lane, tile, s;
     integer ws, cc, scc, cc_chunk, cc_beat, out_idx, actual_row, actual_col;
-    reg signed [31:0] acc;
+{extra_int_decls}    reg signed [31:0] acc;
     reg signed [15:0] sat;
 
     function signed [15:0] sat_int8;
@@ -859,29 +902,31 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
         return generate_synth_verilog(m, k, n, module_name,
                                       weight_rom=weight_rom, emit_rom=emit_rom)
 
-    partitions = _k_spatial_partitions(k, k_spatial)
+    # Passes over K: ``k_spatial`` partitions cover K_CHUNKS chunks in
+    # ``passes = ceil(K_CHUNKS/k_spatial)`` passes; pass q, beat t carries
+    # chunk ``q*k_spatial + p`` on partition p. ``passes == 1`` is today's
+    # full-K endpoint (k_spatial == k_chunks) and reproduces its Verilog
+    # byte-for-byte -- the pass counter is otherwise unused at that endpoint.
+    k_chunks = (k + 7) // 8
+    passes = -(-k_chunks // k_spatial)
+    full_k_spatial = passes == 1
     # Weight-stationary: same contract as the chunked emitter — drop the external
     # b_cols port and register B from the shared ROM instead. emit_rom=False when the
     # combined core hoists one ROM above the `ifndef so both branches read it.
     ksp_ws = weight_rom is not None
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
-    a_width = grid_rows * 64
-    b_width = grid_cols * 64
-    bias_width = b_width
-    a_chunk_width = a_width
-    b_chunk_width = b_width
+    # Narrow per-beat word: partition p carries one 64-bit tile (a K chunk each
+    # pass); the wrapper routes it to the row/col tile by beat index, so no
+    # grid padding -- true for both the single-pass (full-K) and multi-pass
+    # general K-spatial layouts.
+    a_width = 64 * k_spatial
+    b_width = 64 * k_spatial
+    bias_width = grid_cols * 64
+    a_chunk_width = 64
+    b_chunk_width = 64
     c_width = grid_cols * 128
     input_beats = max(m, n)
-    k_chunks = (k + 7) // 8
-    full_k_spatial = k_spatial == k_chunks
-    if full_k_spatial:
-        # Narrow per-beat word: partition p carries one 64-bit tile (its K-chunk);
-        # the wrapper routes it to the row/col tile by beat index, so no grid padding.
-        a_width = 64 * k_chunks
-        b_width = 64 * k_chunks
-        a_chunk_width = 64
-        b_chunk_width = 64
     total_output_rows = grid_rows * 8
 
     if ksp_ws:
@@ -895,50 +940,98 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
 
     row_mask_vals = [tail_mask_hex(m, r) for r in range(grid_rows)]
     col_mask_vals = [tail_mask_hex(n, c) for c in range(grid_cols)]
-    part_comments = "\n".join(
-        f"// K_SPATIAL_PARTITION {p}: chunks {lo}..{hi}" for p, (lo, hi) in enumerate(partitions)
-    )
 
     decls = []
     insts = []
-    for p, (lo, hi) in enumerate(partitions):
-        decls.append(f"    // Spatial grid {p}: contiguous K chunks {lo}..{hi}")
-        if full_k_spatial:
+    if full_k_spatial:
+        # ── passes == 1 (k_spatial == k_chunks): today's full-K endpoint. ──
+        # Kept byte-identical to the pre-fold-K generator: partition p always
+        # carries chunk p (there is only one pass), so every k_size/k_mask is
+        # a Python-computed literal, not a runtime expression.
+        partitions = _k_spatial_partitions(k, k_spatial)
+        part_comments = "\n".join(
+            f"// K_SPATIAL_PARTITION {p}: chunks {lo}..{hi}" for p, (lo, hi) in enumerate(partitions)
+        )
+        for p, (lo, hi) in enumerate(partitions):
+            decls.append(f"    // Spatial grid {p}: contiguous K chunks {lo}..{hi}")
             decls.append(f"    wire part{p}_active = 1'b1;")
             decls.append(f"    wire part{p}_first_chunk = 1'b1;")
             decls.append(f"    wire part{p}_last_chunk = 1'b1;")
             part_k_size = k - lo * 8 if hi == k_chunks - 1 else 8
             part_k_mask = tail_mask_hex(k, hi) if hi == k_chunks - 1 else 0xFF
-        else:
-            decls.append(f"    wire part{p}_active = (chunk_idx >= 16'd{lo}) && (chunk_idx <= 16'd{hi});")
-            decls.append(f"    wire part{p}_first_chunk = (chunk_idx == 16'd{lo});")
-            decls.append(f"    wire part{p}_last_chunk = (chunk_idx == 16'd{hi});")
-            part_k_size = (k - hi * 8) or 8
-            part_k_mask = tail_mask_hex(k, hi)
-        decls.append(
-            f"    wire [7:0] part{p}_k_size = part{p}_last_chunk ? "
-            f"((16'd{hi} == K_CHUNKS - 1) ? 8'd{part_k_size} : 8'd8) : 8'd8;"
-        )
-        decls.append(
-            f"    wire [7:0] part{p}_k_mask = part{p}_last_chunk ? "
-            f"((16'd{hi} == K_CHUNKS - 1) ? {vm(part_k_mask)} : 8'hFF) : 8'hFF;"
-        )
-        for r in range(grid_rows):
-            for c in range(grid_cols):
-                idx = p * grid_rows * grid_cols + r * grid_cols + c
-                if full_k_spatial:
-                    # Narrow word: partition p carries one 64-bit tile at p*64; route
-                    # it to row-tile r / col-tile c by beat index (beat_count/8 == tile).
+            decls.append(
+                f"    wire [7:0] part{p}_k_size = part{p}_last_chunk ? "
+                f"((16'd{hi} == K_CHUNKS - 1) ? 8'd{part_k_size} : 8'd8) : 8'd8;"
+            )
+            decls.append(
+                f"    wire [7:0] part{p}_k_mask = part{p}_last_chunk ? "
+                f"((16'd{hi} == K_CHUNKS - 1) ? {vm(part_k_mask)} : 8'hFF) : 8'hFF;"
+            )
+            for r in range(grid_rows):
+                for c in range(grid_cols):
+                    idx = p * grid_rows * grid_cols + r * grid_cols + c
                     a_expr = f"a_rows_q[{p}*{a_chunk_width} + 63:{p}*{a_chunk_width}]"
                     b_expr = f"b_cols_q[{p}*{b_chunk_width} + 63:{p}*{b_chunk_width}]"
                     a_route = f" && (beat_count >> 3 == {r})"
                     b_route = f" && (beat_count >> 3 == {c})"
-                else:
-                    a_expr = f"a_rows_q[{(r + 1) * 64 - 1}:{r * 64}]"
-                    b_expr = f"b_cols_q[{(c + 1) * 64 - 1}:{c * 64}]"
-                    a_route = ""
-                    b_route = ""
-                insts.append(f"""\
+                    insts.append(f"""\
+        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_p{p}_r{r}_c{c} (
+            .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
+            .start_mat_mul(slice_start && part{p}_active),
+            .done_mat_mul(done_mat_mul[{idx}]),
+            .a_data((in_beat_active && part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
+            .b_data((in_beat_active && part{p}_active && ({r} == 0){b_route}) ? {b_expr} : 64'b0),
+            .a_data_in(64'b0),
+            .b_data_in(64'b0),
+            .a_data_out(),
+            .b_data_out(),
+            .c_data_out(partial_c_p{p}_r{r}_c{c}),
+            .c_data_available(partial_avail_p{p}_r{r}_c{c}),
+            .validity_mask_a_rows({vm(row_mask_vals[r])}),
+            .validity_mask_a_cols_b_rows(part{p}_k_mask),
+            .validity_mask_b_cols({vm(col_mask_vals[c])}),
+            .slice_dtype(2'd0), .slice_mode(1'b0), .op({{2'b00, op0_{r}}}),
+            .preload(1'b0), .no_rounding(1'b0),
+            .final_mat_mul_size(part{p}_k_size),
+            .a_loc(5'd{r}),
+            .b_loc(5'd{c})
+        );""")
+    else:
+        # ── passes > 1: general pass-sequenced K-spatial fold. ──
+        # All k_spatial partitions are active every pass; partition p carries
+        # chunk `chunk_idx*k_spatial + p` (chunk_idx is the pass counter,
+        # renamed from the old placeholder's per-chunk index -- see the
+        # S_WAIT case below). Chunks beyond K_CHUNKS (padding to fill the
+        # last pass) are fully masked so every partition runs every pass.
+        tail_chunk = k_chunks - 1
+        tail_k_size = k - tail_chunk * 8
+        tail_k_mask = tail_mask_hex(k, tail_chunk)
+        part_comments = "\n".join(
+            f"// K_SPATIAL_PARTITION {p}: chunk = pass*{k_spatial} + {p}" for p in range(k_spatial)
+        )
+        for p in range(k_spatial):
+            decls.append(f"    // Spatial grid {p}: chunk = pass*{k_spatial} + {p}")
+            decls.append(f"    wire part{p}_active = 1'b1;")
+            decls.append(f"    wire part{p}_first_chunk = (chunk_idx == 16'd0);")
+            decls.append(f"    wire [15:0] part{p}_chunk = chunk_idx * 16'd{k_spatial} + 16'd{p};")
+            decls.append(f"    wire part{p}_chunk_pad = (part{p}_chunk >= K_CHUNKS);")
+            decls.append(f"    wire part{p}_chunk_tail = (part{p}_chunk == K_CHUNKS - 16'd1);")
+            decls.append(
+                f"    wire [7:0] part{p}_k_size = part{p}_chunk_pad ? 8'd8 : "
+                f"(part{p}_chunk_tail ? 8'd{tail_k_size} : 8'd8);"
+            )
+            decls.append(
+                f"    wire [7:0] part{p}_k_mask = part{p}_chunk_pad ? 8'h00 : "
+                f"(part{p}_chunk_tail ? {vm(tail_k_mask)} : 8'hFF);"
+            )
+            for r in range(grid_rows):
+                for c in range(grid_cols):
+                    idx = p * grid_rows * grid_cols + r * grid_cols + c
+                    a_expr = f"a_rows_q[{p}*{a_chunk_width} + 63:{p}*{a_chunk_width}]"
+                    b_expr = f"b_cols_q[{p}*{b_chunk_width} + 63:{p}*{b_chunk_width}]"
+                    a_route = f" && (beat_count >> 3 == {r})"
+                    b_route = f" && (beat_count >> 3 == {c})"
+                    insts.append(f"""\
         (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_p{p}_r{r}_c{c} (
             .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
             .start_mat_mul(slice_start && part{p}_active),
@@ -1006,9 +1099,11 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
                         state <= S_OUTPUT;
                     end"""
     else:
+        # chunk_idx doubles as the pass counter here: it advances once per
+        # pass (not once per chunk), and the loop exits after `passes` passes.
         wait_body = f"""\
                     if (all_slices_done) begin
-                        if (chunk_idx + 16'd1 == K_CHUNKS) begin
+                        if (chunk_idx + 16'd1 == 16'd{passes}) begin
                             state <= S_OUTPUT;
                         end else begin
                             chunk_idx <= chunk_idx + 16'd1;
@@ -1166,8 +1261,7 @@ endmodule
 def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
                                    requant_shift=0, requant_bits=None,
                                    weight_rom=None, emit_rom=True):
-    k_chunks = (k + 7) // 8
-    sim = generate_sim_verilog(m, k, n, module_name, full_k_spatial=(k_spatial == k_chunks),
+    sim = generate_sim_verilog(m, k, n, module_name, k_spatial=k_spatial,
                                requant_shift=requant_shift, requant_bits=requant_bits,
                                weight_rom=weight_rom, emit_rom=emit_rom)
     if k_spatial == 1:

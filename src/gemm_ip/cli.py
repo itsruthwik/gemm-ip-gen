@@ -36,8 +36,6 @@ def main():
     parser.add_argument("--name", type=str, default="gemm_8x8x8", help="Package name")
     parser.add_argument("--interface", choices=("stream", "array"), default="stream",
                         help="Interface type for generated package metadata/dispatch (default: stream)")
-    parser.add_argument("--k-spatial", type=int, default=None,
-                        help="Number of spatial K grid partitions (default: full K-chunk unroll)")
     # ── mvau user-directed fold/tiling (standalone generation; no hls4ml) ──
     parser.add_argument("--pe", type=int, default=None,
                         help="mvau: N-parallelism (lanes/tile on N). With --simd, pins the fold "
@@ -120,7 +118,7 @@ def _run(args):
                 "output_dir": args.output_dir,
                 "interface": item.get("interface", "stream"),
                 "output_precision": item.get("output_precision"),
-                "gemm_k_spatial": item.get("gemm_k_spatial"),
+                "reuse_factor": item.get("reuse_factor", 1),
                 "input_precision": item.get("input_precision"),
                 "weight_precision": item.get("weight_precision"),
                 "clock_period_ns": item.get("clock_period_ns"),
@@ -166,7 +164,7 @@ def _run(args):
             "name": args.name,
             "output_dir": args.output_dir,
             "interface": args.interface,
-            "gemm_k_spatial": args.k_spatial,
+            "reuse_factor": args.reuse_factor if args.reuse_factor is not None else 1,
             # Standalone unit packages use integer operand codes / int16 result
             # lanes; an integer result type makes the wrapper drain emit
             # value.to_int() so the ac_fixed rescale accumulator converts cleanly

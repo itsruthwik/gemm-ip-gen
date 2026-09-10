@@ -61,31 +61,37 @@ The generated synth RTL wrapper consumes chunk-local 64-bit tile lanes:
 
 Invalid tail M/N/K lanes are masked to zero.
 
-## K-Spatial (full-K) Layout
+## ReuseFactor and K passes
 
-`gemm_k_spatial` selects how the K chunks are consumed. Two modes exist:
+`ReuseFactor` (RF) is the number of sequential passes each input vector's K
+reduction takes over the array -- never a cycle count or an initiation
+interval. `k_spatial` parallel K partitions cover `K_CHUNKS = ceil(K/8)`
+chunks in `passes = ceil(K_CHUNKS / k_spatial)` passes; the legalized RF is
+`passes`. Requests above `K_CHUNKS` legalize down to `K_CHUNKS` (chunked) with
+a warning; RF=1 legalizes to `k_spatial = K_CHUNKS` (full-K, one pass). These
+are the two endpoints of one general layout:
 
-| | chunked (`gemm_k_spatial == 1`) | full-K-spatial (`gemm_k_spatial == K_CHUNKS > 1`) |
+| | chunked (`k_spatial == 1`) | full-K (`k_spatial == K_CHUNKS`, `passes == 1`) |
 |---|---|---|
 | grid | one tensor-slice grid | `K_CHUNKS` grid partitions |
-| feed beats | `K_CHUNKS * max(M,N)` | `max(M,N)` (single pass) |
-| A word width | `GRID_ROWS * 64` | `64 * K_CHUNKS` |
-| B word width | `GRID_COLS * 64` | `64 * K_CHUNKS` |
+| feed beats | `passes * max(M,N)` = `K_CHUNKS * max(M,N)` | `max(M,N)` (single pass) |
+| A word width | `GRID_ROWS * 64` | `64 * k_spatial` |
+| B word width | `GRID_COLS * 64` | `64 * k_spatial` |
 | per-beat content | one K chunk of row/col `t` | **all** K chunks of row/col `t` |
-| wrapper storage | `a_replay[K_CHUNKS][max(M,N)]` | none |
+| wrapper storage | `a_replay[passes][max(M,N)]` | `a_replay[1][max(M,N)]` (unused) |
 
-Full-K mode uses the NARROW per-beat word: partition `p` carries one 64-bit
-tile (its K chunk) and the RTL re-inserts the grid row/column tile offset from
-the beat index, so the deep input FIFO never stores the always-zero grid
-padding. Chunked mode keeps the single-chunk grid-padded width.
-
-Only `K_CHUNKS > 1` can be full-K. For `K_CHUNKS == 1` the package generates the
-chunked grid and the wrapper packs chunked words to match its
-`GRID_COLS * 64`-bit ports.
+In general, a narrow-word package (`k_spatial > 1`) uses a `64 * k_spatial`-bit
+word per beat: pass `q`'s beat `t` carries K chunks `q*k_spatial .. q*k_spatial
++ k_spatial - 1` of row/col `t`, chunk `p` within the word at bit offset
+`p*64`. K is padded to `passes * k_spatial` chunks (`K_CHUNKS_PAD`), with the
+padding chunks masked to zero. The RTL re-inserts the grid row/column tile
+offset from the beat index, so the deep input FIFO never stores the
+always-zero grid padding. `k_spatial == 1` keeps the single-chunk grid-padded
+width instead (today's chunked layout).
 
 Intermediate K-spatial partial sums are INT16, so partition-level overflow is
 possible; correctness depends on quantized operand ranges and partition size.
-The generator prints a warning for every `gemm_k_spatial > 1` package.
+The generator prints a warning for every package with `k_spatial > 1`.
 
 ## Synth Protocol
 

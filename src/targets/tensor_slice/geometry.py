@@ -57,29 +57,92 @@ def k_chunk_mask(k, chunk_index):
     return tail_mask_hex(k, chunk_index)
 
 
-def _validate_gemm_k_spatial(k, gemm_k_spatial):
-    """Validate/normalise the spatial K-partition count against K_CHUNKS."""
-    k_chunks = _ceil_div(k, LANE_WIDTH)
-    if gemm_k_spatial is None:
-        return k_chunks
-    k_spatial = int(gemm_k_spatial)
-    if k_spatial < 1:
-        raise ValueError("gemm_k_spatial must be >= 1")
-    if k_spatial > k_chunks:
-        raise ValueError(
-            f"gemm_k_spatial={k_spatial} exceeds K_CHUNKS={k_chunks}; "
-            "v1 requires at most one spatial grid per K chunk"
+def k_passes(k, k_spatial):
+    """Number of sequential passes over K needed with *k_spatial* parallel chunks.
+
+    This is the legalized ReuseFactor: the number of times each input vector's
+    K reduction is fed through the array (MAC uses per input vector), not a
+    cycle count and not II.
+    """
+    kc = k_chunks(k)
+    return _ceil_div(kc, int(k_spatial))
+
+
+def k_chunks_padded(k, k_spatial):
+    """Total K-chunk slots across all passes, including zero/masked padding."""
+    return k_passes(k, k_spatial) * int(k_spatial)
+
+
+def multipliers(m, n, k_spatial):
+    """INT8 multiplier count for a grid with *k_spatial* parallel K partitions."""
+    return 64 * grid_rows(m) * grid_cols(n) * int(k_spatial)
+
+
+def resolve_reuse_factor(k, reuse_factor, name=None):
+    """Legalize a requested ReuseFactor into a K-partition count.
+
+    ``reuse_factor`` (RF) is the number of passes over K each input vector's
+    reduction takes -- i.e. how many times each MAC in the array is reused
+    per input vector. It is never a cycle count or an initiation interval.
+
+    ``k_spatial`` parallel K partitions cover ``k_chunks = ceil(k/8)`` chunks
+    in ``passes = ceil(k_chunks / k_spatial)`` passes; the legalized RF is
+    ``passes`` (which may land lower than requested -- silently). Requests
+    above ``k_chunks`` (RF > k_chunks) legalize down to ``k_chunks`` (today's
+    chunked, ks=1) with a warning. RF=1 legalizes to ``k_spatial=k_chunks``
+    (today's full-K). The legal range is ``1..k_chunks``.
+
+    Returns a dict: k_spatial, passes, k_chunks, k_chunks_pad,
+    reuse_factor_requested, reuse_factor (legalized), effective_reuse
+    (== passes), warnings (list[str]).
+    """
+    kc = k_chunks(k)
+    rf_req = int(reuse_factor)
+    warnings = []
+    rf_use = rf_req
+    if rf_use < 1:
+        rf_use = 1
+    if rf_use > kc:
+        who = f" for layer {name}" if name is not None else ""
+        warnings.append(
+            f"WARNING: Invalid ReuseFactor={rf_req}{who}. "
+            f"Using ReuseFactor={kc} instead. Valid ReuseFactor(s): 1..{kc}."
         )
-    return k_spatial
+        rf_use = kc
+    ks = _ceil_div(kc, rf_use)
+    passes = _ceil_div(kc, ks)
+    k_chunks_pad = passes * ks
+    return {
+        "k_spatial": ks,
+        "passes": passes,
+        "k_chunks": kc,
+        "k_chunks_pad": k_chunks_pad,
+        "reuse_factor_requested": rf_req,
+        "reuse_factor": passes,
+        "effective_reuse": passes,
+        "warnings": warnings,
+    }
 
 
-def a_stream_width(m):
-    """Bit-width of the activation stream packet for *m* rows."""
+def a_stream_width(m, k_spatial=1):
+    """Bit-width of the activation stream packet for *m* rows.
+
+    ``k_spatial == 1`` keeps today's grid-padded word (one 64-bit lane group
+    per row tile). ``k_spatial > 1`` is the narrow K-spatial word: one 64-bit
+    lane group per K partition, independent of row-tile count.
+    """
+    if k_spatial and int(k_spatial) > 1:
+        return 64 * int(k_spatial)
     return grid_rows(m) * 64
 
 
-def b_stream_width(n):
-    """Bit-width of the weight (and bias) stream packet for *n* columns."""
+def b_stream_width(n, k_spatial=1):
+    """Bit-width of the weight (and bias) stream packet for *n* columns.
+
+    See :func:`a_stream_width` for the ``k_spatial`` word-width rule.
+    """
+    if k_spatial and int(k_spatial) > 1:
+        return 64 * int(k_spatial)
     return grid_cols(n) * 64
 
 
@@ -144,6 +207,31 @@ def latency_cycles(k_val, grid_rows_val, grid_cols_val, m=None, n=None,
         return max(0, total_cycles(m, k, n, feed_mode=feed_mode) - 20 - (grid_rows_val * 8))
     # Fallback
     return (grid_cols_val - 1) * 8 + k_val + 10
+
+
+def latency_first_out(m, k, n, k_spatial):
+    """First-output beat offset for the K-spatial behavioral sim model.
+
+    ``total_beats = passes * max(m, n)``; the remaining wave latency is
+    ``max(0, K' + n - total_beats)`` where ``K'`` is *k* itself whenever there
+    is no K-chunk padding (``k_spatial == 1``, today's chunked endpoint, or
+    ``k_chunks_pad == k_chunks``, today's full-K endpoint and any other
+    passes==1 case) and is ``8 * k_chunks_pad`` otherwise (padded partial
+    passes: the masked pad chunks still occupy a beat's worth of K in the
+    wave-latency term). This reproduces the existing chunked and full-K
+    formulas exactly at their endpoints.
+    """
+    ks = int(k_spatial)
+    kc = k_chunks(k)
+    passes = k_passes(k, ks)
+    kc_pad = passes * ks
+    total_beats = passes * max(m, n)
+    if ks == 1 or kc_pad == kc:
+        k_term = k
+    else:
+        k_term = 8 * kc_pad
+    latency = max(0, k_term + n - total_beats)
+    return total_beats + latency
 
 
 def dead_cycles_raw(grid_cols_val):

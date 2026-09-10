@@ -21,7 +21,10 @@ from gemm_ip.quant import _frac_bits, _operand_bits, _output_bits
 _here = str(Path(__file__).resolve().parent)
 if _here not in sys.path:
     sys.path.insert(0, _here)
-from geometry import LANE_WIDTH, _ceil_div, _validate_gemm_k_spatial  # noqa: E402
+from geometry import (  # noqa: E402
+    LANE_WIDTH, _ceil_div, k_chunks as _geom_k_chunks, k_passes as _geom_k_passes,
+    resolve_reuse_factor, latency_first_out, a_stream_width, b_stream_width,
+)
 
 # Combinational delay (ns) Catapult must budget for any cycle that touches the
 # blackbox boundary. The structural grid registers its inputs and outputs, but
@@ -49,37 +52,30 @@ def _blackbox_delay_ns(clock_period_ns):
     return round(min(0.7 * period, period - 1.5), 2)
 
 
-def latency_cycles(m, k, n, grid_rows, grid_cols, full_k_spatial=False):
+def latency_cycles(m, k, n, grid_rows, grid_cols, k_spatial=1):
     """First-output cycle offset for the C++ simulation model.
 
-    Matches the behavioral grid timing: feed beats + the systolic K+N wave
-    remainder.
-      chunked: first_out = k_chunks × max(M,N) + max(0, K+N − k_chunks×max(M,N))
-      full-K:  first_out =            max(M,N) + max(0, K+N −          max(M,N))
-    Full-K mode feeds every K chunk spatially in one max(M,N)-beat pass, so
-    its first output arrives correspondingly earlier. By construction
-    first_out >= total feed beats, so the first row always lands inside the
-    DRAIN window, never inside FEED. This is the cycle where out_valid fires
-    in the simulation model, offset from clk_cnt = 0 (first in_valid beat).
+    Delegates to ``geometry.latency_first_out`` so the sim-Verilog FIRST_OUT
+    constant and this C++-header-facing count always agree on the same
+    number for a given ``k_spatial`` (number of K partitions fed per pass;
+    ``k_spatial == 1`` is the chunked endpoint, ``k_spatial == k_chunks`` is
+    the full-K endpoint).
     """
-    k_chunks = _ceil_div(k, LANE_WIDTH)
-    input_beats = max(m, n)
-    total_beats = input_beats if full_k_spatial else k_chunks * input_beats
-    return total_beats + max(0, k + n - total_beats)
+    return latency_first_out(m, k, n, k_spatial)
 
 
-def dead_cycles_raw(m, k, n, grid_cols, full_k_spatial=False):
+def dead_cycles_raw(m, k, n, grid_cols, k_spatial=1):
     """Drain dead cycles before the C++ wrapper starts capturing output."""
     return latency_cycles(m, k, n, grid_rows=1, grid_cols=grid_cols,
-                          full_k_spatial=full_k_spatial) + 1
+                          k_spatial=k_spatial) + 1
 
 
-def dead_cycles(m, k, n, grid_cols, full_k_spatial=False):
+def dead_cycles(m, k, n, grid_cols, k_spatial=1):
     """Drain dead cycles + 1-cycle padding."""
-    return dead_cycles_raw(m, k, n, grid_cols, full_k_spatial=full_k_spatial) + 1
+    return dead_cycles_raw(m, k, n, grid_cols, k_spatial=k_spatial) + 1
 
 
-def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gemm_k_spatial=1,
+def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_spatial=1,
                       input_precision=None, weight_precision=None, clock_period_ns=None,
                       n_frames=1, weight_rom=None):
     # Weight-stationary (const-weight) mode: weights live in the RTL wrapper ROM,
@@ -92,21 +88,21 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     col_chunk_bits = grid_cols * 64
     c_bits = grid_cols * 128
     mr = grid_rows * 8
-    k_chunks = _ceil_div(k, LANE_WIDTH)
-    # Full-K-spatial layout applies ONLY to the dedicated k-spatial grid
-    # (gemm_k_spatial == k_chunks > 1); k_chunks == 1 always uses the chunked
-    # grid and its matching word width.
-    full_k_spatial = k_chunks > 1 and gemm_k_spatial == k_chunks
-    # Full-K uses the NARROW per-beat word (one tile, 64 bits per K-chunk); the
-    # wrapper RTL re-inserts the grid row/col tile offset by beat index, so the
-    # deep input FIFO never stores the always-zero grid padding (area saving on
-    # tiled designs).  Chunked keeps the single-chunk grid-padded width.
-    a_bits = 64 * k_chunks if full_k_spatial else row_chunk_bits
-    b_bits = 64 * k_chunks if full_k_spatial else col_chunk_bits
+    ks = int(k_spatial)
+    k_chunks = _geom_k_chunks(k)
+    passes = _geom_k_passes(k, ks)
+    # ``k_spatial == 1`` keeps today's grid-padded word width (chunked
+    # endpoint). ``k_spatial > 1`` is the narrow K-spatial word: 64*k_spatial
+    # bits per beat, independent of the row/col tile count, replayed across
+    # ``passes`` sweeps of K. This is a single general layout: the chunked
+    # (k_spatial == 1, passes == k_chunks) and full-K (k_spatial == k_chunks,
+    # passes == 1) cases are just its two endpoints.
+    a_bits = a_stream_width(m, ks)
+    b_bits = b_stream_width(n, ks)
     bias_bits = col_chunk_bits
     input_beats = max(m, n)
-    total_beats = input_beats if full_k_spatial else k_chunks * input_beats
-    first_out = latency_cycles(m, k, n, grid_rows, grid_cols, full_k_spatial=full_k_spatial)
+    total_beats = passes * input_beats
+    first_out = latency_cycles(m, k, n, grid_rows, grid_cols, k_spatial=ks)
     # Frame slots for the pipelined sim core: feed of frame t+1 may overlap
     # compute/drain of frame t (min frame period = total_beats + 1 calls).
     slots = -(-(first_out + 1 + m) // (total_beats + 1)) + 1
@@ -195,22 +191,26 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
             "                        else sat_val = acc;"
         )
     a_el_expr = (
-        f"a_buf[s][actual_row].slc<8>(k_chunk * 64 + k_lane * 8)"
-        if full_k_spatial
+        f"a_buf[s][(k_chunk / {ks}) * {input_beats} + actual_row]"
+        f".slc<8>((k_chunk % {ks}) * 64 + k_lane * 8)"
+        if ks > 1
         else f"a_buf[s][k_chunk * {input_beats} + actual_row].slc<8>(row_tile * 64 + k_lane * 8)"
     )
     b_el_expr = (
-        f"b_buf[s][actual_col].slc<8>(k_chunk * 64 + k_lane * 8)"
-        if full_k_spatial
+        f"b_buf[s][(k_chunk / {ks}) * {input_beats} + actual_col]"
+        f".slc<8>((k_chunk % {ks}) * 64 + k_lane * 8)"
+        if ks > 1
         else f"b_buf[s][k_chunk * {input_beats} + actual_col].slc<8>(ct * 64 + k_lane * 8)"
     )
 
     # ---- Weight-stationary vs. two-stream: b_cols plumbing inserts -------------
     # Weight-stationary drops b_cols everywhere (run() port, blackbox stub xor,
     # feed-loop decl/pack/arg) and sources the csim b_buf from an internal B_ROM.
-    # Two-stream keeps today's external b_cols beat.  full_k_spatial is never
-    # weight-stationary (gemm_k_spatial is forced to 1), so only the chunked
-    # stream feed loop needs the conditional inserts.
+    # Two-stream keeps today's external b_cols beat. Weight-stationary mode
+    # works for every k_spatial (the B ROM is built by the general
+    # build_weight_rom_k_spatial for whatever k_spatial/passes this package
+    # resolved to), so both the narrow and grid-padded feed loops need the
+    # conditional inserts.
     if weights_in_core:
         bcols_run_param = ""
         bcols_bb_xor = ""
@@ -218,13 +218,11 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         bbuf_src = "B_ROM[cc_slot[wr_slot]]"
         brom_decl = _const_weights_brom_cpp(b_bits, grid_cols, total_beats, weight_rom)
         stream_bcols_decl = ""
-        # Full-K weight-stationary: the IP holds B, so the feed packs no B beat at all.
-        stream_bcols_pack_full_k = ""
+        # Weight-stationary: the IP holds B, so the feed packs no B beat at all.
         stream_bcols_pack = ""
         # Array feed loop, const_weights: no b_cols decl / pack / run-arg (weights in ROM).
         array_bcols_decl = ""
         array_bcols_run_arg = ""
-        array_bcols_pack_full_k = ""
         array_bcols_pack = ""
     else:
         bcols_run_param = f"        ac_int<{b_bits}, false>  b_cols,\n"
@@ -233,21 +231,27 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         bbuf_src = "b_cols"
         brom_decl = ""
         stream_bcols_decl = f"ac_int<{b_bits}, false> b_cols = 0;"
-        stream_bcols_pack_full_k = f"""if (feeding_now && t < {n}) {{
+        # ``weight_cols`` is a plain array (random access, not a single-read
+        # stream), so B never needs a replay buffer: every pass simply
+        # re-slices the same full-K row/column it already has in hand. ``kc``
+        # is the pass index (== the K chunk index when k_spatial == 1).
+        if ks > 1:
+            stream_bcols_pack = f"""if (feeding_now && t < {n}) {{
             b_beat_T b_beat = weight_cols[t];
             #pragma hls_unroll
-            COL_PACK_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
+            COL_PACK_KC: for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
                 #pragma hls_unroll
-                COL_PACK_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
-                    int kk = kc * 8 + kl;
+                COL_PACK_KL: for (int kl = 0; kl < 8; kl++) {{
+                    int kk = (kc * {ks} + kc_local) * 8 + kl;
                     if (kk < {k}) {{
-                        b_cols.set_slc(kc * 64 + kl * 8,
+                        b_cols.set_slc(kc_local * 64 + kl * 8,
                                        {name}_to_gemm_int8(b_beat[kk]));
                     }}
                 }}
             }}
         }}"""
-        stream_bcols_pack = f"""if (feeding_now && t < {n}) {{
+        else:
+            stream_bcols_pack = f"""if (feeding_now && t < {n}) {{
             b_beat_T b_beat = weight_cols[t];
             #pragma hls_unroll
             COL_PACK: for (int kl = 0; kl < 8; kl++) {{
@@ -265,22 +269,24 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         # Array feed loop, two-stream: pack the external weight_cols beat into b_cols_packed.
         array_bcols_decl = f"\n        ac_int<{b_bits}, false> b_cols_packed = 0;"
         array_bcols_run_arg = "b_cols_packed, "
-        array_bcols_pack_full_k = f"""
+        if ks > 1:
+            array_bcols_pack = f"""
         if (step > 0 && step <= {total_beats} && t < {n}) {{
             b_beat_T b_beat = weight_cols[t];
             #pragma hls_unroll
-            COL_PACK_ARRAY_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
+            for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
                 #pragma hls_unroll
-                COL_PACK_ARRAY_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
-                    int kk = kc * 8 + kl;
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = (kc * {ks} + kc_local) * 8 + kl;
                     if (kk < {k}) {{
-                        b_cols_packed.set_slc(kc * 64 + kl * 8,
+                        b_cols_packed.set_slc(kc_local * 64 + kl * 8,
                                               {name}_to_gemm_int8(b_beat[kk]));
                     }}
                 }}
             }}
         }}"""
-        array_bcols_pack = f"""
+        else:
+            array_bcols_pack = f"""
         if (step > 0 && step <= {total_beats} && t < {n}) {{
             b_beat_T b_beat = weight_cols[t];
             #pragma hls_unroll
@@ -362,66 +368,54 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         }}"""
     stream_capture_b2b = _capture_body_b2b
 
-    if full_k_spatial:
-        stream_feed_loop = f"""
-    // Back-to-back feed of {n_frames} frame(s) (full K-spatial: each logical A
-    // row once, A/B words widened to carry every 8-wide K chunk). Each frame is
-    // ONE in_valid=0 beat (p == 0, carrying the preload pulse) + {total_beats}
-    // in_valid beats (period {period}); the core is fed ZERO bias (the real bias
-    // is added in the drain capture). Every step polls out_valid, so rows are
-    // captured as they emerge — frame t+1 feeds while frame t drains in the
-    // core's FRAME_SLOTS.
-    #pragma hls_pipeline_init_interval 1
-    RUN: for (int step = 0; step < {total_steps}; step++) {{
-        bool in_feed = (step < {feed_total});
-        int p = in_feed ? (step % {period}) : {period};
-        bool feeding_now = in_feed && (p >= 1) && (p <= {total_beats});
-        int t = p - 1;
-        ac_int<{a_bits}, false> a_rows = 0;
-        {stream_bcols_decl}
-
-        if (feeding_now && t < {m}) {{
-            a_beat_T a_beat = a_stream.read();
-            #pragma hls_unroll
-            ROW_PACK_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
+    # A-side row pack for the current pass ``kc``, unrolled and written into
+    # ``dest`` (either the live ``a_rows`` word for pass 0, or a ``replay_rows``
+    # scratch word for a later pass prepacked from the same beat).  ks == 1
+    # keeps today's single-chunk, row-tile-addressed pack (offset by row_tile);
+    # ks > 1 packs ``ks`` K chunks into one narrow word (offset by kc_local),
+    # generalizing the old full-K-only pack across every pass.
+    def _a_pack_block(dest, pass_expr, label):
+        if ks > 1:
+            return f"""
                 #pragma hls_unroll
-                ROW_PACK_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
-                    int kk = kc * 8 + kl;
-                    if (kk < {k}) {{
-                        a_rows.set_slc(kc * 64 + kl * 8,
-                                       {name}_to_gemm_int8(a_beat[kk]));
+                {label}_KC: for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
+                    #pragma hls_unroll
+                    {label}_KL: for (int kl = 0; kl < 8; kl++) {{
+                        int kk = (({pass_expr}) * {ks} + kc_local) * 8 + kl;
+                        if (kk < {k}) {{
+                            {dest}.set_slc(kc_local * 64 + kl * 8,
+                                           {name}_to_gemm_int8(a_beat[kk]));
+                        }}
                     }}
-                }}
-            }}
-        }}
-        {stream_bcols_pack_full_k}
+                }}"""
+        return f"""
+                #pragma hls_unroll
+                {label}_KL: for (int kl = 0; kl < 8; kl++) {{
+                    int kk = ({pass_expr}) * 8 + kl;
+                    int row_tile = t / 8;
+                    #pragma hls_unroll
+                    {label}_RT: for (int rt = 0; rt < {grid_rows}; rt++) {{
+                        if (row_tile == rt && kk < {k}) {{
+                            {dest}.set_slc(rt * 64 + kl * 8,
+                                           {name}_to_gemm_int8(a_beat[kk]));
+                        }}
+                    }}
+                }}"""
 
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
-        // preload_valid pulses on each frame's leading beat (p==0) so the
-        // structural core's S_IDLE->S_PRELOAD->S_RUN arm is a live, non-constant
-        // signal. Without it (literal 0) VTR synthesis proves transaction_active,
-        // hence the tensor_slice result path, dead and prunes every slice. This
-        // reuses the per-frame idle beat (formerly a trailing separator -> now a
-        // leading preload, same period); bias stays 0 here (added in the drain).
-        ac_int<1, false> frame_preload = (in_feed && p == 0) ? 1 : 0;
-        gemm.run(a_rows, {bcols_run_arg}bias_packed, frame_preload, feed_valid, c_row, v, l);
-{stream_capture_b2b}
-    }}
-"""
-    else:
-        stream_feed_loop = f"""
+    stream_feed_loop = f"""
     // Replay storage is packed to the blackbox protocol. HLS4ML still emits
-    // each logical K-wide A row once; later K chunks replay packed slices.
+    // each logical K-wide A row once; later K passes replay packed slices.
     // Reused per frame (written at each frame's kc==0 beats, read within the
-    // same frame's later chunks — the feed is sequential in step order).
-    ac_int<{a_bits}, false> a_replay[{k_chunks}][{input_beats}];
+    // same frame's later passes — the feed is sequential in step order). At
+    // passes == 1 (full-K) the replay array is size [1][...] and trivially
+    // unused (the loop below never iterates).
+    ac_int<{a_bits}, false> a_replay[{passes}][{input_beats}];
 
-    // Back-to-back feed of {n_frames} frame(s): M A rows + N B columns as 8-lane
-    // K chunks. Each frame is ONE in_valid=0 beat (p == 0, carrying the preload
-    // pulse) + {total_beats} in_valid beats (period {period}); the core is fed
-    // ZERO bias (the real bias is added in the drain capture). Every step polls
+    // Back-to-back feed of {n_frames} frame(s): M A rows + N B columns, each
+    // pass carrying k_spatial={ks} K chunks (passes={passes} sweeps of K).
+    // Each frame is ONE in_valid=0 beat (p == 0, carrying the preload pulse)
+    // + {total_beats} in_valid beats (period {period}); the core is fed ZERO
+    // bias (the real bias is added in the drain capture). Every step polls
     // out_valid, so rows are captured as they emerge — frame t+1 feeds while
     // frame t drains in the core's FRAME_SLOTS.
     #pragma hls_pipeline_init_interval 1
@@ -437,34 +431,10 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
 
         if (feeding_now && t < {m}) {{
             if (kc == 0) {{
-                a_beat_T a_beat = a_stream.read();
+                a_beat_T a_beat = a_stream.read();{_a_pack_block("a_rows", "0", "ROW_PACK_DIRECT")}
                 #pragma hls_unroll
-                ROW_PACK_DIRECT: for (int kl = 0; kl < 8; kl++) {{
-                    int kk = kl;
-                    int row_tile = t / 8;
-                    #pragma hls_unroll
-                    ROW_TILE_DIRECT: for (int rt = 0; rt < {grid_rows}; rt++) {{
-                        if (row_tile == rt && kk < {k}) {{
-                            a_rows.set_slc(rt * 64 + kl * 8,
-                                           {name}_to_gemm_int8(a_beat[kk]));
-                        }}
-                    }}
-                }}
-                #pragma hls_unroll
-                PREPACK_REPLAY: for (int replay_kc = 1; replay_kc < {k_chunks}; replay_kc++) {{
-                    ac_int<{a_bits}, false> replay_rows = 0;
-                    #pragma hls_unroll
-                    ROW_PACK_REPLAY: for (int kl = 0; kl < 8; kl++) {{
-                        int kk = replay_kc * 8 + kl;
-                        int row_tile = t / 8;
-                        #pragma hls_unroll
-                        ROW_TILE_REPLAY: for (int rt = 0; rt < {grid_rows}; rt++) {{
-                            if (row_tile == rt && kk < {k}) {{
-                                replay_rows.set_slc(rt * 64 + kl * 8,
-                                                    {name}_to_gemm_int8(a_beat[kk]));
-                            }}
-                        }}
-                    }}
+                PREPACK_REPLAY: for (int replay_kc = 1; replay_kc < {passes}; replay_kc++) {{
+                    ac_int<{a_bits}, false> replay_rows = 0;{_a_pack_block("replay_rows", "replay_kc", "ROW_PACK_REPLAY")}
                     a_replay[replay_kc][t] = replay_rows;
                 }}
             }} else {{
@@ -493,44 +463,13 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
     # it to run(); const_weights drops all three b_cols inserts (decl/pack/run-arg) because
     # the ccore holds B in its ROM. One loop serves both the _gemm_ip_array (two-stream)
     # and _gemm_ip_array_const_weights entries.
-    if full_k_spatial:
-        array_feed_loop = f"""
+    # a_rows[] is a plain array (random access), so — like weight_cols — the
+    # array feed loop needs no replay buffer: every pass re-slices the row it
+    # already has in hand.
+    array_feed_loop = f"""
     // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats} preload then
-    // feed each logical A row (and, two-stream, its B column) once — full K-spatial:
-    // A/B words widened to carry every 8-wide K chunk. Every step polls out_valid, so
-    // the frame's rows are captured as they emerge, not in a separate drain loop.
-    #pragma hls_pipeline_init_interval 1
-    RUN_ARRAY: for (int step = 0; step < {run_calls}; step++) {{
-        int t = (step == 0) ? 0 : step - 1;
-        ac_int<{a_bits}, false> a_rows_packed = 0;{array_bcols_decl}
-
-        if (step > 0 && step <= {total_beats} && t < {m}) {{
-            a_beat_T a_beat = a_rows[t];
-            #pragma hls_unroll
-            ROW_PACK_ARRAY_FULL_KC: for (int kc = 0; kc < {k_chunks}; kc++) {{
-                #pragma hls_unroll
-                ROW_PACK_ARRAY_FULL_KL: for (int kl = 0; kl < 8; kl++) {{
-                    int kk = kc * 8 + kl;
-                    if (kk < {k}) {{
-                        a_rows_packed.set_slc(kc * 64 + kl * 8,
-                                              {name}_to_gemm_int8(a_beat[kk]));
-                    }}
-                }}
-            }}
-        }}{array_bcols_pack_full_k}
-
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        ac_int<1, false> feed_valid = (step >= 1 && step <= {total_beats}) ? 1 : 0;
-        ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
-        gemm.run(a_rows_packed, {array_bcols_run_arg}bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
-{array_capture}
-    }}
-"""
-    else:
-        array_feed_loop = f"""
-    // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats} preload then
-    // feed M A rows (and, two-stream, N B columns) as 8-lane K chunks. Every step polls
+    // feed M A rows (and, two-stream, N B columns), each pass carrying
+    // k_spatial={ks} K chunks (passes={passes} sweeps of K). Every step polls
     // out_valid, so the frame's rows are captured as they emerge, not in a drain loop.
     #pragma hls_pipeline_init_interval 1
     RUN_ARRAY: for (int step = 0; step < {run_calls}; step++) {{
@@ -540,19 +479,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, gem
         ac_int<{a_bits}, false> a_rows_packed = 0;{array_bcols_decl}
 
         if (step > 0 && step <= {total_beats} && t < {m}) {{
-            a_beat_T a_beat = a_rows[t];
-            #pragma hls_unroll
-            for (int kl = 0; kl < 8; kl++) {{
-                int kk = kc * 8 + kl;
-                int row_tile = t / 8;
-                #pragma hls_unroll
-                for (int rt = 0; rt < {grid_rows}; rt++) {{
-                    if (row_tile == rt && kk < {k}) {{
-                        a_rows_packed.set_slc(rt * 64 + kl * 8,
-                                              {name}_to_gemm_int8(a_beat[kk]));
-                    }}
-                }}
-            }}
+            a_beat_T a_beat = a_rows[t];{_a_pack_block("a_rows_packed", "kc", "ROW_PACK_ARRAY")}
         }}{array_bcols_pack}
 
         ac_int<{c_bits}, false> c_row;
@@ -1650,6 +1577,26 @@ void gemm_ip_stream_sim(
 def gen_integration_manifest(items):
     cores = []
     for item in items:
+        if "k_spatial" in item and "reuse_factor" in item:
+            rf_req = item.get("reuse_factor_requested", item.get("reuse_factor", 1))
+            rf = item["reuse_factor"]
+            eff_rf = item.get("effective_reuse", rf)
+            ks = item["k_spatial"]
+            kp = item.get("k_passes", ks)
+            kc_pad = item.get("k_chunks_pad")
+            mult = item.get("multipliers")
+        else:
+            resolved = resolve_reuse_factor(item["k"], item.get("reuse_factor", 1), item.get("name"))
+            rf_req = resolved["reuse_factor_requested"]
+            rf = resolved["reuse_factor"]
+            eff_rf = resolved["effective_reuse"]
+            ks = resolved["k_spatial"]
+            kp = resolved["passes"]
+            kc_pad = resolved["k_chunks_pad"]
+            mult = None
+        if mult is None:
+            from geometry import multipliers as _geom_multipliers
+            mult = _geom_multipliers(item["m"], item["n"], ks)
         cores.append({
             "name": item["name"],
             "interface": item.get("interface", "stream"),
@@ -1659,6 +1606,13 @@ def gen_integration_manifest(items):
             "m": item["m"],
             "k": item["k"],
             "n": item["n"],
+            "reuse_factor_requested": rf_req,
+            "reuse_factor": rf,
+            "effective_reuse": eff_rf,
+            "k_spatial": ks,
+            "k_passes": kp,
+            "k_chunks_pad": kc_pad,
+            "multipliers": mult,
             "reset": {
                 "name": "rst",
                 "sync_active": "high"
@@ -1712,21 +1666,20 @@ def _assert_core_port_widths(name, header_text, grid_v, weights_in_core=False):
             )
 
 
-def _assert_core_first_out(name, m, k, n, gemm_k_spatial, grid_v):
+def _assert_core_first_out(name, m, k, n, k_spatial, grid_v):
     """Cross-check the behavioral grid's FIRST_OUT localparam against
     latency_cycles. The C++ sim core, the wrapper's DRAIN capture window, and
-    the behavioral Verilog model must agree on the first-output cycle (chunked
-    vs full-K-spatial); silent drift would desynchronize cosim capture."""
-    k_chunks = _ceil_div(k, LANE_WIDTH)
-    full_k_spatial = k_chunks > 1 and gemm_k_spatial == k_chunks
+    the behavioral Verilog model must agree on the first-output cycle at every
+    k_spatial/passes combination; silent drift would desynchronize cosim
+    capture."""
     expected = latency_cycles(m, k, n, grid_rows=(m + 7) // 8,
-                              grid_cols=(n + 7) // 8, full_k_spatial=full_k_spatial)
+                              grid_cols=(n + 7) // 8, k_spatial=k_spatial)
     found = re.findall(r"localparam integer FIRST_OUT\s*=\s*(\d+);", grid_v)
     if len(found) != 1 or int(found[0]) != expected:
         raise RuntimeError(
             f"{name}: behavioral grid FIRST_OUT {found} does not match "
             f"latency_cycles()={expected} (m={m} k={k} n={n}, "
-            f"gemm_k_spatial={gemm_k_spatial}). The sim model and the wrapper "
+            f"k_spatial={k_spatial}). The sim model and the wrapper "
             "were generated with inconsistent drain timing."
         )
 
@@ -1754,38 +1707,34 @@ def _check_operand_fits_int8_core(name, operand_label, precision):
 
 
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
-                          gemm_k_spatial=None, input_precision=None, weight_precision=None,
+                          reuse_factor=1, input_precision=None, weight_precision=None,
                           clock_period_ns=None, n_frames=1, weight_matrix=None, **_ignored):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     _check_operand_fits_int8_core(name, "input_precision", input_precision)
     _check_operand_fits_int8_core(name, "weight_precision", weight_precision)
-    gemm_k_spatial = _validate_gemm_k_spatial(k, gemm_k_spatial)
+    resolved = resolve_reuse_factor(k, reuse_factor, name)
+    for w in resolved["warnings"]:
+        print(w, file=sys.stderr)
+    k_spatial = resolved["k_spatial"]
+    passes = resolved["passes"]
+    rf_legalized = resolved["reuse_factor"]
     # Weight-stationary (const-weight) variant: weights (B, shape [K, N]) baked into
     # the core ROM AND the csim header; the wrapper takes no external weight port and
-    # the header entry takes A only. Single source of truth = weight_matrix.
+    # the header entry takes A only. Single source of truth = weight_matrix. Works at
+    # every k_spatial/passes combination -- the ROM builder packs the same beats the
+    # generalized narrow/chunked feed loops expect.
     weights_in_core = weight_matrix is not None
     weight_rom = None
     if weights_in_core:
-        # Two supported feeds, each with its own beat layout:
-        #   k_spatial == 1        chunked   k_chunks*input_beats beats, grid_cols*64 bits
-        #   k_spatial == k_chunks full-K    input_beats beats, 64*k_chunks bits
-        # Full-K widens the word instead of adding beats, so baking the weights costs
-        # no latency. Partial (1 < k_spatial < k_chunks) has no weight-stationary beat
-        # layout yet and is rejected rather than mis-generated.
-        _k_chunks = _ceil_div(k, LANE_WIDTH)
-        _full_k = _k_chunks > 1 and gemm_k_spatial == _k_chunks
-        if gemm_k_spatial != 1 and not _full_k:
-            raise NotImplementedError(
-                f"{name}: weight-stationary supports gemm_k_spatial=1 (chunked) or "
-                f"{_k_chunks} (full-K) for K={k}; partial gemm_k_spatial="
-                f"{gemm_k_spatial} is not supported yet"
+        from gemm_ip.weights import build_weight_rom_k_spatial
+        weight_rom = build_weight_rom_k_spatial(weight_matrix, m, n, k, k_spatial)
+        expected_beats = passes * max(m, n)
+        if len(weight_rom) != expected_beats:
+            raise RuntimeError(
+                f"{name}: weight ROM has {len(weight_rom)} beats, expected "
+                f"{expected_beats} (passes={passes} * max(m,n)={max(m, n)})"
             )
-        if _full_k:
-            from gemm_ip.weights import build_weight_rom_full_k as _brom
-        else:
-            from gemm_ip.weights import build_weight_rom as _brom
-        weight_rom = _brom(weight_matrix, m, n, k)
     # The core saturates the raw integer dot-product to the physical 16-bit
     # output lane; result-precision quantization happens in the wrapper drain
     # (rescale + bias + result-type cast), not in the core.
@@ -1807,25 +1756,26 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     if ts_dir not in sys.path:
         sys.path.insert(0, ts_dir)
     from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
-    if gemm_k_spatial == 1:
+    if k_spatial == 1:
         grid_v = generate_combined_core_verilog(m, k, n, module_name=f"{name}_core", out_bits=out_bits,
                                                 requant_shift=requant_shift, requant_bits=requant_bits,
                                                 weight_rom=weight_rom)
     else:
         print(
-            f"WARNING: {name}: gemm_k_spatial={gemm_k_spatial} is experimental; "
-            "tensor-slice partial outputs are INT16 and partial overflow is possible. "
-            "Correctness depends on quantized operand ranges and partition size.",
+            f"WARNING: {name}: ReuseFactor={rf_legalized} partitions K into "
+            f"k_spatial={k_spatial} parallel chunks; tensor-slice partial outputs "
+            "are INT16 and partial overflow is possible. Correctness depends on "
+            "quantized operand ranges and partition size.",
             file=sys.stderr,
         )
         grid_v = generate_k_spatial_combined_core_verilog(
-            m, k, n, module_name=f"{name}_core", k_spatial=gemm_k_spatial, out_bits=out_bits,
+            m, k, n, module_name=f"{name}_core", k_spatial=k_spatial, out_bits=out_bits,
             requant_shift=requant_shift, requant_bits=requant_bits, weight_rom=weight_rom
         )
     header_text = gen_public_header(
         name, m, k, n, grid_rows, grid_cols,
         result_type=output_precision,
-        gemm_k_spatial=gemm_k_spatial,
+        k_spatial=k_spatial,
         input_precision=input_precision,
         weight_precision=weight_precision,
         clock_period_ns=clock_period_ns,
@@ -1833,7 +1783,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         weight_rom=weight_rom,
     )
     _assert_core_port_widths(name, header_text, grid_v, weights_in_core=weights_in_core)
-    _assert_core_first_out(name, m, k, n, gemm_k_spatial, grid_v)
+    _assert_core_first_out(name, m, k, n, k_spatial, grid_v)
     (pkg_dir / f"{name}_core.v").write_text(grid_v)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
     (pkg_dir / f"{name}_gemm_ip.h").write_text(header_text)
@@ -1851,4 +1801,5 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     ))
     (pkg_dir / "run_catapult.tcl").write_text(
         gen_tcl(name, m, k, n, interface, weights_in_core=weight_matrix is not None))
-    print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface}, k_spatial={gemm_k_spatial})")
+    print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface}, "
+          f"reuse_factor={rf_legalized}, k_spatial={k_spatial})")
