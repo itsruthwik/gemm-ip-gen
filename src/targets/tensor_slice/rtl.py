@@ -379,16 +379,26 @@ endmodule
 
 
 def _weight_rom_block(b_width, weight_rom, n, input_beats):
-    """Shared const-weight ROM: declaration + inline init + beat/base counters + w_rom_out.
+    """Shared const-weight ROM: declaration + inline init + beat/addr counters + w_rom_out.
 
     Emitted once (above the `ifndef SYNTHESIS` split in the combined core) so a single
     ROM feeds both the behavioral-sim and structural-synth branches. The ROM holds only
     ``passes*n`` entries (beat ``t < n`` of each pass carries a real column; beats
-    ``t >= n`` — the tail when ``input_beats == max(m, n) > n`` — are wasted zero
+    ``t >= n`` -- the tail when ``input_beats == max(m, n) > n`` -- are wasted zero
     reads, never stored). ``beat_ctr`` counts one presented input beat per pass
     (0..input_beats-1, mirrors the free-running `in_valid`, matching the order the
-    external `b_cols` port received — pack_b_chunk feed order); ``rom_base`` advances
-    by ``n`` each time ``beat_ctr`` wraps to select the next pass's region of the ROM.
+    external `b_cols` port received -- pack_b_chunk feed order). ``rom_addr`` is the
+    registered ROM read address: it must be a register (not a combinational
+    `rom_base + beat_ctr` expression) because VTR's parmys only infers a clocked
+    `single_port_ram` for `w_rom` when the address is register-fed -- a combinational
+    address makes it infer a clockless RAM and vpr aborts on the missing clock. The
+    zero mux for the tail beats (t >= n) stays on the *output*, after the memory read,
+    never on the address. ``rom_addr`` mirrors beat_ctr's advance within a pass and,
+    on wrap, steps one further to land on the next pass's base: the held value at
+    wrap is always `base + n - 1` (it stops advancing once beat_ctr reaches n - 1),
+    so `rom_addr + 1` is exactly `base + n`, the next pass's base -- for both
+    input_beats == n and input_beats > n. That makes a separate `rom_base` register
+    redundant, so it is dropped.
     """
     hexw = (b_width + 3) // 4
     mask = (1 << b_width) - 1
@@ -407,24 +417,30 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats):
 {rom_init}
     end
     reg [15:0] beat_ctr;
-    reg [15:0] rom_base;
+    // rom_addr must be a plain register whose only driver is this always block and
+    // whose only use is indexing w_rom below: VTR's parmys infers w_rom as a clocked
+    // single_port_ram only when the read address comes straight from a register, not
+    // a combinational rom_base+beat_ctr expression (that form gets clk=unconn and
+    // vpr aborts). Held flat, it always equals the current pass base + beat_ctr.
+    reg [15:0] rom_addr;
     always @(posedge clk) begin
         if (rst) begin
             beat_ctr <= 16'd0;
-            rom_base <= 16'd0;
+            rom_addr <= 16'd0;
         end else if (en) begin
             if (!in_valid) begin
                 beat_ctr <= 16'd0;
-                rom_base <= 16'd0;
+                rom_addr <= 16'd0;
             end else if (beat_ctr < 16'd{input_beats - 1}) begin
                 beat_ctr <= beat_ctr + 16'd1;
+                if (beat_ctr + 16'd1 < 16'd{n}) rom_addr <= rom_addr + 16'd1;
             end else begin
                 beat_ctr <= 16'd0;
-                rom_base <= rom_base + 16'd{n};
+                rom_addr <= rom_addr + 16'd1;
             end
         end
     end
-    wire [{b_width - 1}:0] w_rom_out = (beat_ctr < 16'd{n}) ? w_rom[rom_base + beat_ctr] : {b_width}'d0;
+    wire [{b_width - 1}:0] w_rom_out = (beat_ctr < 16'd{n}) ? w_rom[rom_addr] : {b_width}'d0;
 """
 
 
