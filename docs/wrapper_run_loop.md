@@ -75,14 +75,14 @@ its data beats. With `n_frames == 1` the whole feed is one frame, so
   read from the source once (`a_stream.read()` / `a_rows[t]`) and its 8
   K-bytes are packed into the per-tile 64-bit lane of the blackbox word
   (`ROW_PACK_DIRECT`); the remaining passes are pre-packed into
-  `a_replay[passes][input_beats]` and replayed later. B columns are packed
+  `a_replay[passes-1][M]` and replayed later. B columns are packed
   from `weight_cols` every pass (`COL_PACK`).
 - *Full-K packages* (`k_spatial == k_chunks`, `passes == 1`): a single
   `max(M,N)`-beat pass; each beat carries one logical A row / B column with
   **all** K chunks packed into a widened `64*k_spatial`-bit word. No replay
-  storage is used (the replay array degenerates to size `[1][...]`).
+  storage is used (no `a_replay` array is declared at all).
 - *General (`1 < k_spatial < k_chunks`, multi-pass narrow word)*: the same
-  `a_replay[passes][input_beats]` replay mechanism as the chunked case, but
+  `a_replay[passes-1][M]` replay mechanism as the chunked case, but
   each pass's word carries `k_spatial` K chunks (`64*k_spatial` bits) instead
   of one. B is never replayed at any `k_spatial` -- `weight_cols` is a plain
   array, so every pass simply re-slices the columns it already has in hand.

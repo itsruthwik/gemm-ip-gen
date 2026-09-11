@@ -79,7 +79,7 @@ How those beats reach the blackbox depends on the legalized ReuseFactor
 
 - *Chunked* (`k_spatial == 1`, `passes == k_chunks`): the feed makes
   `k_chunks` passes of `max(M,N)` beats. On pass 0 each A row is read and its
-  later passes are pre-packed into `a_replay[passes][max(M,N)]` for replay on
+  later passes are pre-packed into `a_replay[passes-1][M]` for replay on
   subsequent passes. B columns are re-packed from `weight_cols` every pass.
 - *Full-K* (`k_spatial == k_chunks`, `passes == 1`): a single `max(M,N)`-beat
   pass; each beat carries one A row / B column with **all** K chunks packed

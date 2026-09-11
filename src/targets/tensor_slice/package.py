@@ -402,15 +402,34 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                     }}
                 }}"""
 
-    stream_feed_loop = f"""
+    if passes >= 2:
+        a_replay_decl = f"""
     // Replay storage is packed to the blackbox protocol. HLS4ML still emits
     // each logical K-wide A row once; later K passes replay packed slices.
     // Reused per frame (written at each frame's kc==0 beats, read within the
-    // same frame's later passes — the feed is sequential in step order). At
-    // passes == 1 (full-K) the replay array is size [1][...] and trivially
-    // unused (the loop below never iterates).
-    ac_int<{a_bits}, false> a_replay[{passes}][{input_beats}];
+    // same frame's later passes — the feed is sequential in step order).
+    // Slot 0 (pass 0, fed directly from the stream) is never stored, so the
+    // buffer holds only the {passes - 1} replayed passes, each M rows wide.
+    ac_int<{a_bits}, false> a_replay[{passes - 1}][{m}];
+"""
+        a_prepack_replay = f"""
+                #pragma hls_unroll
+                PREPACK_REPLAY: for (int replay_kc = 1; replay_kc < {passes}; replay_kc++) {{
+                    ac_int<{a_bits}, false> replay_rows = 0;{_a_pack_block("replay_rows", "replay_kc", "ROW_PACK_REPLAY")}
+                    a_replay[replay_kc - 1][t] = replay_rows;
+                }}"""
+        a_replay_else = f"""
+            }} else {{
+                a_rows = a_replay[kc - 1][t];
+            }}"""
+    else:
+        a_replay_decl = ""
+        a_prepack_replay = ""
+        a_replay_else = """
+            }"""
 
+    stream_feed_loop = f"""
+{a_replay_decl}
     // Back-to-back feed of {n_frames} frame(s): M A rows + N B columns, each
     // pass carrying k_spatial={ks} K chunks (passes={passes} sweeps of K).
     // Each frame is ONE in_valid=0 beat (p == 0, carrying the preload pulse)
@@ -431,15 +450,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
 
         if (feeding_now && t < {m}) {{
             if (kc == 0) {{
-                a_beat_T a_beat = a_stream.read();{_a_pack_block("a_rows", "0", "ROW_PACK_DIRECT")}
-                #pragma hls_unroll
-                PREPACK_REPLAY: for (int replay_kc = 1; replay_kc < {passes}; replay_kc++) {{
-                    ac_int<{a_bits}, false> replay_rows = 0;{_a_pack_block("replay_rows", "replay_kc", "ROW_PACK_REPLAY")}
-                    a_replay[replay_kc][t] = replay_rows;
-                }}
-            }} else {{
-                a_rows = a_replay[kc][t];
-            }}
+                a_beat_T a_beat = a_stream.read();{_a_pack_block("a_rows", "0", "ROW_PACK_DIRECT")}{a_prepack_replay}{a_replay_else}
         }}
         {stream_bcols_pack}
 

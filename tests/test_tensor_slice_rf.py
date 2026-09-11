@@ -191,7 +191,14 @@ def test_generate_catapult_pkg_reuse_factor_weight_stationary(scratch_dir, reuse
     assert (pkg_dir / f"{name}_core.v").is_file()
     # passes == expect_replay_size at k=24 (k_chunks=3) for rf in {1,2,3}:
     #   rf=1 -> passes=1, rf=2 -> passes=2, rf=3 -> passes=3.
-    assert f"a_replay[{expect_replay_size}][" in header
+    # Slot 0 (fed directly from the stream) is never stored, so the buffer
+    # holds only the passes-1 replayed passes, each of the m A rows wide.
+    # At passes == 1 (full-K, rf=1) there is nothing to replay: no a_replay
+    # buffer is declared at all.
+    if expect_replay_size == 1:
+        assert "a_replay" not in header
+    else:
+        assert f"a_replay[{expect_replay_size - 1}][{m}]" in header
 
 
 def test_generate_catapult_pkg_manifest_fields_via_flow(scratch_dir):

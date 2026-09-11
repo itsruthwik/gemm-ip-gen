@@ -78,7 +78,7 @@ are the two endpoints of one general layout:
 | A word width | `GRID_ROWS * 64` | `64 * k_spatial` |
 | B word width | `GRID_COLS * 64` | `64 * k_spatial` |
 | per-beat content | one K chunk of row/col `t` | **all** K chunks of row/col `t` |
-| wrapper storage | `a_replay[passes][max(M,N)]` | `a_replay[1][max(M,N)]` (unused) |
+| wrapper storage | `a_replay[passes-1][M]` | none (no replay array declared) |
 
 In general, a narrow-word package (`k_spatial > 1`) uses a `64 * k_spatial`-bit
 word per beat: pass `q`'s beat `t` carries K chunks `q*k_spatial .. q*k_spatial
