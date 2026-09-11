@@ -28,11 +28,7 @@ against the N weight columns, producing M result rows. Entry points:
 ```cpp
 static {name}_ccore gemm;        // the stateful core, shared across calls
 int captured = 0;                // result rows captured so far (this frame)
-ac_int<bias_bits, false> bias_packed = 0;
-
-BIAS_PACK: ...                   // unrolled; packs ZERO bias for the core —
-                                 // the real bias is added at capture time in
-                                 // full precision, after the rescale
+                                 // (no bias packing: the bias is baked into the core)
 
 RUN: for (step = 0; step < total_steps; step++) { ... }  // the frame schedule
 
@@ -104,7 +100,7 @@ beats (the core's frame clock is 0 at the first of them). Every step past the
 feed region is an idle call that advances the core's clock.
 
 `frame_preload` must stay a *live* signal. The behavioral core ignores it
-(bias is zero and added in the drain), but if it folds to a compile-time
+(there is no bias port; the bias is baked into the core), but if it folds to a compile-time
 constant, VTR proves the structural core's `S_IDLE -> S_PRELOAD -> S_RUN` arm
 unreachable, concludes the tensor_slice result path is dead, and prunes every
 slice. Pulsing it on the frame's mandatory idle beat costs nothing.
@@ -116,10 +112,8 @@ if (v) {
     if (captured < M) {
         res_T out_pack;
         for (col = 0; col < N; col++) {          // unrolled
-            ac_int<16,true> raw_val = c_row.slc<16>(col_tile*128 + col_local*16);
-            accum_t value = (rescale raw_val by 2^-(frac_a + frac_b))
-                          + biases[col];          // full-precision bias here
-            out_pack[col] = <cast to result type>; // quantize (round/saturate)
+            ac_int<W,true> raw_val = c_row.slc<W>(col_tile*8*W + col_local*W);  // W = out_width
+            out_pack[col] = <reinterpret raw_val as the result type's mantissa>;
         }
         res_stream.write(out_pack);   // array interface: results[captured] = out_pack;
     }
@@ -130,8 +124,9 @@ if (v) {
 Because the poll runs from step 0, rows are captured whenever they emerge —
 including while later feed beats of the same frame are still being issued
 (deep-K full-K shapes finish their wave shortly after the short feed). The
-core emits raw integer dot products in 16-bit lanes; rescale, bias, and
-result-type quantization all live here in the wrapper.
+core emits finished result codes in `out_width`-bit lanes: requantization
+and the baked bias both live in the core (see `rtl_contract.md`,
+"Requantization and Bias"), so the capture is a pure unpack.
 
 ## Cycle budget
 
@@ -282,16 +277,16 @@ N. `logical_n` (the true N) is a second quantity used only where noted below.
   carries the full logical N), fold-N's per-frame `out_valid` rows only carry
   `N_g` columns of ONE group -- a full logical row does not exist until every
   group has landed. The RUN loop's capture is reduced to a raw store: a
-  `c_buf[M][n_passes * N_g]` buffer (16-bit lanes, no rescale/bias/cast) is
+  `c_buf[M][n_passes * N_g]` buffer (`out_width`-bit lanes, already requantised and biased by the core) is
   written at `c_buf[row][g * N_g + col]` as each frame's rows emerge (`gOut =
   captured / M`, `rowOut = captured % M`, from the same monotonic `captured`
   counter phase 1 uses -- frames retire in order and every row is real, so
   this is exactly "group g's rows land at group g's column offset"). AFTER
-  the RUN loop, a separate `EMIT_FOLD_N` loop of M iterations does today's
-  per-row drain (rescale, bias on the full logical-N row, result cast) once
-  per row, reading `c_buf[row][0..logical_n)` and dropping columns
-  `>= logical_n` (the last group's padding tail); bias indexes the full
-  `biases[]` array by the true (global) column. The stream entry writes each
+  the RUN loop, a separate `EMIT_FOLD_N` loop of M iterations assembles the
+  full logical-N row once per row, reading `c_buf[row][0..logical_n)` and
+  dropping columns `>= logical_n` (the last group's padding tail); the lanes
+  are already final codes (the core indexes its baked bias by the emitting
+  frame's group), so this is a pure unpack. The stream entry writes each
   assembled row to `res_stream`; the array entry writes `results[row][col]`
   directly (element-wise, like phase 1's array capture, to keep the loop
   HLS-unrollable).

@@ -71,9 +71,9 @@ set for a layer. Each entry carries `gemm_m`, `gemm_k`, `gemm_n`,
 | RTL wrapper | `{name}_core.v` |
 | Build script | `run_catapult.tcl` |
 | Interface support | `stream`, `array` |
-| Bias handling | In the wrapper capture path, post-rescale, full precision (the core is fed zero bias) |
-| Core output lane | int16 |
-| Result type | `output_precision` (rescale + bias + round/saturate in wrapper) |
+| Bias handling | Baked into the core as a compile-time constant, added before the final round |
+| Core output lane | `out_width` (from `output_precision`; 8 by default) |
+| Result type | `output_precision` (two-stage round-half-up + wrap in the core; the wrapper is a pure unpack) |
 
 ## Generated outputs
 

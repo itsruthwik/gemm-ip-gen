@@ -51,9 +51,32 @@ def _output_bits(output_precision):
     Drives the GEMM-IP output saturation/packing so the result honors the
     configured precision instead of the legacy hardcoded int8 clamp. Returns 8
     (legacy int8) when unset/unparseable so callers without a precision keep
-    the old behavior. The first ``fixed<>`` field is the total bit width.
+    the old behavior. The first ``fixed<>``/``ac_int<>``/``int<>`` field is the
+    total bit width -- integer precisions (the standalone-package default,
+    e.g. ``ac_int<16, true>``) are matched too, not just fixed<>.
     """
     if not output_precision:
         return 8
-    m = re.search(r"u?fixed<\s*(\d+)", str(output_precision))
+    m = re.search(r"u?(?:ac_)?(?:fixed|int)<\s*(\d+)", str(output_precision))
     return int(m.group(1)) if m else 8
+
+
+def _accum_shift_bits(accum_precision, gemm_frac):
+    """Bit width needed to hold ``accum_precision`` re-expressed with ``gemm_frac``
+    fraction bits (sign included), i.e. the width of the GEMM-scale accumulator
+    the layer's ``accum_t`` implies.
+
+    ``accum_precision`` carries its own fractional bits (``frac_bits(accum_precision)``);
+    its integer-bit count (width - frac, which already includes the sign bit for a
+    signed ``fixed<>``) is preserved and re-based onto ``gemm_frac`` fraction bits:
+    ``int_bits + gemm_frac``. Returns ``None`` when ``accum_precision`` is unset/
+    unparseable -- callers should treat that as "assume it fits 16 bits" (S1 = 0,
+    today's behavior).
+    """
+    bits = _operand_bits(accum_precision)
+    if bits is None:
+        return None
+    width, _signed = bits
+    frac = _frac_bits(accum_precision)
+    int_bits = width - frac
+    return int_bits + int(gemm_frac)

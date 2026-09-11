@@ -63,39 +63,12 @@ def pack_memstream_hex(B, n, k, pe, simd, weight_width, word_bits=None):
 
 
 # ── Bias codes: one baking, two renderings (C twin static array + Verilog ROM) ─────
-
-def bias_acc_codes(bias, product_frac, n, has_bias):
-    """Scale per-column real bias to the accumulator (2^product_frac) domain.
-
-    ``has_bias`` (the manifest's own field, computed by hls4ml from the real bias
-    tensor) is the *only* gate for whether a bias is baked: when True this always
-    returns an N-long list of codes -- even if every one of them rounds to zero at
-    this fixed-point scale -- so the generated hardware matches what hls4ml's own
-    csim expects (an add is present) rather than silently disagreeing with the
-    manifest for a sub-LSB bias. When False, returns None (bake nothing) regardless
-    of what ``bias`` holds. Raises if ``has_bias`` is True but ``bias`` is absent --
-    that combination means the manifest is internally inconsistent, not "no bias".
-
-    This is the single source of truth for the baked bias integers: both the C twin's
-    ``static const long`` array and the RTL requant stage's bias ROM render the same
-    ``codes`` list, so the two textual forms can never drift apart.
-    """
-    if not has_bias:
-        return None
-    if not bias:
-        raise ValueError(
-            "has_bias is True but the manifest has no bias values to bake "
-            "(cfg['bias'] is missing/empty)")
-    codes = [int(round(float(b) * (1 << product_frac))) for b in bias]
-    if len(codes) != n:
-        raise ValueError(f"bias length {len(codes)} != N {n}")
-    return codes
-
-
-def bias_c_decl(name, codes):
-    """``static const long <name>_bias[N] = {...};`` C rendering of *codes*."""
-    return (f"static const long {name}_bias[{len(codes)}] = {{"
-            + ", ".join(str(c) for c in codes) + "};\n")
+#
+# Moved to ``gemm_ip.biasrom`` (target-agnostic; tensor_slice bakes a bias the
+# same way, at its own intermediate scale) -- re-exported here so every existing
+# `_wpack.bias_acc_codes` / `_wpack.bias_c_decl` / `_wpack.bias_verilog_rom` call
+# site in this target keeps working unchanged.
+from gemm_ip.biasrom import bias_acc_codes, bias_c_decl, bias_verilog_rom  # noqa: E402,F401
 
 
 def bias_codes_for_tile(bias_codes, ti, ntile_real, ntile_pad):

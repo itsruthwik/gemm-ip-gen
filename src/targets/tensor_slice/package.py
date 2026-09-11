@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from gemm_ip.common import _is_ac_integer_type
-from gemm_ip.quant import _frac_bits, _operand_bits, _output_bits
+from gemm_ip.quant import _frac_bits, _operand_bits, _output_bits, _accum_shift_bits
 
 # geometry is a sibling target module; put this dir on the path and import by
 # name (the same idiom the RTL loaders below use).
@@ -78,7 +78,7 @@ def dead_cycles(m, k, n, grid_cols, k_spatial=1):
 def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_spatial=1,
                       input_precision=None, weight_precision=None, clock_period_ns=None,
                       n_frames=1, weight_rom=None, m_passes=1, logical_m=None,
-                      n_passes=1, logical_n=None):
+                      n_passes=1, logical_n=None, out_width=16, bias_codes=None, s1=0):
     # Weight-stationary (const-weight) mode: weights live in the RTL wrapper ROM,
     # so the ccore run() drops the b_cols port (matching the ROM wrapper), and the
     # csim-only behavioral branch bakes the same per-beat words into an internal
@@ -87,7 +87,10 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     bb_delay_ns = _blackbox_delay_ns(clock_period_ns)
     row_chunk_bits = grid_rows * 64
     col_chunk_bits = grid_cols * 64
-    c_bits = grid_cols * 128
+    # Output lane narrows to out_width (decision 8/scope item 5): the core
+    # itself now emits the fully-requantised, bias-added result -- the drain
+    # below is a pure unpack, no rescale/bias/cast.
+    c_bits = grid_cols * 8 * out_width
     mr = grid_rows * 8
     ks = int(k_spatial)
     k_chunks = _geom_k_chunks(k)
@@ -100,7 +103,18 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # passes == 1) cases are just its two endpoints.
     a_bits = a_stream_width(m, ks)
     b_bits = b_stream_width(n, ks)
-    bias_bits = col_chunk_bits
+    # Bias is a COMPILE-TIME constant now (decision 4): no bias_cols port at
+    # all. ``bias_codes`` (or None -- the add folds away) is the SAME codes
+    # list baked as the Verilog bias ROM (see rtl.py's _bias_rom_block); here
+    # it is baked as a C twin static array, one 16-bit-equivalent signed
+    # value per column, read at the stage-2 intermediate scale.
+    has_bias = bias_codes is not None
+    from gemm_ip.biasrom import bias_c_decl as _bias_c_decl
+    bias_c_array_name = f"{name}_bias_codes"
+    bias_c_decl_block = (
+        "        " + _bias_c_decl(bias_c_array_name, list(bias_codes)).replace("\n", "\n        ").rstrip() + "\n"
+        if has_bias else ""
+    )
     input_beats = max(m, n)
     total_beats = passes * input_beats
     first_out = latency_cycles(m, k, n, grid_rows, grid_cols, k_spatial=ks)
@@ -120,8 +134,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
             f"(run_calls={run_calls}, total_beats={total_beats}; m={m} k={k} n={n})."
         )
 
-    # Back-to-back multi-frame schedule. No BIAS preload step: bias_packed is zero
-    # and the real bias lives in the drain capture. Each frame is ONE in_valid=0
+    # Back-to-back multi-frame schedule. No BIAS preload step: bias is a
+    # compile-time constant baked into the core (decision 4), not a runtime
+    # port. Each frame is ONE in_valid=0
     # beat (p == 0, carrying a live preload_valid pulse - see the RUN loop comment)
     # followed by total_beats in_valid beats; the idle beat drops the core's
     # `feeding` flag so the next frame allocates a fresh slot.
@@ -168,6 +183,29 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     else:
         grp_static_decl = ""
         grp_static_step = ""
+    # Fold-N + bias: an INDEPENDENT group counter (not gated on
+    # weights_in_core -- fold-N + bias must work with an external b_cols
+    # port too). Unlike the weight ROM's `_grp` (read during FEED, so the
+    # live value at capture time is always correct), bias is read at EMIT
+    # time, many cycles after a frame's own feed ends and (with several
+    # frames in flight) possibly after `_grp`-equivalent tracking has already
+    # advanced to a LATER frame's group -- so each slot freezes its OWN group
+    # in `slot_bias_grp[]` at frame-allocation time (mirrors the old
+    # `bias_buf[wr_slot] = bias_cols` capture), read back at emit time
+    # instead of any live counter.
+    fold_n_bias = bool(fold_n and bias_codes is not None)
+    if fold_n_bias:
+        bias_grp_static_decl = (
+            f"\n        static int _bias_grp = {int(n_passes) - 1};"
+            f"\n        static int slot_bias_grp[{slots}] = {{0}};"
+        )
+        bias_grp_static_step = (
+            f"\n                _bias_grp = (_bias_grp + 1) % {int(n_passes)};"
+            f"\n                slot_bias_grp[wr_slot] = _bias_grp;"
+        )
+    else:
+        bias_grp_static_decl = ""
+        bias_grp_static_step = ""
     logical_n = n if logical_n is None else int(logical_n)
 
     # Choose the RHS expression for the final output assignment based on the
@@ -201,26 +239,38 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     requant_shift = max(0, gemm_shift - _out_frac) if _out_frac else 0
     requant_bits = _output_bits(result_type) if requant_shift else None
     drain_shift = _out_frac if requant_shift else gemm_shift
-    if requant_shift:
-        core_requant_emit = (
-            "                        // Requantise the FULLY accumulated dot product once:\n"
-            "                        // round-half-up, shift, wrap to the result width. Mirrors\n"
-            "                        // requant_acc() in the Verilog sim branch.\n"
-            "                        ac_int<16, true> sat_val;\n"
-            "                        {\n"
-            f"                            ac_int<32, true> _r = (acc + {1 << (requant_shift - 1)}) >> {requant_shift};\n"
-            f"                            sat_val = (ac_int<{requant_bits}, true>) _r;\n"
-            "                        }"
-        )
+    # Two-stage requant (jojo-track/open/tensor-slice-bias-in-rtl, phase 1):
+    # this ccore mirrors the Verilog sim branch's folded model exactly: stage
+    # 1 (round-half-up shift by S1, wrap to 16) applied once to the exact
+    # full sum, then stage 2 (wrap-add the bias at the 16-bit intermediate
+    # scale, round-half-up shift by S2, wrap to the physical lane). No
+    # saturation anywhere -- decision 5. `requant_shift` here is the TOTAL
+    # shift (S1 + S2); S2 is the remainder after S1.
+    _s1 = int(s1) if s1 else 0
+    _s2 = max(0, requant_shift - _s1)
+    _half1 = (1 << (_s1 - 1)) if _s1 > 0 else 0
+    _half2 = (1 << (_s2 - 1)) if _s2 > 0 else 0
+    core_requant_emit = (
+        f"                        ac_int<{out_width}, true> sat_val;\n"
+        "                        {\n"
+        "                            // Stage 1: round-half-up shift the exact sum by S1, wrap to 16.\n"
+        f"                            ac_int<33, true> _r1 = (ac_int<33, true>) acc + {_half1};\n"
+        f"                            ac_int<16, true> _p1 = (ac_int<16, true>) (_r1 >> {_s1});\n"
+        "                            // Stage 2: wrap-add the bias, round-half-up shift by S2, wrap.\n"
+        "                            ac_int<16, true> _biased = _p1 + bias_el;\n"
+        f"                            ac_int<32, true> _r2 = (ac_int<32, true>) _biased + {_half2};\n"
+        f"                            sat_val = (ac_int<{out_width}, true>) (_r2 >> {_s2});\n"
+        "                        }"
+    )
+    if fold_n_bias:
+        # Frozen per-slot group (slot_bias_grp[s], captured at that frame's
+        # allocation) -- NOT the live _bias_grp counter, which may already
+        # have advanced to a later frame's group by emit time.
+        bias_el_expr = f"(ac_int<16, true>) {bias_c_array_name}_bias[slot_bias_grp[s] * {n} + actual_col]"
+    elif has_bias:
+        bias_el_expr = f"(ac_int<16, true>) {bias_c_array_name}_bias[actual_col]"
     else:
-        core_requant_emit = (
-            "                        // Legacy: emit the raw accumulator saturated to the\n"
-            "                        // physical 16-bit lane; the drain does the full rescale.\n"
-            "                        ac_int<16, true> sat_val;\n"
-            "                        if (acc > 32767) sat_val = 32767;\n"
-            "                        else if (acc < -32768) sat_val = -32768;\n"
-            "                        else sat_val = acc;"
-        )
+        bias_el_expr = "(ac_int<16, true>) 0"
     a_el_expr = (
         f"a_buf[s][(k_chunk / {ks}) * {input_beats} + actual_row]"
         f".slc<8>((k_chunk % {ks}) * 64 + k_lane * 8)"
@@ -358,17 +408,15 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                 for (int col = 0; col < {n}; col++) {{
                     int col_tile = col / 8;
                     int col_local = col % 8;
-                    ac_int<16, true> raw_val = c_row.template slc<16>(col_tile * 128 + col_local * 16);
-                    // Rescale the raw integer dot-product by 2^-(fa+fb) to the
-                    // real value, then add the full-precision bias (Keras order:
-                    // matmul + bias, then quantize on the result-type cast below).
-                    typename CONFIG_T::accum_t value =
-                        static_cast<typename CONFIG_T::accum_t>(
-                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {drain_shift})
-                        + (HAS_BIAS
-                               ? static_cast<typename CONFIG_T::accum_t>(biases[col])
-                               : static_cast<typename CONFIG_T::accum_t>(0));
-                    out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
+                    // Pure unpack (decision 8): the core already requantised
+                    // (stage 1 + stage 2, bias baked in) to out_width bits --
+                    // no rescale, no bias add, no accum_t. Reinterpret the
+                    // out_width-bit code as the result type's raw bits.
+                    ac_int<{out_width}, true> raw_val =
+                        c_row.template slc<{out_width}>(col_tile * {8 * out_width} + col_local * {out_width});
+                    typename res_T::value_type out_val;
+                    out_val.set_slc(0, raw_val);
+                    out_pack[col] = out_val;
                 }}
                 %SINK%
             }}
@@ -397,14 +445,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                 for (int col = 0; col < {n}; col++) {{
                     int col_tile = col / 8;
                     int col_local = col % 8;
-                    ac_int<16, true> raw_val = c_row.template slc<16>(col_tile * 128 + col_local * 16);
-                    typename CONFIG_T::accum_t value =
-                        static_cast<typename CONFIG_T::accum_t>(
-                            ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {drain_shift})
-                        + (HAS_BIAS
-                               ? static_cast<typename CONFIG_T::accum_t>(biases[col])
-                               : static_cast<typename CONFIG_T::accum_t>(0));
-                    out_pack[col] = static_cast<typename res_T::value_type>({assign_expr});
+                    // Pure unpack (decision 8) -- see _capture_body's comment.
+                    ac_int<{out_width}, true> raw_val =
+                        c_row.template slc<{out_width}>(col_tile * {8 * out_width} + col_local * {out_width});
+                    typename res_T::value_type out_val;
+                    out_val.set_slc(0, raw_val);
+                    out_pack[col] = out_val;
                 }}
                 res_stream.write(out_pack);
                 written++;
@@ -489,7 +535,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                     int col_tile = col / 8;
                     int col_local = col % 8;
                     c_buf[rowOut][gOut * {n} + col] =
-                        c_row.template slc<16>(col_tile * 128 + col_local * 16);
+                        c_row.template slc<{out_width}>(col_tile * {8 * out_width} + col_local * {out_width});
                 }}
             }}
             captured++;
@@ -538,8 +584,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     // Back-to-back feed of {n_frames} frame(s): M A rows + N B columns, each
     // pass carrying k_spatial={ks} K chunks (passes={passes} sweeps of K).
     // Each frame is ONE in_valid=0 beat (p == 0, carrying the preload pulse)
-    // + {total_beats} in_valid beats (period {period}); the core is fed ZERO
-    // bias (the real bias is added in the drain capture). Every step polls
+    // + {total_beats} in_valid beats (period {period}); bias is a
+    // compile-time constant baked into the core (decision 4). Every step polls
     // out_valid, so rows are captured as they emerge — frame t+1 feeds while
     // frame t drains in the core's FRAME_SLOTS.
     #pragma hls_pipeline_init_interval 1
@@ -567,9 +613,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         // signal. Without it (literal 0) VTR synthesis proves transaction_active,
         // hence the tensor_slice result path, dead and prunes every slice. This
         // reuses the per-frame idle beat (formerly a trailing separator -> now a
-        // leading preload, same period); bias stays 0 here (added in the drain).
+        // leading preload, same period); bias is baked into the core, not fed here.
         ac_int<1, false> frame_preload = (in_feed && p == 0) ? 1 : 0;
-        gemm.run(a_rows, {bcols_run_arg}bias_packed, frame_preload, feed_valid, c_row, v, l);
+        gemm.run(a_rows, {bcols_run_arg}frame_preload, feed_valid, c_row, v, l);
 {_stream_capture_use}
     }}
 """
@@ -602,7 +648,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = (step >= 1 && step <= {total_beats}) ? 1 : 0;
         ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
-        gemm.run(a_rows_packed, {array_bcols_run_arg}bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
+        gemm.run(a_rows_packed, {array_bcols_run_arg}feed_preload_valid, feed_valid, c_row, v, l);
 {array_capture}
     }}
 """
@@ -673,7 +719,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
         ac_int<1, false> feed_preload_valid = (in_feed && p == 0) ? 1 : 0;
-        gemm.run(a_rows_packed, {array_bcols_run_arg}bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
+        gemm.run(a_rows_packed, {array_bcols_run_arg}feed_preload_valid, feed_valid, c_row, v, l);
 {array_capture}
     }}
 """
@@ -744,20 +790,19 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
         ac_int<1, false> feed_preload_valid = (in_feed && p == 0) ? 1 : 0;
-        gemm.run(a_rows_packed, {array_bcols_run_arg}bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
+        gemm.run(a_rows_packed, {array_bcols_run_arg}feed_preload_valid, feed_valid, c_row, v, l);
 {capture_fold_n}
     }}
 """
 
     # Fold-N C assembly: raw group-scoped lanes land in c_buf during the RUN
     # loop above (capture_fold_n); once every group's frame has landed, this
-    # separate M-iteration loop assembles/rescales/biases/casts the full
-    # logical_n-wide rows -- exactly today's per-row drain, just deferred
-    # past the last frame instead of interleaved with the feed. gemm_shift/
-    # bias/result-cast text is identical to _capture_body's, just addressed
-    # by a plain row/col loop over c_buf instead of the live c_row port.
+    # separate M-iteration loop pure-unpacks the full logical_n-wide rows
+    # (decision 8: no rescale/bias/accum_t -- the core already requantised,
+    # bias baked in) -- exactly today's per-row drain, just deferred past the
+    # last frame instead of interleaved with the feed.
     _c_buf_decl = (
-        f"    ac_int<16, true> c_buf[{m}][{n_passes * n}];\n" if fold_n else ""
+        f"    ac_int<{out_width}, true> c_buf[{m}][{n_passes * n}];\n" if fold_n else ""
     )
     _fold_n_emit_body = f"""\
     #pragma hls_pipeline_init_interval 1
@@ -765,13 +810,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         %SINK_DECL%
         #pragma hls_unroll
         for (int col = 0; col < {logical_n}; col++) {{
-            ac_int<16, true> raw_val = c_buf[row][col];
-            typename CONFIG_T::accum_t value =
-                static_cast<typename CONFIG_T::accum_t>(
-                    ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {drain_shift})
-                + (HAS_BIAS
-                       ? static_cast<typename CONFIG_T::accum_t>(biases[col])
-                       : static_cast<typename CONFIG_T::accum_t>(0));
+            ac_int<{out_width}, true> raw_val = c_buf[row][col];
             %SINK_COL%
         }}
         %SINK_ROW%
@@ -780,13 +819,15 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     _emit_stream = (
         _fold_n_emit_body
         .replace("        %SINK_DECL%\n", "        res_T out_pack;\n")
-        .replace("            %SINK_COL%", "            out_pack[col] = static_cast<typename res_T::value_type>({});".format(assign_expr))
+        .replace("            %SINK_COL%",
+                 "            typename res_T::value_type out_val; out_val.set_slc(0, raw_val); out_pack[col] = out_val;")
         .replace("        %SINK_ROW%\n", "        res_stream.write(out_pack);\n")
     ) if fold_n else ""
     _emit_array = (
         _fold_n_emit_body
         .replace("        %SINK_DECL%\n", "")
-        .replace("            %SINK_COL%", "            results[row][col] = static_cast<typename res_T::value_type>({});".format(assign_expr))
+        .replace("            %SINK_COL%",
+                 "            typename res_T::value_type out_val; out_val.set_slc(0, raw_val); results[row][col] = out_val;")
         .replace("        %SINK_ROW%\n", "")
     ) if fold_n else ""
 
@@ -815,18 +856,7 @@ void {name}_gemm_ip_stream_const_weights(
     static {name}_ccore gemm;
     int captured = 0;   // total out_valid pulses seen (incl. padding rows)
     int written = 0;    // real result rows written to res_stream
-    ac_int<{bias_bits}, false> bias_packed = 0;
 {_c_buf_decl}
-    #pragma hls_unroll
-    BIAS_PACK: for (int col = 0; col < {n}; col++) {{
-        int col_tile = col / 8;
-        int col_local = col % 8;
-        // Bias is added in the drain (post-rescale, full precision), so the
-        // pure-matmul core is fed zero bias. Keeps the core a clean integer GEMM.
-        (void) col_tile; (void) col_local;
-        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
-    }}
-
 {stream_feed_loop}
 {_emit_stream}}}
 
@@ -850,16 +880,7 @@ void {name}_gemm_ip_array_const_weights(
     static {name}_ccore gemm;
     int captured = 0;
     ac_int<{a_bits}, false> last_a_rows = 0;
-    ac_int<{bias_bits}, false> bias_packed = 0;
 {_c_buf_decl}
-    #pragma hls_unroll
-    BIAS_PACK_ARRAY_WL: for (int col = 0; col < {n}; col++) {{
-        int col_tile = col / 8;
-        int col_local = col % 8;
-        (void) col_tile; (void) col_local;
-        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
-    }}
-
 {array_feed_loop}
 
     #pragma hls_pipeline_init_interval 1
@@ -868,7 +889,7 @@ void {name}_gemm_ip_array_const_weights(
         ac_int<1, false> v, l;
         ac_int<1, false> drain_valid = 0;
         ac_int<1, false> drain_preload_valid = 0;
-        gemm.run(last_a_rows, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
+        gemm.run(last_a_rows, drain_preload_valid, drain_valid, c_row, v, l);
     }}
 {_emit_array}}}
 """
@@ -898,18 +919,7 @@ void {name}_gemm_ip_stream_buffered_b(
     static {name}_ccore gemm;
     int captured = 0;   // total out_valid pulses seen (incl. padding rows)
     int written = 0;    // real result rows written to res_stream
-    ac_int<{bias_bits}, false> bias_packed = 0;
 {_c_buf_decl}
-    #pragma hls_unroll
-    BIAS_PACK: for (int col = 0; col < {n}; col++) {{
-        int col_tile = col / 8;
-        int col_local = col % 8;
-        // Bias is added in the drain (post-rescale, full precision), so the
-        // pure-matmul core is fed zero bias. Keeps the core a clean integer GEMM.
-        (void) col_tile; (void) col_local;
-        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
-    }}
-
 {stream_feed_loop}
 {_emit_stream}}}
 
@@ -947,19 +957,9 @@ void {name}_gemm_ip_array(
     int captured = 0;
     ac_int<{a_bits}, false> last_a_rows = 0;
     ac_int<{b_bits}, false> last_b_cols = 0;
-    ac_int<{bias_bits}, false> bias_packed = 0;
     constexpr bool HAS_BIAS = false;
     typename CONFIG_T::bias_t *biases = nullptr;
 {_c_buf_decl}
-    #pragma hls_unroll
-    BIAS_PACK_ARRAY: for (int col = 0; col < {n}; col++) {{
-        int col_tile = col / 8;
-        int col_local = col % 8;
-        // Bias is added in the drain (post-rescale, full precision), so the
-        // pure-matmul core is fed zero bias. Keeps the core a clean integer GEMM.
-        (void) col_tile; (void) col_local;
-        bias_packed.set_slc(col_tile * 64 + col_local * 8, ac_int<8, true>(0));
-    }}
 
 {array_feed_loop}
 
@@ -969,7 +969,7 @@ void {name}_gemm_ip_array(
         ac_int<1, false> v, l;
         ac_int<1, false> drain_valid = 0;
         ac_int<1, false> drain_preload_valid = 0;
-        gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
+        gemm.run(last_a_rows, last_b_cols, drain_preload_valid, drain_valid, c_row, v, l);
     }}
 {_emit_array}}}
 """
@@ -1000,8 +1000,7 @@ class {name}_ccore {{
     #pragma hls_design interface ccore blackbox
     void run(
         ac_int<{a_bits}, false>  a_rows,
-{bcols_run_param}        ac_int<{bias_bits}, false>  bias_cols,
-        ac_int<1, false>         preload_valid,
+{bcols_run_param}        ac_int<1, false>         preload_valid,
         ac_int<1, false>         in_valid,
         ac_int<{c_bits}, false>& c_row,
         ac_int<1, false>&        out_valid,
@@ -1024,11 +1023,11 @@ class {name}_ccore {{
             .has_state(true)
             .end();
         c_row = 0;
-        c_row[0] = a_rows[0]{bcols_bb_xor} ^ bias_cols[0] ^ preload_valid[0] ^ in_valid[0];
+        c_row[0] = a_rows[0]{bcols_bb_xor} ^ preload_valid[0] ^ in_valid[0];
         out_valid = in_valid;
         out_last = in_valid;
 #else{brom_decl}
-        // Frame-slot behavioral scheduler (mirrors the RTL sim model): up to
+{bias_c_decl_block}        // Frame-slot behavioral scheduler (mirrors the RTL sim model): up to
         // {slots} frames in flight. A frame starts at the first in_valid call
         // after a non-in_valid call (the FEED protocol always inserts the
         // preload step between frames); each frame keeps a private operand
@@ -1037,11 +1036,10 @@ class {name}_ccore {{
         // frames sustain a frame II of {total_beats + 1} calls.
         static ac_int<{a_bits}, false> a_buf[{slots}][{total_beats}];
         static ac_int<{b_bits}, false> b_buf[{slots}][{passes * n}];
-        static ac_int<{bias_bits}, false> bias_buf[{slots}];
         static int cc_slot[{slots}] = {{0}};
         static bool slot_run[{slots}] = {{false}};
         static int wr_slot = {slots - 1};
-        static bool feeding = false;{grp_static_decl}
+        static bool feeding = false;{grp_static_decl}{bias_grp_static_decl}
 
         c_row = 0;
         out_valid = 0;
@@ -1052,8 +1050,7 @@ class {name}_ccore {{
                 wr_slot = (wr_slot + 1) % {slots};
                 feeding = true;
                 slot_run[wr_slot] = true;
-                cc_slot[wr_slot] = 0;
-                bias_buf[wr_slot] = bias_cols;{grp_static_step}
+                cc_slot[wr_slot] = 0;{grp_static_step}{bias_grp_static_step}
             }}
             if (cc_slot[wr_slot] < {total_beats}) {{
                 a_buf[wr_slot][cc_slot[wr_slot]] = a_rows;
@@ -1083,10 +1080,12 @@ class {name}_ccore {{
                     for (int cl = 0; cl < 8; cl++) {{
                         int actual_col = ct * 8 + cl;
                         ac_int<32, true> acc = 0;
-                        // Apply bias from this frame's bias buffer
-                        ac_int<8, true> bias_el = bias_buf[s].slc<8>(ct * 64 + cl * 8);
+                        // Bias no longer pre-adds into the raw accumulation --
+                        // it lands post-stage-1 (core_requant_emit below), read
+                        // from the compile-time bias_c_array (or 0 -- folds the
+                        // add away when has_bias is False), mirroring the
+                        // Verilog sim branch's bias_rom.
                         if (actual_row < {m} && actual_col < {n}) {{
-                            acc = bias_el;
                             for (int kk = 0; kk < {k}; kk++) {{
                                 int k_chunk = kk / 8;
                                 int k_lane = kk % 8;
@@ -1095,8 +1094,9 @@ class {name}_ccore {{
                                 acc += a_el * b_el;
                             }}
                         }}
+                        ac_int<16, true> bias_el = {bias_el_expr};
 {core_requant_emit}
-                        row_out.set_slc(ct * 128 + cl * 16, sat_val);
+                        row_out.set_slc(ct * {8 * out_width} + cl * {out_width}, sat_val);
                     }}
                 }}
                 c_row = row_out;
@@ -1174,7 +1174,8 @@ template <typename T, unsigned N> struct array {
 
 
 def gen_tb(name, m, k, n, interface="stream", n_frames=1,
-           requant_shift=0, requant_bits=None, drain_shift=None, weight_matrix=None):
+           requant_shift=0, requant_bits=None, drain_shift=None, weight_matrix=None,
+           out_width=16):
     weights_in_core = weight_matrix is not None
     if weights_in_core:
         # Golden uses the SAME baked weights as the core ROM.
@@ -1320,19 +1321,23 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
     }}
 """
 
-    if requant_shift:
-        # Requant path: the core emits an already-requantised code of
-        # `requant_bits` carrying `drain_shift` fractional bits, so the wrapper
-        # hands back the result type itself rather than a raw integer lane.
-        _int_bits = requant_bits - drain_shift
-        res_typedef = (
-            f"typedef nnet::array<ac_fixed<{requant_bits}, {_int_bits}, true>, {n}> res_t;"
-        )
-        check_row = f"""\
-// Per-row golden check for the requantised core: accumulate the whole dot
-// product exactly, requantise ONCE (round-half-up, shift, wrap to the result
-// width), then add the bias in the result's fixed-point domain. Mirrors
-// requant_acc() in the Verilog core plus the wrapper drain.
+    # Two-stage requant, no saturation (jojo-track/open/tensor-slice-bias-in-
+    # rtl, phase 1): the core now ALWAYS applies stage 1 (S1, unknown to this
+    # standalone smoke harness -- treated as 0, a single round) + stage 2
+    # (round-half-up shift by the TOTAL `requant_shift`, wrap to out_width),
+    # bias baked in at generation time (this harness never forwards a real
+    # bias to the packager, so its own `biases[]` fixture is zeroed and
+    # unused -- kept only for entry-point signature compatibility). The
+    # drain is a pure unpack: this reference reinterprets the requantised
+    # code as the result type directly, matching the core bit-for-bit
+    # whenever the packager's own S1 is 0 (the common case).
+    _half = (1 << (requant_shift - 1)) if requant_shift else 0
+    res_typedef = f"typedef nnet::array<ac_int<{out_width}, true>, {n}> res_t;"
+    check_row = f"""\
+// Per-row golden check: accumulate the whole dot product exactly, then
+// round-half-up shift by the total gemm->result shift and wrap to
+// out_width -- no saturation, no bias (baked into the core already, if any;
+// this standalone smoke harness never bakes one).
 static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
                       ac_int<8, true> weights[{n}][{k}], int biases[{n}],
                       int f, int i, int &failed) {{
@@ -1341,39 +1346,11 @@ static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
         for (int kk = 0; kk < {k}; kk++) {{
             gemm_acc += a_row[kk].to_int() * weights[j][kk].to_int();
         }}
-        // Single requantisation of the fully accumulated product.
-        ac_int<32, true> rounded = (ac_int<32, true>)(gemm_acc + {1 << (requant_shift - 1)}) >> {requant_shift};
-        ac_int<{requant_bits}, true> code = (ac_int<{requant_bits}, true>) rounded;
-        // Bias enters after the drain shift, i.e. scaled by 2^drain_shift.
-        ac_int<{requant_bits}, true> expect_code = code + (ac_int<{requant_bits}, true>)(biases[j] << {drain_shift});
-        ac_fixed<{requant_bits}, {_int_bits}, true> expect;
-        expect.set_slc(0, expect_code);
-        if (out[j] != expect) {{
-            printf("Mismatch frame %d row %d col %d: got %f expected %f\\n",
-                   f, i, j, out[j].to_double(), expect.to_double());
-            failed = 1;
-        }}
-    }}
-}}"""
-    else:
-        res_typedef = f"typedef nnet::array<ac_int<16, true>, {n}> res_t;"
-        check_row = f"""\
-// Per-row golden check: raw integer dot-product saturated to the 16-bit output
-// lane, then bias added (matches the core + wrapper-drain order).
-static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
-                      ac_int<8, true> weights[{n}][{k}], int biases[{n}],
-                      int f, int i, int &failed) {{
-    for (int j = 0; j < {n}; j++) {{
-        int gemm_acc = 0;
-        for (int kk = 0; kk < {k}; kk++) {{
-            gemm_acc += a_row[kk].to_int() * weights[j][kk].to_int();
-        }}
-        if (gemm_acc > 32767) gemm_acc = 32767;
-        else if (gemm_acc < -32768) gemm_acc = -32768;
-        gemm_acc += biases[j];
-        if (out[j].to_int() != gemm_acc) {{
+        ac_int<32, true> rounded = (ac_int<32, true>)(gemm_acc + {_half}) >> {requant_shift};
+        ac_int<{out_width}, true> expect_code = (ac_int<{out_width}, true>) rounded;
+        if (out[j].to_int() != expect_code.to_int()) {{
             printf("Mismatch frame %d row %d col %d: got %d expected %d\\n",
-                   f, i, j, out[j].to_int(), gemm_acc);
+                   f, i, j, out[j].to_int(), expect_code.to_int());
             failed = 1;
         }}
     }}
@@ -1428,8 +1405,12 @@ int main() {{
         }}
     }}
 
+    // Bias is compile-time now (decision 4): baked into the core at
+    // generation time, if any. This smoke harness never bakes one, so its
+    // own biases[] fixture is zeroed (kept only for entry-point signature
+    // compatibility; check_row ignores it).
     for (int j = 0; j < {n}; j++) {{
-        biases[j] = (j % 5) - 2;
+        biases[j] = 0;
     }}
 {weights_init}
 
@@ -1492,7 +1473,8 @@ def _const_weights_brom_cpp(b_bits, grid_cols, weight_rom):
 
 
 def gen_inst_cpp(name, m, k, n, interface="stream",
-                 requant_shift=0, requant_bits=None, drain_shift=None, weight_matrix=None):
+                 requant_shift=0, requant_bits=None, drain_shift=None, weight_matrix=None,
+                 out_width=16):
     from geometry import grid_rows, grid_cols
     weights_in_core = weight_matrix is not None
     if weights_in_core and interface == "array":
@@ -1536,13 +1518,9 @@ def gen_inst_cpp(name, m, k, n, interface="stream",
 }}"""
     a_w = grid_rows(m) * 8
     b_w = grid_cols(n) * 8
-    # With a requantising core the wrapper hands back the result type itself
-    # (already rescaled), not the raw integer output lane.
-    res_typedef = (
-        f"typedef nnet::array<ac_fixed<{requant_bits}, {requant_bits - drain_shift}, true>, {n}> res_t;"
-        if requant_shift else
-        f"typedef nnet::array<ac_int<16, true>, {n}> res_t;"
-    )
+    # Pure unpack (decision 8): the core already requantised (bias baked in,
+    # if any); this standalone smoke top just carries the out_width-bit code.
+    res_typedef = f"typedef nnet::array<ac_int<{out_width}, true>, {n}> res_t;"
     return f"""\
 #include "nnet_types.h"
 #include "{name}_gemm_ip.h"
@@ -1948,7 +1926,7 @@ def gen_blackbox_tcl(items):
     return "\n".join(lines) + "\n"
 
 
-_CORE_PORTS = ("a_rows", "b_cols", "bias_cols", "c_row")
+_CORE_PORTS = ("a_rows", "b_cols", "c_row")
 
 
 def _assert_core_port_widths(name, header_text, grid_v, weights_in_core=False):
@@ -2024,6 +2002,7 @@ def _check_operand_fits_int8_core(name, operand_label, precision):
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
                           reuse_factor=1, input_precision=None, weight_precision=None,
                           clock_period_ns=None, n_frames=1, weight_matrix=None, fold_axis="k",
+                          accum_precision=None, bias_precision=None, has_bias=None, bias=None,
                           **_ignored):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
@@ -2076,16 +2055,69 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
                 f"{name}: weight ROM has {len(weight_rom)} beats, expected "
                 f"{expected_beats}"
             )
-    # The core saturates the raw integer dot-product to the physical 16-bit
-    # output lane; result-precision quantization happens in the wrapper drain
-    # (rescale + bias + result-type cast), not in the core.
-    out_bits = 16
-    # Same derivation as the wrapper emitter: requantise once after the full
-    # accumulation instead of clamping the raw accumulator to the lane.
+    # Two-stage requant (jojo-track/open/tensor-slice-bias-in-rtl, phase 1).
+    # S1 (in-slice pre-round) is derived from accum_precision when given; S2
+    # is the remainder of the total gemm->result shift. The output lane
+    # narrows to out_width = _output_bits(output_precision) -- 8 bits when
+    # output_precision is unset (the legacy/no-result-type case: this matches
+    # _output_bits()'s own existing fallback and rtl.py's own out_width
+    # default, so an un-annotated package keeps today's already-established
+    # 8-bit lane rather than reverting to a 16-bit one).
+    out_bits = _output_bits(output_precision)
     _gemm_shift = _frac_bits(input_precision) + _frac_bits(weight_precision)
     _out_frac = _frac_bits(output_precision)
-    requant_shift = max(0, _gemm_shift - _out_frac) if _out_frac else 0
+    _total_shift = max(0, _gemm_shift - _out_frac) if _out_frac else 0
+    _accum_w = _accum_shift_bits(accum_precision, _gemm_shift)
+    s1 = max(0, _accum_w - 16) if _accum_w else 0
+    if s1 > _total_shift:
+        raise RuntimeError(
+            f"{name}: accum_precision needs S1={s1} bits of in-slice pre-rounding, "
+            f"more than the total gemm->result shift ({_total_shift}); the output "
+            "needs more than 16 bits of range at the gemm scale.")
+    if s1 > 0:
+        print(f"WARNING: {name}: accum_t forces S1={s1} (in-slice pre-round); "
+              "the phase-1 sim model folds the whole contraction before rounding, "
+              "so this double-rounds against the per-partition synth behavior -- "
+              "see jojo-track/open/tensor-slice-bias-in-rtl.", file=sys.stderr)
+    s2 = _total_shift - s1
+    # gen_inst_cpp/gen_tb's own self-check reference is still a single-round
+    # formula (gemm_acc rounded once by `requant_shift`, bias added at
+    # `drain_shift`) -- it must use the TOTAL shift, not S2 alone, or it
+    # silently under-shifts whenever S1 > 0. This makes the C++ testbench's
+    # self-check a single-round reference (identical to the two-stage DUT
+    # when S1 == 0; expected to disagree by <= 1 output LSB when S1 > 0 --
+    # decision 7 -- not a silent bug, a loud measured mismatch).
+    requant_shift = _total_shift
     requant_bits = _output_bits(output_precision) if requant_shift else None
+
+    # Bake the bias (decision 4): baked at the intermediate scale (gemm_frac
+    # - S1, the scale stage 2 adds it at), one 16-bit signed code per column,
+    # via the SAME shared helper mvau uses (gemm_ip.biasrom), so the C twin
+    # and the Verilog ROM render from one codes list.
+    from gemm_ip.biasrom import bias_acc_codes as _bias_acc_codes
+    _has_bias = bool(has_bias)
+    _intermediate_frac = max(0, _gemm_shift - s1)
+    bias_codes = None
+    if _has_bias:
+        if fold_n:
+            # Fold-N replays the SAME physical core_n-wide core across
+            # n_passes column groups; the bias ROM is baked n_passes*core_n
+            # wide (like the weight ROM's n_full), group g's REAL columns at
+            # base g*core_n, zero-padded tail -- the RTL's out_grp-indexed
+            # lookup (frozen per-frame, not the live/already-advanced group
+            # counter) selects the right slice at emit time.
+            _real_codes = _bias_acc_codes(bias, _intermediate_frac, n, True)
+            bias_codes = [0] * (n_passes * core_n)
+            bias_codes[:n] = _real_codes
+        else:
+            bias_codes = _bias_acc_codes(bias, _intermediate_frac, core_n, True)
+        _bad = [c for c in bias_codes if not (-32768 <= c <= 32767)]
+        if _bad:
+            raise RuntimeError(
+                f"{name}: bias code(s) {_bad} do not fit the 16-bit stage-2 "
+                f"intermediate scale (2^{_intermediate_frac} fractional bits) -- "
+                "reduce the bias magnitude or accum_precision's fractional bits.")
+
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2101,9 +2133,10 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         sys.path.insert(0, ts_dir)
     from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
     if k_spatial == 1:
-        grid_v = generate_combined_core_verilog(core_m, k, core_n, module_name=f"{name}_core", out_bits=out_bits,
-                                                requant_shift=requant_shift, requant_bits=requant_bits,
-                                                weight_rom=weight_rom, n_passes=n_passes)
+        grid_v = generate_combined_core_verilog(core_m, k, core_n, module_name=f"{name}_core",
+                                                out_width=out_bits, s1=s1, s2=s2,
+                                                weight_rom=weight_rom, n_passes=n_passes,
+                                                bias_codes=bias_codes)
     else:
         print(
             f"WARNING: {name}: ReuseFactor={rf_legalized} partitions K into "
@@ -2113,9 +2146,9 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             file=sys.stderr,
         )
         grid_v = generate_k_spatial_combined_core_verilog(
-            core_m, k, core_n, module_name=f"{name}_core", k_spatial=k_spatial, out_bits=out_bits,
-            requant_shift=requant_shift, requant_bits=requant_bits, weight_rom=weight_rom,
-            n_passes=n_passes,
+            core_m, k, core_n, module_name=f"{name}_core", k_spatial=k_spatial,
+            out_width=out_bits, s1=s1, s2=s2, weight_rom=weight_rom,
+            n_passes=n_passes, bias_codes=bias_codes,
         )
     header_text = gen_public_header(
         name, core_m, k, core_n, grid_rows, grid_cols,
@@ -2130,6 +2163,9 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         logical_m=m,
         n_passes=n_passes,
         logical_n=n,
+        out_width=out_bits,
+        s1=s1,
+        bias_codes=bias_codes,
     )
     _assert_core_port_widths(name, header_text, grid_v, weights_in_core=weights_in_core)
     _assert_core_first_out(name, core_m, k, core_n, k_spatial, grid_v)
@@ -2143,13 +2179,13 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         name, m, k, n, interface,
         requant_shift=requant_shift, requant_bits=requant_bits,
         drain_shift=(_out_frac if requant_shift else _gemm_shift),
-        weight_matrix=weight_matrix,
+        weight_matrix=weight_matrix, out_width=out_bits,
     ))
     (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(
         name, m, k, n, interface, n_frames=n_frames,
         requant_shift=requant_shift, requant_bits=requant_bits,
         drain_shift=(_out_frac if requant_shift else _gemm_shift),
-        weight_matrix=weight_matrix,
+        weight_matrix=weight_matrix, out_width=out_bits,
     ))
     (pkg_dir / "run_catapult.tcl").write_text(
         gen_tcl(name, m, k, n, interface, weights_in_core=weight_matrix is not None))

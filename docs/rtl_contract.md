@@ -29,7 +29,7 @@ Catapult-style core:
 ```verilog
 module {name}_core(
     clk, rst, en,
-    a_rows, b_cols, bias_cols,
+    a_rows, b_cols,
     preload_valid, in_valid,
     c_row, out_valid, out_last
 );
@@ -177,14 +177,43 @@ and this file's fold-M section above for the row-fold analogue.
 4. After the final K chunk, the output collector releases one tile-row at a
    time and concatenates its column tiles into full output rows.
 
-## Bias
+## Requantization and Bias
 
-The core is a **pure integer matmul**. `bias_cols` is driven with zero by every
-generated wrapper; the real bias is added in the C++ wrapper's capture path,
-after the `2^-(frac_a + frac_b)` rescale, in full `accum_t` precision, and
-before the result-type quantization (Keras order: matmul + bias, then quantize).
-The `bias_cols` port and the preload phase are retained in the RTL contract, but
-no generated flow uses them to carry coefficients.
+The slices are a **pure integer matmul**; the core owns everything after it, in
+two stages, and `c_row` carries finished result codes of `out_width` bits per
+column (`c_bits = GRID_COLS * 8 * out_width`).
+
+- **Stage 1, in the slice.** The full K contraction accumulates in 32 bits. The
+  slice's 16-bit output is that sum after a round-half-up shift by `S1` and a
+  wrap to 16 bits. `S1` is an IP parameter set out of band; the generator
+  records it as a comment above each instantiation (VTR's hard-block model has
+  no parameters, so it is not a Verilog override). `S1 = 0` is a pass-through
+  and is the normal case: the generator derives `S1` from the layer's
+  `accum_t` as the smallest shift that makes the gemm-scale accumulator fit
+  16 bits, and warns when it is nonzero (that layer double-rounds).
+- **Stage 2, in the wrapper.** The 16-bit partials of the K partitions are
+  summed in 16-bit wrapping arithmetic (one term in the chunked path), the
+  bias is added at that intermediate scale (`frac_a + frac_b - S1`), then a
+  round-half-up shift by `S2` and a wrap to `out_width`. `S1 + S2 =
+  frac_a + frac_b - frac_out`. No saturation anywhere.
+
+The bias is a **compile-time constant**: one 16-bit signed lane per column,
+baked into the core as a flat `wire` from the same codes list the C behavioral
+core and mvau use (`gemm_ip/biasrom.py`). It is a flat wire, not a `reg`
+array, because parmys would otherwise infer an unclocked memory and vpr would
+abort. Under fold-N the wire holds `n_passes * core_n` lanes and is indexed by
+the emitting frame's column group, latched when the frame is allocated (the
+live feed-side group counter has already advanced by emit time). There is no
+bias port. The preload phase remains in the protocol only to keep the
+structural core's `S_PRELOAD` arm live.
+
+The hls4ml-facing drain is a pure unpack: it slices `out_width` bits per
+column and reinterprets them as the result type's mantissa.
+
+The behavioral sim branch folds the whole contraction into one exact
+accumulator before stage 1, so it does not mirror the per-partition stage 1
+of the structural branch. The two agree exactly when `S1 = 0`; aligning them
+structurally is a separate item.
 
 ## Output Collector
 

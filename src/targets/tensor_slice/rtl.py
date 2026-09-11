@@ -18,42 +18,182 @@ from pathlib import Path
 from geometry import tail_mask_hex, vm, total_cycles as _total_cycles
 
 
-def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
-                         requant_shift=0, requant_bits=None, weight_rom=None, emit_rom=True,
-                         n_passes=1):
-    # Body of requant_acc(): applied ONCE to the fully-accumulated dot product.
-    # Emit requant_acc() ONLY when it is used. A declared-but-unused function is
-    # dead Verilog, but it still perturbs synthesis (measured -1.2% Fmax on a
-    # requant_shift==0 design), so requant_shift==0 must reproduce the original
-    # output byte-for-byte.
-    _use_requant = bool(requant_shift and requant_shift > 0)
-    if _use_requant:
-        _w = requant_bits or 8
-        _half = 1 << (requant_shift - 1)
-        requant_fn = f"""
-    // Requantise the FULL contraction once, after everything has been summed
-    // (in-slice and cross-chunk alike are folded into `acc` here, which is the
-    // whole point of the behavioural model). Round-half-up, shift, then reduce
-    // to the output width.
-    function signed [15:0] requant_acc;
+# ── Two-stage requant, shared by every sim/synth emitter below ────────────────
+#
+# Phase 1 of jojo-track/open/tensor-slice-bias-in-rtl: the slice's raw K
+# contraction is requantised in exactly two stages, both round-half-up + wrap
+# (never saturate):
+#   stage 1 (in-slice, S1): round-half-up shift by S1, wrap to 16 bits. S1 is a
+#     Verilog module PARAMETER on the tensor_slice_int8 black box, not a port;
+#     the sim behavioural model applies it once to the exact full sum (see the
+#     "Sim vs synth branches" note in the plan -- phase 2 moves this per-K-
+#     partition).
+#   stage 2 (in the wrapper, S2): sum the 16-bit partials in 16-bit WRAPPING
+#     arithmetic, add the bias (16-bit signed, baked at the intermediate scale
+#     gemm_frac - S1), round-half-up shift by S2, wrap to out_width.
+# Stage 2 is emitted as ONE Verilog function shared by every call site (chunked
+# and K-spatial, sim and synth): only the two arguments (the wrapping partial
+# sum and the bias value) differ per call site, never the function body.
+
+
+def _bias_rom_block(bias_codes, rom_name="bias_rom", width=16):
+    """Compile-time bias constant (decision 4): one *width*-bit signed lane per
+    output column, rendered from the SAME codes list the C behavioral core
+    bakes as a static array (``gemm_ip.biasrom``).
+
+    Emitted as a single FLAT ``wire`` concatenation, not a ``reg`` array: VTR's
+    parmys turns any initialised reg array into a single_port_ram even when every
+    read index is a constant, and a memory with no clocked read then trips vpr's
+    ``clk_pin`` assertion (the same failure the weight ROM's registered-address
+    read exists to avoid). A flat wire with ``[idx*width +: width]`` part-selects
+    is pure wiring for constant indices and a plain mux for the fold-N group
+    index. Readers use ``_bias_lane(rom_name, idx_expr)``.
+    """
+    codes = [int(c) for c in bias_codes]
+    n = len(codes)
+    lanes = []
+    for c in reversed(codes):  # MSB-first concatenation: lane i at [i*width +: width]
+        lanes.append(f"{width}'sd{c}" if c >= 0 else f"-{width}'sd{-c}")
+    body = ",\n        ".join(lanes)
+    return (f"\n    // Baked bias, one {width}-bit signed lane per column (lane i at [i*{width} +: {width}]).\n"
+            f"    wire [{n * width - 1}:0] {rom_name} = {{\n        {body}\n    }};\n")
+
+
+def _bias_lane(rom_name, idx_expr, width=16):
+    """Signed *width*-bit part-select of the flat bias wire at column *idx_expr*."""
+    return f"$signed({rom_name}[({idx_expr}) * {width} +: {width}])"
+
+
+def _fold_n_bias_group_decl(n_passes, reg_name="bias_grp_ctr"):
+    """Independent fold-N group counter for the bias ROM (synth branches).
+
+    Mirrors ``_weight_rom_block``'s ``grp_ctr`` (advances once per frame
+    boundary, on the idle beat right after a frame's feed beats), but is
+    NOT tied to weight-stationarity -- fold-N + bias must work with an
+    external b_cols port too, where no weight ROM/grp_ctr exists at all.
+
+    CAUTION (this is the bug the fold-N + bias item exists to avoid): this
+    live counter tracks the group being FED, which advances as soon as a
+    frame's beats stop (well before that same frame's own K-contraction
+    pipeline latency + drain complete). It is NOT the right index to read
+    the bias ROM with at EMIT time for THAT frame -- callers must latch a
+    frozen per-frame copy (e.g. on ``preload_d``/``slice_start``, before the
+    new frame's own feed can retire and advance this counter again) and use
+    the frozen copy in the drain/stage-2 lookup instead of this live one.
+    """
+    if int(n_passes) <= 1:
+        return "", ""
+    decl = f"""
+    // Fold-N bias group counter (independent of the weight ROM's grp_ctr --
+    // must work with an external b_cols port too). Advances once per frame
+    // boundary; CALLERS MUST LATCH a frozen per-frame copy for the drain
+    // (see _fold_n_bias_group_decl's docstring).
+    reg [15:0] {reg_name};
+    reg {reg_name}_was_feeding;"""
+    body = f"""
+            if (!in_valid) begin
+                if ({reg_name}_was_feeding) begin
+                    if ({reg_name} + 16'd1 >= 16'd{n_passes}) {reg_name} <= 16'd0;
+                    else {reg_name} <= {reg_name} + 16'd1;
+                end
+                {reg_name}_was_feeding <= 1'b0;
+            end else begin
+                {reg_name}_was_feeding <= 1'b1;
+            end"""
+    return decl, body
+
+
+def _stage1_function(s1, func_name="stage1"):
+    """Sim-branch stage 1: round-half-up shift the exact 32-bit sum by *s1*
+    bits, then wrap to 16. ``s1 == 0`` is a true pass-through (low 16 bits of
+    the raw sum, no rounding) -- decision 2 in the plan.
+    """
+    if s1 and s1 > 0:
+        half = 1 << (s1 - 1)
+        body = (
+            f"            r = (x + 32'sd{half}) >>> {s1};\n"
+        )
+    else:
+        body = "            r = x;\n"
+    return f"""\
+    function signed [15:0] {func_name};
         input signed [31:0] x;
         reg signed [31:0] r;
         begin
-            r = (x + 32'sd{_half}) >>> {requant_shift};
-            requant_acc = $signed(r[{_w-1}:0]);
+{body}            {func_name} = r[15:0];
         end
     endfunction
 """
+
+
+def _stage2_function(s2, out_width, func_name="stage2"):
+    """Wrapper-side stage 2, shared verbatim by every emitter: wrap-add the
+    bias to the (already 16-bit-wrapping-summed) partial, round-half-up shift
+    by *s2*, wrap to *out_width*. Both inputs are 16-bit signed; the addition
+    ``sum_partials + bias_val`` truncates (Verilog assignment semantics) to
+    the declared 16-bit ``biased`` reg, which is exactly the 16-bit wrap the
+    plan calls for. ``s2 == 0`` skips the half-LSB round (identity shift).
+    """
+    half = (1 << (s2 - 1)) if s2 and s2 > 0 else 0
+    shift = int(s2) if s2 else 0
+    sext = "{16{biased[15]}}, biased"
+    return (
+        f"    function signed [{out_width - 1}:0] {func_name};\n"
+        "        input signed [15:0] sum_partials;\n"
+        "        input signed [15:0] bias_val;\n"
+        "        reg signed [15:0] biased;\n"
+        "        reg signed [31:0] r;\n"
+        "        begin\n"
+        "            biased = sum_partials + bias_val;\n"
+        f"            r = ({{{sext}}} + 32'sd{half}) >>> {shift};\n"
+        f"            {func_name} = r[{out_width - 1}:0];\n"
+        "        end\n"
+        "    endfunction\n"
+    )
+
+
+def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
+                         s1=0, s2=0, out_width=16, weight_rom=None, emit_rom=True,
+                         n_passes=1, bias_codes=None, emit_bias_rom=True,
+                         bias_rom_name="bias_rom"):
+    has_bias = bias_codes is not None
+    bias_rom_block = _bias_rom_block(bias_codes, bias_rom_name) if (has_bias and emit_bias_rom) else ""
+    # Two-stage requant (jojo-track/open/tensor-slice-bias-in-rtl, phase 1):
+    # stage 1 rounds/wraps the FULL contraction (in-slice and cross-chunk
+    # folded into `acc`, the whole point of the behavioural model) to 16 bits
+    # once; stage 2 (shared verbatim with every other emitter) wrap-adds the
+    # bias and rounds/wraps to out_width. Both stages are plain functions, no
+    # saturation anywhere.
+    #
+    # Bias is a COMPILE-TIME constant (decision 4): no bias_cols port. When
+    # has_bias, the caller (generate_combined_core_verilog et al.) has
+    # already declared a `bias_rom` array (one 16-bit signed entry/column, at
+    # the intermediate scale) hoisted above `ifndef SYNTHESIS`, above this
+    # module's own text; this generator only REFERENCES it by name -- never
+    # declares it, so sim and synth read the exact same ROM. When not
+    # has_bias, the add folds away to a literal 0 (no ROM at all).
+    stage_fns = _stage1_function(s1) + "\n" + _stage2_function(s2, out_width)
+    # Fold-N + bias: the bias ROM holds n_passes*n entries (group g's real
+    # columns at base g*n, like the weight ROM); a frame/slot's bias group is
+    # NOT the live bias_grp_ctr at emit time (it may already have advanced to
+    # the NEXT frame's group by then -- see _fold_n_bias_group_decl) but a
+    # frozen per-slot copy latched at that slot's allocation, mirroring
+    # exactly how the old (removed) bias_buf captured per-slot bias values.
+    _fold_n_bias = bool(has_bias and n_passes and int(n_passes) > 1)
+    if _fold_n_bias:
+        _bias_expr = f"{_bias_lane(bias_rom_name, f'slot_grp[s] * {n} + actual_col')}"
+    elif has_bias:
+        _bias_expr = f"{_bias_lane(bias_rom_name, 'actual_col')}"
     else:
-        requant_fn = ""
-    _sat_call = "requant_acc(acc)" if _use_requant else "sat_int8(acc)"
+        _bias_expr = "16'sd0"
+    _sat_call = f"stage2(stage1(acc), {_bias_expr})"
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     a_width = grid_rows * 64
     b_width = grid_cols * 64
     a_chunk_width = a_width
     b_chunk_width = b_width
-    c_width = grid_cols * 128
+    c_width = grid_cols * 8 * out_width
     input_beats = max(m, n)
     k_chunks = (k + 7) // 8
     passes = -(-k_chunks // k_spatial)
@@ -64,7 +204,6 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
         # pass, no grid padding.
         a_width = 64 * k_spatial
         b_width = 64 * k_spatial
-    bias_width = grid_cols * 64
     total_input_beats = passes * input_beats
     total_output_rows = m
     # Wave-latency term: use k directly whenever there is no K-chunk padding
@@ -192,8 +331,7 @@ module {module_name}(
     input  wire                   rst,
     input  wire                   en,
     input  wire [{a_width-1}:0]   a_rows,
-{sim_b_cols_port}    input  wire [{bias_width-1}:0]   bias_cols,
-    input  wire                   preload_valid,
+{sim_b_cols_port}    input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
     output reg                    out_valid,
@@ -206,7 +344,7 @@ module {module_name}(
 
     {behav_name} grid (
         .clk(clk), .rst(rst), .en(en),
-        .a_rows(a_rows), .b_cols({sim_b_src}), .bias_cols(bias_cols),
+        .a_rows(a_rows), .b_cols({sim_b_src}),
         .preload_valid(preload_valid), .in_valid(in_valid),
         .c_row(behav_c_row), .out_valid(behav_out_valid), .out_last(behav_out_last)
     );
@@ -231,14 +369,13 @@ module {behav_name}(
     input  wire                   en,
     input  wire [{a_width-1}:0]   a_rows,
     input  wire [{b_width-1}:0]   b_cols,
-    input  wire [{bias_width-1}:0]   bias_cols,
     input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
     output reg                    out_valid,
     output reg                    out_last
 );
-
+{bias_rom_block}
     localparam integer INPUT_BEATS       = {input_beats};
     localparam integer K_CHUNKS          = {k_chunks};
     localparam integer TOTAL_INPUT_BEATS = {total_input_beats};
@@ -254,11 +391,12 @@ module {behav_name}(
     // (~one result row per cycle) while each frame keeps its own FIRST_OUT.
     reg signed [7:0]  amat [0:{slots * m - 1}][0:{k - 1}];
     reg signed [7:0]  bmat [0:{slots * k - 1}][0:{n - 1}];
-    reg signed [7:0]  bias_buf [0:{slots * n - 1}];
     reg [31:0] cc_slot [0:{slots - 1}];
     reg        slot_run [0:{slots - 1}];
     reg [31:0] wr_slot;
     reg        feeding;
+{"    reg [15:0] slot_grp [0:" + str(slots - 1) + "];" if _fold_n_bias else ""}
+{"    reg [15:0] bias_grp_ctr;" if _fold_n_bias else ""}
 
     // ── Diagnostics (parsed by the testbench; not load-bearing) ────────────
     reg [31:0] beh_cyc;
@@ -268,17 +406,9 @@ module {behav_name}(
     integer i, j, kk, lane, tile, s;
     integer ws, cc, scc, cc_chunk, cc_beat, out_idx, actual_row, actual_col;
 {extra_int_decls}    reg signed [31:0] acc;
-    reg signed [15:0] sat;
+    reg signed [{out_width-1}:0] sat;
 
-    function signed [15:0] sat_int8;
-        input signed [31:0] x;
-        begin
-            if (x > 32'sd127) sat_int8 = 16'sd127;
-            else if (x < -32'sd128) sat_int8 = -16'sd128;
-            else sat_int8 = x[15:0];
-        end
-    endfunction
-{requant_fn}
+{stage_fns}
     // ═══════════════════════════════════════════════════════════════════════
     // Frame-slot clk_cnt schedule. A frame starts at the first in_valid call
     // after a non-in_valid call (the wrapper protocol always inserts at least
@@ -297,6 +427,7 @@ module {behav_name}(
             end
             wr_slot        <= FRAME_SLOTS - 1;
             feeding        <= 1'b0;
+{"            bias_grp_ctr   <= 16'd0;" if _fold_n_bias else ""}
             c_row          <= {c_width}'d0;
             out_valid      <= 1'b0;
             out_last       <= 1'b0;
@@ -320,8 +451,8 @@ module {behav_name}(
                     feeding      <= 1'b1;
                     slot_run[ws] <= 1'b1;
                     cc_slot[ws]  <= 32'd1;   // cc = 0 is consumed this cycle
-                    for (j = 0; j < {n}; j = j + 1)
-                        bias_buf[ws * {n} + j] <= bias_cols[(j / 8) * 64 + (j % 8) * 8 +: 8];
+{"                    slot_grp[ws] <= bias_grp_ctr;" if _fold_n_bias else ""}
+{f"                    if (bias_grp_ctr + 16'd1 >= 16'd{n_passes}) bias_grp_ctr <= 16'd0; else bias_grp_ctr <= bias_grp_ctr + 16'd1;" if _fold_n_bias else ""}
                     if (prev_beh_start == 0) beh_ii_val <= 32'd0;
                     else                     beh_ii_val <= beh_cyc - prev_beh_start;
                     prev_beh_start <= beh_cyc;
@@ -350,14 +481,17 @@ module {behav_name}(
                             for (lane = 0; lane < 8; lane = lane + 1) begin
                                 actual_col = tile * 8 + lane;
                                 if (actual_row < {m} && actual_col < {n}) begin
-                                    acc = bias_buf[s * {n} + actual_col];
+                                    // Pure integer GEMM: no bias here (decision
+                                    // 4 -- bias lands between stage 1 and stage
+                                    // 2, not folded into the raw accumulation).
+                                    acc = 32'sd0;
                                     for (kk = 0; kk < {k}; kk = kk + 1)
                                         acc = acc + (amat[s * {m} + actual_row][kk] * bmat[s * {k} + kk][actual_col]);
                                     sat = {_sat_call};
                                 end else begin
-                                    sat = 16'sd0;
+                                    sat = {out_width}'sd0;
                                 end
-                                c_row[tile * 128 + lane * 16 +: 16] <= sat;
+                                c_row[tile * {8 * out_width} + lane * {out_width} +: {out_width}] <= sat;
                             end
                         end
                         out_valid <= 1'b1;
@@ -479,13 +613,21 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1):
 
 
 def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="chained", debug=False,
-                           weight_rom=None, emit_rom=True, n_passes=1):
+                           weight_rom=None, emit_rom=True, n_passes=1,
+                           s1=0, s2=0, out_width=16, bias_codes=None, emit_bias_rom=True,
+                           bias_rom_name="bias_rom"):
+    has_bias = bias_codes is not None
+    bias_rom_block = _bias_rom_block(bias_codes, bias_rom_name) if (has_bias and emit_bias_rom) else ""
+    _fold_n_bias = bool(has_bias and n_passes and int(n_passes) > 1)
+    _bias_grp_decl, _bias_grp_body = (
+        _fold_n_bias_group_decl(n_passes) if _fold_n_bias else ("", "")
+    )
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
 
     a_width = grid_rows * 64
     b_width = grid_cols * 64
-    c_width = grid_cols * 128
+    c_width = grid_cols * 8 * out_width
     input_beats = max(m, n)
     total_output_rows = grid_rows * 8
     k_chunks = (k + 7) // 8
@@ -531,12 +673,14 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
     for r in range(grid_rows):
         for c in range(grid_cols):
             inst_lines.append(f"""\
+        // S1 = {s1}: in-slice stage-1 round-half-up shift (IP parameter, set out of band;
+        // not passed as a Verilog override -- the VTR hard-block model has no parameters)
         (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_r{r}_c{c} (
             .clk(clk), .reset(slice_reset), .pe_reset(slice_pe_reset),
             .start_mat_mul(slice_start),
             .done_mat_mul(done_mat_mul[{r*grid_cols+c}]),
             .a_data(a_data_{r}_{c}),
-            .b_data(preload_d ? bias_cols_q[{c}*64 +: 64] : b_data_{r}_{c}),
+            .b_data(b_data_{r}_{c}),
             .a_data_in(a_chain_{r}_{c}),
             .b_data_in(b_chain_{r}_{c}),
             .a_data_out(a_chain_{r}_{c+1}),
@@ -569,11 +713,37 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
         release = (f"emit_phase && (cur_row_tile == 16'd{r})"
                    if grid_rows > 1 else "emit_phase")
         op0_decl.append(f"    wire op0_{r} = !({release});")
+    # Stage 2 (shared with every other emitter -- see _stage2_function): the
+    # chunked path's slice output IS the full K contraction (single
+    # partition, one term), so each lane's stage 2 call sums exactly one
+    # partial. Was: a raw 16-bit c_data concat, with bias injected upstream
+    # via the (now-removed) preload mux; now: the drain applies stage 2 per
+    # lane, narrowing to out_width and adding the bias from the compile-time
+    # bias_rom (or a literal 0 when has_bias is False -- folds the add away).
+    if _fold_n_bias:
+        # Frozen per-frame group (see _fold_n_bias_group_decl): latched from
+        # the live counter at this frame's preload, held through its own
+        # drain -- NOT the live counter itself (which may already have
+        # advanced to the next frame's group by the time this frame emits).
+        _bias_expr_synth = (
+            lambda c, lane: _bias_lane(bias_rom_name, f"out_grp * {n} + {c * 8 + lane}"))
+    elif has_bias:
+        _bias_expr_synth = (lambda c, lane: _bias_lane(bias_rom_name, str(c * 8 + lane)))
+    else:
+        _bias_expr_synth = (lambda c, lane: "16'sd0")
     row_avail_decl = []
     row_data_decl = []
     for r in range(grid_rows):
         avail_terms = " & ".join(f"c_avail_{r}_{c}" for c in range(grid_cols))
-        concat = "{" + ", ".join(f"c_data_{r}_{c}" for c in range(grid_cols - 1, -1, -1)) + "}"
+        tiles = []
+        for c in range(grid_cols):
+            lanes = ", ".join(
+                f"stage2($signed(c_data_{r}_{c}[{lane}*16 +: 16]), "
+                f"{_bias_expr_synth(c, lane)})"
+                for lane in range(7, -1, -1)
+            )
+            tiles.append("{" + lanes + "}")
+        concat = "{" + ", ".join(reversed(tiles)) + "}"
         row_avail_decl.append(f"    wire row_avail_{r} = {avail_terms};")
         row_data_decl.append(f"    wire [{c_width-1}:0] row_data_{r} = {concat};")
     mux_lines = []
@@ -615,6 +785,8 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
         b_cols_q_src = "b_cols"
         w_rom_block = ""
 
+    stage2_fn = _stage2_function(s2, out_width)
+
     return f"""\
 // Auto-generated by rtl.py
 // Chunked structural tensor-slice synth wrapper
@@ -626,14 +798,15 @@ module {module_name}(
     input  wire                   rst,
     input  wire                   en,
     input  wire [{a_width-1}:0]   a_rows,
-{b_cols_port}    input  wire [{b_width-1}:0]   bias_cols,
-    input  wire                   preload_valid,
+{b_cols_port}    input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
     output reg                    out_valid,
     output reg                    out_last
 );
 {w_rom_block}
+{bias_rom_block}
+{stage2_fn}
 
     localparam integer INPUT_BEATS = {input_beats};
     localparam integer K_CHUNKS = {k_chunks};
@@ -649,6 +822,8 @@ module {module_name}(
     reg transaction_active;
     reg [{c_width-1}:0] row_mux;
     reg row_take;
+{_bias_grp_decl}
+{"    reg [15:0] out_grp;" if _fold_n_bias else ""}
 
     // ── Input pipeline stage ────────────────────────────────────────────────
     // Register the whole input bundle (en-gated, so the core stays self-timed),
@@ -656,7 +831,6 @@ module {module_name}(
     // tensor_slice input pins.
     reg [{a_width-1}:0] a_rows_q;
     reg [{b_width-1}:0] b_cols_q;
-    reg [{b_width-1}:0] bias_cols_q;
     reg preload_valid_q;
     reg in_valid_q;
 
@@ -664,13 +838,11 @@ module {module_name}(
         if (rst) begin
             a_rows_q        <= {a_width}'d0;
             b_cols_q        <= {b_width}'d0;
-            bias_cols_q     <= {b_width}'d0;
             preload_valid_q <= 1'b0;
             in_valid_q      <= 1'b0;
         end else if (en) begin
             a_rows_q        <= a_rows;
             b_cols_q        <= {b_cols_q_src};
-            bias_cols_q     <= bias_cols;
             preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;
         end
@@ -725,10 +897,12 @@ module {module_name}(
             c_row <= {c_width}'d0;
             out_valid <= 1'b0;
             out_last <= 1'b0;
+{"            out_grp <= 16'd0;" if _fold_n_bias else ""}
         end else if (en) begin
             preload_d <= 1'b0;
             out_valid <= 1'b0;
             out_last <= 1'b0;
+{_bias_grp_body}
 
             case (state)
                 S_IDLE: begin
@@ -739,6 +913,7 @@ module {module_name}(
                     if (preload_valid_q) begin
                         preload_d <= 1'b1;
                         transaction_active <= 1'b1;
+{"                        out_grp <= bias_grp_ctr;" if _fold_n_bias else ""}
                         state <= S_PRELOAD;
                     end
                 end
@@ -794,42 +969,6 @@ def generate_grid_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="c
     return generate_synth_verilog(m, k, n, module_name, feed_mode, debug)
 
 
-def _widen_output_saturation(text, out_bits):
-    """Rewrite the hardcoded int8 (±127) output-saturation bounds to an
-    ``out_bits``-wide signed range.
-
-    The Catapult core always packs 16-bit output lanes (``c_row[...+:16]``,
-    ``c_bits = grid_cols * 128``); only the clamp *value* was int8, which
-    silently capped the GEMM result at ±127 regardless of the configured
-    ``output_precision``. This rewrites the clamp to the output range
-    (e.g. ±32767 for a 16-bit ``output_precision``). The ``32'sd127`` /
-    ``16'sd127`` / ``-32'sd128`` / ``-16'sd128`` tokens appear ONLY inside the
-    ``sat_int8`` / ``sat_int8_to_i16`` functions, so the substitution is exact.
-    No-op for ``out_bits == 8`` (preserves the legacy int8 contract).
-    """
-    if out_bits is None or out_bits == 8:
-        return text
-    if out_bits > 16:
-        # The tensor_slice output lane is physically 16 bits, so the saturation
-        # clamp can be at most ±2^15. Cap here rather than rejecting the design:
-        # the GEMM result is lossless as long as its raw integer magnitude fits
-        # 16 bits, which the Keras-vs-C-sim gate certifies per design (a design
-        # that genuinely overflows would saturate and fail that bit-exact check).
-        import sys as _sys
-        print(f"  [gemm-ip-gen] WARNING: output_precision is {out_bits} bits but the "
-              f"Catapult tensor_slice lane is 16 bits; clamping saturation to 16 bits. "
-              f"Correctness depends on the raw GEMM result fitting 16 bits "
-              f"(verify via Keras-vs-C-sim).", file=_sys.stderr)
-        out_bits = 16
-    pos = (1 << (out_bits - 1)) - 1          # e.g. 32767
-    neg = (1 << (out_bits - 1))              # e.g. 32768
-    subs = [("32'sd127", f"32'sd{pos}"), ("16'sd127", f"16'sd{pos}"),
-            ("-32'sd128", f"-32'sd{neg}"), ("-16'sd128", f"-16'sd{neg}")]
-    for old, new in subs:
-        text = text.replace(old, new)
-    return text
-
-
 def _split_module(text, name):
     """Split a single-module Verilog string into (header, body).
 
@@ -851,8 +990,9 @@ def _split_after_first_endmodule(text):
     return text[:idx], rest
 
 
-def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out_bits=8,
-                                   requant_shift=0, requant_bits=None, weight_rom=None, n_passes=1):
+def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out_bits=None,
+                                   s1=0, s2=0, out_width=None, weight_rom=None, n_passes=1,
+                                   bias_codes=None):
     """Generate a single {module_name}.v with ifndef SYNTHESIS guard.
 
     ``ifndef SYNTHESIS`` — behavioral simulation model (wrapper + behav_grid).
@@ -861,39 +1001,71 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
     ``else`` — structural synth wrapper with tensor_slice_int8 black-box slices.
     Used by Catapult HLS → downstream synthesis (Design Compiler).
 
-    Both share the same port list so the ac_blackbox() binding is identical.
+    Both share the same port list so the ac_blackbox() binding is identical, and
+    -- critically -- the SAME (s1, s2, out_width) so the two branches' stage-2
+    text (and lane width) never disagree. ``bias_codes`` (or None -- the add
+    folds away, decision 4) is baked as ONE compile-time bias ROM hoisted above
+    the `ifndef, exactly like the weight ROM, so sim and synth read the
+    identical declaration.
 
-    ``out_bits`` is the result-lane width derived from ``output_precision``
-    (default 8 = legacy int8 clamp; 16 = honor a fixed<16,…> output_precision).
+    ``out_bits`` is accepted as a legacy alias for ``out_width`` (some callers
+    still pass it); ``out_width`` wins when both are given. Defaults to 8
+    (today's legacy int8-lane default) when neither is given.
     """
-    # Weight-stationary: hoist a SINGLE weight ROM above the `ifndef so both the sim
-    # and synth branches read the same w_rom_out (one source of truth; sim ≡ synth
-    # weights by construction). The combined core becomes ONE module with the `ifndef
-    # INSIDE it; the sim's behav_grid helper stays a trailing module.
-    if weight_rom is not None:
-        sim_top = generate_sim_verilog(m, k, n, module_name, requant_shift=requant_shift,
-                                       requant_bits=requant_bits, weight_rom=weight_rom, emit_rom=False)
-        synth_top = generate_synth_verilog(m, k, n, module_name, weight_rom=weight_rom, emit_rom=False)
+    if out_width is None:
+        out_width = out_bits if out_bits is not None else 8
+    has_bias = bias_codes is not None
+    # Weight-stationary and/or a real bias: hoist shared ROM(s) above the `ifndef
+    # so both branches read the identical declaration (one source of truth). The
+    # combined core becomes ONE module with the `ifndef INSIDE it; the sim's
+    # behav_grid helper stays a trailing module. No-weight-rom/no-bias keeps the
+    # old simple full-text ifndef/else path untouched (byte-identical output).
+    #
+    # Bias hoisting has one wrinkle weight-rom hoisting doesn't: the sim
+    # branch's actual per-column bias use lives inside `behav_grid`, a
+    # SEPARATE Verilog module (not the top wrapper), so a `bias_rom` declared
+    # in the wrapper's scope (above `ifndef) is not visible there -- unlike
+    # `w_rom_out`, which the wrapper passes into `grid` as a plain port. So:
+    # the sim branch self-declares its OWN bias_rom inside behav_grid
+    # (emit_bias_rom=True); the synth branch (single module, no submodule)
+    # reads the ONE hoisted declaration below. Both are built from the same
+    # `bias_codes` list, so the two declarations are byte-identical text even
+    # though physically duplicated -- the single Python source of truth the
+    # plan asks for, same as the K-spatial combined core already does for its
+    # (also per-branch) weight ROM.
+    if weight_rom is not None or has_bias:
+        sim_top = generate_sim_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width,
+                                       weight_rom=weight_rom, emit_rom=False,
+                                       bias_codes=bias_codes, emit_bias_rom=True)
+        synth_top = generate_synth_verilog(m, k, n, module_name, weight_rom=weight_rom, emit_rom=False,
+                                           s1=s1, s2=s2, out_width=out_width,
+                                           bias_codes=bias_codes, emit_bias_rom=False)
         b_width = ((n + 7) // 8) * 64
         input_beats = max(m, n)
         header, syn_body = _split_module(synth_top, module_name)   # header incl. 'module..);'
         sim_wrapper, sim_behav = _split_after_first_endmodule(sim_top)
         _, sim_body = _split_module(sim_wrapper, module_name)
-        rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes)
+        rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes) \
+            if weight_rom is not None else ""
+        bias_rom = _bias_rom_block(bias_codes) if has_bias else ""
+        tag = []
+        if weight_rom is not None:
+            tag.append("shared const-weight ROM")
+        if has_bias:
+            tag.append("bias ROM (synth branch; sim's behav_grid self-declares the identical ROM)")
         out = (
             f"// Auto-generated by rtl.py\n"
-            f"// Combined core (weight-stationary): M={m}, K={k}, N={n}\n"
-            f"//   shared const-weight ROM above `ifndef feeds both branches\n"
-            f"{header}\n{rom_block}\n"
+            f"// Combined core: M={m}, K={k}, N={n}\n"
+            f"//   {' + '.join(tag)} above `ifndef feeds both branches\n"
+            f"{header}\n{rom_block}{bias_rom}\n"
             f"`ifndef SYNTHESIS\n{sim_body}`else\n{syn_body}`endif\n"
             f"endmodule\n\n"
             f"`ifndef SYNTHESIS\n{sim_behav}`endif\n"
         )
-        return _widen_output_saturation(out, out_bits)
+        return out
 
-    sim_top = generate_sim_verilog(m, k, n, module_name,
-                                   requant_shift=requant_shift, requant_bits=requant_bits)
-    synth_top = generate_synth_verilog(m, k, n, module_name)
+    sim_top = generate_sim_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width)
+    synth_top = generate_synth_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width)
 
     lines = []
     lines.append("// Auto-generated by rtl.py")
@@ -912,7 +1084,7 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
         lines.append(l)
     lines.append("")
     lines.append("`endif")
-    return _widen_output_saturation("\n".join(lines) + "\n", out_bits)
+    return "\n".join(lines) + "\n"
 
 
 def _k_spatial_partitions(k, k_spatial):
@@ -936,39 +1108,33 @@ def _k_spatial_partitions(k, k_spatial):
 
 
 def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, n_passes=1,
-                                     requant_shift=0, requant_bits=None,
-                                     weight_rom=None, emit_rom=True):
+                                     s1=0, s2=0, out_width=16,
+                                     weight_rom=None, emit_rom=True,
+                                     bias_codes=None, emit_bias_rom=True, bias_rom_name="bias_rom"):
     """Structural K-spatial core.
 
     Tensor-slice outputs (and therefore the K-chunk partials) are 16-bit, as in
-    the current architecture. Only the post-accum32 step changes: the summed
-    partials are requantised rather than clamped.
+    the current architecture. Stage 2 (shared with every other emitter) sums the
+    partials in 16-bit wrapping arithmetic, adds the bias, and rounds/wraps to
+    out_width -- no saturation anywhere.
 
     The structural body instantiates multiple tensor-slice grids and exposes the
     intended partition/control topology. Functional RTL simulation for this
     experimental mode is provided by the combined core's behavioral branch.
     """
-    # As in the sim branch: emit the function only when used, so a
-    # requant_shift==0 core is byte-identical to the pre-requant generator.
-    if requant_shift and requant_shift > 0:
-        _w = requant_bits or 8
-        _half = 1 << (requant_shift - 1)
-        requant_fn = f"""
-    // Requantise the summed cross-chunk result once, replacing the old clamp.
-    function signed [15:0] requant_acc;
-        input signed [31:0] x;
-        reg signed [31:0] r;
-        begin
-            r = (x + 32'sd{_half}) >>> {requant_shift};
-            requant_acc = $signed(r[{_w-1}:0]);
-        end
-    endfunction
-"""
-    else:
-        requant_fn = ""
+    has_bias = bias_codes is not None
+    bias_rom_block = _bias_rom_block(bias_codes, bias_rom_name) if (has_bias and emit_bias_rom) else ""
+    _fold_n_bias = bool(has_bias and n_passes and int(n_passes) > 1)
+    _bias_grp_decl, _bias_grp_body = (
+        _fold_n_bias_group_decl(n_passes) if _fold_n_bias else ("", "")
+    )
+    stage2_fn = _stage2_function(s2, out_width)
     if k_spatial == 1:
         return generate_synth_verilog(m, k, n, module_name,
-                                      weight_rom=weight_rom, emit_rom=emit_rom)
+                                      weight_rom=weight_rom, emit_rom=emit_rom,
+                                      s1=s1, s2=s2, out_width=out_width,
+                                      bias_codes=bias_codes, emit_bias_rom=emit_bias_rom,
+                                      bias_rom_name=bias_rom_name)
 
     # Passes over K: ``k_spatial`` partitions cover K_CHUNKS chunks in
     # ``passes = ceil(K_CHUNKS/k_spatial)`` passes; pass q, beat t carries
@@ -990,10 +1156,9 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
     # general K-spatial layouts.
     a_width = 64 * k_spatial
     b_width = 64 * k_spatial
-    bias_width = grid_cols * 64
     a_chunk_width = 64
     b_chunk_width = 64
-    c_width = grid_cols * 128
+    c_width = grid_cols * 8 * out_width
     input_beats = max(m, n)
     total_output_rows = grid_rows * 8
 
@@ -1043,6 +1208,8 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
                     a_route = f" && (beat_count >> 3 == {r})"
                     b_route = f" && (beat_count >> 3 == {c})"
                     insts.append(f"""\
+        // S1 = {s1}: in-slice stage-1 round-half-up shift (IP parameter, set out of band;
+        // not passed as a Verilog override -- the VTR hard-block model has no parameters)
         (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_p{p}_r{r}_c{c} (
             .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
             .start_mat_mul(slice_start && part{p}_active),
@@ -1100,6 +1267,8 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
                     a_route = f" && (beat_count >> 3 == {r})"
                     b_route = f" && (beat_count >> 3 == {c})"
                     insts.append(f"""\
+        // S1 = {s1}: in-slice stage-1 round-half-up shift (IP parameter, set out of band;
+        // not passed as a Verilog override -- the VTR hard-block model has no parameters)
         (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_p{p}_r{r}_c{c} (
             .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
             .start_mat_mul(slice_start && part{p}_active),
@@ -1139,20 +1308,27 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
         row_mux_cases.append(f"        if (row_avail_{r}) begin")
         for c in range(grid_cols):
             for lane in range(8):
+                # Stage 2 (shared with every other emitter -- see
+                # _stage2_function): sum the K-partition 16-bit partials in
+                # 16-bit WRAPPING arithmetic (the `accum16` reg truncates the
+                # sum to 16 bits on assignment), then let stage2() add the
+                # bias and round/wrap to out_width. Slice outputs (and hence
+                # the partials) stay 16-bit; no saturation anywhere.
                 terms = " + ".join(
                     f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*16 +: 16])" for p in range(k_spatial)
                 )
+                row_mux_cases.append(f"            accum16 = {terms};")
+                if _fold_n_bias:
+                    # Frozen per-frame group (see _fold_n_bias_group_decl),
+                    # not the live counter -- it may already have advanced.
+                    _bias_e = f"{_bias_lane(bias_rom_name, f'out_grp * {n} + {c * 8 + lane}')}"
+                elif has_bias:
+                    _bias_e = f"{_bias_lane(bias_rom_name, str(c * 8 + lane))}"
+                else:
+                    _bias_e = "16'sd0"
                 row_mux_cases.append(
-                    f"            accum32 = {terms} + $signed({{ {{24{{bias_cols_q[{c}*64 + {lane}*8 + 7]}}}}, bias_cols_q[{c}*64 + {lane}*8 +: 8] }});"
-                )
-                # Slice outputs (and hence the partials) remain 16-bit -- unchanged.
-                # The ONLY change is what happens after accum32: requantise the
-                # cross-chunk sum instead of clamping it, matching requant_acc()
-                # in the behavioural branch.
-                _drain = ("requant_acc(accum32)" if requant_shift
-                          else "sat_int8_to_i16(accum32)")
-                row_mux_cases.append(
-                    f"            row_mux[{c}*128 + {lane}*16 +: 16] = {_drain};"
+                    f"            row_mux[{c}*{8*out_width} + {lane}*{out_width} +: {out_width}] = "
+                    f"stage2(accum16, {_bias_e});"
                 )
         row_mux_cases.append("        end")
     any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
@@ -1193,14 +1369,14 @@ module {module_name}(
     input  wire                   rst,
     input  wire                   en,
     input  wire [{a_width-1}:0]   a_rows,
-{ksp_b_cols_port}    input  wire [{bias_width-1}:0]   bias_cols,
-    input  wire                   preload_valid,
+{ksp_b_cols_port}    input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
     output reg                    out_valid,
     output reg                    out_last
 );
 {ksp_rom_block}
+{bias_rom_block}
     localparam integer INPUT_BEATS = {input_beats};
     localparam integer K_CHUNKS = {k_chunks};
     localparam integer K_SPATIAL = {k_spatial};
@@ -1211,8 +1387,10 @@ module {module_name}(
     reg [15:0] beat_count;
     reg [15:0] chunk_idx;
     reg [15:0] out_row_count;
-    reg signed [31:0] accum32;
+    reg signed [15:0] accum16;
     reg [{c_width-1}:0] row_mux;
+{_bias_grp_decl}
+{"    reg [15:0] out_grp;" if _fold_n_bias else ""}
 
     // Input pipeline stage (same rationale as the chunked emitter): register
     // the whole bundle en-gated so the beat decode + partition gating muxes
@@ -1220,7 +1398,6 @@ module {module_name}(
     // wrapper into the tensor_slice input pins.
     reg [{a_width-1}:0] a_rows_q;
     reg [{b_width-1}:0] b_cols_q;
-    reg [{bias_width-1}:0] bias_cols_q;
     reg preload_valid_q;
     reg in_valid_q;
 
@@ -1228,13 +1405,11 @@ module {module_name}(
         if (rst) begin
             a_rows_q        <= {a_width}'d0;
             b_cols_q        <= {b_width}'d0;
-            bias_cols_q     <= {bias_width}'d0;
             preload_valid_q <= 1'b0;
             in_valid_q      <= 1'b0;
         end else if (en) begin
             a_rows_q        <= a_rows;
             b_cols_q        <= {ksp_b_cols_src};
-            bias_cols_q     <= bias_cols;
             preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;
         end
@@ -1264,18 +1439,10 @@ module {module_name}(
 
     wire any_avail = {any_avail_expr};
 
-    function [15:0] sat_int8_to_i16;
-        input signed [31:0] x;
-        begin
-            if (x > 32'sd127) sat_int8_to_i16 = 16'sd127;
-            else if (x < -32'sd128) sat_int8_to_i16 = -16'sd128;
-            else sat_int8_to_i16 = x[15:0];
-        end
-    endfunction
-{requant_fn}
+{stage2_fn}
     always @(*) begin
         row_mux = {c_width}'d0;
-        accum32 = 32'sd0;
+        accum16 = 16'sd0;
 {chr(10).join(row_mux_cases)}
     end
 
@@ -1288,15 +1455,20 @@ module {module_name}(
             c_row <= {c_width}'d0;
             out_valid <= 1'b0;
             out_last <= 1'b0;
+{"            out_grp <= 16'd0;" if _fold_n_bias else ""}
         end else if (en) begin
             out_valid <= 1'b0;
             out_last <= 1'b0;
+{_bias_grp_body}
             case (state)
                 S_IDLE: begin
                     beat_count <= 16'd0;
                     chunk_idx <= 16'd0;
                     out_row_count <= 16'd0;
-                    if (preload_valid_q) state <= S_RUN;
+                    if (preload_valid_q) begin
+{"                        out_grp <= bias_grp_ctr;" if _fold_n_bias else ""}
+                        state <= S_RUN;
+                    end
                 end
                 S_RUN: begin
                     if (in_beat_active) begin
@@ -1327,11 +1499,13 @@ endmodule
 
 
 def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
-                                   requant_shift=0, requant_bits=None,
-                                   weight_rom=None, emit_rom=True, n_passes=1):
+                                   s1=0, s2=0, out_width=16,
+                                   weight_rom=None, emit_rom=True, n_passes=1,
+                                   bias_codes=None, emit_bias_rom=True):
     sim = generate_sim_verilog(m, k, n, module_name, k_spatial=k_spatial,
-                               requant_shift=requant_shift, requant_bits=requant_bits,
-                               weight_rom=weight_rom, emit_rom=emit_rom, n_passes=n_passes)
+                               s1=s1, s2=s2, out_width=out_width,
+                               weight_rom=weight_rom, emit_rom=emit_rom, n_passes=n_passes,
+                               bias_codes=bias_codes, emit_bias_rom=emit_bias_rom)
     if k_spatial == 1:
         return sim
     banner = (
@@ -1341,25 +1515,33 @@ def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_s
     return banner + sim
 
 
-def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, out_bits=8,
-                                            requant_shift=0, requant_bits=None, weight_rom=None, n_passes=1):
+def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, out_bits=None,
+                                            s1=0, s2=0, out_width=None, weight_rom=None, n_passes=1,
+                                            bias_codes=None):
+    if out_width is None:
+        out_width = out_bits if out_bits is not None else 8
     if k_spatial == 1:
-        return generate_combined_core_verilog(m, k, n, module_name, out_bits=out_bits,
-                                              requant_shift=requant_shift, requant_bits=requant_bits,
-                                              weight_rom=weight_rom, n_passes=n_passes)
+        return generate_combined_core_verilog(m, k, n, module_name, out_width=out_width,
+                                              s1=s1, s2=s2,
+                                              weight_rom=weight_rom, n_passes=n_passes,
+                                              bias_codes=bias_codes)
     _k_spatial_partitions(k, k_spatial)
-    # Weight-stationary: each branch emits its own ROM. Unlike the chunked combined
-    # core — which splits the two modules apart to hoist a single shared ROM above the
-    # `ifndef — the K-spatial core keeps sim and synth as whole modules, so hoisting
-    # would mean the same module surgery on an experimental structural body. Both ROMs
-    # are built from the same weight_rom, so sim and synth weights stay identical by
-    # construction; only one branch is ever compiled.
+    # Weight-stationary and/or bias: each branch emits its OWN ROM(s). Unlike
+    # the chunked combined core -- which splits the two modules apart to hoist
+    # a single shared ROM above the `ifndef -- the K-spatial core keeps sim
+    # and synth as whole modules, so hoisting would mean the same module
+    # surgery on an experimental structural body. Both ROMs are built from the
+    # same weight_rom/bias_codes, so sim and synth stay identical by
+    # construction (byte-for-byte the same declaration in each branch); only
+    # one branch is ever compiled.
     sim_top = generate_k_spatial_sim_verilog(m, k, n, module_name, k_spatial,
-                                            requant_shift=requant_shift, requant_bits=requant_bits,
-                                            weight_rom=weight_rom, n_passes=n_passes)
+                                            s1=s1, s2=s2, out_width=out_width,
+                                            weight_rom=weight_rom, n_passes=n_passes,
+                                            bias_codes=bias_codes)
     synth_top = generate_k_spatial_synth_verilog(m, k, n, module_name, k_spatial,
-                                                requant_shift=requant_shift, requant_bits=requant_bits,
-                                                weight_rom=weight_rom, n_passes=n_passes)
+                                                s1=s1, s2=s2, out_width=out_width,
+                                                weight_rom=weight_rom, n_passes=n_passes,
+                                                bias_codes=bias_codes)
 
     lines = []
     lines.append("// Auto-generated by rtl.py")
@@ -1377,7 +1559,7 @@ def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wra
     lines.extend(synth_top.splitlines())
     lines.append("")
     lines.append("`endif")
-    return _widen_output_saturation("\n".join(lines) + "\n", out_bits)
+    return "\n".join(lines) + "\n"
 
 
 if __name__ == "__main__":
