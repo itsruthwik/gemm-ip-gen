@@ -70,10 +70,9 @@ def build_weight_rom(B, m, n, k):
 
     grid_cols = (n + 7) // 8
     k_chunks = (k + 7) // 8
-    input_beats = max(m, n)
     rom = []
     for chunk in range(k_chunks):
-        for t in range(input_beats):
+        for t in range(n):
             rom.append(int(pack_b_chunk(B, t, chunk, grid_cols, n, k)))
     return rom
 
@@ -83,8 +82,10 @@ def build_weight_rom_k_spatial(B, m, n, k, k_spatial):
 
     ``k_spatial`` parallel K partitions cover ``k_chunks = ceil(k/8)`` chunks in
     ``passes = ceil(k_chunks/k_spatial)`` passes; each pass feeds ONE
-    ``max(M, N)``-beat sweep, so the ROM holds ``passes*input_beats`` entries of
-    ``64*k_spatial`` bits. ``k_spatial == 1`` is today's chunked endpoint
+    ``max(M, N)``-beat sweep, but only the first ``N`` beats of each pass carry a
+    real column (beat ``t >= N`` is a wasted repeat), so the ROM holds only
+    ``passes*N`` entries of ``64*k_spatial`` bits; the wrapper zero-fills beats
+    ``t >= N`` at read time. ``k_spatial == 1`` is today's chunked endpoint
     (``build_weight_rom``); ``k_spatial == k_chunks`` (one pass) is today's
     full-K endpoint (``build_weight_rom_full_k``). Widening the word rather
     than adding beats per chunk is deliberate: serialising the baked weights
@@ -106,12 +107,11 @@ def build_weight_rom_k_spatial(B, m, n, k, k_spatial):
     _ts_dir_on_path()
     from golden import pack_b_k_spatial_narrow  # noqa: F401
 
-    input_beats = max(m, n)
     k_chunks = (k + 7) // 8
     passes = -(-k_chunks // k_spatial)
     rom = []
     for pass_idx in range(passes):
-        for t in range(input_beats):
+        for t in range(n):
             rom.append(int(pack_b_k_spatial_narrow(B, t, pass_idx, n, k, k_spatial)))
     return rom
 

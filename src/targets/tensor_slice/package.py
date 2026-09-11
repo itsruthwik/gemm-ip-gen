@@ -196,11 +196,14 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         if ks > 1
         else f"a_buf[s][k_chunk * {input_beats} + actual_row].slc<8>(row_tile * 64 + k_lane * 8)"
     )
+    # b_buf is sized passes*n (only real columns t < n are ever captured — see the
+    # capture block below), so its index scales by n, not input_beats, unlike a_buf
+    # (which keeps the full input_beats stride: every beat t < m carries a real row).
     b_el_expr = (
-        f"b_buf[s][(k_chunk / {ks}) * {input_beats} + actual_col]"
+        f"b_buf[s][(k_chunk / {ks}) * {n} + actual_col]"
         f".slc<8>((k_chunk % {ks}) * 64 + k_lane * 8)"
         if ks > 1
-        else f"b_buf[s][k_chunk * {input_beats} + actual_col].slc<8>(ct * 64 + k_lane * 8)"
+        else f"b_buf[s][k_chunk * {n} + actual_col].slc<8>(ct * 64 + k_lane * 8)"
     )
 
     # ---- Weight-stationary vs. two-stream: b_cols plumbing inserts -------------
@@ -215,8 +218,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         bcols_run_param = ""
         bcols_bb_xor = ""
         bcols_run_arg = ""
-        bbuf_src = "B_ROM[cc_slot[wr_slot]]"
-        brom_decl = _const_weights_brom_cpp(b_bits, grid_cols, total_beats, weight_rom)
+        # Raw feed beat cc_slot[wr_slot] runs 0..total_beats-1 (kc*input_beats+t), but
+        # only beat t < n of each pass carries a real column, so B_ROM (like the RTL
+        # ROM) holds just passes*n entries; the capture block below only reads this
+        # for _t < n (see _bidx), matching rtl.py's beat_ctr/rom_base mux exactly.
+        bbuf_src = "B_ROM[_bidx]"
+        brom_decl = _const_weights_brom_cpp(b_bits, grid_cols, weight_rom)
         stream_bcols_decl = ""
         # Weight-stationary: the IP holds B, so the feed packs no B beat at all.
         stream_bcols_pack = ""
@@ -748,7 +755,7 @@ class {name}_ccore {{
         // [first_out+1, first_out+1+{m}) of its own clock. Back-to-back
         // frames sustain a frame II of {total_beats + 1} calls.
         static ac_int<{a_bits}, false> a_buf[{slots}][{total_beats}];
-        static ac_int<{b_bits}, false> b_buf[{slots}][{total_beats}];
+        static ac_int<{b_bits}, false> b_buf[{slots}][{passes * n}];
         static ac_int<{bias_bits}, false> bias_buf[{slots}];
         static int cc_slot[{slots}] = {{0}};
         static bool slot_run[{slots}] = {{false}};
@@ -769,7 +776,14 @@ class {name}_ccore {{
             }}
             if (cc_slot[wr_slot] < {total_beats}) {{
                 a_buf[wr_slot][cc_slot[wr_slot]] = a_rows;
-                b_buf[wr_slot][cc_slot[wr_slot]] = {bbuf_src};
+                // Only beat t < n of each pass carries a real column (see b_el_expr /
+                // B_ROM above); beats t >= n are never captured (and never read back).
+                int _t = cc_slot[wr_slot] % {input_beats};
+                if (_t < {n}) {{
+                    int _bidx = (cc_slot[wr_slot] / {input_beats}) * {n} + _t;
+                    (void) _bidx;
+                    b_buf[wr_slot][_bidx] = {bbuf_src};
+                }}
             }}
         }} else {{
             feeding = false;
@@ -1154,20 +1168,20 @@ int main() {{
 """
 
 
-def _const_weights_brom_cpp(b_bits, grid_cols, total_beats, weight_rom):
+def _const_weights_brom_cpp(b_bits, grid_cols, weight_rom):
     """csim-only internal weight ROM for the const_weights ccore #else branch.
 
-    ``weight_rom`` is the list of per-beat b_cols words (each ``b_bits`` wide) from
-    ``build_weight_rom`` — the SAME beats the RTL wrapper ROM holds. Big words don't
-    fit a single C++ integer literal, so each word is split into ``grid_cols`` 64-bit
-    chunks stored as ``unsigned long long`` and reassembled into an ``ac_int`` via
-    ``set_slc`` in a one-time init. Emitted inside the ``#else`` (behavioral) branch,
-    so the synth/cosim translation unit never contains the table.
+    ``weight_rom`` is the list of per-pass, per-real-column b_cols words (each
+    ``b_bits`` wide) from ``build_weight_rom`` — the SAME ``passes*n`` beats the
+    RTL wrapper ROM holds (only beat ``t < n`` of each pass carries a real
+    column; the ccore, like the RTL, zero-fills the read for ``t >= n`` rather
+    than storing a wasted entry). Big words don't fit a single C++ integer
+    literal, so each word is split into ``grid_cols`` 64-bit chunks stored as
+    ``unsigned long long`` and reassembled into an ``ac_int`` via ``set_slc``
+    in a one-time init. Emitted inside the ``#else`` (behavioral) branch, so
+    the synth/cosim translation unit never contains the table.
     """
-    if len(weight_rom) != total_beats:
-        raise ValueError(
-            f"weight_rom has {len(weight_rom)} beats, expected total_beats={total_beats}"
-        )
+    nbeats = len(weight_rom)
     chunks = b_bits // 64
     mask64 = (1 << 64) - 1
     rows = []
@@ -1176,17 +1190,19 @@ def _const_weights_brom_cpp(b_bits, grid_cols, total_beats, weight_rom):
         rows.append("{" + ", ".join(f"{(w >> (g * 64)) & mask64}ULL" for g in range(chunks)) + "}")
     init = ",\n            ".join(rows)
     return f"""
-        // csim-only weight ROM: per-beat b_cols words baked from the same
-        // weight_matrix that fills the RTL wrapper ROM (single .dat source). Split
-        // into 64-bit chunks (a full word may exceed a C++ literal) and reassembled.
-        static const unsigned long long _brom_w[{total_beats}][{chunks}] = {{
+        // csim-only weight ROM: per-pass, per-real-column b_cols words baked from
+        // the same weight_matrix that fills the RTL wrapper ROM (single .dat
+        // source; only n of every input_beats beats per pass are stored, mirroring
+        // the RTL's rom_base/beat_ctr addressing). Split into 64-bit chunks (a full
+        // word may exceed a C++ literal) and reassembled.
+        static const unsigned long long _brom_w[{nbeats}][{chunks}] = {{
             {init}
         }};
-        static ac_int<{b_bits}, false> B_ROM[{total_beats}];
+        static ac_int<{b_bits}, false> B_ROM[{nbeats}];
         {{
             static bool _brom_init = false;
             if (!_brom_init) {{
-                for (int _i = 0; _i < {total_beats}; _i++)
+                for (int _i = 0; _i < {nbeats}; _i++)
                     for (int _g = 0; _g < {chunks}; _g++)
                         B_ROM[_i].set_slc(_g * 64, ac_int<64, false>(_brom_w[_i][_g]));
                 _brom_init = true;
@@ -1740,11 +1756,11 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     if weights_in_core:
         from gemm_ip.weights import build_weight_rom_k_spatial
         weight_rom = build_weight_rom_k_spatial(weight_matrix, m, n, k, k_spatial)
-        expected_beats = passes * max(m, n)
+        expected_beats = passes * n
         if len(weight_rom) != expected_beats:
             raise RuntimeError(
                 f"{name}: weight ROM has {len(weight_rom)} beats, expected "
-                f"{expected_beats} (passes={passes} * max(m,n)={max(m, n)})"
+                f"{expected_beats} (passes={passes} * n={n})"
             )
     # The core saturates the raw integer dot-product to the physical 16-bit
     # output lane; result-precision quantization happens in the wrapper drain

@@ -30,10 +30,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
+SRC = HERE.parent.parent
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
 from golden import generate_tb
 from geometry import k_chunks as _k_chunks, resolve_reuse_factor
+from gemm_ip.weights import build_weight_rom_k_spatial
 
 GEN_DIR = HERE / "tb" / "generated"
 
@@ -66,12 +70,22 @@ DEFAULT_CASES = [
 ]
 DEFAULT_SEEDS = [1, 7, 42]
 
+# Weight-stationary (const-weight ROM) cases, m > n: the ROM now holds only
+# passes*n entries (see gemm_ip/weights.py + rtl.py _weight_rom_block), so beats
+# t >= n of each pass — which only exist here because input_beats = max(m,n) = m
+# > n — must read back zero via the beat_ctr/rom_base mux. One rf=1 (full-K, one
+# pass) and one rf>1 (multi-pass) case, both m > n, exercise that tail.
+ROM_CASES = [
+    (16, 8, 8, 1),   # m > n, full-K (rf=1 -> k_spatial=k_chunks=1 pass)
+    (16, 24, 8, 2),  # m > n, multi-pass K-spatial (rf=2 -> passes=k_chunks/2)
+]
+
 
 def _run(cmd):
     return subprocess.run(cmd, text=True, capture_output=True)
 
 
-def run_case(m, k, n, seed, rf=None):
+def run_case(m, k, n, seed, rf=None, weights_in_core=False):
     """Generate wrapper RTL + TB for one shape/seed/ReuseFactor, simulate, return (ok, log)."""
     rf_use = rf if rf is not None else _k_chunks(k)
     resolved = resolve_reuse_factor(k, rf_use)
@@ -80,17 +94,29 @@ def run_case(m, k, n, seed, rf=None):
     k_spatial = resolved["k_spatial"]
 
     stem = f"gemm_{m}x{k}x{n}_rf{rf_use}_s{seed}"
+    if weights_in_core:
+        stem += "_rom"
     mod = f"{stem}_wrapper"
     rtl = GEN_DIR / f"{stem}.v"
     tb = GEN_DIR / f"tb_{stem}.v"
     out = GEN_DIR / f"{stem}.out"
 
+    weight_rom = None
+    fixed_B = None
+    if weights_in_core:
+        import numpy as np
+        rng = np.random.default_rng(seed)
+        max_val = max(1, int((127 / max(k, 1)) ** 0.5))
+        fixed_B = rng.integers(-max_val, max_val + 1, size=(k, n), dtype=np.int8)
+        weight_rom = build_weight_rom_k_spatial(fixed_B, m, n, k, k_spatial)
+
     if k_spatial == 1:
-        rtl.write_text(generate_combined_core_verilog(m, k, n, module_name=mod))
+        rtl.write_text(generate_combined_core_verilog(m, k, n, module_name=mod, weight_rom=weight_rom))
     else:
         rtl.write_text(generate_k_spatial_combined_core_verilog(
-            m, k, n, module_name=mod, k_spatial=k_spatial, out_bits=8))
-    tb.write_text(generate_tb(m, k, n, module_name=mod, seed=seed, k_spatial=k_spatial))
+            m, k, n, module_name=mod, k_spatial=k_spatial, out_bits=8, weight_rom=weight_rom))
+    tb.write_text(generate_tb(m, k, n, module_name=mod, seed=seed, k_spatial=k_spatial,
+                              weights_in_core=weights_in_core, fixed_B=fixed_B))
 
     # No -DSYNTHESIS: the behavioral branch is compiled, so no external slice IP.
     comp = _run(["iverilog", "-g2012", "-o", str(out), str(tb), str(rtl)])
@@ -116,6 +142,7 @@ def run(cases=None, seeds=None, keep=False):
         print("ERROR: iverilog/vvp not found on PATH", file=sys.stderr)
         return 2
 
+    rom_cases = list(ROM_CASES) if not cases else []
     cases = list(cases) if cases else list(DEFAULT_CASES)
     seeds = list(seeds) if seeds else list(DEFAULT_SEEDS)
 
@@ -132,10 +159,21 @@ def run(cases=None, seeds=None, keep=False):
                 print(log)
                 failures.append(tag)
 
+    for case in rom_cases:
+        m, k, n, rf = case if len(case) == 4 else (*case, None)
+        for seed in seeds:
+            ok, log = run_case(m, k, n, seed, rf=rf, weights_in_core=True)
+            rf_tag = f" rf={rf}" if rf is not None else ""
+            tag = f"{m}x{k}x{n}{rf_tag} seed={seed} rom"
+            print(f"{'PASS' if ok else 'FAIL'} {tag}")
+            if not ok:
+                print(log)
+                failures.append(tag)
+
     if not keep:
         shutil.rmtree(GEN_DIR, ignore_errors=True)
 
-    total = len(cases) * len(seeds)
+    total = len(cases) * len(seeds) + len(rom_cases) * len(seeds)
     if failures:
         print(f"\n{len(failures)}/{total} FAILED:")
         for t in failures:
