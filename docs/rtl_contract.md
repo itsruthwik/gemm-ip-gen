@@ -116,6 +116,53 @@ stays `1` (each row's MACs happen once) -- the manifest reports
 the two are never confused. See `wrapper_run_loop.md` for the multi-frame
 feed/capture schedule.
 
+## FoldAxis and fold-N
+
+`m` above folds M behind FoldAxis; `n` folds N the same way. Under `n`, K and M
+stay fully spatial (`k_spatial = K_CHUNKS`, one K pass, all row tiles in every
+frame); RF folds column tiles instead of K chunks or row tiles. `GRID_COLS =
+ceil(N/8)` column tiles are covered by `cg = ceil(GRID_COLS / RF)` column
+tiles per group, in `n_passes = ceil(GRID_COLS / cg)` back-to-back frames; the
+legalized RF is `n_passes`. Requests above `GRID_COLS` legalize down to
+`GRID_COLS` (one column tile per frame) with a warning; RF=1 legalizes to
+`cg = GRID_COLS`, `n_passes = 1` -- one frame, functionally today's
+single-frame hardware. The legal range is `1..GRID_COLS`.
+
+No new RTL beyond the weight ROM's group counter (see below): the core
+generated is the plain rf=1 core sized for `N_g = 8*cg` columns. The wrapper
+issues `n_passes` frames of that core back-to-back; frame `g` covers logical
+columns `[g*N_g, (g+1)*N_g)`. Unlike fold-M (which pads spare ROWS in the last
+frame), every frame here emits M REAL rows -- only the tail column tiles of
+the LAST group may be padding (silently zero, dropped past the logical N
+bound when the wrapper assembles the full row). Multipliers = `64 * GRID_ROWS
+* cg * K_CHUNKS`; `effective_reuse` tracks `n_passes` (each frame reuses the
+array once per group, unlike fold-M's per-vector reuse of 1) -- the manifest
+reports `reuse_factor` (the fold-N pass count) and `effective_reuse`
+separately.
+
+**Weight ROM group addressing** (weight-stationary only): the ROM holds
+`n_passes * N_g` entries, group `g`'s columns at base `g * N_g` (the packer
+zero-pads any tile columns past the real N). The existing `rom_addr`
+register already steps to the next block's base on every frame's wrap beat
+(`rom_addr + 1 == base + N_g`, same mechanism the K-multipass ROM uses
+between K passes); fold-N adds a `grp_ctr` register, only emitted when
+`n_passes > 1`, that gates the idle-beat rewind: `rom_addr` only rewinds to 0
+once every group has been visited (`grp_ctr` reaches `n_passes - 1`),
+otherwise it holds the wrap's next-base value and `grp_ctr` advances. A
+`grp_was_feeding` register distinguishes a REAL frame boundary (the idle beat
+right after a frame fed real beats) from any OTHER idle cycle (reset settle
+beats, or a testbench's trailing wait) -- only a real boundary may advance or
+wrap the group counter, since consecutive idle cycles are common outside a
+frame's feed window and must not double-advance it. With `n_passes == 1` none
+of this is emitted, so the ROM block is byte-for-byte today's.
+
+The two-operand (external `b_cols`) path needs no RTL change: the wrapper
+already re-inserts the tile offset by beat index, so fold-N just restricts
+each frame's B beats to `weight_cols[g * N_g .. g * N_g + N_g)`.
+
+See `wrapper_run_loop.md` for the multi-frame feed/capture/emission schedule
+and this file's fold-M section above for the row-fold analogue.
+
 ## Synth Protocol
 
 1. The wrapper pulses `preload_valid` for one cycle at the head of each frame.

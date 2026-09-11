@@ -53,8 +53,9 @@ def main():
                         help="mvau: which dimension ReuseFactor folds -- 'n' (default) "
                              "pads N and sets SIMD=K, PE=N_pad/RF; 'k' pads K and sets "
                              "PE=N, SIMD=K_pad/RF (floored at 3); 'kn' folds both. "
-                             "tensor_slice: 'k' (default, phase 1 K-partition) or 'm' "
-                             "(fold-M row-tile groups issued as back-to-back frames).")
+                             "tensor_slice: 'k' (default, phase 1 K-partition), 'm' "
+                             "(fold-M row-tile groups) or 'n' (fold-N column-tile groups), "
+                             "each issued as back-to-back frames.")
     parser.add_argument("--strategy", type=str, default="latency",
                         help="generic target: GEMM kernel strategy, 'latency' (default) "
                              "or 'resource' (case-insensitive); validated where consumed.")

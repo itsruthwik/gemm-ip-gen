@@ -41,19 +41,27 @@ class TensorSliceTarget(Target):
 
     knobs = [
         {"name": "FoldAxis", "key": "fold_axis", "type": "enum",
-         "choices": ("k", "m"), "default": "k",
+         "choices": ("k", "m", "n"), "default": "k",
          "description": "which dimension ReuseFactor folds"},
     ]
 
     def geometry(self, shape, reuse_factor=1, fold_axis="k"):
         m, k, n = shape
         gr, gc = _geom.grid_rows(m), _geom.grid_cols(n)
-        resolved = _geom.resolve_reuse_factor(k, reuse_factor, fold_axis=fold_axis, m=m)
+        resolved = _geom.resolve_reuse_factor(k, reuse_factor, fold_axis=fold_axis, m=m, n=n)
         for w in resolved["warnings"]:
             print(w, file=sys.stderr)
         ks = resolved["k_spatial"]
         mg = resolved.get("mg", gr)
         m_passes = resolved.get("m_passes", 1)
+        cg = resolved.get("cg", gc)
+        n_passes = resolved.get("n_passes", 1)
+        if fold_axis == "m":
+            mult = 64 * mg * gc * resolved["k_chunks"]
+        elif fold_axis == "n":
+            mult = 64 * gr * cg * resolved["k_chunks"]
+        else:
+            mult = _geom.multipliers(m, n, ks)
         return {
             "grid_rows": gr,
             "grid_cols": gc,
@@ -68,7 +76,11 @@ class TensorSliceTarget(Target):
             "m_groups": mg,
             "m_passes": m_passes,
             "grid_rows_pad": resolved.get("grid_rows_pad", gr),
-            "multipliers": _geom.multipliers(m, n, ks) if fold_axis != "m" else 64 * mg * gc * resolved["k_chunks"],
+            "n_groups": cg if fold_axis == "n" else gc,
+            "n_passes": n_passes,
+            "grid_cols_pad": resolved.get("grid_cols_pad", gc),
+            "core_cols": n if n_passes == 1 else 8 * cg,
+            "multipliers": mult,
             "a_stream_width": _geom.a_stream_width(m, ks),
             "b_stream_width": _geom.b_stream_width(n, ks),
             "c_stream_width": _geom.c_stream_width(n),
@@ -119,13 +131,15 @@ class TensorSliceTarget(Target):
             fold_axis = str(item.get("fold_axis") or "k").lower()
             resolved = _geom.resolve_reuse_factor(
                 item["k"], item.get("reuse_factor", 1), item.get("name"),
-                fold_axis=fold_axis, m=item["m"])
+                fold_axis=fold_axis, m=item["m"], n=item["n"])
             for w in resolved["warnings"]:
                 print(w, file=sys.stderr)
             gr = _geom.grid_rows(item["m"])
             gc = _geom.grid_cols(item["n"])
             mg = resolved.get("mg", gr)
             m_passes = resolved.get("m_passes", 1)
+            cg = resolved.get("cg", gc)
+            n_passes = resolved.get("n_passes", 1)
             item["k_spatial"] = resolved["k_spatial"]
             item["k_passes"] = resolved["passes"]
             item["k_chunks_pad"] = resolved["k_chunks_pad"]
@@ -136,8 +150,14 @@ class TensorSliceTarget(Target):
             item["m_groups"] = mg
             item["m_passes"] = m_passes
             item["grid_rows_pad"] = resolved.get("grid_rows_pad", gr)
+            item["n_groups"] = cg
+            item["n_passes"] = n_passes
+            item["grid_cols_pad"] = resolved.get("grid_cols_pad", gc)
+            item["core_cols"] = item["n"] if n_passes == 1 else 8 * cg
             if fold_axis == "m":
                 item["multipliers"] = 64 * mg * gc * resolved["k_chunks"]
+            elif fold_axis == "n":
+                item["multipliers"] = 64 * gr * cg * resolved["k_chunks"]
             else:
                 item["multipliers"] = _geom.multipliers(item["m"], item["n"], resolved["k_spatial"])
         return items

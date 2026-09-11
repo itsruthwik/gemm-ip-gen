@@ -121,18 +121,62 @@ def resolve_fold_m(m, reuse_factor, name=None):
     }
 
 
-def resolve_reuse_factor(k, reuse_factor, name=None, fold_axis="k", m=None):
+def resolve_fold_n(n, reuse_factor, name=None):
+    """Legalize a requested ReuseFactor into a column-tile-group (fold-N) plan.
+
+    ``reuse_factor`` (RF) is the number of column-tile groups (frames) the N
+    dimension is folded into: ``grid_cols = ceil(n/8)`` column tiles are
+    covered by ``cg = ceil(grid_cols / RF)`` column tiles per group, in
+    ``n_passes = ceil(grid_cols / cg)`` back-to-back frames; the legalized RF
+    is ``n_passes`` (which may land lower than requested -- silently).
+    Requests above ``grid_cols`` (RF > grid_cols) legalize down to
+    ``grid_cols`` (one column tile per frame) with a warning. RF=1 legalizes
+    to ``cg=grid_cols``, ``n_passes=1`` -- today's single-frame hardware. The
+    legal range is ``1..grid_cols``.
+
+    Returns a dict: cg, n_passes, grid_cols, grid_cols_pad,
+    reuse_factor_requested, reuse_factor (legalized), warnings (list[str]).
+    """
+    gc = grid_cols(n)
+    rf_req = int(reuse_factor)
+    warnings = []
+    rf_use = rf_req
+    if rf_use < 1:
+        rf_use = 1
+    if rf_use > gc:
+        who = f" for layer {name}" if name is not None else ""
+        warnings.append(
+            f"WARNING: Invalid ReuseFactor={rf_req}{who}. "
+            f"Using ReuseFactor={gc} instead. Valid ReuseFactor(s): 1..{gc}."
+        )
+        rf_use = gc
+    cg = _ceil_div(gc, rf_use)
+    n_passes = _ceil_div(gc, cg)
+    grid_cols_pad = n_passes * cg
+    return {
+        "cg": cg,
+        "n_passes": n_passes,
+        "grid_cols": gc,
+        "grid_cols_pad": grid_cols_pad,
+        "reuse_factor_requested": rf_req,
+        "reuse_factor": n_passes,
+        "warnings": warnings,
+    }
+
+
+def resolve_reuse_factor(k, reuse_factor, name=None, fold_axis="k", m=None, n=None):
     """Legalize a requested ReuseFactor for the tensor_slice target.
 
     ``fold_axis`` selects which dimension ReuseFactor folds: ``"k"`` (default)
     is the phase 1 K-partition legalization above; ``"m"`` folds row tiles
     instead (see :func:`resolve_fold_m`) and keeps K fully spatial
-    (``k_spatial = k_chunks``, one K pass -- the rf=1 K fields).
+    (``k_spatial = k_chunks``, one K pass -- the rf=1 K fields); ``"n"`` folds
+    column tiles instead (see :func:`resolve_fold_n`) and also keeps K and M
+    fully spatial (``k_spatial = k_chunks``, one K pass -- the rf=1 K fields).
 
-    Under ``fold_axis="m"`` this returns the same dict shape as the ``k``
-    path, with the K fields pinned to their rf=1 values and ``mg``,
-    ``m_passes``, ``grid_rows``, ``grid_rows_pad`` added; ``reuse_factor`` is
-    the legalized fold-M pass count.
+    Under ``fold_axis="m"``/``"n"`` this returns the same dict shape as the
+    ``k`` path, with the K fields pinned to their rf=1 values and the fold
+    fields added; ``reuse_factor`` is the legalized fold pass count.
     """
     if fold_axis == "m":
         if m is None:
@@ -152,6 +196,25 @@ def resolve_reuse_factor(k, reuse_factor, name=None, fold_axis="k", m=None):
             "m_passes": fm["m_passes"],
             "grid_rows": fm["grid_rows"],
             "grid_rows_pad": fm["grid_rows_pad"],
+        }
+    if fold_axis == "n":
+        if n is None:
+            raise ValueError("resolve_reuse_factor(fold_axis='n') requires n")
+        kc = k_chunks(k)
+        fn = resolve_fold_n(n, reuse_factor, name)
+        return {
+            "k_spatial": kc,
+            "passes": 1,
+            "k_chunks": kc,
+            "k_chunks_pad": kc,
+            "reuse_factor_requested": fn["reuse_factor_requested"],
+            "reuse_factor": fn["reuse_factor"],
+            "effective_reuse": fn["reuse_factor"],
+            "warnings": fn["warnings"],
+            "cg": fn["cg"],
+            "n_passes": fn["n_passes"],
+            "grid_cols": fn["grid_cols"],
+            "grid_cols_pad": fn["grid_cols_pad"],
         }
     return _resolve_reuse_factor_k(k, reuse_factor, name)
 

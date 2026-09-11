@@ -605,12 +605,65 @@ endmodule
 """
 
 
+def _gen_all_stimulus_fold_n(core_m, k, core_n, n_passes, base_seed, k_spatial, fixed_b_full=None):
+    """Group-aware fold-N stimulus: ONE shared A and ONE shared full-width B,
+    sliced into ``n_passes`` groups of ``core_n`` columns each (group g is
+    columns ``[g*core_n, (g+1)*core_n)`` of the full B) -- unlike the plain
+    K/M-fold regressions (independent random vectors per frame), fold-N needs
+    every frame fed the SAME A so frame g's checked golden is really
+    ``A @ B[:, group g]``, exactly what the wrapper's multi-frame RUN loop
+    composes back into one logical GEMM (see docs/wrapper_run_loop.md).
+
+    Returns the same 6-tuple ``generate_tb``'s other stimulus builders do,
+    plus the full B (``[k, n_passes*core_n]``) for the caller's own use (e.g.
+    building a matching weight ROM for a weights_in_core RTL regression case).
+    """
+    grid_rows = (core_m + 7) // 8
+    grid_cols = (core_n + 7) // 8  # per-group/per-frame core grid cols
+    input_beats = max(core_m, core_n)
+    k_chunks = (k + 7) // 8
+    passes = -(-k_chunks // k_spatial)  # always 1 under fold-N (single K pass)
+
+    rng = np.random.default_rng(base_seed)
+    max_val = max(1, int((127 / max(k, 1)) ** 0.5))
+    A = rng.integers(-max_val, max_val + 1, size=(core_m, k), dtype=np.int8)
+    n_full = n_passes * core_n
+    if fixed_b_full is not None:
+        B_full = np.asarray(fixed_b_full, dtype=np.int8)
+    else:
+        B_full = rng.integers(-max_val, max_val + 1, size=(k, n_full), dtype=np.int8)
+
+    all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
+    for g in range(n_passes):
+        B_g = B_full[:, g * core_n:(g + 1) * core_n]
+        biases_g = np.zeros((core_n,), dtype=np.int8)
+        C_ref = A.astype(np.int32) @ B_g.astype(np.int32) + biases_g.astype(np.int32)
+        C_sat = np.clip(C_ref, -128, 127).astype(np.int8)
+
+        a_stim, b_stim = [], []
+        for pass_idx in range(passes):
+            for t in range(input_beats):
+                a_stim.append(pack_a_k_spatial_narrow(A, t, pass_idx, core_m, k, k_spatial))
+                b_stim.append(pack_b_k_spatial_narrow(B_g, t, pass_idx, core_n, k, k_spatial))
+        all_a_stim.append(a_stim)
+        all_b_stim.append(b_stim)
+        all_bias.append(pack_bias(biases_g, grid_cols, core_n))
+
+        golden = []
+        for rt in range(grid_rows):
+            for row in range(8):
+                golden.append(pack_c_row(C_sat, rt, row, grid_cols, core_m, core_n, "catapult"))
+        all_golden.append(golden)
+
+    return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols, B_full
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 
 def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="catapult",
                 num_vectors=10, timing=False, back2back=False, k_spatial=1,
-                weights_in_core=False, fixed_B=None):
+                weights_in_core=False, fixed_B=None, fold_n_groups=None):
     """Generate a self-checking multi-vector Verilog testbench.
 
     Args:
@@ -631,7 +684,14 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
     Returns:
         Verilog source as a string.
     """
-    if k_spatial > 1:
+    if fold_n_groups and fold_n_groups > 1:
+        # Fold-N (FoldAxis="n"): group-aware stimulus -- ONE shared A, ONE
+        # shared full-width B sliced by group; overrides num_vectors with
+        # fold_n_groups (one vector per group/frame, checked in frame order
+        # by the existing back2back path).
+        all_a, all_b, all_bias, all_golden, gr, gc, _ = _gen_all_stimulus_fold_n(
+            m, k, n, fold_n_groups, seed, k_spatial, fixed_b_full=fixed_B)
+    elif k_spatial > 1:
         all_a, all_b, all_bias, all_golden, gr, gc = _gen_all_stimulus_catapult_k_spatial(
             m, k, n, num_vectors, seed, k_spatial, fixed_B=fixed_B)
     else:

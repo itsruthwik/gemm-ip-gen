@@ -19,7 +19,8 @@ from geometry import tail_mask_hex, vm, total_cycles as _total_cycles
 
 
 def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
-                         requant_shift=0, requant_bits=None, weight_rom=None, emit_rom=True):
+                         requant_shift=0, requant_bits=None, weight_rom=None, emit_rom=True,
+                         n_passes=1):
     # Body of requant_acc(): applied ONCE to the fully-accumulated dot product.
     # Emit requant_acc() ONLY when it is used. A declared-but-unused function is
     # dead Verilog, but it still perturbs synthesis (measured -1.2% Fmax on a
@@ -174,7 +175,7 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
     if _sim_ws:
         sim_b_cols_port = ""
         sim_b_src = "w_rom_out"
-        sim_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats) if emit_rom else ""
+        sim_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes) if emit_rom else ""
     else:
         sim_b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
         sim_b_src = "b_cols"
@@ -378,7 +379,7 @@ endmodule
 """
 
 
-def _weight_rom_block(b_width, weight_rom, n, input_beats):
+def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1):
     """Shared const-weight ROM: declaration + inline init + beat/addr counters + w_rom_out.
 
     Emitted once (above the `ifndef SYNTHESIS` split in the combined core) so a single
@@ -407,7 +408,39 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats):
         f"        w_rom[{i}] = {b_width}'h{(int(v) & mask):0{hexw}x};"
         for i, v in enumerate(weight_rom)
     )
-    return f"""
+    # Fold-N group counter, emitted only when n_passes > 1 (the ROM then holds
+    # n_passes*n entries, group g's columns at base g*n). The wrap on a frame's
+    # last beat already lands rom_addr on the next group's base (base + n); the
+    # idle beat between frames rewinds rom_addr to 0 only once every group has
+    # been visited, otherwise it holds the wrapped value and advances the
+    # counter. ``grp_was_feeding`` marks a real frame boundary (the idle beat
+    # right after fed beats) so reset settle beats and trailing idle cycles
+    # never advance the counter. With n_passes == 1 every fragment is empty and
+    # the block is byte-for-byte the single-group text.
+    if int(n_passes) > 1:
+        grp_decl = """
+    // Fold-N group counter: completed column-tile groups within the ROM's
+    // back-to-back frame replay; grp_was_feeding marks a real frame boundary.
+    reg [15:0] grp_ctr;
+    reg grp_was_feeding;"""
+        grp_reset = """
+            grp_ctr <= 16'd0;
+            grp_was_feeding <= 1'b0;"""
+        grp_idle = f"""                if (grp_was_feeding) begin
+                    if (grp_ctr + 16'd1 >= 16'd{n_passes}) begin
+                        rom_addr <= 16'd0;
+                        grp_ctr <= 16'd0;
+                    end else begin
+                        grp_ctr <= grp_ctr + 16'd1;
+                    end
+                end
+                grp_was_feeding <= 1'b0;"""
+        grp_feeding = """
+                grp_was_feeding <= 1'b1;"""
+    else:
+        grp_decl = grp_reset = grp_feeding = ""
+        grp_idle = "                rom_addr <= 16'd0;"
+    text = f"""
     // Weight-stationary const-weight ROM (baked; no external b_cols port). One beat
     // per presented input cycle; feeds both the sim and synth branches below. Only
     // {n} of every {input_beats} beats per pass carry a real column ({nbeats} entries
@@ -422,30 +455,31 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats):
     // single_port_ram only when the read address comes straight from a register, not
     // a combinational rom_base+beat_ctr expression (that form gets clk=unconn and
     // vpr aborts). Held flat, it always equals the current pass base + beat_ctr.
-    reg [15:0] rom_addr;
+    reg [15:0] rom_addr;{grp_decl}
     always @(posedge clk) begin
         if (rst) begin
             beat_ctr <= 16'd0;
-            rom_addr <= 16'd0;
+            rom_addr <= 16'd0;{grp_reset}
         end else if (en) begin
             if (!in_valid) begin
                 beat_ctr <= 16'd0;
-                rom_addr <= 16'd0;
+{grp_idle}
             end else if (beat_ctr < 16'd{input_beats - 1}) begin
                 beat_ctr <= beat_ctr + 16'd1;
-                if (beat_ctr + 16'd1 < 16'd{n}) rom_addr <= rom_addr + 16'd1;
+                if (beat_ctr + 16'd1 < 16'd{n}) rom_addr <= rom_addr + 16'd1;{grp_feeding}
             end else begin
                 beat_ctr <= 16'd0;
-                rom_addr <= rom_addr + 16'd1;
+                rom_addr <= rom_addr + 16'd1;{grp_feeding}
             end
         end
     end
     wire [{b_width - 1}:0] w_rom_out = (beat_ctr < 16'd{n}) ? w_rom[rom_addr] : {b_width}'d0;
 """
+    return text
 
 
 def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="chained", debug=False,
-                           weight_rom=None, emit_rom=True):
+                           weight_rom=None, emit_rom=True, n_passes=1):
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
 
@@ -575,7 +609,7 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
         b_cols_port = ""
         b_cols_q_src = "w_rom_out"
         # emit_rom=False when the combined core provides the shared ROM above `ifndef.
-        w_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats) if emit_rom else ""
+        w_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes) if emit_rom else ""
     else:
         b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
         b_cols_q_src = "b_cols"
@@ -818,7 +852,7 @@ def _split_after_first_endmodule(text):
 
 
 def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out_bits=8,
-                                   requant_shift=0, requant_bits=None, weight_rom=None):
+                                   requant_shift=0, requant_bits=None, weight_rom=None, n_passes=1):
     """Generate a single {module_name}.v with ifndef SYNTHESIS guard.
 
     ``ifndef SYNTHESIS`` — behavioral simulation model (wrapper + behav_grid).
@@ -845,7 +879,7 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
         header, syn_body = _split_module(synth_top, module_name)   # header incl. 'module..);'
         sim_wrapper, sim_behav = _split_after_first_endmodule(sim_top)
         _, sim_body = _split_module(sim_wrapper, module_name)
-        rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats)
+        rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes)
         out = (
             f"// Auto-generated by rtl.py\n"
             f"// Combined core (weight-stationary): M={m}, K={k}, N={n}\n"
@@ -901,7 +935,7 @@ def _k_spatial_partitions(k, k_spatial):
     return out
 
 
-def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
+def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, n_passes=1,
                                      requant_shift=0, requant_bits=None,
                                      weight_rom=None, emit_rom=True):
     """Structural K-spatial core.
@@ -966,7 +1000,7 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
     if ksp_ws:
         ksp_b_cols_port = ""
         ksp_b_cols_src = "w_rom_out"
-        ksp_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats) if emit_rom else ""
+        ksp_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes) if emit_rom else ""
     else:
         ksp_b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
         ksp_b_cols_src = "b_cols"
@@ -1294,10 +1328,10 @@ endmodule
 
 def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
                                    requant_shift=0, requant_bits=None,
-                                   weight_rom=None, emit_rom=True):
+                                   weight_rom=None, emit_rom=True, n_passes=1):
     sim = generate_sim_verilog(m, k, n, module_name, k_spatial=k_spatial,
                                requant_shift=requant_shift, requant_bits=requant_bits,
-                               weight_rom=weight_rom, emit_rom=emit_rom)
+                               weight_rom=weight_rom, emit_rom=emit_rom, n_passes=n_passes)
     if k_spatial == 1:
         return sim
     banner = (
@@ -1308,11 +1342,11 @@ def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_s
 
 
 def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, out_bits=8,
-                                            requant_shift=0, requant_bits=None, weight_rom=None):
+                                            requant_shift=0, requant_bits=None, weight_rom=None, n_passes=1):
     if k_spatial == 1:
         return generate_combined_core_verilog(m, k, n, module_name, out_bits=out_bits,
                                               requant_shift=requant_shift, requant_bits=requant_bits,
-                                              weight_rom=weight_rom)
+                                              weight_rom=weight_rom, n_passes=n_passes)
     _k_spatial_partitions(k, k_spatial)
     # Weight-stationary: each branch emits its own ROM. Unlike the chunked combined
     # core — which splits the two modules apart to hoist a single shared ROM above the
@@ -1322,10 +1356,10 @@ def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wra
     # construction; only one branch is ever compiled.
     sim_top = generate_k_spatial_sim_verilog(m, k, n, module_name, k_spatial,
                                             requant_shift=requant_shift, requant_bits=requant_bits,
-                                            weight_rom=weight_rom)
+                                            weight_rom=weight_rom, n_passes=n_passes)
     synth_top = generate_k_spatial_synth_verilog(m, k, n, module_name, k_spatial,
                                                 requant_shift=requant_shift, requant_bits=requant_bits,
-                                                weight_rom=weight_rom)
+                                                weight_rom=weight_rom, n_passes=n_passes)
 
     lines = []
     lines.append("// Auto-generated by rtl.py")

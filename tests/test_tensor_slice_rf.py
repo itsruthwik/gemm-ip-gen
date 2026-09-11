@@ -204,7 +204,6 @@ def test_generate_catapult_pkg_reuse_factor_weight_stationary(scratch_dir, reuse
 def test_generate_catapult_pkg_manifest_fields_via_flow(scratch_dir):
     """The batch manifest path (flow.normalize_config + gen_integration_manifest)
     carries the new RF fields end to end."""
-    import flow as _flow_mod  # loaded relative to the tensor_slice dir below
 
     tdir = str(_SRC / "targets" / "tensor_slice")
     saved_path = list(sys.path)
@@ -408,3 +407,181 @@ def test_generate_catapult_pkg_fold_axis_k_byte_identical_to_default(scratch_dir
         b = (scratch_dir / name_k / f"{name_k}{ext}").read_text()
         a = a.replace(name_default.upper(), name_k.upper()).replace(name_default, name_k)
         assert a == b
+
+
+# ── fold-N (FoldAxis="n") ────────────────────────────────────────────────────
+
+resolve_fold_n = _geom.resolve_fold_n
+
+# n=20 -> grid_cols = ceil(20/8) = 3
+N20_GRID_COLS = 3
+
+
+def test_resolve_fold_n_legal_set_n20():
+    for rf in range(1, N20_GRID_COLS + 1):
+        resolved = resolve_fold_n(20, rf)
+        assert resolved["grid_cols"] == N20_GRID_COLS
+        assert resolved["n_passes"] == resolved["reuse_factor"]
+        assert resolved["warnings"] == []
+        assert resolved["cg"] * resolved["n_passes"] >= N20_GRID_COLS
+
+
+def test_resolve_fold_n_rf1_is_single_frame():
+    resolved = resolve_fold_n(20, 1)
+    assert resolved["cg"] == N20_GRID_COLS
+    assert resolved["n_passes"] == 1
+    assert resolved["reuse_factor"] == 1
+    assert resolved["grid_cols_pad"] == N20_GRID_COLS
+
+
+def test_resolve_fold_n_out_of_range_warns_and_clamps():
+    resolved = resolve_fold_n(20, N20_GRID_COLS + 5, name="mylayer")
+    assert len(resolved["warnings"]) == 1
+    msg = resolved["warnings"][0]
+    assert msg == (
+        f"WARNING: Invalid ReuseFactor={N20_GRID_COLS + 5} for layer mylayer. "
+        f"Using ReuseFactor={N20_GRID_COLS} instead. Valid ReuseFactor(s): 1..{N20_GRID_COLS}."
+    )
+    assert resolved["reuse_factor"] == N20_GRID_COLS
+    assert resolved["cg"] == 1
+
+
+def test_resolve_fold_n_silent_lower_landing():
+    # grid_cols(100) = 13; rf=6 -> cg=ceil(13/6)=3, n_passes=ceil(13/3)=5 < 6:
+    # the request lands lower than asked, silently (no warning -- only an
+    # out-of-range request above grid_cols warns).
+    assert resolve_fold_n(100, 1)["grid_cols"] == 13
+    resolved = resolve_fold_n(100, 6)
+    assert resolved["cg"] == 3
+    assert resolved["n_passes"] == 5
+    assert resolved["reuse_factor"] == 5
+    assert resolved["warnings"] == []
+
+
+def test_resolve_fold_n_padding_arithmetic():
+    # grid_cols(20) = 3, rf=2 -> cg = ceil(3/2) = 2, n_passes = ceil(3/2) = 2,
+    # grid_cols_pad = 4 (one padding column tile in the last group).
+    resolved = resolve_fold_n(20, 2)
+    assert resolved["cg"] == 2
+    assert resolved["n_passes"] == 2
+    assert resolved["grid_cols_pad"] == 4
+
+
+def test_resolve_reuse_factor_fold_axis_n_pins_k_fields_at_rf1():
+    resolved = resolve_reuse_factor(24, 2, fold_axis="n", n=20)
+    kc = K24_CHUNKS
+    assert resolved["k_spatial"] == kc
+    assert resolved["passes"] == 1
+    assert resolved["k_chunks_pad"] == kc
+    assert resolved["cg"] == 2
+    assert resolved["n_passes"] == 2
+    assert resolved["reuse_factor"] == 2
+    # Unlike fold-M (effective_reuse pinned at 1), fold-N's effective_reuse
+    # tracks the pass count: each frame reuses the array once per group.
+    assert resolved["effective_reuse"] == 2
+
+
+def test_flow_normalize_config_fold_axis_n_fields(scratch_dir):
+    tdir = str(_SRC / "targets" / "tensor_slice")
+    saved_path = list(sys.path)
+    saved_modules = {k: sys.modules.get(k) for k in ("geometry", "package", "rtl", "golden", "flow", "base")}
+    sys.path.insert(0, str(_SRC / "targets"))
+    sys.path.insert(0, tdir)
+    for stale in ("geometry", "package", "rtl", "golden", "flow", "base"):
+        sys.modules.pop(stale, None)
+    try:
+        spec = importlib.util.spec_from_file_location("_ts_flow_n", Path(tdir) / "flow.py")
+        flow_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(flow_mod)
+        target = flow_mod.TARGET
+        items = [{"name": "l0", "m": 20, "k": 24, "n": 20, "reuse_factor": 2, "fold_axis": "n"}]
+        norm = target.normalize_config(items)
+        manifest = json.loads(target.integration_manifest(norm))
+        k_items = [{"name": "l1", "m": 20, "k": 24, "n": 20, "reuse_factor": 2}]
+        k_norm = target.normalize_config(k_items)
+        k_manifest = json.loads(target.integration_manifest(k_norm))
+        d_norm = target.normalize_config({"l2": {
+            "type": "Gemm", "n_in": 24, "n_out": 20, "gemm_m": 20,
+            "reuse_factor": 2, "fold_axis": "n"}})
+    finally:
+        sys.path[:] = saved_path
+        for stale, prev in saved_modules.items():
+            if prev is None:
+                sys.modules.pop(stale, None)
+            else:
+                sys.modules[stale] = prev
+
+    item = norm[0]
+    assert item["fold_axis"] == "n"
+    assert d_norm[0]["fold_axis"] == "n" and d_norm[0]["n_passes"] == 2
+    assert item["n_groups"] == 2
+    assert item["n_passes"] == 2
+    assert item["grid_cols_pad"] == 4
+    assert item["core_cols"] == 16
+    assert item["k_spatial"] == K24_CHUNKS
+    assert item["k_passes"] == 1
+
+    core = manifest["cores"][0]
+    assert core["n_groups"] == 2
+    assert core["n_passes"] == 2
+    assert core["grid_cols_pad"] == 4
+
+    # Default axis ("k") reports n_groups=grid_cols, n_passes=1, core_cols=n.
+    k_core = k_manifest["cores"][0]
+    assert k_core["n_groups"] == N20_GRID_COLS
+    assert k_core["n_passes"] == 1
+
+
+def test_generate_catapult_pkg_fold_axis_n_rf1_byte_identical_to_k(scratch_dir):
+    """RF=1 under fold_axis='n' is a single frame: the generated core, header
+    and RTL are byte-identical to the fold_axis='k' package for the same shape
+    (only the manifest's fold fields differ)."""
+    m, k, n = 20, 24, 16
+    for name, axis in (("foldn_rf1", "n"), ("foldk_rf1b", "k")):
+        _with_tensor_slice_on_path(
+            generate_catapult_pkg, m, k, n, name, str(scratch_dir),
+            interface="stream", reuse_factor=1, fold_axis=axis,
+        )
+    dn, dk = scratch_dir / "foldn_rf1", scratch_dir / "foldk_rf1b"
+    for fn_ in sorted(dn.iterdir()):
+        fk = dk / fn_.name.replace("foldn_rf1", "foldk_rf1b")
+        assert fk.exists(), fn_.name
+        tn = fn_.read_text().replace("foldn_rf1", "X").replace("FOLDN_RF1", "X")
+        tk = fk.read_text().replace("foldk_rf1b", "X").replace("FOLDK_RF1B", "X")
+        assert tn == tk, fn_.name
+
+
+def test_generate_catapult_pkg_fold_axis_n_generates_full_package(scratch_dir):
+    """A multi-frame fold-N package (rf > 1) still produces a complete,
+    well-formed package (core/header/inst/tb/tcl all present and non-empty)."""
+    m, k, n = 12, 24, 32
+    name = "foldn_manifest"
+    pkg = _with_tensor_slice_on_path(
+        generate_catapult_pkg, m, k, n, name, str(scratch_dir),
+        interface="stream", reuse_factor=4, fold_axis="n",
+    )
+    pkg_dir = scratch_dir / name
+    for f in (f"{name}_core.v", "nnet_types.h", f"{name}_gemm_ip.h",
+              f"{name}_inst.cpp", f"{name}_tb.cpp", "run_catapult.tcl"):
+        assert (pkg_dir / f).is_file() and (pkg_dir / f).stat().st_size > 0, f
+
+
+
+def test_generate_catapult_pkg_fold_axis_n_rom_read_offsets_by_group(scratch_dir):
+    """Under fold-N with baked weights the C model must read frame g's column
+    group from the ROM (the RTL's group counter does); a plain per-pass index
+    would feed group 0 on every frame and csim would disagree with cosim."""
+    m, k, n = 12, 24, 32
+    W = _random_weight_matrix(k, n)
+    for name, axis in (("romn2", "n"), ("romk1", "k")):
+        _with_tensor_slice_on_path(
+            generate_catapult_pkg, m, k, n, name, str(scratch_dir),
+            interface="stream", reuse_factor=2 if axis == "n" else 1, fold_axis=axis,
+            input_precision="fixed<8,2>", weight_precision="fixed<8,2>",
+            output_precision="fixed<16,6>", weight_matrix=W,
+        )
+    hdr_n = (scratch_dir / "romn2" / "romn2_gemm_ip.h").read_text()
+    hdr_k = (scratch_dir / "romk1" / "romk1_gemm_ip.h").read_text()
+    assert "B_ROM[_bidx + _grp * 16]" in hdr_n
+    assert "_grp = (_grp + 1) % 2;" in hdr_n
+    assert "_grp" not in hdr_k

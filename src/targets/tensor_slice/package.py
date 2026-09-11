@@ -77,7 +77,8 @@ def dead_cycles(m, k, n, grid_cols, k_spatial=1):
 
 def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_spatial=1,
                       input_precision=None, weight_precision=None, clock_period_ns=None,
-                      n_frames=1, weight_rom=None, m_passes=1, logical_m=None):
+                      n_frames=1, weight_rom=None, m_passes=1, logical_m=None,
+                      n_passes=1, logical_n=None):
     # Weight-stationary (const-weight) mode: weights live in the RTL wrapper ROM,
     # so the ccore run() drops the b_cols port (matching the ROM wrapper), and the
     # csim-only behavioral branch bakes the same per-beat words into an internal
@@ -148,6 +149,26 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # logical_m == m and nothing below changes any generated text.
     fold_m = int(m_passes) > 1
     logical_m = m if logical_m is None else int(logical_m)
+
+    # Fold-N: ``n`` here is the CORE column count (N_g == 8*cg); ``logical_n``
+    # is the true N the caller's CONFIG_T::gemm_n and res_T carry. ``n_passes``
+    # frames of N_g core columns are issued back-to-back (n_frames == n_passes
+    # drives the period/feed_total/total_steps schedule below, same as
+    # fold-M). Unlike fold-M (which pads spare ROWS in the LAST frame), every
+    # frame here emits M real rows -- only the tail COLUMN tiles of the LAST
+    # group may be padding (silently zero, dropped by the emission loop's
+    # ``col < logical_n`` bound). fold_n is False (n_passes == 1) for every
+    # phase 1/2 (fold_axis in {{"k", "m"}}) package, in which case logical_n
+    # == n and nothing below changes any generated text.
+    fold_n = int(n_passes) > 1
+    # C-model group counter for the baked-ROM read under fold-N (see bbuf_src).
+    if fold_n and weights_in_core:
+        grp_static_decl = f"\n        static int _grp = {int(n_passes) - 1};"
+        grp_static_step = f"\n                _grp = (_grp + 1) % {int(n_passes)};"
+    else:
+        grp_static_decl = ""
+        grp_static_step = ""
+    logical_n = n if logical_n is None else int(logical_n)
 
     # Choose the RHS expression for the final output assignment based on the
     # configured result type.  Integer types (ac_int / ac_uint) need an explicit
@@ -224,6 +245,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # build_weight_rom_k_spatial for whatever k_spatial/passes this package
     # resolved to), so both the narrow and grid-padded feed loops need the
     # conditional inserts.
+    # Under fold-N the external weight beats of frame g are group g's columns
+    # (the array feed under fold-N has its own override further down).
+    b_col_idx = f"g * {n} + t" if fold_n else "t"
     if weights_in_core:
         bcols_run_param = ""
         bcols_bb_xor = ""
@@ -232,7 +256,11 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # only beat t < n of each pass carries a real column, so B_ROM (like the RTL
         # ROM) holds just passes*n entries; the capture block below only reads this
         # for _t < n (see _bidx), matching rtl.py's beat_ctr/rom_base mux exactly.
-        bbuf_src = "B_ROM[_bidx]"
+        # Under fold-N frame g reads group g's columns: the ROM holds n_passes
+        # groups of core_n entries per pass, so offset the read by the frame's
+        # group (a static counter stepping at each frame start, as the RTL's
+        # group counter does). Single-group packages keep the plain index.
+        bbuf_src = "B_ROM[_bidx + _grp * %d]" % n if fold_n else "B_ROM[_bidx]"
         brom_decl = _const_weights_brom_cpp(b_bits, grid_cols, weight_rom)
         stream_bcols_decl = ""
         # Weight-stationary: the IP holds B, so the feed packs no B beat at all.
@@ -254,7 +282,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # is the pass index (== the K chunk index when k_spatial == 1).
         if ks > 1:
             stream_bcols_pack = f"""if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[t];
+            b_beat_T b_beat = weight_cols[{b_col_idx}];
             #pragma hls_unroll
             COL_PACK_KC: for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
                 #pragma hls_unroll
@@ -269,7 +297,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         }}"""
         else:
             stream_bcols_pack = f"""if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[t];
+            b_beat_T b_beat = weight_cols[{b_col_idx}];
             #pragma hls_unroll
             COL_PACK: for (int kl = 0; kl < 8; kl++) {{
                 int kk = kc * 8 + kl;
@@ -289,7 +317,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         if ks > 1:
             array_bcols_pack = f"""
         if (step > 0 && step <= {total_beats} && t < {n}) {{
-            b_beat_T b_beat = weight_cols[t];
+            b_beat_T b_beat = weight_cols[{b_col_idx}];
             #pragma hls_unroll
             for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
                 #pragma hls_unroll
@@ -305,7 +333,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         else:
             array_bcols_pack = f"""
         if (step > 0 && step <= {total_beats} && t < {n}) {{
-            b_beat_T b_beat = weight_cols[t];
+            b_beat_T b_beat = weight_cols[{b_col_idx}];
             #pragma hls_unroll
             for (int kl = 0; kl < 8; kl++) {{
                 int kk = kc * 8 + kl;
@@ -445,6 +473,29 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         a_replay_else = """
             }"""
 
+    # Fold-N raw output capture: shared by the stream and array RUN loops.
+    # Every frame emits M REAL rows (M is fully spatial under fold_axis="n"),
+    # so `captured` needs no padding guard beyond the plain n_passes*m total;
+    # only the group's N_g columns are stored, at that group's column offset
+    # -- the emission loop after RUN assembles/rescales/biases the full
+    # logical_n-wide rows once every group has landed.
+    capture_fold_n = f"""\
+        if (v) {{
+            if (captured < {n_passes * m}) {{
+                int gOut = captured / {m};
+                int rowOut = captured % {m};
+                #pragma hls_unroll
+                for (int col = 0; col < {n}; col++) {{
+                    int col_tile = col / 8;
+                    int col_local = col % 8;
+                    c_buf[rowOut][gOut * {n} + col] =
+                        c_row.template slc<16>(col_tile * 128 + col_local * 16);
+                }}
+            }}
+            captured++;
+        }}"""
+
+    _a_read_guard = "kc == 0"
     _stream_feed_cond = f"feeding_now && t < {m}"
     _stream_g_decl = ""
     _stream_capture_use = stream_capture_b2b
@@ -459,6 +510,28 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         _stream_g_decl = "\n        int g = step / %d;" % period
         _stream_feed_cond = f"feeding_now && t < {m} && (g * {m} + t) < {logical_m}"
         _stream_capture_use = stream_capture
+    elif fold_n:
+        # Fold-N: A rows are IDENTICAL across every frame (same M rows, only
+        # the B columns / output group change), but the stream is single-read
+        # -- frame 0 stores the rows as they are read (one shared slot: every
+        # later frame replays the exact same value, so a_replay does not need
+        # a per-frame copy the way the K-pass replay does). Capture is the
+        # raw group-scoped c_buf write above.
+        a_replay_decl = f"""
+    // Fold-N: A rows repeat identically across every frame (only B's group
+    // and the output group change); frame 0 stores them as they are read off
+    // the stream (single-read ac_channel), frames >= 1 replay the same slot.
+    ac_int<{a_bits}, false> a_replay_n[{m}];
+"""
+        a_prepack_replay = f"""
+                a_replay_n[t] = a_rows;"""
+        a_replay_else = f"""
+            }} else {{
+                a_rows = a_replay_n[t];
+            }}"""
+        _a_read_guard = "g == 0"
+        _stream_g_decl = "\n        int g = step / %d;" % period
+        _stream_capture_use = capture_fold_n
 
     stream_feed_loop = f"""
 {a_replay_decl}
@@ -481,7 +554,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         {stream_bcols_decl}
 
         if ({_stream_feed_cond}) {{
-            if (kc == 0) {{
+            if ({_a_read_guard}) {{
                 a_beat_T a_beat = a_stream.read();{_a_pack_block("a_rows", "0", "ROW_PACK_DIRECT")}{a_prepack_replay}{a_replay_else}
         }}
         {stream_bcols_pack}
@@ -540,7 +613,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         elif ks > 1:
             fold_array_bcols_pack = f"""
         if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[t];
+            b_beat_T b_beat = weight_cols[{b_col_idx}];
             #pragma hls_unroll
             for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
                 #pragma hls_unroll
@@ -556,7 +629,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         else:
             fold_array_bcols_pack = f"""
         if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[t];
+            b_beat_T b_beat = weight_cols[{b_col_idx}];
             #pragma hls_unroll
             for (int kl = 0; kl < 8; kl++) {{
                 int kk = kc * 8 + kl;
@@ -604,6 +677,118 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
 {array_capture}
     }}
 """
+    elif fold_n:
+        if weights_in_core:
+            fold_n_array_bcols_pack = ""
+        elif ks > 1:
+            fold_n_array_bcols_pack = f"""
+        if (feeding_now && t < {n}) {{
+            b_beat_T b_beat = weight_cols[g * {n} + t];
+            #pragma hls_unroll
+            for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
+                #pragma hls_unroll
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = (kc * {ks} + kc_local) * 8 + kl;
+                    if (kk < {k}) {{
+                        b_cols_packed.set_slc(kc_local * 64 + kl * 8,
+                                              {name}_to_gemm_int8(b_beat[kk]));
+                    }}
+                }}
+            }}
+        }}"""
+        else:
+            fold_n_array_bcols_pack = f"""
+        if (feeding_now && t < {n}) {{
+            b_beat_T b_beat = weight_cols[g * {n} + t];
+            #pragma hls_unroll
+            for (int kl = 0; kl < 8; kl++) {{
+                int kk = kc * 8 + kl;
+                int col_tile = t / 8;
+                #pragma hls_unroll
+                for (int ct = 0; ct < {grid_cols}; ct++) {{
+                    if (col_tile == ct && kk < {k}) {{
+                        b_cols_packed.set_slc(ct * 64 + kl * 8,
+                                              {name}_to_gemm_int8(b_beat[kk]));
+                    }}
+                }}
+            }}
+        }}"""
+        # Fold-N array loop: same multi-frame schedule as the fold-N stream RUN
+        # loop above (period/feed_total/total_steps). A rows come straight from
+        # a_rows[] (random access -- no replay buffer needed, unlike the
+        # channel-fed stream entry); every frame re-reads the SAME M rows, and
+        # group g's B columns are restricted by beat index (two-stream) or by
+        # the group-scoped ROM (const weights). Capture is the raw group-scoped
+        # c_buf write; the drain/rescale/bias/cast is a separate loop after RUN.
+        array_feed_loop = f"""
+    // Fold-N multi-frame feed: {n_passes} frames of {m} rows each (core
+    // N_g={n} columns per frame, K and M fully spatial, k_spatial={ks}),
+    // issued back-to-back. Every frame re-reads the same M rows off a_rows[].
+    #pragma hls_pipeline_init_interval 1
+    RUN_ARRAY: for (int step = 0; step < {total_steps}; step++) {{
+        bool in_feed = (step < {feed_total});
+        int p = in_feed ? (step % {period}) : {period};
+        int g = step / {period};
+        bool feeding_now = in_feed && (p >= 1) && (p <= {total_beats});
+        int pf = p - 1;
+        int kc = pf / {input_beats};
+        int t = pf % {input_beats};
+        ac_int<{a_bits}, false> a_rows_packed = 0;{array_bcols_decl}
+
+        if (feeding_now && t < {m}) {{
+            a_beat_T a_beat = a_rows[t];{_a_pack_block("a_rows_packed", "kc", "ROW_PACK_ARRAY_FOLD_N")}
+        }}
+        {fold_n_array_bcols_pack}
+
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
+        ac_int<1, false> feed_preload_valid = (in_feed && p == 0) ? 1 : 0;
+        gemm.run(a_rows_packed, {array_bcols_run_arg}bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
+{capture_fold_n}
+    }}
+"""
+
+    # Fold-N C assembly: raw group-scoped lanes land in c_buf during the RUN
+    # loop above (capture_fold_n); once every group's frame has landed, this
+    # separate M-iteration loop assembles/rescales/biases/casts the full
+    # logical_n-wide rows -- exactly today's per-row drain, just deferred
+    # past the last frame instead of interleaved with the feed. gemm_shift/
+    # bias/result-cast text is identical to _capture_body's, just addressed
+    # by a plain row/col loop over c_buf instead of the live c_row port.
+    _c_buf_decl = (
+        f"    ac_int<16, true> c_buf[{m}][{n_passes * n}];\n" if fold_n else ""
+    )
+    _fold_n_emit_body = f"""\
+    #pragma hls_pipeline_init_interval 1
+    EMIT_FOLD_N: for (int row = 0; row < {m}; row++) {{
+        %SINK_DECL%
+        #pragma hls_unroll
+        for (int col = 0; col < {logical_n}; col++) {{
+            ac_int<16, true> raw_val = c_buf[row][col];
+            typename CONFIG_T::accum_t value =
+                static_cast<typename CONFIG_T::accum_t>(
+                    ((ac_fixed<48, 24, true>) raw_val.to_int()) >> {drain_shift})
+                + (HAS_BIAS
+                       ? static_cast<typename CONFIG_T::accum_t>(biases[col])
+                       : static_cast<typename CONFIG_T::accum_t>(0));
+            %SINK_COL%
+        }}
+        %SINK_ROW%
+    }}
+"""
+    _emit_stream = (
+        _fold_n_emit_body
+        .replace("        %SINK_DECL%\n", "        res_T out_pack;\n")
+        .replace("            %SINK_COL%", "            out_pack[col] = static_cast<typename res_T::value_type>({});".format(assign_expr))
+        .replace("        %SINK_ROW%\n", "        res_stream.write(out_pack);\n")
+    ) if fold_n else ""
+    _emit_array = (
+        _fold_n_emit_body
+        .replace("        %SINK_DECL%\n", "")
+        .replace("            %SINK_COL%", "            results[row][col] = static_cast<typename res_T::value_type>({});".format(assign_expr))
+        .replace("        %SINK_ROW%\n", "")
+    ) if fold_n else ""
 
     if weights_in_core:
         # Weight-stationary: the self-contained const_weights STREAM entry plus the
@@ -621,7 +806,7 @@ void {name}_gemm_ip_stream_const_weights(
     ac_channel<res_T> &res_stream
 ) {{
     static_assert(CONFIG_T::gemm_m == {logical_m}, "Generated GEMM wrapper requires matching gemm_m.");
-    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
+    static_assert(CONFIG_T::gemm_n == {logical_n}, "Generated GEMM wrapper requires matching gemm_n.");
     static_assert(a_beat_T::size == CONFIG_T::gemm_k,
                   "a_beat_T must carry one A-row K-width beat.");
     static_assert(res_T::size == CONFIG_T::gemm_n,
@@ -631,7 +816,7 @@ void {name}_gemm_ip_stream_const_weights(
     int captured = 0;   // total out_valid pulses seen (incl. padding rows)
     int written = 0;    // real result rows written to res_stream
     ac_int<{bias_bits}, false> bias_packed = 0;
-
+{_c_buf_decl}
     #pragma hls_unroll
     BIAS_PACK: for (int col = 0; col < {n}; col++) {{
         int col_tile = col / 8;
@@ -643,7 +828,7 @@ void {name}_gemm_ip_stream_const_weights(
     }}
 
 {stream_feed_loop}
-}}
+{_emit_stream}}}
 
 // Weight-stationary ARRAY entry (io_parallel): array in / array out, weights in
 // the core. Direct feed — A rows go straight into gemm.run() (no b_cols, weights
@@ -656,7 +841,7 @@ void {name}_gemm_ip_array_const_weights(
     res_T results[CONFIG_T::gemm_m]
 ) {{
     static_assert(CONFIG_T::gemm_m == {logical_m}, "Generated GEMM wrapper requires matching gemm_m.");
-    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
+    static_assert(CONFIG_T::gemm_n == {logical_n}, "Generated GEMM wrapper requires matching gemm_n.");
     static_assert(a_beat_T::size == CONFIG_T::gemm_k,
                   "a_beat_T must carry one A-row K-width beat.");
     static_assert(res_T::size == CONFIG_T::gemm_n,
@@ -666,7 +851,7 @@ void {name}_gemm_ip_array_const_weights(
     int captured = 0;
     ac_int<{a_bits}, false> last_a_rows = 0;
     ac_int<{bias_bits}, false> bias_packed = 0;
-
+{_c_buf_decl}
     #pragma hls_unroll
     BIAS_PACK_ARRAY_WL: for (int col = 0; col < {n}; col++) {{
         int col_tile = col / 8;
@@ -685,7 +870,7 @@ void {name}_gemm_ip_array_const_weights(
         ac_int<1, false> drain_preload_valid = 0;
         gemm.run(last_a_rows, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
     }}
-}}
+{_emit_array}}}
 """
     else:
         # Two-stream: buffered-B worker + external-weight stream/array entries
@@ -699,7 +884,7 @@ void {name}_gemm_ip_stream_buffered_b(
     ac_channel<res_T> &res_stream
 ) {{
     static_assert(CONFIG_T::gemm_m == {logical_m}, "Generated GEMM wrapper requires matching gemm_m.");
-    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
+    static_assert(CONFIG_T::gemm_n == {logical_n}, "Generated GEMM wrapper requires matching gemm_n.");
     static_assert(a_beat_T::size == CONFIG_T::gemm_k,
                   "a_beat_T must carry one A-row K-width beat.");
     static_assert(CONFIG_T::transpose_weights,
@@ -714,7 +899,7 @@ void {name}_gemm_ip_stream_buffered_b(
     int captured = 0;   // total out_valid pulses seen (incl. padding rows)
     int written = 0;    // real result rows written to res_stream
     ac_int<{bias_bits}, false> bias_packed = 0;
-
+{_c_buf_decl}
     #pragma hls_unroll
     BIAS_PACK: for (int col = 0; col < {n}; col++) {{
         int col_tile = col / 8;
@@ -726,7 +911,7 @@ void {name}_gemm_ip_stream_buffered_b(
     }}
 
 {stream_feed_loop}
-}}
+{_emit_stream}}}
 
 // Two-operand entry: no bias port -- a two-operand GEMM never owns one, so the
 // shared buffered-B worker above is instantiated with HAS_BIAS=false (biases=nullptr),
@@ -737,9 +922,9 @@ void {name}_gemm_ip_stream(
     ac_channel<b_beat_T> &b_stream,
     ac_channel<res_T> &res_stream
 ) {{
-    b_beat_T weight_cols[{n}];
+    b_beat_T weight_cols[{logical_n}];
     #pragma hls_pipeline_init_interval 1
-    READ_B_COLS: for (int col = 0; col < {n}; col++) {{
+    READ_B_COLS: for (int col = 0; col < {logical_n}; col++) {{
         weight_cols[col] = b_stream.read();
     }}
     {name}_gemm_ip_stream_buffered_b<a_beat_T, b_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T, false>(
@@ -756,7 +941,7 @@ void {name}_gemm_ip_array(
     res_T results[CONFIG_T::gemm_m]
 ) {{
     static_assert(CONFIG_T::gemm_m == {logical_m}, "Generated GEMM wrapper requires matching gemm_m.");
-    static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
+    static_assert(CONFIG_T::gemm_n == {logical_n}, "Generated GEMM wrapper requires matching gemm_n.");
 
     static {name}_ccore gemm;
     int captured = 0;
@@ -765,7 +950,7 @@ void {name}_gemm_ip_array(
     ac_int<{bias_bits}, false> bias_packed = 0;
     constexpr bool HAS_BIAS = false;
     typename CONFIG_T::bias_t *biases = nullptr;
-
+{_c_buf_decl}
     #pragma hls_unroll
     BIAS_PACK_ARRAY: for (int col = 0; col < {n}; col++) {{
         int col_tile = col / 8;
@@ -786,7 +971,7 @@ void {name}_gemm_ip_array(
         ac_int<1, false> drain_preload_valid = 0;
         gemm.run(last_a_rows, last_b_cols, bias_packed, drain_preload_valid, drain_valid, c_row, v, l);
     }}
-}}
+{_emit_array}}}
 """
 
     return f"""\
@@ -856,7 +1041,7 @@ class {name}_ccore {{
         static int cc_slot[{slots}] = {{0}};
         static bool slot_run[{slots}] = {{false}};
         static int wr_slot = {slots - 1};
-        static bool feeding = false;
+        static bool feeding = false;{grp_static_decl}
 
         c_row = 0;
         out_valid = 0;
@@ -868,7 +1053,7 @@ class {name}_ccore {{
                 feeding = true;
                 slot_run[wr_slot] = true;
                 cc_slot[wr_slot] = 0;
-                bias_buf[wr_slot] = bias_cols;
+                bias_buf[wr_slot] = bias_cols;{grp_static_step}
             }}
             if (cc_slot[wr_slot] < {total_beats}) {{
                 a_buf[wr_slot][cc_slot[wr_slot]] = a_rows;
@@ -1714,6 +1899,10 @@ def gen_integration_manifest(items):
         mult = item["multipliers"]
         gr_pad = item["grid_rows_pad"]
         core_rows = mg * 8 if mp > 1 else item["m"]
+        ng = item["n_groups"]
+        np_ = item["n_passes"]
+        gc_pad = item["grid_cols_pad"]
+        core_cols = item["core_cols"]
         cores.append({
             "name": item["name"],
             "interface": item.get("interface", "stream"),
@@ -1735,6 +1924,10 @@ def gen_integration_manifest(items):
             "m_passes": mp,
             "grid_rows_pad": gr_pad,
             "core_rows": core_rows,
+            "n_groups": ng,
+            "n_passes": np_,
+            "grid_cols_pad": gc_pad,
+            "core_cols": core_cols,
             "reset": {
                 "name": "rst",
                 "sync_active": "high"
@@ -1837,19 +2030,25 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     _check_operand_fits_int8_core(name, "input_precision", input_precision)
     _check_operand_fits_int8_core(name, "weight_precision", weight_precision)
     fold_axis = str(fold_axis).lower()
-    resolved = resolve_reuse_factor(k, reuse_factor, name, fold_axis=fold_axis, m=m)
+    resolved = resolve_reuse_factor(k, reuse_factor, name, fold_axis=fold_axis, m=m, n=n)
     for w in resolved["warnings"]:
         print(w, file=sys.stderr)
     k_spatial = resolved["k_spatial"]
     passes = resolved["passes"]
     rf_legalized = resolved["reuse_factor"]
     fold_m = fold_axis == "m"
+    fold_n = fold_axis == "n"
     m_passes = resolved.get("m_passes", 1) if fold_m else 1
+    n_passes = resolved.get("n_passes", 1) if fold_n else 1
     # ``core_m`` is the RTL/csim-core row count: M_g = 8*mg when fold-M issues
     # more than one frame (m_passes frames of core_m rows assemble the logical
     # M rows), otherwise the logical M itself, so a single-frame package is
     # today's shape whichever axis was named.
     core_m = resolved["mg"] * 8 if m_passes > 1 else m
+    # ``core_n`` is the RTL/csim-core column count: N_g = 8*cg when fold-N
+    # issues more than one frame (n_passes frames of core_n columns assemble
+    # the logical N columns), otherwise the logical N itself.
+    core_n = resolved["cg"] * 8 if n_passes > 1 else n
     # Weight-stationary (const-weight) variant: weights (B, shape [K, N]) baked into
     # the core ROM AND the csim header; the wrapper takes no external weight port and
     # the header entry takes A only. Single source of truth = weight_matrix. Works at
@@ -1859,12 +2058,23 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     weight_rom = None
     if weights_in_core:
         from gemm_ip.weights import build_weight_rom_k_spatial
-        weight_rom = build_weight_rom_k_spatial(weight_matrix, core_m, n, k, k_spatial)
-        expected_beats = passes * n
+        if n_passes > 1:
+            # Fold-N: the ROM holds every group's columns back to back (group
+            # g's block at base g*core_n, padded tail columns zero -- weight_
+            # matrix's own N may be smaller than n_passes*core_n).
+            import numpy as _np
+            n_full = n_passes * core_n
+            b_full = _np.zeros((k, n_full), dtype=_np.asarray(weight_matrix).dtype)
+            b_full[:, :n] = weight_matrix
+            weight_rom = build_weight_rom_k_spatial(b_full, core_m, n_full, k, k_spatial)
+            expected_beats = n_full
+        else:
+            weight_rom = build_weight_rom_k_spatial(weight_matrix, core_m, core_n, k, k_spatial)
+            expected_beats = passes * core_n
         if len(weight_rom) != expected_beats:
             raise RuntimeError(
                 f"{name}: weight ROM has {len(weight_rom)} beats, expected "
-                f"{expected_beats} (passes={passes} * n={n})"
+                f"{expected_beats}"
             )
     # The core saturates the raw integer dot-product to the physical 16-bit
     # output lane; result-precision quantization happens in the wrapper drain
@@ -1879,10 +2089,11 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
-    # ``grid_rows``/RTL-core generation are sized on the CORE row count
-    # (core_m == m under fold_axis="k"; core_m == M_g under fold_axis="m").
+    # ``grid_rows``/``grid_cols``/RTL-core generation are sized on the CORE
+    # row/column counts (core_m == m, core_n == n under fold_axis="k"; core_m
+    # == M_g under fold_axis="m"; core_n == N_g under fold_axis="n").
     grid_rows = (core_m + 7) // 8
-    grid_cols = (n + 7) // 8
+    grid_cols = (core_n + 7) // 8
 
     # The combined core (ifndef SYNTHESIS) lives in the rtl sibling module.
     ts_dir = str(Path(__file__).resolve().parent)
@@ -1890,9 +2101,9 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         sys.path.insert(0, ts_dir)
     from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
     if k_spatial == 1:
-        grid_v = generate_combined_core_verilog(core_m, k, n, module_name=f"{name}_core", out_bits=out_bits,
+        grid_v = generate_combined_core_verilog(core_m, k, core_n, module_name=f"{name}_core", out_bits=out_bits,
                                                 requant_shift=requant_shift, requant_bits=requant_bits,
-                                                weight_rom=weight_rom)
+                                                weight_rom=weight_rom, n_passes=n_passes)
     else:
         print(
             f"WARNING: {name}: ReuseFactor={rf_legalized} partitions K into "
@@ -1902,23 +2113,26 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             file=sys.stderr,
         )
         grid_v = generate_k_spatial_combined_core_verilog(
-            core_m, k, n, module_name=f"{name}_core", k_spatial=k_spatial, out_bits=out_bits,
-            requant_shift=requant_shift, requant_bits=requant_bits, weight_rom=weight_rom
+            core_m, k, core_n, module_name=f"{name}_core", k_spatial=k_spatial, out_bits=out_bits,
+            requant_shift=requant_shift, requant_bits=requant_bits, weight_rom=weight_rom,
+            n_passes=n_passes,
         )
     header_text = gen_public_header(
-        name, core_m, k, n, grid_rows, grid_cols,
+        name, core_m, k, core_n, grid_rows, grid_cols,
         result_type=output_precision,
         k_spatial=k_spatial,
         input_precision=input_precision,
         weight_precision=weight_precision,
         clock_period_ns=clock_period_ns,
-        n_frames=(m_passes if fold_m else n_frames),
+        n_frames=(m_passes if fold_m else (n_passes if fold_n else n_frames)),
         weight_rom=weight_rom,
         m_passes=m_passes,
         logical_m=m,
+        n_passes=n_passes,
+        logical_n=n,
     )
     _assert_core_port_widths(name, header_text, grid_v, weights_in_core=weights_in_core)
-    _assert_core_first_out(name, core_m, k, n, k_spatial, grid_v)
+    _assert_core_first_out(name, core_m, k, core_n, k_spatial, grid_v)
     (pkg_dir / f"{name}_core.v").write_text(grid_v)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
     (pkg_dir / f"{name}_gemm_ip.h").write_text(header_text)

@@ -36,7 +36,7 @@ if str(SRC) not in sys.path:
 
 from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
 from golden import generate_tb
-from geometry import k_chunks as _k_chunks, resolve_reuse_factor, resolve_fold_m
+from geometry import k_chunks as _k_chunks, resolve_reuse_factor, resolve_fold_m, resolve_fold_n
 from gemm_ip.weights import build_weight_rom_k_spatial
 
 GEN_DIR = HERE / "tb" / "generated"
@@ -97,6 +97,23 @@ FOLD_M_CASES = [
     (16, 40, 16, 5),
 ]
 
+# Fold-N regression: (m, k, n, rf). The core is generated for (M, K, N_g)
+# columns (K and M fully spatial, one K pass); the golden testbench's
+# GROUP-AWARE back-to-back mode (num_vectors=n_passes, fold_n_groups=n_passes)
+# feeds every frame the SAME A while frame g's B columns are group g's real
+# slice of one shared full-width B, and checks frame g's output rows against
+# A @ B[:, group g] (padded tail columns expected zero) -- exactly how the
+# wrapper's fold-N RUN loop composes the logical N-wide GEMM back together.
+# (12,24,32,2) exact division; (12,24,32,4) rf=4 pads the last group's tail
+# columns; (20,24,16,2) M > N_g; (9,17,10,2) M < N_g and K > 8 (non-8-multiple
+# K exercises the K-spatial tail mask together with the group counter).
+FOLD_N_CASES = [
+    (12, 24, 32, 2),
+    (12, 24, 32, 4),
+    (20, 24, 16, 2),
+    (9, 17, 10, 2),
+]
+
 
 def _run(cmd):
     return subprocess.run(cmd, text=True, capture_output=True)
@@ -109,6 +126,8 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k"):
     the testbench's back-to-back multi-frame mode feeds m_passes frames -- the
     RTL-level equivalent of the wrapper's multi-frame RUN loop (see FOLD_M_CASES).
     """
+    n_passes = 1
+    core_n = n
     if fold_axis == "m":
         fm = resolve_fold_m(m, rf if rf is not None else 1)
         for w in fm["warnings"]:
@@ -116,6 +135,16 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k"):
         rf_use = fm["reuse_factor"]
         core_m = fm["mg"] * 8
         num_vectors = fm["m_passes"]
+        k_spatial = _k_chunks(k)
+    elif fold_axis == "n":
+        fn = resolve_fold_n(n, rf if rf is not None else 1)
+        for w in fn["warnings"]:
+            print(w, file=sys.stderr)
+        rf_use = fn["reuse_factor"]
+        core_m = m
+        core_n = fn["cg"] * 8
+        n_passes = fn["n_passes"]
+        num_vectors = fn["n_passes"]
         k_spatial = _k_chunks(k)
     else:
         rf_use = rf if rf is not None else _k_chunks(k)
@@ -138,21 +167,32 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k"):
 
     weight_rom = None
     fixed_B = None
-    if weights_in_core:
+    if weights_in_core and fold_axis == "n":
+        import numpy as np
+        rng = np.random.default_rng(seed)
+        max_val = max(1, int((127 / max(k, 1)) ** 0.5))
+        # ROM holds every group's columns back to back (base g*core_n).
+        fixed_B = rng.integers(-max_val, max_val + 1, size=(k, n_passes * core_n), dtype=np.int8)
+        weight_rom = build_weight_rom_k_spatial(fixed_B, core_m, n_passes * core_n, k, k_spatial)
+    elif weights_in_core:
         import numpy as np
         rng = np.random.default_rng(seed)
         max_val = max(1, int((127 / max(k, 1)) ** 0.5))
         fixed_B = rng.integers(-max_val, max_val + 1, size=(k, n), dtype=np.int8)
         weight_rom = build_weight_rom_k_spatial(fixed_B, core_m, n, k, k_spatial)
 
+    n_passes_rtl = n_passes if fold_axis == "n" else 1
     if k_spatial == 1:
-        rtl.write_text(generate_combined_core_verilog(core_m, k, n, module_name=mod, weight_rom=weight_rom))
+        rtl.write_text(generate_combined_core_verilog(core_m, k, core_n, module_name=mod,
+                                                       weight_rom=weight_rom, n_passes=n_passes_rtl))
     else:
         rtl.write_text(generate_k_spatial_combined_core_verilog(
-            core_m, k, n, module_name=mod, k_spatial=k_spatial, out_bits=8, weight_rom=weight_rom))
-    tb.write_text(generate_tb(core_m, k, n, module_name=mod, seed=seed, k_spatial=k_spatial,
-                              num_vectors=num_vectors, back2back=(fold_axis == "m"),
-                              weights_in_core=weights_in_core, fixed_B=fixed_B))
+            core_m, k, core_n, module_name=mod, k_spatial=k_spatial, out_bits=8, weight_rom=weight_rom,
+            n_passes=n_passes_rtl))
+    tb.write_text(generate_tb(core_m, k, core_n, module_name=mod, seed=seed, k_spatial=k_spatial,
+                              num_vectors=num_vectors, back2back=(fold_axis in ("m", "n")),
+                              weights_in_core=weights_in_core, fixed_B=fixed_B,
+                              fold_n_groups=(n_passes if fold_axis == "n" else None)))
 
     comp = _run(["iverilog", "-g2012", "-o", str(out), str(tb), str(rtl)])
     if comp.returncode != 0:
@@ -178,6 +218,7 @@ def run(cases=None, seeds=None, keep=False):
 
     rom_cases = list(ROM_CASES) if not cases else []
     fold_m_cases = list(FOLD_M_CASES) if not cases else []
+    fold_n_cases = list(FOLD_N_CASES) if not cases else []
     cases = list(cases) if cases else list(DEFAULT_CASES)
     seeds = list(seeds) if seeds else list(DEFAULT_SEEDS)
 
@@ -216,10 +257,22 @@ def run(cases=None, seeds=None, keep=False):
                     print(log)
                     failures.append(tag)
 
+    for case in fold_n_cases:
+        m, k, n, rf = case
+        for seed in seeds:
+            for rom in (False, True):
+                ok, log = run_case(m, k, n, seed, rf=rf, weights_in_core=rom, fold_axis="n")
+                tag = f"{m}x{k}x{n} rf={rf} seed={seed} fold_axis=n{' rom' if rom else ''}"
+                print(f"{'PASS' if ok else 'FAIL'} {tag}")
+                if not ok:
+                    print(log)
+                    failures.append(tag)
+
     if not keep:
         shutil.rmtree(GEN_DIR, ignore_errors=True)
 
-    total = len(cases) * len(seeds) + len(rom_cases) * len(seeds) + len(fold_m_cases) * len(seeds)
+    total = (len(cases) * len(seeds) + len(rom_cases) * len(seeds) + len(fold_m_cases) * len(seeds)
+             + len(fold_n_cases) * len(seeds) * 2)
     if failures:
         print(f"\n{len(failures)}/{total} FAILED:")
         for t in failures:

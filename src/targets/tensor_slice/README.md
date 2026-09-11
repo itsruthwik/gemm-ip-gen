@@ -82,12 +82,14 @@ into a K-partition count:
 
 The batch manifest (`gen_integration_manifest`) carries `reuse_factor_requested`,
 `reuse_factor` (legalized), `effective_reuse`, `k_spatial`, `k_passes`,
-`k_chunks_pad`, `multipliers`, `fold_axis`, `m_groups`, `m_passes`, and
-`grid_rows_pad` for every core.
+`k_chunks_pad`, `multipliers`, `fold_axis`, `m_groups`, `m_passes`,
+`grid_rows_pad`, `n_groups`, `n_passes`, `grid_cols_pad`, and `core_cols` for
+every core. Under `fold_axis` `k`/`m`, `n_groups == grid_cols`, `n_passes ==
+1`, `core_cols == n` (the N axis is never folded).
 
 ## FoldAxis
 
-`FoldAxis` (knob key `fold_axis`, choices `k`/`m`, default `k`) selects which
+`FoldAxis` (knob key `fold_axis`, choices `k`/`m`/`n`, default `k`) selects which
 dimension `ReuseFactor` folds. `k` is the ReuseFactor model above. `m` keeps K
 and N fully spatial (`k_spatial = k_chunks`, one K pass -- the rf=1 K fields)
 and folds row tiles instead: `resolve_fold_m(m, reuse_factor)` legalizes RF
@@ -110,6 +112,32 @@ No new hardware: the RTL core generated is the plain rf=1 core sized for
 frame `g` covering logical rows `[g*M_g, (g+1)*M_g)`. See
 `docs/wrapper_run_loop.md`'s fold-M section for the multi-frame feed/capture
 schedule and `docs/rtl_contract.md`'s FoldAxis section for the RTL-side model.
+
+`n` keeps K and M fully spatial and folds column tiles instead:
+`resolve_fold_n(n, reuse_factor)` legalizes RF into a column-tile-group
+count, mirroring `resolve_fold_m` on N --
+
+- `grid_cols = ceil(N / 8)`; the legal RF range is `1..grid_cols`.
+- `cg = ceil(grid_cols / rf)` column tiles per group, `n_passes =
+  ceil(grid_cols / cg)` back-to-back frames; the legalized RF is `n_passes`
+  (may land lower than requested, silently).
+- `RF > grid_cols` clamps to `grid_cols` (one column tile per frame) with a
+  bound warning. `RF == 1` legalizes to `cg == grid_cols`, `n_passes == 1` --
+  one frame, functionally today's single-frame hardware.
+- `multipliers = 64 * grid_rows(m) * cg * k_chunks`; `effective_reuse`
+  tracks `n_passes` (unlike fold-M's `effective_reuse == 1`, each frame here
+  reuses the array once per column group).
+
+No new RTL beyond the weight ROM's group counter: the core generated is the
+plain rf=1 core sized for `N_g = 8*cg` columns; the wrapper issues `n_passes`
+frames of it back-to-back, frame `g` covering logical columns `[g*N_g,
+(g+1)*N_g)`. Every frame emits M REAL rows (M is never folded here); only
+the last group's tail columns may be padding. The wrapper defers the
+rescale/bias/cast drain to a separate emission loop run once every group has
+landed (see `docs/wrapper_run_loop.md`'s fold-N section) and, for the
+weight-stationary variant, the RTL ROM holds every group back to back and
+self-addresses by frame boundary (see `docs/rtl_contract.md`'s FoldAxis
+section).
 
 ## Verification
 

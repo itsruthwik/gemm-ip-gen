@@ -252,3 +252,56 @@ differences are what `M` means and what the loop reads/captures:
 - RF=1 (`m_passes == 1`) is a single frame: the loop's fold-M-only feed/
   capture text collapses to the ordinary single-frame path with `logical_m ==
   M_g`, matching today's (`FoldAxis="k"`) single-frame hardware.
+
+## Fold-N multi-frame schedule (FoldAxis="n")
+
+A fold-N package reuses the same loop with `n_frames = n_passes`, but unlike
+fold-M (which pads spare ROWS in the last frame) every frame emits M REAL
+rows; only the tail COLUMNS of the last group may be padding. The core is
+generated for `N_g = 8*cg` columns (`k_spatial = K_CHUNKS`, one K pass, M
+fully spatial); `n` in the RUN-loop formulas above is `N_g`, not the logical
+N. `logical_n` (the true N) is a second quantity used only where noted below.
+
+- **A replay**: A is read once per column-group's frame but must be
+  IDENTICAL across every frame (same M rows, only the B columns and output
+  group change), and the stream is single-read. Frame 0 (`g == 0`) reads
+  `a_stream` and stores the packed row in a NEW replay buffer,
+  `a_replay_n[M]` (one shared slot -- the replayed value is the same for
+  every later frame, unlike the K-multipass replay buffer, which needs a
+  distinct slot per pass because each pass slices different K bytes from the
+  same beat). Frames `g >= 1` read `a_rows = a_replay_n[t]` instead of the
+  channel. The array entry needs no replay at all: `a_rows[]` is already
+  randomly addressable, so every frame just re-reads it.
+- **B restriction**: frame `g`'s B beats are restricted to group `g`'s
+  columns. Two-stream: `weight_cols[g * N_g + t]` instead of `weight_cols[t]`
+  (both the stream and array RUN loops). Weight-stationary: the RTL ROM holds
+  every group back to back and self-addresses by frame boundary (see
+  `rtl_contract.md`'s FoldAxis section) -- the wrapper feeds no B beat at all.
+- **C assembly (capture + a separate emission loop)**: unlike fold-M (which
+  can write each row's res_T the moment it emerges, since every row already
+  carries the full logical N), fold-N's per-frame `out_valid` rows only carry
+  `N_g` columns of ONE group -- a full logical row does not exist until every
+  group has landed. The RUN loop's capture is reduced to a raw store: a
+  `c_buf[M][n_passes * N_g]` buffer (16-bit lanes, no rescale/bias/cast) is
+  written at `c_buf[row][g * N_g + col]` as each frame's rows emerge (`gOut =
+  captured / M`, `rowOut = captured % M`, from the same monotonic `captured`
+  counter phase 1 uses -- frames retire in order and every row is real, so
+  this is exactly "group g's rows land at group g's column offset"). AFTER
+  the RUN loop, a separate `EMIT_FOLD_N` loop of M iterations does today's
+  per-row drain (rescale, bias on the full logical-N row, result cast) once
+  per row, reading `c_buf[row][0..logical_n)` and dropping columns
+  `>= logical_n` (the last group's padding tail); bias indexes the full
+  `biases[]` array by the true (global) column. The stream entry writes each
+  assembled row to `res_stream`; the array entry writes `results[row][col]`
+  directly (element-wise, like phase 1's array capture, to keep the loop
+  HLS-unrollable).
+- No row padding, no cross-frame row buffering: M is never folded under
+  `FoldAxis="n"`, so every frame's M rows are real and complete at the end of
+  its own pass -- only the COLUMN assembly is deferred to the emission loop.
+- RF=1 (`n_passes == 1`) is a single frame: `logical_n == N_g`, the A replay
+  buffer and B restriction are unused (`g` is always 0), and the emission
+  loop's `c_buf` round-trip reproduces today's inline per-call capture
+  exactly (same rescale/bias/cast text, just deferred by one loop) --
+  byte-identical text to `FoldAxis="k"`'s single-frame path (n_passes==1
+  short-circuits the c_buf/emission text entirely; see
+  `test_generate_catapult_pkg_fold_axis_n_rf1_byte_identical_to_k`).
