@@ -77,7 +77,7 @@ def dead_cycles(m, k, n, grid_cols, k_spatial=1):
 
 def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_spatial=1,
                       input_precision=None, weight_precision=None, clock_period_ns=None,
-                      n_frames=1, weight_rom=None):
+                      n_frames=1, weight_rom=None, m_passes=1, logical_m=None):
     # Weight-stationary (const-weight) mode: weights live in the RTL wrapper ROM,
     # so the ccore run() drops the b_cols port (matching the ROM wrapper), and the
     # csim-only behavioral branch bakes the same per-beat words into an internal
@@ -138,6 +138,16 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # regression for n_frames == 1).
     total_steps = (n_frames - 1) * period + first_out + mr + 6
     total_rows = n_frames * m
+
+    # Fold-M: ``m`` here is the CORE row count (M_g = 8*mg); ``logical_m`` is
+    # the true M the caller's CONFIG_T::gemm_m carries. ``m_passes`` frames of
+    # M_g core rows are issued back-to-back (n_frames == m_passes drives the
+    # period/feed_total/total_steps schedule above); only the trailing rows of
+    # the LAST frame that fall past logical_m are padding. fold_m is False
+    # (m_passes == 1) for every phase 1 (fold_axis="k") package, in which case
+    # logical_m == m and nothing below changes any generated text.
+    fold_m = int(m_passes) > 1
+    logical_m = m if logical_m is None else int(logical_m)
 
     # Choose the RHS expression for the final output assignment based on the
     # configured result type.  Integer types (ac_int / ac_uint) need an explicit
@@ -314,7 +324,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # collected as they emerge while the frame is still feeding/computing.
     _capture_body = f"""\
         if (v) {{
-            if (captured < {m}) {{
+            if (captured < {logical_m}) {{
                 res_T out_pack;
                 #pragma hls_unroll
                 for (int col = 0; col < {n}; col++) {{
@@ -435,6 +445,21 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         a_replay_else = """
             }"""
 
+    _stream_feed_cond = f"feeding_now && t < {m}"
+    _stream_g_decl = ""
+    _stream_capture_use = stream_capture_b2b
+    if fold_m:
+        # Fold-M: gate the per-frame read against the logical row bound too
+        # (frame g's beat t is global row g*M_g + t; only real rows are read
+        # off a_stream -- there are exactly `logical_m` of them, not
+        # m_passes*M_g). Padding rows feed zero A. Capture uses the
+        # single-frame-style body (bound `logical_m`, a plain monotonic
+        # counter across every frame), which already drops the last frame's
+        # trailing padding pulses in emission order.
+        _stream_g_decl = "\n        int g = step / %d;" % period
+        _stream_feed_cond = f"feeding_now && t < {m} && (g * {m} + t) < {logical_m}"
+        _stream_capture_use = stream_capture
+
     stream_feed_loop = f"""
 {a_replay_decl}
     // Back-to-back feed of {n_frames} frame(s): M A rows + N B columns, each
@@ -447,7 +472,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     #pragma hls_pipeline_init_interval 1
     RUN: for (int step = 0; step < {total_steps}; step++) {{
         bool in_feed = (step < {feed_total});
-        int p = in_feed ? (step % {period}) : {period};
+        int p = in_feed ? (step % {period}) : {period};{_stream_g_decl}
         bool feeding_now = in_feed && (p >= 1) && (p <= {total_beats});
         int pf = p - 1;
         int kc = pf / {input_beats};
@@ -455,7 +480,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         ac_int<{a_bits}, false> a_rows = 0;
         {stream_bcols_decl}
 
-        if (feeding_now && t < {m}) {{
+        if ({_stream_feed_cond}) {{
             if (kc == 0) {{
                 a_beat_T a_beat = a_stream.read();{_a_pack_block("a_rows", "0", "ROW_PACK_DIRECT")}{a_prepack_replay}{a_replay_else}
         }}
@@ -472,7 +497,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         // leading preload, same period); bias stays 0 here (added in the drain).
         ac_int<1, false> frame_preload = (in_feed && p == 0) ? 1 : 0;
         gemm.run(a_rows, {bcols_run_arg}bias_packed, frame_preload, feed_valid, c_row, v, l);
-{stream_capture_b2b}
+{_stream_capture_use}
     }}
 """
 
@@ -509,6 +534,77 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     }}
 """
 
+    if fold_m:
+        if weights_in_core:
+            fold_array_bcols_pack = ""
+        elif ks > 1:
+            fold_array_bcols_pack = f"""
+        if (feeding_now && t < {n}) {{
+            b_beat_T b_beat = weight_cols[t];
+            #pragma hls_unroll
+            for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
+                #pragma hls_unroll
+                for (int kl = 0; kl < 8; kl++) {{
+                    int kk = (kc * {ks} + kc_local) * 8 + kl;
+                    if (kk < {k}) {{
+                        b_cols_packed.set_slc(kc_local * 64 + kl * 8,
+                                              {name}_to_gemm_int8(b_beat[kk]));
+                    }}
+                }}
+            }}
+        }}"""
+        else:
+            fold_array_bcols_pack = f"""
+        if (feeding_now && t < {n}) {{
+            b_beat_T b_beat = weight_cols[t];
+            #pragma hls_unroll
+            for (int kl = 0; kl < 8; kl++) {{
+                int kk = kc * 8 + kl;
+                int col_tile = t / 8;
+                #pragma hls_unroll
+                for (int ct = 0; ct < {grid_cols}; ct++) {{
+                    if (col_tile == ct && kk < {k}) {{
+                        b_cols_packed.set_slc(ct * 64 + kl * 8,
+                                              {name}_to_gemm_int8(b_beat[kk]));
+                    }}
+                }}
+            }}
+        }}"""
+        # Fold-M array loop: structurally the same frame schedule as the stream
+        # RUN loop above (period/feed_total/total_steps), sourcing A directly
+        # from a_rows[] instead of a channel read, gated the same way (frame
+        # g's beat t is global row g*M_g + t; only rows < logical_m are real).
+        array_feed_loop = f"""
+    // Fold-M multi-frame feed: {m_passes} frames of {m} core rows each (K and N
+    // fully spatial, k_spatial={ks}), issued back-to-back like the stream RUN
+    // loop. Frame g reads logical rows [g*{m}, (g+1)*{m}) directly from
+    // a_rows; rows at/after the logical M bound are the last frame's padding
+    // (fed zero A, dropped by the captured < {logical_m} guard in the capture body).
+    #pragma hls_pipeline_init_interval 1
+    RUN_ARRAY: for (int step = 0; step < {total_steps}; step++) {{
+        bool in_feed = (step < {feed_total});
+        int p = in_feed ? (step % {period}) : {period};
+        int g = step / {period};
+        bool feeding_now = in_feed && (p >= 1) && (p <= {total_beats});
+        int pf = p - 1;
+        int kc = pf / {input_beats};
+        int t = pf % {input_beats};
+        ac_int<{a_bits}, false> a_rows_packed = 0;{array_bcols_decl}
+
+        if (feeding_now && t < {m} && (g * {m} + t) < {logical_m}) {{
+            a_beat_T a_beat = a_rows[g * {m} + t];{_a_pack_block("a_rows_packed", "kc", "ROW_PACK_ARRAY_FOLD")}
+        }}
+        {fold_array_bcols_pack}
+
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
+        ac_int<1, false> feed_preload_valid = (in_feed && p == 0) ? 1 : 0;
+        gemm.run(a_rows_packed, {array_bcols_run_arg}bias_packed, feed_preload_valid, feed_valid, c_row, v, l);
+{array_capture}
+    }}
+"""
+
     if weights_in_core:
         # Weight-stationary: the self-contained const_weights STREAM entry plus the
         # const_weights ARRAY entry (io_parallel). Neither references an external b_cols;
@@ -524,7 +620,7 @@ void {name}_gemm_ip_stream_const_weights(
     bias_T *biases,
     ac_channel<res_T> &res_stream
 ) {{
-    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
+    static_assert(CONFIG_T::gemm_m == {logical_m}, "Generated GEMM wrapper requires matching gemm_m.");
     static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
     static_assert(a_beat_T::size == CONFIG_T::gemm_k,
                   "a_beat_T must carry one A-row K-width beat.");
@@ -559,7 +655,7 @@ void {name}_gemm_ip_array_const_weights(
     bias_T *biases,
     res_T results[CONFIG_T::gemm_m]
 ) {{
-    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
+    static_assert(CONFIG_T::gemm_m == {logical_m}, "Generated GEMM wrapper requires matching gemm_m.");
     static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
     static_assert(a_beat_T::size == CONFIG_T::gemm_k,
                   "a_beat_T must carry one A-row K-width beat.");
@@ -602,7 +698,7 @@ void {name}_gemm_ip_stream_buffered_b(
     bias_T *biases,
     ac_channel<res_T> &res_stream
 ) {{
-    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
+    static_assert(CONFIG_T::gemm_m == {logical_m}, "Generated GEMM wrapper requires matching gemm_m.");
     static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
     static_assert(a_beat_T::size == CONFIG_T::gemm_k,
                   "a_beat_T must carry one A-row K-width beat.");
@@ -659,7 +755,7 @@ void {name}_gemm_ip_array(
     b_beat_T weight_cols[CONFIG_T::gemm_n],
     res_T results[CONFIG_T::gemm_m]
 ) {{
-    static_assert(CONFIG_T::gemm_m == {m}, "Generated GEMM wrapper requires matching gemm_m.");
+    static_assert(CONFIG_T::gemm_m == {logical_m}, "Generated GEMM wrapper requires matching gemm_m.");
     static_assert(CONFIG_T::gemm_n == {n}, "Generated GEMM wrapper requires matching gemm_n.");
 
     static {name}_ccore gemm;
@@ -1602,28 +1698,22 @@ void gemm_ip_stream_sim(
 
 
 def gen_integration_manifest(items):
+    """Items must have been through ``flow.normalize_config``: every fold
+    field below is read as resolved there, never recomputed here."""
     cores = []
     for item in items:
-        if "k_spatial" in item and "reuse_factor" in item:
-            rf_req = item.get("reuse_factor_requested", item.get("reuse_factor", 1))
-            rf = item["reuse_factor"]
-            eff_rf = item.get("effective_reuse", rf)
-            ks = item["k_spatial"]
-            kp = item.get("k_passes", ks)
-            kc_pad = item.get("k_chunks_pad")
-            mult = item.get("multipliers")
-        else:
-            resolved = resolve_reuse_factor(item["k"], item.get("reuse_factor", 1), item.get("name"))
-            rf_req = resolved["reuse_factor_requested"]
-            rf = resolved["reuse_factor"]
-            eff_rf = resolved["effective_reuse"]
-            ks = resolved["k_spatial"]
-            kp = resolved["passes"]
-            kc_pad = resolved["k_chunks_pad"]
-            mult = None
-        if mult is None:
-            from geometry import multipliers as _geom_multipliers
-            mult = _geom_multipliers(item["m"], item["n"], ks)
+        fold_axis = item["fold_axis"]
+        mg = item["m_groups"]
+        mp = item["m_passes"]
+        rf_req = item["reuse_factor_requested"]
+        rf = item["reuse_factor"]
+        eff_rf = item["effective_reuse"]
+        ks = item["k_spatial"]
+        kp = item["k_passes"]
+        kc_pad = item["k_chunks_pad"]
+        mult = item["multipliers"]
+        gr_pad = item["grid_rows_pad"]
+        core_rows = mg * 8 if mp > 1 else item["m"]
         cores.append({
             "name": item["name"],
             "interface": item.get("interface", "stream"),
@@ -1640,6 +1730,11 @@ def gen_integration_manifest(items):
             "k_passes": kp,
             "k_chunks_pad": kc_pad,
             "multipliers": mult,
+            "fold_axis": fold_axis,
+            "m_groups": mg,
+            "m_passes": mp,
+            "grid_rows_pad": gr_pad,
+            "core_rows": core_rows,
             "reset": {
                 "name": "rst",
                 "sync_active": "high"
@@ -1735,17 +1830,26 @@ def _check_operand_fits_int8_core(name, operand_label, precision):
 
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
                           reuse_factor=1, input_precision=None, weight_precision=None,
-                          clock_period_ns=None, n_frames=1, weight_matrix=None, **_ignored):
+                          clock_period_ns=None, n_frames=1, weight_matrix=None, fold_axis="k",
+                          **_ignored):
     if interface not in ("stream", "array"):
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     _check_operand_fits_int8_core(name, "input_precision", input_precision)
     _check_operand_fits_int8_core(name, "weight_precision", weight_precision)
-    resolved = resolve_reuse_factor(k, reuse_factor, name)
+    fold_axis = str(fold_axis).lower()
+    resolved = resolve_reuse_factor(k, reuse_factor, name, fold_axis=fold_axis, m=m)
     for w in resolved["warnings"]:
         print(w, file=sys.stderr)
     k_spatial = resolved["k_spatial"]
     passes = resolved["passes"]
     rf_legalized = resolved["reuse_factor"]
+    fold_m = fold_axis == "m"
+    m_passes = resolved.get("m_passes", 1) if fold_m else 1
+    # ``core_m`` is the RTL/csim-core row count: M_g = 8*mg when fold-M issues
+    # more than one frame (m_passes frames of core_m rows assemble the logical
+    # M rows), otherwise the logical M itself, so a single-frame package is
+    # today's shape whichever axis was named.
+    core_m = resolved["mg"] * 8 if m_passes > 1 else m
     # Weight-stationary (const-weight) variant: weights (B, shape [K, N]) baked into
     # the core ROM AND the csim header; the wrapper takes no external weight port and
     # the header entry takes A only. Single source of truth = weight_matrix. Works at
@@ -1755,7 +1859,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     weight_rom = None
     if weights_in_core:
         from gemm_ip.weights import build_weight_rom_k_spatial
-        weight_rom = build_weight_rom_k_spatial(weight_matrix, m, n, k, k_spatial)
+        weight_rom = build_weight_rom_k_spatial(weight_matrix, core_m, n, k, k_spatial)
         expected_beats = passes * n
         if len(weight_rom) != expected_beats:
             raise RuntimeError(
@@ -1775,7 +1879,9 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
-    grid_rows = (m + 7) // 8
+    # ``grid_rows``/RTL-core generation are sized on the CORE row count
+    # (core_m == m under fold_axis="k"; core_m == M_g under fold_axis="m").
+    grid_rows = (core_m + 7) // 8
     grid_cols = (n + 7) // 8
 
     # The combined core (ifndef SYNTHESIS) lives in the rtl sibling module.
@@ -1784,7 +1890,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         sys.path.insert(0, ts_dir)
     from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
     if k_spatial == 1:
-        grid_v = generate_combined_core_verilog(m, k, n, module_name=f"{name}_core", out_bits=out_bits,
+        grid_v = generate_combined_core_verilog(core_m, k, n, module_name=f"{name}_core", out_bits=out_bits,
                                                 requant_shift=requant_shift, requant_bits=requant_bits,
                                                 weight_rom=weight_rom)
     else:
@@ -1796,24 +1902,29 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             file=sys.stderr,
         )
         grid_v = generate_k_spatial_combined_core_verilog(
-            m, k, n, module_name=f"{name}_core", k_spatial=k_spatial, out_bits=out_bits,
+            core_m, k, n, module_name=f"{name}_core", k_spatial=k_spatial, out_bits=out_bits,
             requant_shift=requant_shift, requant_bits=requant_bits, weight_rom=weight_rom
         )
     header_text = gen_public_header(
-        name, m, k, n, grid_rows, grid_cols,
+        name, core_m, k, n, grid_rows, grid_cols,
         result_type=output_precision,
         k_spatial=k_spatial,
         input_precision=input_precision,
         weight_precision=weight_precision,
         clock_period_ns=clock_period_ns,
-        n_frames=n_frames,
+        n_frames=(m_passes if fold_m else n_frames),
         weight_rom=weight_rom,
+        m_passes=m_passes,
+        logical_m=m,
     )
     _assert_core_port_widths(name, header_text, grid_v, weights_in_core=weights_in_core)
-    _assert_core_first_out(name, m, k, n, k_spatial, grid_v)
+    _assert_core_first_out(name, core_m, k, n, k_spatial, grid_v)
     (pkg_dir / f"{name}_core.v").write_text(grid_v)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
     (pkg_dir / f"{name}_gemm_ip.h").write_text(header_text)
+    # The inst wrapper, testbench and tcl see the logical shape: the header
+    # asserts CONFIG_T::gemm_m == m and the fold-M frames are internal to one
+    # call, so they never see core_m or m_passes.
     (pkg_dir / f"{name}_inst.cpp").write_text(gen_inst_cpp(
         name, m, k, n, interface,
         requant_shift=requant_shift, requant_bits=requant_bits,
@@ -1829,4 +1940,4 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     (pkg_dir / "run_catapult.tcl").write_text(
         gen_tcl(name, m, k, n, interface, weights_in_core=weight_matrix is not None))
     print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface}, "
-          f"reuse_factor={rf_legalized}, k_spatial={k_spatial})")
+          f"reuse_factor={rf_legalized}, k_spatial={k_spatial}, fold_axis={fold_axis})")

@@ -49,10 +49,12 @@ def main():
     parser.add_argument("--reuse-factor", type=int, default=None,
                         help="mvau: ReuseFactor, how many times each MAC is used per "
                              "input vector (RF = K*N/(PE*SIMD)), when --pe/--simd are unset.")
-    parser.add_argument("--fold-axis", type=str, choices=("n", "k", "kn"), default=None,
+    parser.add_argument("--fold-axis", type=str, choices=("n", "k", "kn", "m"), default=None,
                         help="mvau: which dimension ReuseFactor folds -- 'n' (default) "
                              "pads N and sets SIMD=K, PE=N_pad/RF; 'k' pads K and sets "
-                             "PE=N, SIMD=K_pad/RF (floored at 3); 'kn' folds both.")
+                             "PE=N, SIMD=K_pad/RF (floored at 3); 'kn' folds both. "
+                             "tensor_slice: 'k' (default, phase 1 K-partition) or 'm' "
+                             "(fold-M row-tile groups issued as back-to-back frames).")
     parser.add_argument("--strategy", type=str, default="latency",
                         help="generic target: GEMM kernel strategy, 'latency' (default) "
                              "or 'resource' (case-insensitive); validated where consumed.")

@@ -93,6 +93,29 @@ Intermediate K-spatial partial sums are INT16, so partition-level overflow is
 possible; correctness depends on quantized operand ranges and partition size.
 The generator prints a warning for every package with `k_spatial > 1`.
 
+## FoldAxis and fold-M
+
+`FoldAxis` selects which dimension `ReuseFactor` folds: `k` (default, the
+model above) or `m`. Under `m`, K and N stay fully spatial (`k_spatial =
+K_CHUNKS`, one K pass); RF folds row tiles instead of K chunks. `GRID_ROWS =
+ceil(M/8)` row tiles are covered by `mg = ceil(GRID_ROWS / RF)` row tiles per
+group, in `m_passes = ceil(GRID_ROWS / mg)` back-to-back frames; the
+legalized RF is `m_passes`. Requests above `GRID_ROWS` legalize down to
+`GRID_ROWS` (one row tile per frame) with a warning; RF=1 legalizes to
+`mg = GRID_ROWS`, `m_passes = 1` -- one frame, functionally today's
+single-frame hardware. The legal range is `1..GRID_ROWS`.
+
+No new RTL: the core generated is the plain rf=1 (full-K, full-N) core sized
+for `M_g = 8*mg` rows. The wrapper issues `m_passes` frames of that core
+back-to-back (the same frame-slot pipelining the core already has); frame `g`
+covers logical rows `[g*M_g, (g+1)*M_g)`. The last frame's rows past the
+logical M are padding (zero-fed A), dropped at capture in emission order.
+Multipliers = `64 * mg * GRID_COLS * K_CHUNKS`; per-vector `effective_reuse`
+stays `1` (each row's MACs happen once) -- the manifest reports
+`reuse_factor` (the fold-M pass count) and `effective_reuse` separately so
+the two are never confused. See `wrapper_run_loop.md` for the multi-frame
+feed/capture schedule.
+
 ## Synth Protocol
 
 1. The wrapper pulses `preload_valid` for one cycle at the head of each frame.

@@ -244,3 +244,167 @@ def test_generate_catapult_pkg_manifest_fields_via_flow(scratch_dir):
 # header/wrapper -- there is no existing cheap pattern in this repo's test
 # suite for compiling the Catapult-facing csim header, and standing one up
 # (ac_datatypes include path, etc.) is out of scope for this pass.
+
+
+# ── fold-M (FoldAxis="m") ────────────────────────────────────────────────────
+
+resolve_fold_m = _geom.resolve_fold_m
+
+# m=20 -> grid_rows = ceil(20/8) = 3
+M20_GRID_ROWS = 3
+
+
+def test_resolve_fold_m_legal_set_m20():
+    for rf in range(1, M20_GRID_ROWS + 1):
+        resolved = resolve_fold_m(20, rf)
+        assert resolved["grid_rows"] == M20_GRID_ROWS
+        assert resolved["m_passes"] == resolved["reuse_factor"]
+        assert resolved["warnings"] == []
+        assert resolved["mg"] * resolved["m_passes"] >= M20_GRID_ROWS
+
+
+def test_resolve_fold_m_rf1_is_single_frame():
+    resolved = resolve_fold_m(20, 1)
+    assert resolved["mg"] == M20_GRID_ROWS
+    assert resolved["m_passes"] == 1
+    assert resolved["reuse_factor"] == 1
+    assert resolved["grid_rows_pad"] == M20_GRID_ROWS
+
+
+def test_resolve_fold_m_out_of_range_warns_and_clamps():
+    resolved = resolve_fold_m(20, M20_GRID_ROWS + 5, name="mylayer")
+    assert len(resolved["warnings"]) == 1
+    msg = resolved["warnings"][0]
+    assert msg == (
+        f"WARNING: Invalid ReuseFactor={M20_GRID_ROWS + 5} for layer mylayer. "
+        f"Using ReuseFactor={M20_GRID_ROWS} instead. Valid ReuseFactor(s): 1..{M20_GRID_ROWS}."
+    )
+    assert resolved["reuse_factor"] == M20_GRID_ROWS
+    assert resolved["mg"] == 1
+
+
+def test_resolve_fold_m_silent_lower_landing():
+    # grid_rows(100) = 13; rf=6 -> mg=ceil(13/6)=3, m_passes=ceil(13/3)=5 < 6:
+    # the request lands lower than asked, silently (no warning -- only an
+    # out-of-range request above grid_rows warns).
+    assert resolve_fold_m(100, 1)["grid_rows"] == 13
+    resolved = resolve_fold_m(100, 6)
+    assert resolved["mg"] == 3
+    assert resolved["m_passes"] == 5
+    assert resolved["reuse_factor"] == 5
+    assert resolved["warnings"] == []
+
+
+def test_resolve_fold_m_padding_arithmetic():
+    # grid_rows(20) = 3, rf=2 -> mg = ceil(3/2) = 2, m_passes = ceil(3/2) = 2,
+    # grid_rows_pad = 4 (one padding row tile in the last frame).
+    resolved = resolve_fold_m(20, 2)
+    assert resolved["mg"] == 2
+    assert resolved["m_passes"] == 2
+    assert resolved["grid_rows_pad"] == 4
+
+
+def test_resolve_reuse_factor_fold_axis_m_pins_k_fields_at_rf1():
+    resolved = resolve_reuse_factor(24, 2, fold_axis="m", m=20)
+    kc = K24_CHUNKS
+    assert resolved["k_spatial"] == kc
+    assert resolved["passes"] == 1
+    assert resolved["k_chunks_pad"] == kc
+    assert resolved["effective_reuse"] == 1
+    assert resolved["mg"] == 2
+    assert resolved["m_passes"] == 2
+    assert resolved["reuse_factor"] == 2
+
+
+def test_flow_normalize_config_fold_axis_m_fields(scratch_dir):
+    tdir = str(_SRC / "targets" / "tensor_slice")
+    saved_path = list(sys.path)
+    saved_modules = {k: sys.modules.get(k) for k in ("geometry", "package", "rtl", "golden", "flow", "base")}
+    sys.path.insert(0, str(_SRC / "targets"))
+    sys.path.insert(0, tdir)
+    for stale in ("geometry", "package", "rtl", "golden", "flow", "base"):
+        sys.modules.pop(stale, None)
+    try:
+        spec = importlib.util.spec_from_file_location("_ts_flow_m", Path(tdir) / "flow.py")
+        flow_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(flow_mod)
+        target = flow_mod.TARGET
+        items = [{"name": "l0", "m": 20, "k": 24, "n": 16, "reuse_factor": 2, "fold_axis": "m"}]
+        norm = target.normalize_config(items)
+        manifest = json.loads(target.integration_manifest(norm))
+        k_items = [{"name": "l1", "m": 20, "k": 24, "n": 16, "reuse_factor": 2}]
+        k_norm = target.normalize_config(k_items)
+        k_manifest = json.loads(target.integration_manifest(k_norm))
+        # The runner emits the dict form (name -> layer); the shared normalizer
+        # must forward fold_axis through that path too.
+        d_norm = target.normalize_config({"l2": {
+            "type": "Gemm", "n_in": 24, "n_out": 16, "gemm_m": 20,
+            "reuse_factor": 2, "fold_axis": "m"}})
+    finally:
+        sys.path[:] = saved_path
+        for stale, prev in saved_modules.items():
+            if prev is None:
+                sys.modules.pop(stale, None)
+            else:
+                sys.modules[stale] = prev
+
+    item = norm[0]
+    assert item["fold_axis"] == "m"
+    assert d_norm[0]["fold_axis"] == "m" and d_norm[0]["m_passes"] == 2
+    assert item["m_groups"] == 2
+    assert item["m_passes"] == 2
+    assert item["grid_rows_pad"] == 4
+    assert item["k_spatial"] == K24_CHUNKS
+    assert item["k_passes"] == 1
+
+    core = manifest["cores"][0]
+    assert core["fold_axis"] == "m"
+    assert core["m_groups"] == 2
+    assert core["m_passes"] == 2
+    assert core["grid_rows_pad"] == 4
+
+    # Default axis ("k") reports fold_axis="k", m_groups=grid_rows, m_passes=1.
+    k_core = k_manifest["cores"][0]
+    assert k_core["fold_axis"] == "k"
+    assert k_core["m_groups"] == M20_GRID_ROWS
+    assert k_core["m_passes"] == 1
+
+
+def test_generate_catapult_pkg_fold_axis_m_rf1_byte_identical_to_k(scratch_dir):
+    """RF=1 under fold_axis='m' is a single frame: the generated core, header
+    and RTL are byte-identical to the fold_axis='k' package for the same shape
+    (only the manifest's fold fields differ)."""
+    import filecmp
+    m, k, n = 20, 24, 16
+    for name, axis in (("foldm_rf1", "m"), ("foldk_rf1", "k")):
+        _with_tensor_slice_on_path(
+            generate_catapult_pkg, m, k, n, name, str(scratch_dir),
+            interface="stream", reuse_factor=1, fold_axis=axis,
+        )
+    dm, dk = scratch_dir / "foldm_rf1", scratch_dir / "foldk_rf1"
+    for fm in sorted(dm.iterdir()):
+        fk = dk / fm.name.replace("foldm_rf1", "foldk_rf1")
+        assert fk.exists(), fm.name
+        tm = fm.read_text().replace("foldm_rf1", "X").replace("FOLDM_RF1", "X")
+        tk = fk.read_text().replace("foldk_rf1", "X").replace("FOLDK_RF1", "X")
+        assert tm == tk, fm.name
+
+
+def test_generate_catapult_pkg_fold_axis_k_byte_identical_to_default(scratch_dir):
+    """fold_axis defaults to 'k' and must not change phase 1 output at all."""
+    m, k, n = 9, 17, 10
+    name_default = "nofoldaxis"
+    name_k = "explicit_k"
+    _with_tensor_slice_on_path(
+        generate_catapult_pkg, m, k, n, name_default, str(scratch_dir),
+        interface="stream", reuse_factor=2,
+    )
+    _with_tensor_slice_on_path(
+        generate_catapult_pkg, m, k, n, name_k, str(scratch_dir),
+        interface="stream", reuse_factor=2, fold_axis="k",
+    )
+    for ext in ("_gemm_ip.h", "_core.v"):
+        a = (scratch_dir / name_default / f"{name_default}{ext}").read_text()
+        b = (scratch_dir / name_k / f"{name_k}{ext}").read_text()
+        a = a.replace(name_default.upper(), name_k.upper()).replace(name_default, name_k)
+        assert a == b

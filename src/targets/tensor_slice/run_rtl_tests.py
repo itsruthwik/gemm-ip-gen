@@ -36,7 +36,7 @@ if str(SRC) not in sys.path:
 
 from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
 from golden import generate_tb
-from geometry import k_chunks as _k_chunks, resolve_reuse_factor
+from geometry import k_chunks as _k_chunks, resolve_reuse_factor, resolve_fold_m
 from gemm_ip.weights import build_weight_rom_k_spatial
 
 GEN_DIR = HERE / "tb" / "generated"
@@ -80,20 +80,55 @@ ROM_CASES = [
     (16, 24, 8, 2),  # m > n, multi-pass K-spatial (rf=2 -> passes=k_chunks/2)
 ]
 
+# Fold-M regression: (m, k, n, rf). The core is generated for M_g = 8*mg rows
+# (K and N fully spatial, one K pass); the golden iverilog testbench's
+# back-to-back multi-frame mode (back2back=True, num_vectors=m_passes) is the
+# regression hook -- it feeds m_passes distinct frames of M_g rows each and
+# checks every output row against golden in frame order, exactly how the
+# wrapper RUN loop replays the same rf=1 core (proven in
+# temp_space/multiframe-probe/). (9,17,10,2) pads the last pass; (16,40,16,2)
+# is an exact-division fold; (8,16,8,1) is the RF=1 (m_passes=1, single-frame)
+# identity case; (16,40,16,5) drives RF to its grid_rows bound (5 -> legalizes
+# down since grid_rows(16)=2).
+FOLD_M_CASES = [
+    (9, 17, 10, 2),
+    (16, 40, 16, 2),
+    (8, 16, 8, 1),
+    (16, 40, 16, 5),
+]
+
 
 def _run(cmd):
     return subprocess.run(cmd, text=True, capture_output=True)
 
 
-def run_case(m, k, n, seed, rf=None, weights_in_core=False):
-    """Generate wrapper RTL + TB for one shape/seed/ReuseFactor, simulate, return (ok, log)."""
-    rf_use = rf if rf is not None else _k_chunks(k)
-    resolved = resolve_reuse_factor(k, rf_use)
-    for w in resolved["warnings"]:
-        print(w, file=sys.stderr)
-    k_spatial = resolved["k_spatial"]
+def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k"):
+    """Generate core RTL + TB for one shape/seed/ReuseFactor/axis, simulate, return (ok, log).
+
+    Under fold_axis "m" the core is the rf=1 (full-K, full-N) core for M_g rows and
+    the testbench's back-to-back multi-frame mode feeds m_passes frames -- the
+    RTL-level equivalent of the wrapper's multi-frame RUN loop (see FOLD_M_CASES).
+    """
+    if fold_axis == "m":
+        fm = resolve_fold_m(m, rf if rf is not None else 1)
+        for w in fm["warnings"]:
+            print(w, file=sys.stderr)
+        rf_use = fm["reuse_factor"]
+        core_m = fm["mg"] * 8
+        num_vectors = fm["m_passes"]
+        k_spatial = _k_chunks(k)
+    else:
+        rf_use = rf if rf is not None else _k_chunks(k)
+        resolved = resolve_reuse_factor(k, rf_use)
+        for w in resolved["warnings"]:
+            print(w, file=sys.stderr)
+        core_m = m
+        num_vectors = 10
+        k_spatial = resolved["k_spatial"]
 
     stem = f"gemm_{m}x{k}x{n}_rf{rf_use}_s{seed}"
+    if fold_axis != "k":
+        stem += f"_fold{fold_axis}"
     if weights_in_core:
         stem += "_rom"
     mod = f"{stem}_wrapper"
@@ -108,21 +143,20 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False):
         rng = np.random.default_rng(seed)
         max_val = max(1, int((127 / max(k, 1)) ** 0.5))
         fixed_B = rng.integers(-max_val, max_val + 1, size=(k, n), dtype=np.int8)
-        weight_rom = build_weight_rom_k_spatial(fixed_B, m, n, k, k_spatial)
+        weight_rom = build_weight_rom_k_spatial(fixed_B, core_m, n, k, k_spatial)
 
     if k_spatial == 1:
-        rtl.write_text(generate_combined_core_verilog(m, k, n, module_name=mod, weight_rom=weight_rom))
+        rtl.write_text(generate_combined_core_verilog(core_m, k, n, module_name=mod, weight_rom=weight_rom))
     else:
         rtl.write_text(generate_k_spatial_combined_core_verilog(
-            m, k, n, module_name=mod, k_spatial=k_spatial, out_bits=8, weight_rom=weight_rom))
-    tb.write_text(generate_tb(m, k, n, module_name=mod, seed=seed, k_spatial=k_spatial,
+            core_m, k, n, module_name=mod, k_spatial=k_spatial, out_bits=8, weight_rom=weight_rom))
+    tb.write_text(generate_tb(core_m, k, n, module_name=mod, seed=seed, k_spatial=k_spatial,
+                              num_vectors=num_vectors, back2back=(fold_axis == "m"),
                               weights_in_core=weights_in_core, fixed_B=fixed_B))
 
-    # No -DSYNTHESIS: the behavioral branch is compiled, so no external slice IP.
     comp = _run(["iverilog", "-g2012", "-o", str(out), str(tb), str(rtl)])
     if comp.returncode != 0:
         return False, "iverilog compile failed\n" + comp.stdout + comp.stderr
-
     sim = _run(["vvp", str(out)])
     log = sim.stdout + sim.stderr
     if sim.returncode != 0:
@@ -143,6 +177,7 @@ def run(cases=None, seeds=None, keep=False):
         return 2
 
     rom_cases = list(ROM_CASES) if not cases else []
+    fold_m_cases = list(FOLD_M_CASES) if not cases else []
     cases = list(cases) if cases else list(DEFAULT_CASES)
     seeds = list(seeds) if seeds else list(DEFAULT_SEEDS)
 
@@ -170,10 +205,21 @@ def run(cases=None, seeds=None, keep=False):
                 print(log)
                 failures.append(tag)
 
+    for case in fold_m_cases:
+        m, k, n, rf = case
+        for seed in seeds:
+            for rom in (False, True):
+                ok, log = run_case(m, k, n, seed, rf=rf, weights_in_core=rom, fold_axis="m")
+                tag = f"{m}x{k}x{n} rf={rf} seed={seed} fold_axis=m{' rom' if rom else ''}"
+                print(f"{'PASS' if ok else 'FAIL'} {tag}")
+                if not ok:
+                    print(log)
+                    failures.append(tag)
+
     if not keep:
         shutil.rmtree(GEN_DIR, ignore_errors=True)
 
-    total = len(cases) * len(seeds) + len(rom_cases) * len(seeds)
+    total = len(cases) * len(seeds) + len(rom_cases) * len(seeds) + len(fold_m_cases) * len(seeds)
     if failures:
         print(f"\n{len(failures)}/{total} FAILED:")
         for t in failures:

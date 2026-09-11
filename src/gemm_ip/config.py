@@ -121,6 +121,7 @@ def _normalize_config_items(cfg):
                 "gemm_ip_index": item.get("gemm_ip_index"),
                 "strategy": item.get("strategy", "latency"),
                 "reuse_factor": item.get("reuse_factor", 1),
+                "fold_axis": item.get("fold_axis"),
                 "output_precision": item.get("output_precision"),
                 "input_precision": item.get("input_precision"),
                 "weight_precision": item.get("weight_precision"),

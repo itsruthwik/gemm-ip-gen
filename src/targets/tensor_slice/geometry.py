@@ -78,7 +78,85 @@ def multipliers(m, n, k_spatial):
     return 64 * grid_rows(m) * grid_cols(n) * int(k_spatial)
 
 
-def resolve_reuse_factor(k, reuse_factor, name=None):
+def resolve_fold_m(m, reuse_factor, name=None):
+    """Legalize a requested ReuseFactor into a row-tile-group (fold-M) plan.
+
+    ``reuse_factor`` (RF) is the number of row-tile groups (frames) the M
+    dimension is folded into: ``grid_rows = ceil(m/8)`` row tiles are covered
+    by ``mg = ceil(grid_rows / RF)`` row tiles per group, in
+    ``m_passes = ceil(grid_rows / mg)`` back-to-back frames; the legalized RF
+    is ``m_passes`` (which may land lower than requested -- silently).
+    Requests above ``grid_rows`` (RF > grid_rows) legalize down to
+    ``grid_rows`` (one row tile per frame) with a warning. RF=1 legalizes to
+    ``mg=grid_rows``, ``m_passes=1`` -- today's single-frame hardware. The
+    legal range is ``1..grid_rows``.
+
+    Returns a dict: mg, m_passes, grid_rows, grid_rows_pad,
+    reuse_factor_requested, reuse_factor (legalized), warnings (list[str]).
+    """
+    gr = grid_rows(m)
+    rf_req = int(reuse_factor)
+    warnings = []
+    rf_use = rf_req
+    if rf_use < 1:
+        rf_use = 1
+    if rf_use > gr:
+        who = f" for layer {name}" if name is not None else ""
+        warnings.append(
+            f"WARNING: Invalid ReuseFactor={rf_req}{who}. "
+            f"Using ReuseFactor={gr} instead. Valid ReuseFactor(s): 1..{gr}."
+        )
+        rf_use = gr
+    mg = _ceil_div(gr, rf_use)
+    m_passes = _ceil_div(gr, mg)
+    grid_rows_pad = m_passes * mg
+    return {
+        "mg": mg,
+        "m_passes": m_passes,
+        "grid_rows": gr,
+        "grid_rows_pad": grid_rows_pad,
+        "reuse_factor_requested": rf_req,
+        "reuse_factor": m_passes,
+        "warnings": warnings,
+    }
+
+
+def resolve_reuse_factor(k, reuse_factor, name=None, fold_axis="k", m=None):
+    """Legalize a requested ReuseFactor for the tensor_slice target.
+
+    ``fold_axis`` selects which dimension ReuseFactor folds: ``"k"`` (default)
+    is the phase 1 K-partition legalization above; ``"m"`` folds row tiles
+    instead (see :func:`resolve_fold_m`) and keeps K fully spatial
+    (``k_spatial = k_chunks``, one K pass -- the rf=1 K fields).
+
+    Under ``fold_axis="m"`` this returns the same dict shape as the ``k``
+    path, with the K fields pinned to their rf=1 values and ``mg``,
+    ``m_passes``, ``grid_rows``, ``grid_rows_pad`` added; ``reuse_factor`` is
+    the legalized fold-M pass count.
+    """
+    if fold_axis == "m":
+        if m is None:
+            raise ValueError("resolve_reuse_factor(fold_axis='m') requires m")
+        kc = k_chunks(k)
+        fm = resolve_fold_m(m, reuse_factor, name)
+        return {
+            "k_spatial": kc,
+            "passes": 1,
+            "k_chunks": kc,
+            "k_chunks_pad": kc,
+            "reuse_factor_requested": fm["reuse_factor_requested"],
+            "reuse_factor": fm["reuse_factor"],
+            "effective_reuse": 1,
+            "warnings": fm["warnings"],
+            "mg": fm["mg"],
+            "m_passes": fm["m_passes"],
+            "grid_rows": fm["grid_rows"],
+            "grid_rows_pad": fm["grid_rows_pad"],
+        }
+    return _resolve_reuse_factor_k(k, reuse_factor, name)
+
+
+def _resolve_reuse_factor_k(k, reuse_factor, name=None):
     """Legalize a requested ReuseFactor into a K-partition count.
 
     ``reuse_factor`` (RF) is the number of passes over K each input vector's

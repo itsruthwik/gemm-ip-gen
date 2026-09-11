@@ -82,7 +82,34 @@ into a K-partition count:
 
 The batch manifest (`gen_integration_manifest`) carries `reuse_factor_requested`,
 `reuse_factor` (legalized), `effective_reuse`, `k_spatial`, `k_passes`,
-`k_chunks_pad`, and `multipliers` for every core.
+`k_chunks_pad`, `multipliers`, `fold_axis`, `m_groups`, `m_passes`, and
+`grid_rows_pad` for every core.
+
+## FoldAxis
+
+`FoldAxis` (knob key `fold_axis`, choices `k`/`m`, default `k`) selects which
+dimension `ReuseFactor` folds. `k` is the ReuseFactor model above. `m` keeps K
+and N fully spatial (`k_spatial = k_chunks`, one K pass -- the rf=1 K fields)
+and folds row tiles instead: `resolve_fold_m(m, reuse_factor)` legalizes RF
+into a row-tile-group count --
+
+- `grid_rows = ceil(M / 8)`; the legal RF range is `1..grid_rows`.
+- `mg = ceil(grid_rows / rf)` row tiles per group, `m_passes = ceil(grid_rows
+  / mg)` back-to-back frames; the legalized RF is `m_passes` (may land lower
+  than requested, silently).
+- `RF > grid_rows` clamps to `grid_rows` (one row tile per frame) with a
+  bound warning. `RF == 1` legalizes to `mg == grid_rows`, `m_passes == 1` --
+  one frame, functionally today's single-frame hardware.
+- `multipliers = 64 * mg * grid_cols(n) * k_chunks`; `effective_reuse` stays
+  `1` (each row's MACs happen once per input vector) -- the manifest's
+  `reuse_factor` (the fold-M pass count) and `effective_reuse` are reported
+  separately so the two are never confused.
+
+No new hardware: the RTL core generated is the plain rf=1 core sized for
+`M_g = 8*mg` rows; the wrapper issues `m_passes` frames of it back-to-back,
+frame `g` covering logical rows `[g*M_g, (g+1)*M_g)`. See
+`docs/wrapper_run_loop.md`'s fold-M section for the multi-frame feed/capture
+schedule and `docs/rtl_contract.md`'s FoldAxis section for the RTL-side model.
 
 ## Verification
 

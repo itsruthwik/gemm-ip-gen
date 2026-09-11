@@ -219,3 +219,36 @@ Overlap *across* frames happens two ways:
 - `n_frames == 1` (the real hls4ml flow) is one frame per wrapper call, so
   cross-frame overlap depends on a caller issuing multiple frames through one
   core (multi-frame conv tiling, einsum head loops).
+
+## Fold-M multi-frame schedule (FoldAxis="m")
+
+A fold-M package reuses this exact loop with `n_frames = m_passes`; the only
+differences are what `M` means and what the loop reads/captures:
+
+- The core is generated for `M_g = 8*mg` rows (`k_spatial = K_CHUNKS`, one K
+  pass — see `rtl_contract.md`'s FoldAxis section), so `m` in the formulas
+  above (`total_beats`, `period`, `first_out`, ...) is `M_g`, not the logical
+  M. `logical_m` (the true M) is a second, separate quantity threaded through
+  only the two places below.
+- **Feed gating**: frame `g`'s beat `t` is global row `g*M_g + t`. The loop
+  reads `a_stream`/`a_rows[]` only when that global row is `< logical_m` (an
+  extra `g * M_g + t < logical_m` term on the feed condition); beats past
+  `logical_m` feed zero A instead of reading — there are exactly `logical_m`
+  real rows available, not `m_passes * M_g`. Only the last frame ever has
+  padding rows.
+- **Capture**: fold-M drops the b2b capture body's `n_frames * m`-row bound
+  (which would keep every frame's rows, all real) for the single-frame-style
+  body's bound (`captured < logical_m`, the same guard phase 1 uses for one
+  frame). `captured` is one counter declared outside the loop, incremented on
+  every `v` pulse across every frame, so this is exactly "keep the first
+  `logical_m` pulses in emission order" — since frames retire in order and
+  only the last frame's tail is padding, that is exactly the real rows.
+- No replay buffer, no C buffer, no ROM reshaping: K is a single pass (no
+  replay), each frame's rows are complete and in order at the end of its own
+  pass (no cross-frame buffering), and the ROM rewinds on every frame's
+  leading idle beat (`beat_ctr`/`rom_base` reset on `!in_valid`), so it
+  re-reads the same `N` (or `K_CHUNKS * N`) entries for every frame — no
+  group-scoped addressing needed.
+- RF=1 (`m_passes == 1`) is a single frame: the loop's fold-M-only feed/
+  capture text collapses to the ordinary single-frame path with `logical_m ==
+  M_g`, matching today's (`FoldAxis="k"`) single-frame hardware.

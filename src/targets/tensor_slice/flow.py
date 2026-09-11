@@ -39,13 +39,21 @@ class TensorSliceTarget(Target):
     name = "tensor_slice"
     tool = "catapult"
 
-    def geometry(self, shape, reuse_factor=1):
+    knobs = [
+        {"name": "FoldAxis", "key": "fold_axis", "type": "enum",
+         "choices": ("k", "m"), "default": "k",
+         "description": "which dimension ReuseFactor folds"},
+    ]
+
+    def geometry(self, shape, reuse_factor=1, fold_axis="k"):
         m, k, n = shape
         gr, gc = _geom.grid_rows(m), _geom.grid_cols(n)
-        resolved = _geom.resolve_reuse_factor(k, reuse_factor)
+        resolved = _geom.resolve_reuse_factor(k, reuse_factor, fold_axis=fold_axis, m=m)
         for w in resolved["warnings"]:
             print(w, file=sys.stderr)
         ks = resolved["k_spatial"]
+        mg = resolved.get("mg", gr)
+        m_passes = resolved.get("m_passes", 1)
         return {
             "grid_rows": gr,
             "grid_cols": gc,
@@ -56,7 +64,11 @@ class TensorSliceTarget(Target):
             "reuse_factor_requested": resolved["reuse_factor_requested"],
             "reuse_factor": resolved["reuse_factor"],
             "effective_reuse": resolved["effective_reuse"],
-            "multipliers": _geom.multipliers(m, n, ks),
+            "fold_axis": fold_axis,
+            "m_groups": mg,
+            "m_passes": m_passes,
+            "grid_rows_pad": resolved.get("grid_rows_pad", gr),
+            "multipliers": _geom.multipliers(m, n, ks) if fold_axis != "m" else 64 * mg * gc * resolved["k_chunks"],
             "a_stream_width": _geom.a_stream_width(m, ks),
             "b_stream_width": _geom.b_stream_width(n, ks),
             "c_stream_width": _geom.c_stream_width(n),
@@ -103,17 +115,31 @@ class TensorSliceTarget(Target):
         from gemm_ip.config import _normalize_config_items
         items = _normalize_config_items(cfg)
         for item in items:
+            self.validate_knobs(item, item.get("name"))
+            fold_axis = str(item.get("fold_axis") or "k").lower()
             resolved = _geom.resolve_reuse_factor(
-                item["k"], item.get("reuse_factor", 1), item.get("name"))
+                item["k"], item.get("reuse_factor", 1), item.get("name"),
+                fold_axis=fold_axis, m=item["m"])
             for w in resolved["warnings"]:
                 print(w, file=sys.stderr)
+            gr = _geom.grid_rows(item["m"])
+            gc = _geom.grid_cols(item["n"])
+            mg = resolved.get("mg", gr)
+            m_passes = resolved.get("m_passes", 1)
             item["k_spatial"] = resolved["k_spatial"]
             item["k_passes"] = resolved["passes"]
             item["k_chunks_pad"] = resolved["k_chunks_pad"]
             item["reuse_factor_requested"] = resolved["reuse_factor_requested"]
             item["reuse_factor"] = resolved["reuse_factor"]
             item["effective_reuse"] = resolved["effective_reuse"]
-            item["multipliers"] = _geom.multipliers(item["m"], item["n"], resolved["k_spatial"])
+            item["fold_axis"] = fold_axis
+            item["m_groups"] = mg
+            item["m_passes"] = m_passes
+            item["grid_rows_pad"] = resolved.get("grid_rows_pad", gr)
+            if fold_axis == "m":
+                item["multipliers"] = 64 * mg * gc * resolved["k_chunks"]
+            else:
+                item["multipliers"] = _geom.multipliers(item["m"], item["n"], resolved["k_spatial"])
         return items
 
     def combined_header(self, items):
