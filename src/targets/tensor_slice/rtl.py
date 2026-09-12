@@ -655,6 +655,13 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
     for c in range(grid_cols):
         boundary.append(f"    assign b_chain_0_{c} = 64'b0;")
 
+    # Slice data pins are NOT gated on the beat window (Ruthwik, 2026-09-11):
+    # the registered beat word drives the boundary tiles' a_data/b_data directly
+    # and the slice's own start/K-count decides what it consumes. The old
+    # `in_beat_active ? word : 0` gate was the chunked cores' critical path
+    # (state decode + 16-bit beat compare + a 64-bit mux fanned out to every
+    # slice pin). Only the static "which boundary tile" select remains, which
+    # constant-folds to wiring.
     data_wires = []
     for r in range(grid_rows):
         a_hi = (r + 1) * 64 - 1
@@ -663,10 +670,10 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
             b_hi = (c + 1) * 64 - 1
             b_lo = c * 64
             data_wires.append(
-                f"    wire [63:0] a_data_{r}_{c} = (in_beat_active && ({c} == 0)) ? a_rows_q[{a_hi}:{a_lo}] : 64'b0;"
+                f"    wire [63:0] a_data_{r}_{c} = ({c} == 0) ? a_rows_q[{a_hi}:{a_lo}] : 64'b0;"
             )
             data_wires.append(
-                f"    wire [63:0] b_data_{r}_{c} = (in_beat_active && ({r} == 0)) ? b_cols_q[{b_hi}:{b_lo}] : 64'b0;"
+                f"    wire [63:0] b_data_{r}_{c} = ({r} == 0) ? b_cols_q[{b_hi}:{b_lo}] : 64'b0;"
             )
 
     inst_lines = []
@@ -1214,8 +1221,8 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
             .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
             .start_mat_mul(slice_start && part{p}_active),
             .done_mat_mul(done_mat_mul[{idx}]),
-            .a_data((in_beat_active && part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
-            .b_data((in_beat_active && part{p}_active && ({r} == 0){b_route}) ? {b_expr} : 64'b0),
+            .a_data((part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
+            .b_data((part{p}_active && ({r} == 0){b_route}) ? {b_expr} : 64'b0),
             .a_data_in(64'b0),
             .b_data_in(64'b0),
             .a_data_out(),
@@ -1273,8 +1280,8 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
             .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
             .start_mat_mul(slice_start && part{p}_active),
             .done_mat_mul(done_mat_mul[{idx}]),
-            .a_data((in_beat_active && part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
-            .b_data((in_beat_active && part{p}_active && ({r} == 0){b_route}) ? {b_expr} : 64'b0),
+            .a_data((part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
+            .b_data((part{p}_active && ({r} == 0){b_route}) ? {b_expr} : 64'b0),
             .a_data_in(64'b0),
             .b_data_in(64'b0),
             .a_data_out(),
