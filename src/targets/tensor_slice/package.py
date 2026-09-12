@@ -230,15 +230,17 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # the real value, then adds the (full-precision) bias and quantizes to the
     # result type. gemm_shift == 0 collapses to the legacy integer-coded path.
     gemm_shift = _frac_bits(input_precision) + _frac_bits(weight_precision)
-    # Requantise ONCE, after the whole contraction is accumulated (in-slice and
-    # cross-chunk folded together in the behavioural model). The accumulator
-    # carries frac = frac_a + frac_b; the result lane carries frac(out), so the
-    # single shift is their difference. requant_shift == 0 -> legacy path (core
-    # emits the raw accumulator and the drain does the whole rescale).
+    # Total gemm->result shift: the accumulator carries frac_a + frac_b, the
+    # result lane carries frac(out). A zero result fraction is an ordinary
+    # value here (the shift is then the whole product fraction) -- there is no
+    # legacy "drain rescales" path any more, the drain is a pure unpack.
     _out_frac = _frac_bits(result_type)
-    requant_shift = max(0, gemm_shift - _out_frac) if _out_frac else 0
-    requant_bits = _output_bits(result_type) if requant_shift else None
-    drain_shift = _out_frac if requant_shift else gemm_shift
+    requant_shift = gemm_shift - _out_frac
+    if requant_shift < 0:
+        raise ValueError(
+            f"{name}: result type {result_type!r} carries {_out_frac} fraction bits, "
+            f"more than the {gemm_shift} the product carries; a left shift is not "
+            "supported by the tensor_slice requant.")
     # Two-stage requant (jojo-track/open/tensor-slice-bias-in-rtl, phase 1):
     # this ccore mirrors the Verilog sim branch's folded model exactly: stage
     # 1 (round-half-up shift by S1, wrap to 16) applied once to the exact
@@ -1174,7 +1176,7 @@ template <typename T, unsigned N> struct array {
 
 
 def gen_tb(name, m, k, n, interface="stream", n_frames=1,
-           requant_shift=0, requant_bits=None, drain_shift=None, weight_matrix=None,
+           requant_shift=0, weight_matrix=None,
            out_width=16):
     weights_in_core = weight_matrix is not None
     if weights_in_core:
@@ -1473,7 +1475,7 @@ def _const_weights_brom_cpp(b_bits, grid_cols, weight_rom):
 
 
 def gen_inst_cpp(name, m, k, n, interface="stream",
-                 requant_shift=0, requant_bits=None, drain_shift=None, weight_matrix=None,
+                 requant_shift=0, weight_matrix=None,
                  out_width=16):
     from geometry import grid_rows, grid_cols
     weights_in_core = weight_matrix is not None
@@ -2066,7 +2068,15 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     out_bits = _output_bits(output_precision)
     _gemm_shift = _frac_bits(input_precision) + _frac_bits(weight_precision)
     _out_frac = _frac_bits(output_precision)
-    _total_shift = max(0, _gemm_shift - _out_frac) if _out_frac else 0
+    # No zero-fraction guard: a result with no fraction bits still needs the
+    # whole product fraction shifted out (the old guard fed a legacy path in
+    # which the drain rescaled; the drain is a pure unpack now).
+    _total_shift = _gemm_shift - _out_frac
+    if _total_shift < 0:
+        raise ValueError(
+            f"{name}: output_precision {output_precision!r} carries {_out_frac} "
+            f"fraction bits, more than the {_gemm_shift} the product carries; a "
+            "left shift is not supported by the tensor_slice requant.")
     _accum_w = _accum_shift_bits(accum_precision, _gemm_shift)
     s1 = max(0, _accum_w - 16) if _accum_w else 0
     if s1 > _total_shift:
@@ -2080,15 +2090,11 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
               "so this double-rounds against the per-partition synth behavior -- "
               "see jojo-track/open/tensor-slice-bias-in-rtl.", file=sys.stderr)
     s2 = _total_shift - s1
-    # gen_inst_cpp/gen_tb's own self-check reference is still a single-round
-    # formula (gemm_acc rounded once by `requant_shift`, bias added at
-    # `drain_shift`) -- it must use the TOTAL shift, not S2 alone, or it
-    # silently under-shifts whenever S1 > 0. This makes the C++ testbench's
-    # self-check a single-round reference (identical to the two-stage DUT
-    # when S1 == 0; expected to disagree by <= 1 output LSB when S1 > 0 --
-    # decision 7 -- not a silent bug, a loud measured mismatch).
+    # gen_inst_cpp/gen_tb's own self-check reference is a single-round
+    # formula (gemm_acc rounded once by the TOTAL shift). Identical to the
+    # two-stage DUT when S1 == 0; expected to disagree by <= 1 output LSB when
+    # S1 > 0 (decision 7) -- a loud measured mismatch, not a silent bug.
     requant_shift = _total_shift
-    requant_bits = _output_bits(output_precision) if requant_shift else None
 
     # Bake the bias (decision 4): baked at the intermediate scale (gemm_frac
     # - S1, the scale stage 2 adds it at), one 16-bit signed code per column,
@@ -2177,14 +2183,12 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     # call, so they never see core_m or m_passes.
     (pkg_dir / f"{name}_inst.cpp").write_text(gen_inst_cpp(
         name, m, k, n, interface,
-        requant_shift=requant_shift, requant_bits=requant_bits,
-        drain_shift=(_out_frac if requant_shift else _gemm_shift),
+        requant_shift=requant_shift,
         weight_matrix=weight_matrix, out_width=out_bits,
     ))
     (pkg_dir / f"{name}_tb.cpp").write_text(gen_tb(
         name, m, k, n, interface, n_frames=n_frames,
-        requant_shift=requant_shift, requant_bits=requant_bits,
-        drain_shift=(_out_frac if requant_shift else _gemm_shift),
+        requant_shift=requant_shift,
         weight_matrix=weight_matrix, out_width=out_bits,
     ))
     (pkg_dir / "run_catapult.tcl").write_text(

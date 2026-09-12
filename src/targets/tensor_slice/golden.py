@@ -6,8 +6,9 @@ Drives the Catapult ``{core}`` with ``clk/rst/en``, ``a_rows/b_cols``,
 ``preload_valid/in_valid``, and checks ``c_row/out_valid/out_last``.
 
 Stimulus: random INT8 matrices A, B are generated in Python, multiplied with
-int32 accumulation, bias added, saturated to int8/result type, and embedded as
-Verilog literals for self-checking.
+exact accumulation, put through the two-stage requant (stage-1 shift and wrap
+to 16, bias add, stage-2 shift and wrap to the result width, no saturation),
+and embedded as Verilog literals for self-checking.
 """
 import argparse
 import numpy as np
