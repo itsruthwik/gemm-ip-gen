@@ -37,7 +37,7 @@ if str(SRC) not in sys.path:
 from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
 from golden import generate_tb
 from geometry import k_chunks as _k_chunks, resolve_reuse_factor, resolve_fold_m, resolve_fold_n
-from gemm_ip.weights import build_weight_rom_k_spatial
+from gemm_ip.weights import build_weight_rom_k_spatial, build_weight_rom_fold_n
 
 GEN_DIR = HERE / "tb" / "generated"
 
@@ -108,6 +108,8 @@ FOLD_M_CASES = [
 # columns; (20,24,16,2) M > N_g; (9,17,10,2) M < N_g and K > 8 (non-8-multiple
 # K exercises the K-spatial tail mask together with the group counter).
 FOLD_N_CASES = [
+    (8, 8, 32, 2),    # single K chunk (chunked ROM layout) -- the width bug's shape
+    (12, 8, 24, 3),   # single K chunk, three groups, ragged last group
     (12, 24, 32, 2),
     (12, 24, 32, 4),
     (20, 24, 16, 2),
@@ -254,7 +256,7 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
         max_val = max(1, int((127 / max(k, 1)) ** 0.5))
         # ROM holds every group's columns back to back (base g*core_n).
         fixed_B = rng.integers(-max_val, max_val + 1, size=(k, n_passes * core_n), dtype=np.int8)
-        weight_rom = build_weight_rom_k_spatial(fixed_B, core_m, n_passes * core_n, k, k_spatial)
+        weight_rom = build_weight_rom_fold_n(fixed_B, core_m, core_n, k, k_spatial, n_passes)
     elif weights_in_core:
         import numpy as np
         rng = np.random.default_rng(seed)

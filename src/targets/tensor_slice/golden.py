@@ -723,10 +723,20 @@ def _gen_all_stimulus_fold_n(core_m, k, core_n, n_passes, base_seed, k_spatial, 
         C_out = two_stage_reference(A, B_g, biases_g, s1=s1, s2=s2, out_width=out_width)
 
         a_stim, b_stim = [], []
-        for pass_idx in range(passes):
-            for t in range(input_beats):
-                a_stim.append(pack_a_k_spatial_narrow(A, t, pass_idx, core_m, k, k_spatial))
-                b_stim.append(pack_b_k_spatial_narrow(B_g, t, pass_idx, core_n, k, k_spatial))
+        if k_spatial == 1:
+            # Single K chunk: the core is the CHUNKED emitter, whose beat word is
+            # grid-padded (row/col t at tile t // 8), not the narrow K-spatial
+            # word. Packing narrow here left every row past the first tile
+            # zero in the RTL.
+            for chunk in range(k_chunks):
+                for t in range(input_beats):
+                    a_stim.append(pack_a_chunk(A, t, chunk, grid_rows, core_m, k))
+                    b_stim.append(pack_b_chunk(B_g, t, chunk, grid_cols, core_n, k))
+        else:
+            for pass_idx in range(passes):
+                for t in range(input_beats):
+                    a_stim.append(pack_a_k_spatial_narrow(A, t, pass_idx, core_m, k, k_spatial))
+                    b_stim.append(pack_b_k_spatial_narrow(B_g, t, pass_idx, core_n, k, k_spatial))
         all_a_stim.append(a_stim)
         all_b_stim.append(b_stim)
         all_bias.append(pack_bias(biases_g, grid_cols, core_n))

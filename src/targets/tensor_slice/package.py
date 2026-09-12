@@ -1177,7 +1177,7 @@ template <typename T, unsigned N> struct array {
 
 def gen_tb(name, m, k, n, interface="stream", n_frames=1,
            requant_shift=0, weight_matrix=None,
-           out_width=16):
+           out_width=16, bias_codes=None):
     weights_in_core = weight_matrix is not None
     if weights_in_core:
         # Golden uses the SAME baked weights as the core ROM.
@@ -1272,8 +1272,11 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
 #ifdef CCS_SCVERIFY
     CCS_DESIGN({name}_inst)(a_rows, weight_cols, biases, results);
 #else
-    nnet::{name}_gemm_ip_array<a_beat_t, b_beat_t, int, res_t, {name}_config>(
-        a_rows, weight_cols, biases, results);
+    // Two-operand entry: no bias port (a two-operand GEMM never owns one) --
+    // 3 call args, 4 template params, matching {name}_gemm_ip_array's actual
+    // signature exactly (no bias_T, no biases pointer).
+    nnet::{name}_gemm_ip_array<a_beat_t, b_beat_t, res_t, {name}_config>(
+        a_rows, weight_cols, results);
 #endif
 
     for (int i = 0; i < {m}; i++) {{
@@ -1311,8 +1314,11 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
 #ifdef CCS_SCVERIFY
     CCS_DESIGN({name}_inst)(a_stream, b_stream, biases, res_stream);
 #else
-    nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, int, res_t, {name}_config>(
-        a_stream, b_stream, biases, res_stream);
+    // Two-operand entry: no bias port (a two-operand GEMM never owns one) --
+    // 3 call args, 4 template params, matching {name}_gemm_ip_stream's actual
+    // signature exactly (no bias_T, no biases channel).
+    nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, res_t, {name}_config>(
+        a_stream, b_stream, res_stream);
 #endif
 
     for (int f = 0; f < NFRAMES; f++) {{
@@ -1335,11 +1341,22 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
     # whenever the packager's own S1 is 0 (the common case).
     _half = (1 << (requant_shift - 1)) if requant_shift else 0
     res_typedef = f"typedef nnet::array<ac_int<{out_width}, true>, {n}> res_t;"
+    # Bias codes (decision 4): the SAME integer codes baked into the core's
+    # bias ROM at generation time (gemm_ip.biasrom.bias_acc_codes, at the
+    # intermediate scale gemm_frac - S1). This harness assumes S1 == 0 (the
+    # caller is responsible for choosing precisions that make that true --
+    # see generate_catapult_pkg's own S1 derivation), so the intermediate
+    # scale is the full gemm_shift and this add lands at the exact point
+    # two_stage_reference's stage-2 add does when s1 == 0. No bias -> zeros.
+    _bias_vals = list(bias_codes) if bias_codes is not None else [0] * n
+    _bias_lit = ", ".join(str(int(b)) for b in _bias_vals)
     check_row = f"""\
-// Per-row golden check: accumulate the whole dot product exactly, then
-// round-half-up shift by the total gemm->result shift and wrap to
-// out_width -- no saturation, no bias (baked into the core already, if any;
-// this standalone smoke harness never bakes one).
+// Per-row golden check: accumulate the whole dot product exactly, add the
+// SAME bias codes baked into the core's bias ROM (zero if this package has
+// no bias), then round-half-up shift by the total gemm->result shift and
+// wrap to out_width -- no saturation. This mirrors two_stage_reference()
+// (golden.py) under the S1==0 assumption noted above.
+static const int _golden_bias_codes[{n}] = {{{_bias_lit}}};
 static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
                       ac_int<8, true> weights[{n}][{k}], int biases[{n}],
                       int f, int i, int &failed) {{
@@ -1348,7 +1365,8 @@ static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
         for (int kk = 0; kk < {k}; kk++) {{
             gemm_acc += a_row[kk].to_int() * weights[j][kk].to_int();
         }}
-        ac_int<32, true> rounded = (ac_int<32, true>)(gemm_acc + {_half}) >> {requant_shift};
+        int biased = gemm_acc + _golden_bias_codes[j];
+        ac_int<32, true> rounded = (ac_int<32, true>)(biased + {_half}) >> {requant_shift};
         ac_int<{out_width}, true> expect_code = (ac_int<{out_width}, true>) rounded;
         if (out[j].to_int() != expect_code.to_int()) {{
             printf("Mismatch frame %d row %d col %d: got %d expected %d\\n",
@@ -1505,8 +1523,10 @@ def gen_inst_cpp(name, m, k, n, interface="stream",
     int biases[{n}],
     res_t results[{m}]
 ) {{
-    nnet::{name}_gemm_ip_array<a_beat_t, b_beat_t, int, res_t, {name}_config>(
-        a_rows, weight_cols, biases, results);
+    // Two-operand entry has no bias port; biases[] stays part of this
+    // smoke top's own signature but is not forwarded.
+    nnet::{name}_gemm_ip_array<a_beat_t, b_beat_t, res_t, {name}_config>(
+        a_rows, weight_cols, results);
 }}"""
     else:
         top_signature = f"""\
@@ -1515,8 +1535,10 @@ def gen_inst_cpp(name, m, k, n, interface="stream",
     int biases[{n}],
     ac_channel<res_t> &res_stream
 ) {{
-    nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, int, res_t, {name}_config>(
-        a_stream, b_stream, biases, res_stream);
+    // Two-operand entry has no bias port; biases[] stays part of this
+    // smoke top's own signature but is not forwarded.
+    nnet::{name}_gemm_ip_stream<a_beat_t, b_beat_t, res_t, {name}_config>(
+        a_stream, b_stream, res_stream);
 }}"""
     a_w = grid_rows(m) * 8
     b_w = grid_cols(n) * 8
@@ -2038,16 +2060,17 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     weights_in_core = weight_matrix is not None
     weight_rom = None
     if weights_in_core:
-        from gemm_ip.weights import build_weight_rom_k_spatial
+        from gemm_ip.weights import build_weight_rom_k_spatial, build_weight_rom_fold_n
         if n_passes > 1:
             # Fold-N: the ROM holds every group's columns back to back (group
             # g's block at base g*core_n, padded tail columns zero -- weight_
-            # matrix's own N may be smaller than n_passes*core_n).
+            # matrix's own N may be smaller than n_passes*core_n). Built per
+            # group so each word is core_n wide (see build_weight_rom_fold_n).
             import numpy as _np
             n_full = n_passes * core_n
             b_full = _np.zeros((k, n_full), dtype=_np.asarray(weight_matrix).dtype)
             b_full[:, :n] = weight_matrix
-            weight_rom = build_weight_rom_k_spatial(b_full, core_m, n_full, k, k_spatial)
+            weight_rom = build_weight_rom_fold_n(b_full, core_m, core_n, k, k_spatial, n_passes)
             expected_beats = n_full
         else:
             weight_rom = build_weight_rom_k_spatial(weight_matrix, core_m, core_n, k, k_spatial)
@@ -2190,6 +2213,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         name, m, k, n, interface, n_frames=n_frames,
         requant_shift=requant_shift,
         weight_matrix=weight_matrix, out_width=out_bits,
+        bias_codes=(bias_codes[:n] if bias_codes is not None else None),
     ))
     (pkg_dir / "run_catapult.tcl").write_text(
         gen_tcl(name, m, k, n, interface, weights_in_core=weight_matrix is not None))

@@ -116,6 +116,25 @@ def build_weight_rom_k_spatial(B, m, n, k, k_spatial):
     return rom
 
 
+def build_weight_rom_fold_n(B_full, m, core_n, k, k_spatial, n_passes):
+    """Fold-N weight ROM: ``n_passes`` column groups of ``core_n`` columns each,
+    group ``g``'s beats at base ``g * core_n``. ``B_full`` is ``[K, n_passes*core_n]``
+    (real columns first, zero-padded tail).
+
+    Built per group so every word is sized for ``core_n`` columns -- the width the
+    fold-N core's ``b_cols`` register and csim ``B_ROM`` actually have. Building it
+    in one call with ``n = n_passes*core_n`` would, on the chunked layout
+    (``k_spatial == 1``), place group ``g``'s column in tile ``g`` of a
+    ``grid_cols(n_full)``-wide word, which the ``core_n``-wide consumers truncate.
+    The narrow K-spatial layout is width-independent of ``n`` so it was unaffected.
+    """
+    rom = []
+    for g in range(n_passes):
+        Bg = np.asarray(B_full)[:, g * core_n:(g + 1) * core_n]
+        rom.extend(build_weight_rom_k_spatial(Bg, m, core_n, k, k_spatial))
+    return rom
+
+
 def build_weight_rom_full_k(B, m, n, k):
     """Today's full-K endpoint of :func:`build_weight_rom_k_spatial` (one pass)."""
     k_chunks = (k + 7) // 8
