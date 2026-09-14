@@ -130,6 +130,13 @@ module tb;
   integer n_match = 0, n_mismatch = 0;
 {b_idx_decl}
 
+  // ---- free-running cycle counter (for latency measurement) ----
+  integer cyc = 0;
+  always @(posedge ap_clk) begin
+    if (ap_rst) cyc <= 0;
+    else cyc <= cyc + 1;
+  end
+
   initial begin
     $readmemh("{a_dat}", a_mem);
     $readmemh("{exp_dat}", exp_mem);
@@ -154,21 +161,13 @@ module tb;
     rnd_bit = lfsr[0];
   endfunction
 
-  always @(posedge ap_clk) begin
-    if (ap_rst) a_empty_n <= 0;
-    else if (!a_empty_n || (a_read && a_empty_n)) begin
-      // present a new beat only if data remains; randomized gap otherwise
-      if (a_idx < A_BEATS) a_empty_n <= rnd_bit() | rnd_bit();  // biased toward valid
-      else a_empty_n <= 0;
-    end
-  end
+{a_empty_process}
 
-  always @(posedge ap_clk) begin
-    if (ap_rst) p_full_n <= 0;
-    else p_full_n <= rnd_bit() | rnd_bit() | rnd_bit();  // biased toward ready
-  end
+{p_full_process}
 
 {b_feed_process}
+
+{fsm_debug_process}
 
   // ---- feed A ----
   // NOTE: a_read/a_empty_n are sampled combinationally against the CURRENT
@@ -200,6 +199,8 @@ module tb;
 
   // ---- top-level: drive ap_start/ap_continue per node ----
   integer node;
+  integer ready_cyc, done_cyc, first_start_cyc, last_done_cyc;
+  real per_node_cyc;
   initial begin
     ap_start = 0; ap_continue = 0;
     @(negedge ap_rst);
@@ -207,15 +208,23 @@ module tb;
     for (node = 0; node < NNODES; node = node + 1) begin
       @(posedge ap_clk); #1;
       ap_start = 1;
+      if (node == 0) first_start_cyc = cyc;
       while (!ap_ready) @(posedge ap_clk);
+      ready_cyc = cyc;
       @(posedge ap_clk); #1;
       ap_start = 0;
       while (!ap_done) @(posedge ap_clk);
+      done_cyc = cyc;
+      last_done_cyc = cyc;
+      $display("NODE %0d ready=%0d done=%0d", node, ready_cyc, done_cyc);
       @(posedge ap_clk); #1;
       ap_continue = 1;
       @(posedge ap_clk); #1;
       ap_continue = 0;
     end
+    per_node_cyc = (last_done_cyc - first_start_cyc) * 1.0 / NNODES;
+    $display("CYCLES nodes=%0d first_start=%0d last_done=%0d per_node=%0.3f",
+              NNODES, first_start_cyc, last_done_cyc, per_node_cyc);
     // drain any remaining output beats
     begin : drain_wait
       integer dc;
@@ -237,8 +246,72 @@ endmodule
 
 
 def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
-                   a_dat, exp_dat, bb=None, b_beats=None, b_dat=None):
-    """Build the SV TB text. ``kind`` is 'ws' (no B port) or '2op' (has B port)."""
+                   a_dat, exp_dat, bb=None, b_beats=None, b_dat=None,
+                   backpressure=True, fsm_debug=False):
+    """Build the SV TB text. ``kind`` is 'ws' (no B port) or '2op' (has B port).
+
+    ``backpressure`` (default True, unchanged behaviour): random a_empty_n /
+    b_empty_n gaps and random p_full_n stalls, biased toward valid/ready.
+    When False, a_empty_n/b_empty_n/p_full_n are asserted every cycle data
+    remains (no artificial stalling), so measured cycles reflect only the
+    wrapper/core's own pipeline cost.
+
+    ``fsm_debug`` (2op only): emit extra $display stamps -- FSM_WRITE/FSM_RUN
+    (cycle the DUT's internal ``state`` register enters WRITE/RUN, via the
+    hierarchical ``dut.state`` reference -- only meaningful for the memstream
+    ('ms') two-operand shim, which has the IDLE/FILL/WRITE/DRAIN/RUN FSM),
+    A_BEAT (cycle each A beat is accepted) and P_BEAT (cycle each P beat is
+    written).
+    """
+    if backpressure:
+        a_empty_process = """\
+  always @(posedge ap_clk) begin
+    if (ap_rst) a_empty_n <= 0;
+    else if (!a_empty_n || (a_read && a_empty_n)) begin
+      // present a new beat only if data remains; randomized gap otherwise
+      if (a_idx < A_BEATS) a_empty_n <= rnd_bit() | rnd_bit();  // biased toward valid
+      else a_empty_n <= 0;
+    end
+  end"""
+        p_full_process = """\
+  always @(posedge ap_clk) begin
+    if (ap_rst) p_full_n <= 0;
+    else p_full_n <= rnd_bit() | rnd_bit() | rnd_bit();  // biased toward ready
+  end"""
+    else:
+        a_empty_process = """\
+  // backpressure disabled: present a beat every cycle data remains
+  always @(posedge ap_clk) begin
+    if (ap_rst) a_empty_n <= 0;
+    else a_empty_n <= (a_idx < A_BEATS);
+  end"""
+        p_full_process = """\
+  // backpressure disabled: always ready to accept an output beat
+  always @(posedge ap_clk) begin
+    if (ap_rst) p_full_n <= 0;
+    else p_full_n <= 1'b1;
+  end"""
+
+    fsm_debug_process = ""
+    if fsm_debug and kind != "ws":
+        fsm_debug_process = """\
+  // ---- fsm_debug: extra latency-breakdown stamps ----
+  reg [2:0] dbg_prev_state = 3'd0;
+  always @(posedge ap_clk) begin
+    if (ap_rst) dbg_prev_state <= 3'd0;
+    else begin
+      if (dut.state !== dbg_prev_state) begin
+        if (dut.state == 3'd2) $display("FSM_WRITE cyc=%0d", cyc);
+        if (dut.state == 3'd4) $display("FSM_RUN cyc=%0d", cyc);
+      end
+      dbg_prev_state <= dut.state;
+    end
+  end
+  always @(posedge ap_clk)
+    if (!ap_rst && a_read && a_empty_n) $display("A_BEAT cyc=%0d", cyc);
+  always @(posedge ap_clk)
+    if (!ap_rst && p_write && p_full_n) $display("P_BEAT cyc=%0d", cyc);"""
+
     if kind == "ws":
         b_ports_decl = ""
         b_mem_decl = ""
@@ -259,7 +332,8 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
         b_mem_decl = "  reg [BW-1:0] b_mem [0:B_BEATS-1];\n"
         b_idx_decl = "  integer b_idx = 0;\n"
         b_readmemh = f'    $readmemh("{b_dat}", b_mem);\n'
-        b_feed_process = f"""
+        if backpressure:
+            b_empty_process = """\
   always @(posedge ap_clk) begin
     if (ap_rst) b_empty_n <= 0;
     else if (!b_empty_n || (b_read && b_empty_n)) begin
@@ -272,7 +346,16 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
       if (b_idx < B_BEATS) b_empty_n <= rnd_bit() | rnd_bit();
       else b_empty_n <= 0;
     end
-  end
+  end"""
+        else:
+            b_empty_process = """\
+  // backpressure disabled: present a beat every cycle data remains
+  always @(posedge ap_clk) begin
+    if (ap_rst) b_empty_n <= 0;
+    else b_empty_n <= (b_idx < B_BEATS);
+  end"""
+        b_feed_process = f"""
+{b_empty_process}
   always @(posedge ap_clk) begin
     if (!ap_rst && b_read && b_empty_n) begin
       if (b_idx + 1 < B_BEATS) b_dout <= b_mem[b_idx + 1];
@@ -293,5 +376,6 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
         bw_localparam=bw_localparam, b_ports_decl=b_ports_decl,
         b_mem_decl=b_mem_decl, b_idx_decl=b_idx_decl, b_readmemh=b_readmemh,
         b_feed_process=b_feed_process, a_dat=a_dat, exp_dat=exp_dat,
-        dut_inst=dut_inst,
+        dut_inst=dut_inst, a_empty_process=a_empty_process,
+        p_full_process=p_full_process, fsm_debug_process=fsm_debug_process,
     )

@@ -79,7 +79,7 @@ def _round_bits(n):
 
 # ── case builders: each returns (workdir, module_name, sv_files, kind, tb_args) ──
 
-def _build_ws_case(work, name, shape, seed, **plan_kw):
+def _build_ws_case(work, name, shape, seed, backpressure=True, **plan_kw):
     plan = _find_case_plan(shape, **plan_kw)
     t = plan["tile"]
     N, K, K_pad = plan["n"], plan["k"], plan["k_pad"]
@@ -131,12 +131,12 @@ def _build_ws_case(work, name, shape, seed, **plan_kw):
     _tb.write_dat(exp_dat, exp_words, (pb + 3) // 4)
 
     sv_tb = _tb.generate_sv_tb("ws", module_name, ab, pb, len(a_words), len(exp_words),
-                               N_NODES, str(a_dat), str(exp_dat))
+                               N_NODES, str(a_dat), str(exp_dat), backpressure=backpressure)
     (work / "tb.sv").write_text(sv_tb)
     return module_name, [work / f"{module_name}.v"]
 
 
-def _build_2op_case(work, name, shape, seed, kind, **plan_kw):
+def _build_2op_case(work, name, shape, seed, kind, backpressure=True, fsm_debug=False, **plan_kw):
     """kind: 'reg' (SF=NF=1) or 'ms' (SF*NF>=2, untiled)."""
     plan = _find_case_plan(shape, **plan_kw)
     t = plan["tile"]
@@ -208,23 +208,32 @@ def _build_2op_case(work, name, shape, seed, kind, **plan_kw):
 
     sv_tb = _tb.generate_sv_tb("2op", module_name, ab, pb, len(a_words), len(exp_words),
                                N_NODES, str(a_dat), str(exp_dat), bb=bb,
-                               b_beats=len(b_words), b_dat=str(b_dat))
+                               b_beats=len(b_words), b_dat=str(b_dat),
+                               backpressure=backpressure, fsm_debug=fsm_debug)
     (work / "tb.sv").write_text(sv_tb)
     return module_name, [work / f"{module_name}.v"]
 
 
 CASES = {
-    "a_plain_ws": lambda work, seed: _build_ws_case(work, "a", (4, 4, 4), seed),
-    "b_padded_ws": lambda work, seed: _build_ws_case(
-        work, "b", (2, 7, 5), seed, reuse_factor=2, fold_axis="kn"),
-    "c_sf2_ws": lambda work, seed: _build_ws_case(
-        work, "c", (2, 8, 4), seed, pe=4, simd=4),
-    "d_ktiled_ws": lambda work, seed: _build_ws_case(
-        work, "d", (2, 16, 4), seed, pe=4, simd=4, k_tiles=2),
-    "e_2op_register": lambda work, seed: _build_2op_case(
-        work, "e", (2, 4, 4), seed, "reg", pe=4, simd=4),
-    "f_2op_memstream": lambda work, seed: _build_2op_case(
-        work, "f", (2, 8, 4), seed, "ms", pe=4, simd=4),
+    "a_plain_ws": lambda work, seed, **kw: _build_ws_case(
+        work, "a", (4, 4, 4), seed, backpressure=kw.get("backpressure", True)),
+    "b_padded_ws": lambda work, seed, **kw: _build_ws_case(
+        work, "b", (2, 7, 5), seed, reuse_factor=2, fold_axis="kn",
+        backpressure=kw.get("backpressure", True)),
+    "c_sf2_ws": lambda work, seed, **kw: _build_ws_case(
+        work, "c", (2, 8, 4), seed, pe=4, simd=4, backpressure=kw.get("backpressure", True)),
+    "d_ktiled_ws": lambda work, seed, **kw: _build_ws_case(
+        work, "d", (2, 16, 4), seed, pe=4, simd=4, k_tiles=2,
+        backpressure=kw.get("backpressure", True)),
+    "e_2op_register": lambda work, seed, **kw: _build_2op_case(
+        work, "e", (2, 4, 4), seed, "reg", pe=4, simd=4,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "f_2op_memstream": lambda work, seed, **kw: _build_2op_case(
+        work, "f", (2, 8, 4), seed, "ms", pe=4, simd=4,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "g_2op_qk_memstream": lambda work, seed, **kw: _build_2op_case(
+        work, "g", (16, 12, 16), seed, "ms", pe=16, simd=6,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
 }
 
 RTL_STATIC_DIR = HERE / "rtl_static"
@@ -238,7 +247,7 @@ def _run(cmd, cwd, env):
     return subprocess.run(cmd, cwd=str(cwd), env=env, text=True, capture_output=True)
 
 
-def run_case(case_name, seed=1, keep=False, env=None):
+def run_case(case_name, seed=1, keep=False, env=None, backpressure=True, fsm_debug=False):
     """Generate + xvlog/xelab/xsim one case. Returns (ok, detail_dict)."""
     work = WORK_ROOT / f"{case_name}_s{seed}"
     if work.exists():
@@ -247,7 +256,8 @@ def run_case(case_name, seed=1, keep=False, env=None):
     for s in STATIC_SOURCES:
         shutil.copy(RTL_STATIC_DIR / s, work / s)
 
-    module_name, core_files = CASES[case_name](work, seed)
+    module_name, core_files = CASES[case_name](
+        work, seed, backpressure=backpressure, fsm_debug=fsm_debug)
 
     glbl = None
     for cand in Path(env["XILINX_VIVADO"]).glob("data/verilog/src/glbl.v") if env.get("XILINX_VIVADO") else []:
@@ -285,11 +295,59 @@ def run_case(case_name, seed=1, keep=False, env=None):
 
     result = {"stage": "xsim", "log": log}
     ok = False
+    nodes = []
+    fsm_write, fsm_run, a_beats_log, p_beats_log = [], [], [], []
     for line in log.splitlines():
+        if "NODE " in line and "ready=" in line and "done=" in line:
+            parts = line.split()
+            # NODE <i> ready=<c> done=<c>
+            i = int(parts[1])
+            ready = int(parts[2].split("=", 1)[1])
+            done = int(parts[3].split("=", 1)[1])
+            nodes.append({"node": i, "ready": ready, "done": done})
+        elif "CYCLES nodes=" in line:
+            fields = dict(tok.split("=", 1) for tok in line.split()[1:])
+            result["cycles"] = {
+                "nodes": int(fields["nodes"]),
+                "first_start": int(fields["first_start"]),
+                "last_done": int(fields["last_done"]),
+                "per_node": float(fields["per_node"]),
+            }
+        elif line.startswith("FSM_WRITE cyc="):
+            fsm_write.append(int(line.split("cyc=", 1)[1]))
+        elif line.startswith("FSM_RUN cyc="):
+            fsm_run.append(int(line.split("cyc=", 1)[1]))
+        elif line.startswith("A_BEAT cyc="):
+            a_beats_log.append(int(line.split("cyc=", 1)[1]))
+        elif line.startswith("P_BEAT cyc="):
+            p_beats_log.append(int(line.split("cyc=", 1)[1]))
         if "TEST_RESULT:" in line:
             result["result_line"] = line.strip()
             ok = "PASS" in line and r.returncode == 0
             break
+    if nodes:
+        result["node_cycles"] = nodes
+    if nodes and (fsm_write or fsm_run or a_beats_log or p_beats_log):
+        # fsm_debug: bucket each stamp by the [ready(node), ready(node+1)) interval
+        # it falls in, so per-node WRITE/RUN entry + last A/P beat can be reported.
+        breakdown = []
+        for idx, n in enumerate(nodes):
+            lo = n["ready"]
+            hi = nodes[idx + 1]["ready"] if idx + 1 < len(nodes) else float("inf")
+            def _first(lst, lo=lo, hi=hi):
+                xs = [c for c in lst if lo <= c < hi]
+                return xs[0] if xs else None
+            def _last(lst, lo=lo, hi=hi):
+                xs = [c for c in lst if lo <= c < hi]
+                return xs[-1] if xs else None
+            breakdown.append({
+                "node": n["node"],
+                "write_enter": _first(fsm_write),
+                "run_enter": _first(fsm_run),
+                "last_a_beat": _last(a_beats_log),
+                "last_p_beat": _last(p_beats_log),
+            })
+        result["fsm_breakdown"] = breakdown
     if not keep:
         shutil.rmtree(work, ignore_errors=True)
     return ok, result
