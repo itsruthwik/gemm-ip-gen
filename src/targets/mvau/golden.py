@@ -15,8 +15,8 @@ The C twin is bit-identical to the RTL (pure integer ``Σ w·x``); csim runs it,
 cosim runs the FINN RTL, and they must agree.
 """
 
-import geometry as _geom
-import weightpack as _wpack
+from . import geometry as _geom
+from . import weightpack as _wpack
 
 
 def _plan(shape, plan=None, **kw):
@@ -124,24 +124,26 @@ def _ws_core_twin(p, t, func_name, B, bias_codes=None):
     scale), shift + round-half-up + wrap to ``out_width`` -- identical arithmetic
     to the RTL requant stage, same baked bias codes.
 
-    N-tiling: the result beat concatenates the ``n_tiles`` tiles; in beat ``nf``,
-    tile ``ti`` lane ``pe`` (bits ``ti*PB + pe*out_width +: out_width``) holds the
-    already-requantized code for global output column ``ti*n_tile + nf*PE + pe``
-    -- matching the RTL shim's concatenation. Padded lanes (local_oc >=
-    NTILE_REAL) are left 0 (their weight column is all-zero, so their true
-    requantized value is 0 too; the drain never reads them)."""
+    Boundary is now UNPADDED, matching the RTL wrapper and hls4ml's own row
+    widths: ``a`` is one raw ``K_raw*AW``-bit beat (one hls4ml row; zero-padded to
+    ``k_pad`` right here, mirroring the RTL's ``arow_reg``) and ``p`` is one raw
+    ``N*out_width``-bit beat holding all ``N`` unpadded output columns in order
+    (``oc = ti*NTILE_REAL + local_oc``), the N-tile stitching and pad-column drop
+    already done -- matching the RTL shim's ``orow_reg``/``p_din``. Padded lanes
+    (local_oc >= NTILE_REAL) are simply never written to the output beat."""
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     ACCU = t["accu_width"]
     AW = t["activation_width"]
-    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
     NT, NTILE = p["n_tiles"], p["n_tile"]
-    PB_TOTAL = NT * PB
-    M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
+    M, KPAD, N = p["num_input_vectors"], p["k_pad"], p["n"]
+    K_RAW = p["k"]   # unpadded K -- the beat this twin's boundary actually carries
+    AB = K_RAW * AW   # raw, unpadded activation beat (one hls4ml row)
     NTILE_REAL = N // NT   # unpadded per-tile column count; the interface presents only these
+    PB = N * p["output_width"]   # raw, unpadded result beat (one hls4ml row)
     outW = p["output_width"]
     shift = p["product_frac"] - p["output_frac"]
     actt = _act_ctype(t["signed_activations"], AW)
-    wlit = _w_matrix_literal(B, N, K)
+    wlit = _w_matrix_literal(B, N, KPAD)
     pad = ' ' * (len(func_name) + 6)
     if bias_codes:
         bias_decl = ("static const long %s_bias[%d] = {%s};\n"
@@ -149,7 +151,7 @@ def _ws_core_twin(p, t, func_name, B, bias_codes=None):
         bias_add = f" + {func_name}_bias[oc]"
     else:
         bias_decl, bias_add = "", ""
-    req = _requant_block(shift, outW, f"(long)acc{bias_add}", "q", ' ' * 20)
+    req = _requant_block(shift, outW, f"(long)acc{bias_add}", "q", ' ' * 12)
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 
@@ -157,74 +159,75 @@ def _ws_core_twin(p, t, func_name, B, bias_codes=None):
 // N_TILES={NT}). Weights baked here match the memstreams the RTL bakes; Vitis
 // substitutes the RTL (memstream(s) + mvu_vvu_axi) for csynth/cosim. Per lane: integer
 // matmul, + baked bias (if any), shift + round-half-up + wrap to out_width -- the RTL
-// requant stage's arithmetic, so this beat is already the narrow, final code.
-static const long {func_name}_W[{N}][{K}] = {wlit};
+// requant stage's arithmetic, so this beat is already the narrow, final code. K-padding
+// (zero-fill to k_pad) and N-tile stitching/pad-drop happen here too, mirroring the RTL
+// wrapper -- the boundary is hls4ml's own unpadded row width on both sides.
+static const long {func_name}_W[{N}][{KPAD}] = {wlit};
 {bias_decl}
 void {func_name}(hls::stream<ap_uint<{AB}> >& a,
-{pad}hls::stream<ap_uint<{PB_TOTAL}> >& p) {{
+{pad}hls::stream<ap_uint<{PB}> >& p) {{
     for (int vec = 0; vec < {M}; vec++) {{
-        {actt} x[{SF}][{SIMD}];
-        for (int sf = 0; sf < {SF}; sf++) {{
+        {actt} x[{KPAD}];
+        {{
             ap_uint<{AB}> ab = a.read();
-            for (int s = 0; s < {SIMD}; s++)
-                x[sf][s] = ab.range(s * {AW} + {AW} - 1, s * {AW});
+            for (int k = 0; k < {K_RAW}; k++) x[k] = ab.range(k * {AW} + {AW} - 1, k * {AW});
+            for (int k = {K_RAW}; k < {KPAD}; k++) x[k] = 0;   // zero-fill the K-pad lanes
         }}
-        for (int nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{PB_TOTAL}> ob = 0;
-            for (int ti = 0; ti < {NT}; ti++)
-                for (int pe = 0; pe < {PE}; pe++) {{
-                    int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
-                    if (local_oc < {NTILE_REAL}) {{   // drop the N-pad tail columns
-                    int oc = ti * {NTILE_REAL} + local_oc;   // global output column
-                    ap_int<{ACCU}> acc = 0;
-                    for (int sf = 0; sf < {SF}; sf++)
-                        for (int s = 0; s < {SIMD}; s++)
-                            acc += (ap_int<64>){func_name}_W[oc][sf * {SIMD} + s]
-                                 * (ap_int<64>)x[sf][s];
+        ap_uint<{PB}> ob = 0;
+        for (int ti = 0; ti < {NT}; ti++)
+            for (int local_oc = 0; local_oc < {NTILE_REAL}; local_oc++) {{
+                int oc = ti * {NTILE_REAL} + local_oc;   // global output column
+                ap_int<{ACCU}> acc = 0;
+                for (int k = 0; k < {KPAD}; k++)
+                    acc += (ap_int<64>){func_name}_W[oc][k] * (ap_int<64>)x[k];
 {req}
-                    ob.range(ti * {PB} + pe * {outW} + {outW} - 1, ti * {PB} + pe * {outW})
-                        = (ap_uint<{outW}>)q;
-                    }}
-                }}
-            p.write(ob);
-        }}
+                ob.range(oc * {outW} + {outW} - 1, oc * {outW}) = (ap_uint<{outW}>)q;
+            }}
+        p.write(ob);
     }}
 }}
 """
 
 
 def _kt_core_twin(p, t, func_name, B, bias_codes=None):
-    """General tiled weight-stationary C twin (nt×gk grid): per vector ``SF_tile`` wide
-    activation beats of ``KT*AB`` stream the K-bands (K-sliced, broadcast over N-slices).
-    Tile (j,i) reduces K-slice i (rows ``i*MW_tile..``) for N-slice j (cols ``j*NTILE..``);
-    the twin now SUMS the ``gk`` K-partials, adds bias, and shift/round/wraps to
-    ``out_width`` right here (mirrors the RTL requant stage's K-sum-then-requant order),
-    so the beat this twin emits is already ``nt*PB`` (one out_width lane per N-tile
-    column, K-tiling summed away) -- no separate K-sum downstream."""
+    """General tiled weight-stationary C twin (nt×gk grid). Boundary is now UNPADDED,
+    matching the RTL wrapper and hls4ml's own row widths: ``a`` is one raw
+    ``K_raw*AW``-bit beat (one hls4ml row; zero-padded to the grid's total ``k_pad``
+    right here, mirroring the RTL's ``arow_reg``) and ``p`` is one raw
+    ``N*out_width``-bit beat holding all ``N`` unpadded output columns in order
+    (``oc = j*NTILE_REAL + local_oc``), K-tile summed, N-tile stitched, and the
+    pad-column drop already done -- matching the RTL shim's ``orow_reg``/``p_din``.
+    Tile (j,i) reduces K-slice i (rows ``i*MW_tile..``) for N-slice j
+    (cols ``j*NTILE..``); the twin SUMS the ``gk`` K-partials, adds bias, and
+    shift/round/wraps to ``out_width`` right here (mirrors the RTL requant stage's
+    K-sum-then-requant order)."""
     PE, SIMD, MW = t["pe"], t["simd"], t["mw"]
     ACCU = t["accu_width"]
     ACCU_SUM = p["accu_sum"]
     AW = t["activation_width"]
-    AB, PB, NF = t["input_stream_width_ba"], t["output_stream_width_ba"], t["nf"]
+    NF = t["nf"]
     KT, NT = p["k_tiles"], p["n_tiles"]
     SFT = MW // SIMD
-    A_TOTAL, PB_TOTAL = KT * AB, NT * PB
-    M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
+    M, N = p["num_input_vectors"], p["n"]
+    KPAD = p["k_pad"]           # grid's total padded K (MW*KT)
+    K_RAW = p["k"]               # unpadded K -- the beat this twin's boundary actually carries
+    AB = K_RAW * AW              # raw, unpadded activation beat (one hls4ml row)
     NTILE = N // NT
+    PB = N * p["output_width"]   # raw, unpadded result beat (one hls4ml row)
     outW = p["output_width"]
     shift = p["product_frac"] - p["output_frac"]
     actt = _act_ctype(t["signed_activations"], AW)
-    wlit = _w_matrix_literal(B, N, K)
+    wlit = _w_matrix_literal(B, N, KPAD)
     pad = ' ' * (len(func_name) + 6)
-    apmax = max(1024, ((max(A_TOTAL, PB_TOTAL) + 1023) // 1024 + 1) * 1024)
+    apmax = max(1024, ((max(AB, PB) + 1023) // 1024 + 1) * 1024)
     if bias_codes:
         bias_decl = ("static const long %s_bias[%d] = {%s};\n"
                       % (func_name, N, ", ".join(str(c) for c in bias_codes)))
         bias_add = f" + {func_name}_bias[oc]"
     else:
         bias_decl, bias_add = "", ""
-    req = _requant_block(shift, outW, f"(long)raw{bias_add}", "q", ' ' * 20)
-    return f"""#define AP_INT_MAX_W {apmax}   // wide grid activation beat (KT*AB={A_TOTAL}) may exceed the 1024-bit default
+    req = _requant_block(shift, outW, f"(long)raw{bias_add}", "q", ' ' * 12)
+    return f"""#define AP_INT_MAX_W {apmax}   // raw K-wide activation row may exceed the 1024-bit default
 #include <hls_stream.h>
 #include <ap_int.h>
 
@@ -232,67 +235,61 @@ def _kt_core_twin(p, t, func_name, B, bias_codes=None):
 // N_tile={NTILE} SIMD={SIMD} PE={PE} SF_tile={SFT} NF={NF}). Weights baked here match the grid
 // memstreams the RTL bakes; Vitis substitutes the RTL for csynth/cosim. Per lane: sum the gk
 // K-partials, + baked bias (if any), shift + round-half-up + wrap to out_width -- the beat is
-// already the narrow, final, K-summed code.
-static const long {func_name}_W[{N}][{K}] = {wlit};
+// already the narrow, final, K-summed code. K-padding (zero-fill to k_pad) and N-tile
+// stitching/pad-drop happen here too, mirroring the RTL wrapper -- the boundary is hls4ml's
+// own unpadded row width on both sides.
+static const long {func_name}_W[{N}][{KPAD}] = {wlit};
 {bias_decl}
-void {func_name}(hls::stream<ap_uint<{A_TOTAL}> >& a,
-{pad}hls::stream<ap_uint<{PB_TOTAL}> >& p) {{
+void {func_name}(hls::stream<ap_uint<{AB}> >& a,
+{pad}hls::stream<ap_uint<{PB}> >& p) {{
     for (int vec = 0; vec < {M}; vec++) {{
-        {actt} x[{K}];
-        for (int sf = 0; sf < {SFT}; sf++) {{
-            ap_uint<{A_TOTAL}> ab = a.read();
-            for (int i = 0; i < {KT}; i++)
-                for (int s = 0; s < {SIMD}; s++)
-                    x[i * {MW} + sf * {SIMD} + s] =
-                        ab.range(i * {AB} + s * {AW} + {AW} - 1, i * {AB} + s * {AW});
+        {actt} x[{KPAD}];
+        {{
+            ap_uint<{AB}> ab = a.read();
+            for (int k = 0; k < {K_RAW}; k++) x[k] = ab.range(k * {AW} + {AW} - 1, k * {AW});
+            for (int k = {K_RAW}; k < {KPAD}; k++) x[k] = 0;   // zero-fill the K-pad lanes
         }}
-        for (int nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{PB_TOTAL}> ob = 0;
-            for (int j = 0; j < {NT}; j++)
-                for (int pe = 0; pe < {PE}; pe++) {{
-                    int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
-                    if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
-                    int oc = j * {NTILE} + local_oc;
-                    ap_int<{ACCU_SUM}> raw = 0;
-                    for (int i = 0; i < {KT}; i++) {{
-                        ap_int<{ACCU}> acc = 0;
-                        for (int kk = 0; kk < {MW}; kk++)
-                            acc += (ap_int<64>){func_name}_W[oc][i * {MW} + kk]
-                                 * (ap_int<64>)x[i * {MW} + kk];
-                        raw += acc;               // K-tile sum first, mirrors the RTL adder
-                    }}
-{req}
-                    ob.range(j * {PB} + pe * {outW} + {outW} - 1, j * {PB} + pe * {outW})
-                        = (ap_uint<{outW}>)q;
-                    }}
+        ap_uint<{PB}> ob = 0;
+        for (int j = 0; j < {NT}; j++)
+            for (int local_oc = 0; local_oc < {NTILE}; local_oc++) {{
+                int oc = j * {NTILE} + local_oc;   // global output column
+                ap_int<{ACCU_SUM}> raw = 0;
+                for (int i = 0; i < {KT}; i++) {{
+                    ap_int<{ACCU}> acc = 0;
+                    for (int kk = 0; kk < {MW}; kk++)
+                        acc += (ap_int<64>){func_name}_W[oc][i * {MW} + kk]
+                             * (ap_int<64>)x[i * {MW} + kk];
+                    raw += acc;               // K-tile sum first, mirrors the RTL adder
                 }}
-            p.write(ob);
-        }}
+{req}
+                ob.range(oc * {outW} + {outW} - 1, oc * {outW}) = (ap_uint<{outW}>)q;
+            }}
+        p.write(ob);
     }}
 }}
 """
 
 
 def _kt_tb(p, t, top_name, seed, bias_codes, B, n_nodes=6):
-    """K-tiled self-checking TB: baked weights, top ``(a, c)`` with one wide ``KT*AB``
-    activation beat per vector. Independent full-K golden matmul + requant reference.
+    """K-tiled self-checking TB: baked weights, top ``(a, c)`` with one raw, unpadded
+    ``K_raw*AW``-bit activation row beat and one raw, unpadded ``N*out_width``-bit
+    result row beat per vector -- matches the RTL wrapper's / hls4ml's own row
+    widths (no SF/NF/K-tile beat splitting at this boundary). Independent full-K
+    golden matmul + requant reference.
 
     Weights are baked (shared across nodes); ``n_nodes`` distinct activation sets are
     queued back-to-back (all writes before any call), then the top is invoked
     ``n_nodes`` times and all ``n_nodes*M`` output rows are drained and checked --
     exercising overlapped/pipelined invocations of the blackbox core in cosim."""
     NN = n_nodes
-    PE, SIMD, MW = t["pe"], t["simd"], t["mw"]
     AW = t["activation_width"]
-    AB = t["input_stream_width_ba"]
-    KT = p["k_tiles"]
-    SFT = MW // SIMD
-    A_TOTAL = KT * AB
-    M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
+    M, KPAD, N = p["num_input_vectors"], p["k_pad"], p["n"]
+    K = p["k"]   # unpadded K -- the beat this TB's boundary actually carries
+    AB = K * AW
     outW = p["output_width"]
     req_shift = p["product_frac"] - p["output_frac"]
-    CB = ((N * outW) + 7) // 8 * 8
-    wlit = _w_matrix_literal(B, N, K)
+    CB = N * outW
+    wlit = _w_matrix_literal(B, N, KPAD)
     if bias_codes:
         bias_arr = "    long bias[%d] = {%s};\n" % (N, ", ".join(str(c) for c in bias_codes))
         bias_add_tb = " + bias[o]"
@@ -306,7 +303,7 @@ def _kt_tb(p, t, top_name, seed, bias_codes, B, n_nodes=6):
 #include <ap_int.h>
 #include <cstdio>
 
-void {top_name}(hls::stream<ap_uint<{A_TOTAL}> >&,
+void {top_name}(hls::stream<ap_uint<{AB}> >&,
 {' ' * (len(top_name) + 1)}hls::stream<ap_uint<{CB}> >&);
 
 // Independent requant reference: round-half-up shift by req_shift, then wrap
@@ -323,14 +320,15 @@ static long requant_ref(long acc) {{
     return q;
 }}
 
-// K-tiled tile set: N={N} K={K} KT={KT} SIMD={SIMD} PE={PE}, M={M} vectors.
-// Weights baked (must match the KT memstream inits the RTL loads); only activations fed.
-static const long W[{N}][{K}] = {wlit};
+// K-tiled tile set: N={N} K={K} KPAD={KPAD}, M={M} vectors.
+// Weights baked (must match the KT memstreams the RTL loads); only raw, unpadded
+// activation rows are fed -- the RTL wrapper does the K-padding + SF_tile fan-out.
+static const long W[{N}][{KPAD}] = {wlit};
 
 #define NN {NN}
 
 int main() {{
-    hls::stream<ap_uint<{A_TOTAL}> > a_in;
+    hls::stream<ap_uint<{AB}> > a_in;
     hls::stream<ap_uint<{CB}> > c_out;
 
     static long X[NN][{M}][{K}], golden[NN][{M}][{N}];
@@ -340,19 +338,17 @@ int main() {{
         for (int v = 0; v < {M}; v++)
             for (int o = 0; o < {N}; o++) {{
                 long acc = 0;
-                for (int k = 0; k < {K}; k++) acc += W[o][k] * X[n][v][k];
+                for (int k = 0; k < {K}; k++) acc += W[o][k] * X[n][v][k];   // pad columns of W are 0
                 golden[n][v][o] = requant_ref(acc{bias_add_tb});
             }}
 
-        for (int v = 0; v < {M}; v++)
-            for (int sf = 0; sf < {SFT}; sf++) {{
-                ap_uint<{A_TOTAL}> ab = 0;
-                for (int ti = 0; ti < {KT}; ti++)
-                    for (int s = 0; s < {SIMD}; s++)
-                        ab.range(ti * {AB} + s * {AW} + {AW} - 1, ti * {AB} + s * {AW}) =
-                            (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][ti * {MW} + sf * {SIMD} + s];
-                a_in.write(ab);
-            }}
+        for (int v = 0; v < {M}; v++) {{
+            ap_uint<{AB}> ab = 0;
+            for (int k = 0; k < {K}; k++)
+                ab.range(k * {AW} + {AW} - 1, k * {AW}) =
+                    (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][k];
+            a_in.write(ab);
+        }}
     }}
 
     for (int n = 0; n < NN; n++) {top_name}(a_in, c_out);
@@ -534,59 +530,65 @@ int main() {{
 
 
 def _2op_kt_core_twin(p, t, func_name):
-    """General tiled two-operand C twin (nt×gk grid): B is a runtime stream (N-wide K-row
-    beats) buffered into W[N][K]; per vector ``SF_tile`` wide activation beats of gk*AB stream
-    the K-bands; per vector ``NF`` output beats carry the nt PE-wide requantized codes (tile
-    (j,i) = N-slice j, K-slice i) -- the twin sums the gk K-partials, then shift/round/wraps to
-    out_width right here (no bias -- two-operand GEMM never has one), so the beat this twin
-    emits is already ``nt*PB`` (K-tiling summed away), mirroring the RTL requant stage."""
+    """General tiled two-operand C twin (nt×gk grid, memstream form: SF_tile*NF >= 2), C
+    twin of ``_2op_grid_memstream_shim``'s UNPADDED boundary (mirrors ``_2op_reg_core_twin``,
+    generalized to SF_tile>1 fan-out and NF>1 stitching): ``a`` is one raw ``K*AW``-bit beat
+    per vector (zero-padded to the grid's total ``k_pad`` right here, mirroring the RTL's
+    ``arow_pad``/``arow_reg`` fan-out), ``b`` is one raw ``N*WW``-bit K-row beat (``K`` beats
+    total -- no K_pad tail; the RTL wrapper zero-fills the missing rows internally), and ``p``
+    is one raw ``N*out_width``-bit beat per vector holding all ``N`` unpadded output columns
+    (K-tile summed, N-tile stitched, NF column-blocks concatenated, pad tail columns dropped)."""
     PE, SIMD, MW = t["pe"], t["simd"], t["mw"]
-    WW, AW, ACCU = t["weight_width"], t["activation_width"], t["accu_width"]
-    AB, PB, NF = t["input_stream_width_ba"], t["output_stream_width_ba"], t["nf"]
-    gk, nt = p["k_tiles"], p["n_tiles"]
-    ACCU_SUM = p["accu_sum"]
+    ACCU, ACCU_SUM, AW, WW = t["accu_width"], p["accu_sum"], t["activation_width"], t["weight_width"]
+    gk, nt = p.get("k_tiles", 1), p["n_tiles"]
+    NF = t["nf"]
     SFT = MW // SIMD
-    N, K, M = p["n"], p["k_pad"], p["num_input_vectors"]
-    NTILE = N // nt
-    BB = ((N * WW) + 7) // 8 * 8
-    A_TOTAL, PB_TOTAL = gk * AB, nt * PB
-    outW = p["output_width"]
+    M, N = p["num_input_vectors"], p["n"]
+    K = p["k"]                    # raw, unpadded K -- the beats this twin's boundary carries
+    KPAD = gk * MW                # grid's total padded K
+    NTILE = N // nt                # unpadded per-N-tile column count
+    ARAW = K * AW
+    PRAW = N * t["output_width"]
+    outW = t["output_width"]
     shift = p["product_frac"] - p["output_frac"]
     actt = _act_ctype(t["signed_activations"], AW)
-    apmax = max(1024, ((A_TOTAL + 1023) // 1024 + 1) * 1024)
     pad = ' ' * (len(func_name) + 6)
-    req = _requant_block(shift, outW, "(long)raw", "q", ' ' * 24)
-    return f"""#define AP_INT_MAX_W {apmax}   // wide grid activation beat (gk*AB={A_TOTAL}) may exceed the 1024-bit default
+    apmax = max(1024, ((max(ARAW, PRAW) + 1023) // 1024 + 1) * 1024)
+    req = _requant_block(shift, outW, "(long)raw", "q", ' ' * 16)
+    return f"""#define AP_INT_MAX_W {apmax}   // raw K-wide activation row may exceed the 1024-bit default
 #include <hls_stream.h>
 #include <ap_int.h>
 
 // General tiled two-operand C twin of {func_name} (nt={nt} x gk={gk} grid; MW_tile={MW}
-// N_tile={NTILE} SIMD={SIMD} PE={PE} SF_tile={SFT} NF={NF}). A SF_tile beats/vector; B replayed.
-// Per lane: sum the gk K-partials, shift + round-half-up + wrap to out_width (no bias).
-void {func_name}(hls::stream<ap_uint<{A_TOTAL}> >& a,
-{pad}hls::stream<ap_uint<{BB}> >& b,
-{pad}hls::stream<ap_uint<{PB_TOTAL}> >& p) {{
-    ap_int<{WW}> W[{N}][{K}];
+// N_tile={NTILE} SIMD={SIMD} PE={PE} SF_tile={SFT} NF={NF}, no bias -- two-operand GEMM
+// never has one). B is a runtime stream (N-wide K-row beats, K={K} real rows, zero-padded
+// to k_pad={KPAD} right here mirroring the RTL wrapper's internal K-padding). Per lane: sum
+// the gk K-partials, shift + round-half-up + wrap to out_width -- the boundary is hls4ml's
+// own unpadded row width on both sides (one A/one C beat per vector).
+void {func_name}(hls::stream<ap_uint<{ARAW}> >& a,
+{pad}hls::stream<ap_uint<{N * WW}> >& b,
+{pad}hls::stream<ap_uint<{PRAW}> >& p) {{
+    ap_int<{WW}> W[{N}][{KPAD}];
     for (int k = 0; k < {K}; k++) {{
-        ap_uint<{BB}> bb = b.read();
+        ap_uint<{N * WW}> bb = b.read();
         for (int o = 0; o < {N}; o++) W[o][k] = bb.range(o * {WW} + {WW} - 1, o * {WW});
     }}
+    for (int k = {K}; k < {KPAD}; k++)
+        for (int o = 0; o < {N}; o++) W[o][k] = 0;   // zero-fill the K-pad rows
     for (int vec = 0; vec < {M}; vec++) {{
-        {actt} x[{K}];
-        for (int sf = 0; sf < {SFT}; sf++) {{
-            ap_uint<{A_TOTAL}> ab = a.read();
-            for (int i = 0; i < {gk}; i++)
-                for (int s = 0; s < {SIMD}; s++)
-                    x[i * {MW} + sf * {SIMD} + s] =
-                        ab.range(i * {AB} + s * {AW} + {AW} - 1, i * {AB} + s * {AW});
+        {actt} x[{KPAD}];
+        {{
+            ap_uint<{ARAW}> ab = a.read();
+            for (int k = 0; k < {K}; k++) x[k] = ab.range(k * {AW} + {AW} - 1, k * {AW});
+            for (int k = {K}; k < {KPAD}; k++) x[k] = 0;   // zero-fill the K-pad lanes
         }}
-        for (int nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{PB_TOTAL}> ob = 0;
-            for (int j = 0; j < {nt}; j++) {{
-                    int local_oc = nf * {PE};   // pe added below; 0..n_pad-1 within this tile
-                    for (int pe = 0; pe < {PE}; pe++) {{
-                    if (local_oc + pe < {NTILE}) {{   // drop the N-pad tail columns
-                    int oc = j * {NTILE} + local_oc + pe;
+        ap_uint<{PRAW}> ob = 0;
+        for (int j = 0; j < {nt}; j++)
+            for (int nf = 0; nf < {NF}; nf++)
+                for (int pe = 0; pe < {PE}; pe++) {{
+                    int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this N-tile
+                    if (local_oc < {NTILE}) {{         // drop the N-pad tail columns
+                    int oc = j * {NTILE} + local_oc;
                     ap_int<{ACCU_SUM}> raw = 0;
                     for (int i = 0; i < {gk}; i++) {{
                         ap_int<{ACCU}> acc = 0;
@@ -595,35 +597,30 @@ void {func_name}(hls::stream<ap_uint<{A_TOTAL}> >& a,
                         raw += acc;
                     }}
 {req}
-                    ob.range(j * {PB} + pe * {outW} + {outW} - 1, j * {PB} + pe * {outW}) = (ap_uint<{outW}>)q;
+                    ob.range(oc * {outW} + {outW} - 1, oc * {outW}) = (ap_uint<{outW}>)q;
                     }}
-                    }}
-            }}
-            p.write(ob);
-        }}
+                }}
+        p.write(ob);
     }}
 }}
 """
 
 
 def _2op_kt_tb(p, t, top_name, func_name, seed, n_nodes=6):
-    """K-tiled two-operand self-checking TB: feed A as M wide beats (gk*AB, tile-sliced) and
-    B as K N-wide K-row beats; golden = full-K integer matmul + affine requant (no bias).
-
-    ``n_nodes`` distinct (A,B) pairs are queued back-to-back before any call, then the
-    top is invoked ``n_nodes`` times and all rows drained/checked (overlapped invocations)."""
+    """Self-checking TB for the memstream two-operand grid (mirrors ``_2op_reg_tb``,
+    generalized to SF_tile/NF>1): feed A as one raw K*AW-bit beat/vector and B as K raw
+    N*WW-bit K-row beats; golden = full-K integer matmul + affine requant (no bias)."""
     NN = n_nodes
     PE, SIMD, MW = t["pe"], t["simd"], t["mw"]
     WW, AW = t["weight_width"], t["activation_width"]
-    AB = t["input_stream_width_ba"]
-    gk = p["k_tiles"]
-    SFT = MW // SIMD
-    N, K, M = p["n"], p["k_pad"], p["num_input_vectors"]
-    BB = ((N * WW) + 7) // 8 * 8
-    A_TOTAL = gk * AB
+    gk, nt = p.get("k_tiles", 1), p["n_tiles"]
+    N, M = p["n"], p["num_input_vectors"]
+    K = p["k"]
+    ARAW = K * AW
+    BRAW = N * WW
     outW = p["output_width"]
     req_shift = p["product_frac"] - p["output_frac"]
-    CB = ((N * outW) + 7) // 8 * 8
+    CB = N * outW
     signed = bool(t["signed_activations"])
     wrange = (1 << (WW - 1)) - 1
     arange = (1 << (AW - 1)) - 1 if signed else (1 << AW) - 1
@@ -634,7 +631,7 @@ def _2op_kt_tb(p, t, top_name, func_name, seed, n_nodes=6):
 #include <ap_int.h>
 #include <cstdio>
 
-void {top_name}(hls::stream<ap_uint<{A_TOTAL}> >&, hls::stream<ap_uint<{BB}> >&,
+void {top_name}(hls::stream<ap_uint<{ARAW}> >&, hls::stream<ap_uint<{BRAW}> >&,
 {' ' * (len(top_name) + 1)}hls::stream<ap_uint<{CB}> >&);
 
 static long requant_ref(long acc) {{
@@ -649,12 +646,13 @@ static long requant_ref(long acc) {{
     return q;
 }}
 
-// K-tiled two-operand: N={N} K={K} gk={gk} SIMD={SIMD} PE={PE}, M={M} vectors, no bias.
+// Memstream two-operand grid: N={N} K={K} nt={nt} gk={gk} SIMD={SIMD} PE={PE},
+// M={M} vectors, no bias.
 #define NN {NN}
 
 int main() {{
-    hls::stream<ap_uint<{A_TOTAL}> > a_in;
-    hls::stream<ap_uint<{BB}> > b_in;
+    hls::stream<ap_uint<{ARAW}> > a_in;
+    hls::stream<ap_uint<{BRAW}> > b_in;
     hls::stream<ap_uint<{CB}> > c_out;
 
     static long Bm[NN][{K}][{N}], X[NN][{M}][{K}], golden[NN][{M}][{N}];
@@ -671,20 +669,17 @@ int main() {{
             }}
 
         for (int k = 0; k < {K}; k++) {{
-            ap_uint<{BB}> bb = 0;
+            ap_uint<{BRAW}> bb = 0;
             for (int o = 0; o < {N}; o++)
                 bb.range(o * {WW} + {WW} - 1, o * {WW}) = (ap_uint<{WW}>)(ap_int<{WW}>)Bm[n][k][o];
             b_in.write(bb);
         }}
-        for (int v = 0; v < {M}; v++)
-            for (int sf = 0; sf < {SFT}; sf++) {{
-                ap_uint<{A_TOTAL}> ab = 0;
-                for (int ti = 0; ti < {gk}; ti++)
-                    for (int s = 0; s < {SIMD}; s++)
-                        ab.range(ti * {AB} + s * {AW} + {AW} - 1, ti * {AB} + s * {AW}) =
-                            (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][ti * {MW} + sf * {SIMD} + s];
-                a_in.write(ab);
-            }}
+        for (int v = 0; v < {M}; v++) {{
+            ap_uint<{ARAW}> ab = 0;
+            for (int k = 0; k < {K}; k++)
+                ab.range(k * {AW} + {AW} - 1, k * {AW}) = (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][k];
+            a_in.write(ab);
+        }}
     }}
 
     for (int n = 0; n < NN; n++) {top_name}(a_in, b_in, c_out);
@@ -713,11 +708,189 @@ def _2op_use_kt(p):
     return p.get("k_tiles", 1) > 1 or (t["sf"] == 1 and t["nf"] == 1)
 
 
+def _2op_register_form(p):
+    """True for the fully-spatial (DEPTH_tile = SF_tile*NF == 1) grid shim
+    (``_2op_grid_register_shim`` in rtl.py) -- covers plain, K-tiled and N-tiled grids
+    alike whenever the per-tile fold is fully spatial. This is the only two-operand
+    form with an UNPADDED RTL boundary today; the memstream grid/single-tile forms
+    (SF_tile*NF >= 2) keep the older, byte-aligned/padded boundary."""
+    t = p["tile"]
+    return t["sf"] == 1 and t["nf"] == 1
+
+
+def _2op_reg_core_twin(p, t, func_name):
+    """C twin of ``_2op_grid_register_shim``'s UNPADDED boundary: ``a`` is one raw
+    ``K*AW``-bit beat (one hls4ml row, zero-padded to the grid's total ``k_pad`` right
+    here, mirroring the RTL's ``arow_pad``), ``b`` is one raw ``N*WW``-bit K-row beat
+    (``K`` beats total -- no K_pad tail beats; the RTL wrapper zero-fills the missing
+    rows internally), and ``p`` is one raw ``N*out_width``-bit beat holding all ``N``
+    unpadded output columns (K-tile summed, N-tile stitched -- PE == NTILE exactly in
+    this fully-spatial form, so there is no pad-column drop to do)."""
+    PE, SIMD, MW = t["pe"], t["simd"], t["mw"]
+    ACCU, ACCU_SUM, AW, WW = t["accu_width"], p["accu_sum"], t["activation_width"], t["weight_width"]
+    gk, nt = p.get("k_tiles", 1), p["n_tiles"]
+    M, N = p["num_input_vectors"], p["n"]
+    K = p["k"]                    # raw, unpadded K -- the beats this twin's boundary carries
+    KPAD = gk * MW                # grid's total padded K
+    NTILE = N // nt
+    ARAW = K * AW
+    PRAW = N * t["output_width"]
+    outW = t["output_width"]
+    shift = p["product_frac"] - p["output_frac"]
+    actt = _act_ctype(t["signed_activations"], AW)
+    pad = ' ' * (len(func_name) + 6)
+    apmax = max(1024, ((max(ARAW, PRAW) + 1023) // 1024 + 1) * 1024)
+    req = _requant_block(shift, outW, "(long)raw", "q", ' ' * 12)
+    return f"""#define AP_INT_MAX_W {apmax}   // raw K-wide activation row may exceed the 1024-bit default
+#include <hls_stream.h>
+#include <ap_int.h>
+
+// Fully-spatial two-operand grid C twin of {func_name} (nt={nt} x gk={gk}, MW_tile={MW}
+// N_tile={NTILE} SIMD={SIMD} PE={PE}, no bias -- two-operand GEMM never has one). B is a
+// runtime stream (N-wide K-row beats, K={K} real rows, zero-padded to k_pad={KPAD} right
+// here mirroring the RTL wrapper's internal K-padding). Per lane: sum the gk K-partials,
+// shift + round-half-up + wrap to out_width -- the boundary is hls4ml's own unpadded row
+// width on both sides (no N-pad tail: PE == N_tile exactly in this fully-spatial form).
+void {func_name}(hls::stream<ap_uint<{ARAW}> >& a,
+{pad}hls::stream<ap_uint<{N * WW}> >& b,
+{pad}hls::stream<ap_uint<{PRAW}> >& p) {{
+    ap_int<{WW}> W[{N}][{KPAD}];
+    for (int k = 0; k < {K}; k++) {{
+        ap_uint<{N * WW}> bb = b.read();
+        for (int o = 0; o < {N}; o++) W[o][k] = bb.range(o * {WW} + {WW} - 1, o * {WW});
+    }}
+    for (int k = {K}; k < {KPAD}; k++)
+        for (int o = 0; o < {N}; o++) W[o][k] = 0;   // zero-fill the K-pad rows
+    for (int vec = 0; vec < {M}; vec++) {{
+        {actt} x[{KPAD}];
+        {{
+            ap_uint<{ARAW}> ab = a.read();
+            for (int k = 0; k < {K}; k++) x[k] = ab.range(k * {AW} + {AW} - 1, k * {AW});
+            for (int k = {K}; k < {KPAD}; k++) x[k] = 0;   // zero-fill the K-pad lanes
+        }}
+        ap_uint<{PRAW}> ob = 0;
+        for (int j = 0; j < {nt}; j++)
+            for (int pe = 0; pe < {PE}; pe++) {{
+                int oc = j * {NTILE} + pe;
+                ap_int<{ACCU_SUM}> raw = 0;
+                for (int i = 0; i < {gk}; i++) {{
+                    ap_int<{ACCU}> acc = 0;
+                    for (int kk = 0; kk < {MW}; kk++)
+                        acc += (ap_int<64>)W[oc][i * {MW} + kk] * (ap_int<64>)x[i * {MW} + kk];
+                    raw += acc;
+                }}
+{req}
+                ob.range(oc * {outW} + {outW} - 1, oc * {outW}) = (ap_uint<{outW}>)q;
+            }}
+        p.write(ob);
+    }}
+}}
+"""
+
+
+def _2op_reg_tb(p, t, top_name, func_name, seed, n_nodes=6):
+    """Self-checking TB for the fully-spatial two-operand grid: feed A as one raw
+    K*AW-bit beat/vector and B as K raw N*WW-bit K-row beats; golden = full-K integer
+    matmul + affine requant (no bias). Mirrors ``_kt_tb``'s overlapped-invocation style."""
+    NN = n_nodes
+    PE, SIMD, MW = t["pe"], t["simd"], t["mw"]
+    WW, AW = t["weight_width"], t["activation_width"]
+    gk, nt = p.get("k_tiles", 1), p["n_tiles"]
+    N, M = p["n"], p["num_input_vectors"]
+    K = p["k"]
+    ARAW = K * AW
+    BRAW = N * WW
+    outW = p["output_width"]
+    req_shift = p["product_frac"] - p["output_frac"]
+    CB = N * outW
+    signed = bool(t["signed_activations"])
+    wrange = (1 << (WW - 1)) - 1
+    arange = (1 << (AW - 1)) - 1 if signed else (1 << AW) - 1
+    wmod, amod = min(7, 2 * wrange + 1), min(7, arange + 1)
+    woff = wrange if wmod == 2 * wrange + 1 else 3
+    aoff = 3 if signed else 0
+    return f"""#include <hls_stream.h>
+#include <ap_int.h>
+#include <cstdio>
+
+void {top_name}(hls::stream<ap_uint<{ARAW}> >&, hls::stream<ap_uint<{BRAW}> >&,
+{' ' * (len(top_name) + 1)}hls::stream<ap_uint<{CB}> >&);
+
+static long requant_ref(long acc) {{
+    long shift = {req_shift};
+    long q;
+    if (shift > 0)      q = (acc + (1L << (shift - 1))) >> shift;
+    else if (shift < 0) q = acc << (-shift);
+    else                q = acc;
+    unsigned long mask = (1UL << {outW}) - 1;
+    q &= (long)mask;
+    if (q & (1L << ({outW} - 1))) q -= (1L << {outW});   // wrap: keep only the low outW bits
+    return q;
+}}
+
+// Fully-spatial two-operand grid: N={N} K={K} nt={nt} gk={gk} SIMD={SIMD} PE={PE},
+// M={M} vectors, no bias.
+#define NN {NN}
+
+int main() {{
+    hls::stream<ap_uint<{ARAW}> > a_in;
+    hls::stream<ap_uint<{BRAW}> > b_in;
+    hls::stream<ap_uint<{CB}> > c_out;
+
+    static long Bm[NN][{K}][{N}], X[NN][{M}][{K}], golden[NN][{M}][{N}];
+    for (int n = 0; n < NN; n++) {{
+        for (int k = 0; k < {K}; k++)
+            for (int o = 0; o < {N}; o++) Bm[n][k][o] = ((o + k + 5 * n + {seed}) % {wmod}) - {woff};
+        for (int v = 0; v < {M}; v++)
+            for (int k = 0; k < {K}; k++) X[n][v][k] = ((v * 2 + k + 3 * n + {seed}) % {amod}) - {aoff};
+        for (int v = 0; v < {M}; v++)
+            for (int o = 0; o < {N}; o++) {{
+                long acc = 0;
+                for (int k = 0; k < {K}; k++) acc += Bm[n][k][o] * X[n][v][k];
+                golden[n][v][o] = requant_ref(acc);
+            }}
+
+        for (int k = 0; k < {K}; k++) {{
+            ap_uint<{BRAW}> bb = 0;
+            for (int o = 0; o < {N}; o++)
+                bb.range(o * {WW} + {WW} - 1, o * {WW}) = (ap_uint<{WW}>)(ap_int<{WW}>)Bm[n][k][o];
+            b_in.write(bb);
+        }}
+        for (int v = 0; v < {M}; v++) {{
+            ap_uint<{ARAW}> ab = 0;
+            for (int k = 0; k < {K}; k++)
+                ab.range(k * {AW} + {AW} - 1, k * {AW}) = (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][k];
+            a_in.write(ab);
+        }}
+    }}
+
+    for (int n = 0; n < NN; n++) {top_name}(a_in, b_in, c_out);
+
+    int errors = 0;
+    for (int n = 0; n < NN; n++)
+        for (int v = 0; v < {M}; v++) {{
+            ap_uint<{CB}> crow = c_out.read();
+            for (int o = 0; o < {N}; o++) {{
+                ap_int<{outW}> y = crow.range(o * {outW} + {outW} - 1, o * {outW});
+                long got = (long)y, exp = golden[n][v][o];
+                if (got != exp) {{ errors++; std::printf("MISMATCH n=%d v=%d o=%d got=%ld exp=%ld\\n", n, v, o, got, exp); }}
+            }}
+        }}
+    if (errors == 0) std::printf("MVAU_PKG PASS\\n");
+    else             std::printf("MVAU_PKG FAIL errors=%d\\n", errors);
+    return errors;
+}}
+"""
+
+
 def generate_2op_core_twin(shape, func_name="mvau_core", plan=None, **kw):
-    """Public entry for the two-operand C twin. The general nt×gk grid twin covers N-tiling,
-    K-tiling and the register single-tile; the single-tile memstream twin serves the untiled
-    temporal fold."""
+    """Public entry for the two-operand C twin. The register twin (unpadded boundary)
+    covers any grid (plain/N-tiled/K-tiled) whose per-tile fold is fully spatial; the
+    older, padded grid twin serves the memstream (temporal-fold) grids, and the
+    single-tile memstream twin serves the untiled temporal fold."""
     p = _plan(shape, plan=plan, **kw)
+    if _2op_register_form(p):
+        return _2op_reg_core_twin(p, p["tile"], func_name)
     if p.get("n_tiles", 1) > 1 or _2op_use_kt(p):
         return _2op_kt_core_twin(p, p["tile"], func_name)
     return _2op_core_twin(p, p["tile"], func_name)
@@ -731,6 +904,8 @@ def generate_2op_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, 
     all inputs pre-queued before the first call, so cosim exercises overlapped
     invocations of the blackbox core."""
     p = _plan(shape, plan=plan, **kw)
+    if _2op_register_form(p):
+        return _2op_reg_tb(p, p["tile"], top_name, func_name, seed, n_nodes=n_nodes)
     if p.get("n_tiles", 1) > 1 or _2op_use_kt(p):
         return _2op_kt_tb(p, p["tile"], top_name, func_name, seed, n_nodes=n_nodes)
     return _2op_tb(p, p["tile"], top_name, func_name, seed, n_nodes=n_nodes)
@@ -741,16 +916,21 @@ def _ws_tb(p, t, top_name, seed, bias_codes, B, n_nodes=6):
     Independent golden with the same round-half-up + wrap requant reference.
 
     Weights are shared across nodes (baked); ``n_nodes`` distinct activation sets are
-    queued before any call, then the top is invoked ``n_nodes`` times back-to-back."""
+    queued before any call, then the top is invoked ``n_nodes`` times back-to-back.
+
+    Boundary is UNPADDED (matches the RTL wrapper / hls4ml row widths): the top
+    takes one raw ``K_raw*AW``-bit beat in and one raw ``N*out_width``-bit beat out,
+    per vector -- no SF/NF beat splitting at this boundary any more."""
     NN = n_nodes
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     AW = t["activation_width"]
-    AB = t["input_stream_width_ba"]
-    M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
+    M, KPAD, N = p["num_input_vectors"], p["k_pad"], p["n"]
+    K = p["k"]   # unpadded K -- the beat this TB's boundary actually carries
+    AB = K * AW
     outW = p["output_width"]
     req_shift = p["product_frac"] - p["output_frac"]
-    CB = ((N * outW) + 7) // 8 * 8
-    wlit = _w_matrix_literal(B, N, K)
+    CB = N * outW
+    wlit = _w_matrix_literal(B, N, KPAD)
     if bias_codes:
         bias_arr = "    long bias[%d] = {%s};\n" % (N, ", ".join(str(c) for c in bias_codes))
         bias_add_tb = " + bias[o]"
@@ -801,14 +981,13 @@ int main() {{
                 golden[n][v][o] = requant_ref(acc{bias_add_tb});
             }}
 
-        for (int v = 0; v < {M}; v++)
-            for (int sf = 0; sf < {SF}; sf++) {{
-                ap_uint<{AB}> ab = 0;
-                for (int s = 0; s < {SIMD}; s++)
-                    ab.range(s * {AW} + {AW} - 1, s * {AW}) =
-                        (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][sf * {SIMD} + s];
-                a_in.write(ab);
-            }}
+        for (int v = 0; v < {M}; v++) {{
+            ap_uint<{AB}> ab = 0;
+            for (int k = 0; k < {K}; k++)
+                ab.range(k * {AW} + {AW} - 1, k * {AW}) =
+                    (ap_uint<{AW}>)(ap_int<{AW}>)X[n][v][k];
+            a_in.write(ab);
+        }}
     }}
 
     for (int n = 0; n < NN; n++) {top_name}(a_in, c_out);

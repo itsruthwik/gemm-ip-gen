@@ -1,7 +1,7 @@
 """mvau target: FINN's RTL MVU (mvu_vvu_axi + mvu_vvu_8sx9_dsp58) blackboxed into
 a Vitis HLS dataflow top.
 
-Tool: Vitis HLS. The DSP-dense counterpart to the soft-logic ``generic`` Vitis
+Tool: Vitis HLS. The DSP-dense counterpart to the soft-logic ``v-generic`` Vitis
 target, and the Vitis analogue of Catapult's ``tensor_slice``. Delegates the
 Target contract to sibling modules: ``geometry`` (ReuseFactor/fold_axis ->
 (PE, SIMD) resolution), ``rtl`` (wrapper fill + shim), ``golden`` (C twin +
@@ -13,19 +13,10 @@ Interface, shim and packaging are validated end-to-end on Vitis 2025.2 -- see
 jojo-track/open/mvau-vitis-target and temp_space/mvau-spike (cosim PASS).
 """
 
-import sys
 from pathlib import Path
 
-# base.py is one level up (src/targets/); sibling modules are alongside.
-_targets_root = str(Path(__file__).resolve().parent.parent)
-if _targets_root not in sys.path:
-    sys.path.insert(0, _targets_root)
-_here = str(Path(__file__).resolve().parent)
-if _here not in sys.path:
-    sys.path.insert(0, _here)
-
-from base import Target  # noqa: E402
-import geometry as _geom  # noqa: E402
+from ..base import Target
+from . import geometry as _geom
 
 #: The vendored FINN static RTL compiled alongside every generated wrapper/shim.
 RTL_STATIC = Path(__file__).resolve().parent / "rtl_static"
@@ -93,17 +84,17 @@ def _normalize_mvau_items(cfg):
 
 
 def _rtl():
-    import rtl
+    from . import rtl
     return rtl
 
 
 def _golden():
-    import golden
+    from . import golden
     return golden
 
 
 def _package():
-    import package
+    from . import package
     return package
 
 
@@ -191,7 +182,7 @@ class MvauTarget(Target):
     def sources_tcl(self, items):
         """RTL-blackbox seam: emit ``add_files -blackbox`` for each core so
         hls4ml's Vitis writer brings the IP into the build (unlike the base
-        no-op / the header-only ``generic`` target)."""
+        no-op / the header-only ``v-generic`` target)."""
         return _package().gen_sources_tcl(items)
 
     def finalize(self, items, output_dir):

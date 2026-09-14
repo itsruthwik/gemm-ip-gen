@@ -16,8 +16,8 @@ blackbox by the C function name, not ``rtl_top_module_name`` (learned in cosim).
 Self-contained (only ``geometry`` as a sibling import).
 """
 
-import geometry as _geom
-import weightpack as _wpack
+from . import geometry as _geom
+from . import weightpack as _wpack
 
 
 def _tile(shape, tile=None, **plan_kwargs):
@@ -97,7 +97,8 @@ def _requant_lanes(t, n_lanes, raw_exprs, bias_codes, reg_prefix, bias_index_exp
 
 def generate_shim(shape, module_name="mvau_core", force_behavioral=True,
                   tile=None, weights_in_core=False, init_file=None,
-                  init_files=None, n_tiles=1, k_tiles=1, bias_codes=None, **plan_kwargs):
+                  init_files=None, n_tiles=1, k_tiles=1, bias_codes=None,
+                  raw_k=None, raw_n=None, **plan_kwargs):
     """Emit the shim Verilog wrapping ``mvu_vvu_axi`` for one MVU tile.
 
     ``module_name`` must match the blackbox C function name. ``force_behavioral``
@@ -132,9 +133,11 @@ def generate_shim(shape, module_name="mvau_core", force_behavioral=True,
             init_files = [init_file] if init_file else None
         if k_tiles > 1:
             return _generate_kt_shim(t, module_name, fb, wbits, abits, pbits,
-                                     init_files, n_tiles, k_tiles, m, bias_codes=bias_codes)
+                                     init_files, n_tiles, k_tiles, m, bias_codes=bias_codes,
+                                     raw_k=raw_k, raw_n=raw_n)
         return _generate_ws_shim(t, module_name, fb, wbits, abits, pbits,
-                                 init_files, n_tiles, m, bias_codes=bias_codes)
+                                 init_files, n_tiles, m, bias_codes=bias_codes,
+                                 raw_k=raw_k, raw_n=raw_n)
     if n_tiles != 1:
         raise NotImplementedError(
             "streamed (two-operand) shim does not support N-tiling yet; "
@@ -254,18 +257,26 @@ endmodule
 """
 
 
-def _nf_counter(nf, reg_name="nf_cnt", advance_cond="p_write"):
+def _nf_counter(nf, reg_name="nf_cnt", advance_cond="p_write", split=False):
     """A free-running ``0..nf-1`` counter tracking which of the ``nf`` per-vector
     column blocks is on the output beat this cycle, advancing on *advance_cond*
     (a real, backpressure-gated transfer) and resetting to 0 when a new invocation
     starts (``ap_ready``). Needed only when a requantize stage's bias ROM must be
     addressed dynamically (``nf>1`` and the layer has a bias): the same PE lanes
     carry different output columns on different cycles, so a compile-time lane
-    index alone cannot pick the right bias code."""
+    index alone cannot pick the right bias code.
+
+    If *split* is True, returns a ``(decl, always_block)`` pair instead of one
+    combined string: the register declaration alone (so callers referencing
+    *reg_name* combinationally can declare it ahead of their own wires), and the
+    sequential update block separately (so it can be placed after *advance_cond*
+    is itself declared, when that's a wire computed later in the module, e.g.
+    ``accept_beat``).
+    """
     def _w(n):
         return max(1, (n - 1).bit_length())
-    return f"""    reg [{_w(nf) - 1}:0] {reg_name} = 0;   // which of the {nf} per-vector column blocks is on the beat
-    always @(posedge ap_clk) begin
+    decl = f"    reg [{_w(nf) - 1}:0] {reg_name} = 0;   // which of the {nf} per-vector column blocks is on the beat\n"
+    always_block = f"""    always @(posedge ap_clk) begin
         if (ap_rst) {reg_name} <= 0;
         else if (ap_ce) begin
             if (ap_ready) {reg_name} <= 0;
@@ -273,6 +284,9 @@ def _nf_counter(nf, reg_name="nf_cnt", advance_cond="p_write"):
         end
     end
 """
+    if split:
+        return decl, always_block
+    return decl + always_block
 
 
 def _mvu_inst(t, fb, i, act_expr="a_dout"):
@@ -336,33 +350,59 @@ def _ws_tile_block(t, fb, wbits, wmem, i, init_file, act_expr="a_dout", label=No
 
 
 def _generate_kt_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_tiles, k_tiles, m,
-                      bias_codes=None):
-    """K-tiled (and combined N+K) weight-stationary grid shim: an ``n_tiles``×``k_tiles`` grid
+                      bias_codes=None, raw_k=None, raw_n=None):
+    """K-tiled (and combined N+K) weight-stationary grid shim: an ``n_tiles``x``k_tiles`` grid
     of MVU cores. Tile (j,i) reduces K-slice i (MW=K_pad/k_tiles) for N-slice j (MH=N_tile),
-    each a baked ``memstream`` (DEPTH = wmem = SF_tile*NF) holding that (j,i) weight block. The
-    activation arrives as ``SF_tile`` beats of ``k_tiles*abits`` per vector, K-sliced (tile
-    reads lane ``[i*abits +: abits]``) and broadcast across N-slices. Per output column, the
-    ``k_tiles`` raw partials are summed, bias-added, and shift/round-half-up/wrapped to
-    ``out_width`` right here (mirrors the C twin's raw += loop order), so the beat this shim
-    emits is ``n_tiles*PB`` (K-tiling summed away, PB now the narrow per-N-tile width) --
-    concatenated over N only. Reduces to the pure K-tiled shim at n_tiles=1."""
+    each a baked ``memstream`` (DEPTH = wmem = SF_tile*NF) holding that (j,i) weight block.
+
+    Boundary ports are UNPADDED and match hls4ml's own TDATA widths exactly, same contract
+    as ``_generate_ws_shim``: ``a_dout`` is ``raw_k*ACTIVATION_WIDTH`` bits (one full hls4ml
+    row per beat) and ``p_din`` is ``raw_n*out_width`` bits (no PE/NF padding, no N-tile pad
+    tail). ALL K-padding (zero-fill to the grid's total ``k_pad`` = MW_tile*k_tiles) and the
+    SF_tile-way SIMD fan-out (one per-K-tile SIMD-wide slice per cycle, broadcast identically
+    to every N-slice) now happen in an ``arow_reg`` shift register here, exactly mirroring
+    ``_generate_ws_shim``'s activation side -- the only difference is each of the ``k_tiles``
+    slices routes to a *different* physical tile's lane instead of the single tile's lane.
+    Per output column, the ``k_tiles`` raw partials are summed, bias-added, and
+    shift/round-half-up/wrapped to ``out_width`` (mirrors the C twin's raw += loop order);
+    the ``NF`` per-vector beats and ``n_tiles`` N-slices latch into one ``orow_reg`` exactly as
+    in ``_generate_ws_shim``, so the beat this shim emits is one unpadded ``N*out_width`` row,
+    once per external vector. Reduces to the pure K-tiled shim at n_tiles=1."""
     ntiles = n_tiles * k_tiles
     if not init_files or any(not f for f in init_files) or len(init_files) != ntiles:
         raise ValueError(f"grid shim needs {ntiles} (= n_tiles*k_tiles) memstream init file(s)")
     wmem = t["wmem"]
     accu = t["accu_width"]
-    pe = t["pe"]
-    a_total = k_tiles * abits
-    pb_total = n_tiles * pbits   # requant sums the k_tiles partials away; concatenate over N only
+    aw, outw = t["activation_width"], t["output_width"]
+    pe, nf, simd, mw = t["pe"], t["nf"], t["simd"], t["mw"]
+    sf_tile = mw // simd                 # per-tile SF: SIMD-wide beats to drain one tile's MW
+    k_pad = mw * k_tiles                 # grid's total padded K (all k_tiles concatenated)
+    K = raw_k if raw_k is not None else k_pad
+    N = raw_n if raw_n is not None else n_tiles * t["mh"]
+    ntile_real = N // n_tiles            # unpadded per-tile column count
+    ABR = K * aw                         # raw, unpadded activation PORT width
+    APAD = k_pad * aw                    # zero-padded internal row-register width
+    PBR = N * outw                       # raw, unpadded result port width
+
+    # tile (j,i)'s activation slice: SIMD lanes [i*MW + sf_cnt*SIMD, ...) of the padded
+    # row register -- the grid twin of _generate_ws_shim's single "cur_slice" wire, just
+    # indexed per K-tile instead of shared by every tile.
+    def _tile_act_expr(i):
+        base = f"{i} * {mw} * {aw} + sf_cnt * {simd * aw}"
+        return f"arow_reg[({base}) +: {simd * aw}]"
     blocks = "\n".join(
         _ws_tile_block(t, fb, wbits, wmem, j * k_tiles + i, init_files[j * k_tiles + i],
-                       act_expr=f"a_dout[{(i + 1) * abits - 1}:{i * abits}]",
+                       act_expr=_tile_act_expr(i),
                        label=f"N-slice {j} K-slice {i} partial ({t['mh']} cols)")
         for j in range(n_tiles) for i in range(k_tiles))
 
-    nf = t["nf"]
-    need_nf_cnt = bool(bias_codes) and nf > 1
-    nf_cnt_decl = _nf_counter(nf) if need_nf_cnt else ""
+    # nf_cnt is needed whenever NF>1: to pick the right bias code (dynamic column) AND to
+    # know, in the output accumulator below, which of the NF beats is on the wire this cycle.
+    need_nf_cnt = nf > 1
+    if need_nf_cnt:
+        nf_cnt_decl, nf_cnt_seq = _nf_counter(nf, advance_cond="accept_beat", split=True)
+    else:
+        nf_cnt_decl, nf_cnt_seq = "", ""
     nf_expr = "nf_cnt" if need_nf_cnt else "0"
 
     # Per output column (N-slice j, lane pe): sum the k_tiles raw partials, then
@@ -373,7 +413,6 @@ def _generate_kt_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
             raw_exprs.append([
                 f"out_tdata_{j * k_tiles + i}[{pe_i * accu} +: {accu}]" for i in range(k_tiles)])
     if bias_codes:
-        ntile_real = len(bias_codes) // n_tiles
         full_codes = []
         for j in range(n_tiles):
             full_codes += _wpack.bias_codes_for_tile(bias_codes, j, ntile_real, t["mh"])
@@ -383,22 +422,48 @@ def _generate_kt_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
         full_codes, bias_idx = None, None
     req_decls, req_regs = _requant_lanes(t, n_tiles * pe, raw_exprs, full_codes, "rq",
                                          bias_index_exprs=bias_idx)
-    req_decls = nf_cnt_decl + req_decls
-    req_assign = "\n".join(
-        f"    assign p_din[{j * pbits + pe_i * t['output_width']} +: {t['output_width']}] = "
-        f"{req_regs[j * pe + pe_i]};"
-        for j in range(n_tiles) for pe_i in range(pe))
 
     def _w(n):
         return max(1, (n - 1).bit_length())
-    sf_tile = t["mw"] // t["simd"]
-    in_total = m * sf_tile           # activation beats/node (matches feed_a's m*SF_tile reads)
-    run_total = m * t["nf"]          # output beats/node (matches requant's m*NF reads)
+
+    # ---- output side: latch the NF*n_tiles per-column requant registers into one
+    # unpadded N*out_width beat, dropping each tile's pad tail columns (local_oc
+    # >= ntile_real), and fire p_write once per external row (the last NF beat) --
+    # identical to _generate_ws_shim's output accumulator. ----
+    oc_src = {}
+    for j in range(n_tiles):
+        for nf_i in range(nf):
+            for pe_i in range(pe):
+                local_oc = nf_i * pe + pe_i
+                if local_oc < ntile_real:
+                    oc = j * ntile_real + local_oc
+                    oc_src[oc] = (req_regs[j * pe + pe_i], nf_i)
+    orow_bits = []
+    for oc in range(N):
+        reg, nf_i = oc_src[oc]
+        live = f"(nf_cnt == {nf_i})" if need_nf_cnt else "1'b1"
+        orow_bits.append((oc, reg, nf_i, live))
+    p_din_assign = "\n".join(
+        f"    assign p_din[{oc * outw} +: {outw}] = {live} ? {reg} : orow_reg[{oc * outw} +: {outw}];"
+        for oc, reg, nf_i, live in orow_bits)
+    orow_latch = "\n".join(
+        f"        if (accept_beat && {nf_expr} == {nf_i}) orow_reg[{oc * outw} +: {outw}] <= {reg};"
+        for oc, reg, nf_i, live in orow_bits if nf_i != nf - 1)   # last phase never needs latching
+
+    in_total = m          # one external activation beat (one full row) per vector
+    run_total = m          # one external result beat (one full row) per vector
+    sf_bits = _w(sf_tile)
+    pad_bits = (k_pad - K) * aw
+    arow_pad_expr = ("a_dout" if pad_bits == 0
+                     else "{" + "{%d{1'b0}}" % pad_bits + ", a_dout}")
     return f"""// Generated by gemm-ip-gen (mvau target). Weight-stationary grid shim:
-// {n_tiles}x{k_tiles} (N-tiles x K-tiles) MVU cores; tile (j,i) reduces K-slice i (MW={t['mw']})
-// for N-slice j ({t['mh']} cols); activation K-sliced + broadcast over N, partials concatenated
-// (summed over K + concatenated over N in the drain).
-// Tile: MW(K/tile)={t['mw']} MH(N/tile)={t['mh']} PE={t['pe']} SIMD={t['simd']} \
+// {n_tiles}x{k_tiles} (N-tiles x K-tiles) MVU cores; tile (j,i) reduces K-slice i (MW={mw})
+// for N-slice j ({t['mh']} cols). Boundary is UNPADDED (matches hls4ml's own TDATA widths):
+// a_dout is one raw K={K}*ACTIVATION_WIDTH row/beat (K-padding to k_pad={k_pad} + the per-tile
+// SF_tile={sf_tile}-way SIMD fan-out happen here); p_din is one raw N={N}*out_width beat
+// (K-tile partials summed, N-tile stitching + pad-column drop happen here too). See
+// _generate_kt_shim's docstring.
+// Tile: MW(K/tile)={mw} MH(N/tile)={t['mh']} PE={t['pe']} SIMD={simd} \
 core={t['compute_core']} ACCU={t['accu_width']} WMEM={wmem} N_TILES={n_tiles} K_TILES={k_tiles}
 // Module name MUST equal the JSON c_function_name (Vitis instantiates by it).
 module {module_name} (
@@ -411,12 +476,12 @@ module {module_name} (
     output wire                 ap_done,    // ap_ctrl_chain: held until ap_continue
     output wire                 ap_idle,    // ap_ctrl_chain: no invocation in flight/pending
 
-    // activation FIFO (input)  {a_total} = K_TILES * ceil(SIMD*ACTIVATION_WIDTH/8)*8
-    input  wire [{a_total - 1}:0] a_dout,
+    // activation FIFO (input)  {ABR} = raw K*ACTIVATION_WIDTH, UNPADDED (one hls4ml row/beat)
+    input  wire [{ABR - 1}:0] a_dout,
     input  wire                 a_empty_n,
     output wire                 a_read,
-    // output FIFO (output)     {pb_total} = N_TILES * ceil(PE*out_width/8)*8 (post-requant, K-summed)
-    output wire [{pb_total - 1}:0] p_din,
+    // output FIFO (output)     {PBR} = raw N*out_width, UNPADDED (K-summed, no N-tile pad tail)
+    output wire [{PBR - 1}:0] p_din,
     input  wire                 p_full_n,
     output wire                 p_write
 );
@@ -426,38 +491,65 @@ module {module_name} (
     localparam IDLE = 1'd0, RUN = 1'd1;
     reg                        state = IDLE;
     reg                        done_r = 0;
-    reg  [{_w(in_total + 1) - 1}:0]  icnt = 0;   // activation beats accepted this node
-    reg  [{_w(run_total + 1) - 1}:0]  ocnt = 0;   // output beats produced this node
+    reg  [{_w(in_total + 1) - 1}:0]  icnt = 0;   // external activation rows accepted this node
+    reg  [{_w(run_total + 1) - 1}:0]  ocnt = 0;   // external result rows produced this node
 
     assign ap_ready = (state == IDLE) & ~done_r & ap_start & ap_ce;
     assign ap_done  = done_r;
     assign ap_idle  = (state == IDLE) & ~done_r;
 
-    // gate on icnt too: stop pulling A beats once this node's {in_total} beats
+    // gate on icnt too: stop pulling A rows once this node's {in_total} rows
     // are accepted, even if the next node's rows are already queued in the FIFO.
     wire in_open = (state == RUN) & (icnt != {in_total});
 
-    // one wide activation beat feeds all tiles (each its own K-lane slice); lockstep.
-    wire in_tvalid  = ap_ce & in_open & a_empty_n;
-    wire out_tready = ap_ce & p_full_n;
+    // ---- activation side: buffer one external (unpadded) row, zero-filled to the
+    // grid's total k_pad={k_pad}, and fan it out to the {sf_tile} SIMD-wide beats every
+    // tile needs, one per cycle (every K-tile advances in lockstep, reading its own
+    // MW-wide band of the same padded row).
+    reg  [{APAD - 1}:0] arow_reg;
+    reg                  row_valid = 0;
+    reg  [{max(sf_bits - 1, 0)}:0] sf_cnt = 0;
+    wire [{APAD - 1}:0] arow_pad = {arow_pad_expr};
+    wire need_load = ~row_valid;
+    wire can_load  = ap_ce & in_open & need_load & a_empty_n;
+    assign a_read = can_load;
+    wire in_tvalid = ap_ce & row_valid;
+
+    // per-tile handshakes: every tile in the grid shares the same sf_cnt-selected
+    // activation slice + output backpressure, so they all run in lockstep.
     wire [{ntiles - 1}:0] in_tready;
     wire [{ntiles - 1}:0] out_tvalid;
-    assign a_read  = ap_ce & in_open & (&in_tready);
-    assign p_write = ap_ce & (&out_tvalid) & p_full_n;   // count only real transfers
+    // nf_cnt (0..{nf - 1}, advancing on accept_beat) -- needed whenever NF>1, both
+    // to pick a dynamic bias code (in the per-lane requantize section below) and
+    // to know, here, which of the NF beats/vector is on the wire this cycle.
+    // Declared here, ahead of its first use in out_tready/p_write below.
+{nf_cnt_decl}    wire out_tready  = ap_ce & (({nf_expr} != {nf - 1}) | p_full_n);
+    wire accept_beat = ap_ce & (&out_tvalid) & out_tready;
+    assign p_write = accept_beat & ({nf_expr} == {nf - 1});   // one row/beat, unpadded
+{nf_cnt_seq}
 
     always @(posedge ap_clk) begin
         if (ap_rst) begin
             state <= IDLE; done_r <= 0; icnt <= 0; ocnt <= 0;
+            row_valid <= 0; sf_cnt <= 0;
         end else if (ap_ce) begin
             if (ap_ready) begin
                 state <= RUN; icnt <= 0; ocnt <= 0;
             end else if (state == RUN) begin
-                if (in_tvalid & (&in_tready)) icnt <= icnt + 1'b1;
+                if (can_load) icnt <= icnt + 1'b1;
                 if (p_write) begin
                     if (ocnt == {run_total - 1}) begin
                         state <= IDLE; done_r <= 1'b1;
                     end else ocnt <= ocnt + 1'b1;
                 end
+            end
+            // activation row buffer: load a fresh (zero-padded) row, else shift
+            // through its {sf_tile} SIMD-wide slices as each is accepted by every tile.
+            if (can_load) begin
+                arow_reg <= arow_pad; row_valid <= 1'b1; sf_cnt <= 0;
+            end else if (row_valid & (&in_tready)) begin
+                if (sf_cnt == {sf_tile - 1}) begin row_valid <= 0; sf_cnt <= 0; end
+                else sf_cnt <= sf_cnt + 1'b1;
             end
             if (done_r & ap_continue) done_r <= 1'b0;
         end
@@ -466,10 +558,18 @@ module {module_name} (
 {blocks}
     // per-column requantize stage: sum the K_TILES raw partials, bias add, shift +
     // round-half-up + wrap to out_width (declared after the tile blocks so it
-    // never references an out_tdata_i wire, or its optional nf_cnt counter's
-    // p_write/ap_ready, before their declaration)
+    // never references an out_tdata_i wire, or its nf_cnt counter's accept_beat/
+    // ap_ready, before their declaration)
 {req_decls}
-{req_assign}
+    // output accumulator: latch every phase but the last (which is driven live,
+    // combinationally, on the very cycle p_write fires) into the unpadded p_din beat.
+    reg [{PBR - 1}:0] orow_reg;
+    always @(posedge ap_clk) begin
+        if (accept_beat) begin
+{orow_latch if orow_latch else "            // NF == 1: every column is driven live, nothing to latch"}
+        end
+    end
+{p_din_assign}
 endmodule
 """
 
@@ -690,26 +790,57 @@ def _2op_grid_memstream_shim(t, p, module_name, force_behavioral, nt, gk, sf_til
     cores. Tile (j,i) reduces K-slice i (rows [i*MW_tile:(i+1)*MW_tile)) for N-slice j
     (columns [j*N_tile:(j+1)*N_tile)), each a runtime ``memstream`` (DEPTH=SF_tile*NF) loaded
     from B and replayed across the M vectors. One shared FSM loads the K-slices sequentially,
-    writing all nt N-slices of the current K-slice in parallel; then all cores RUN in lockstep.
-    The drain sums the gk K-partials per column and concatenates the nt N-slices. Reduces to
-    the single-tile / K-tiled / N-tiled shims at (nt=gk=1) / (nt=1) / (gk=1)."""
+    writing all nt N-slices of the current K-slice in parallel; then all cores RUN in
+    lockstep. The drain sums the gk K-partials per column and concatenates the nt N-slices.
+    Reduces to the single-tile / K-tiled / N-tiled shims at (nt=gk=1) / (nt=1) / (gk=1).
+
+    Boundary ports are UNPADDED and match hls4ml's own TDATA widths exactly: ``a_dout`` is
+    one raw ``K*ACTIVATION_WIDTH``-bit row per beat (K = the real, unpadded contraction
+    dimension), ``b_dout`` is one raw ``N*WEIGHT_WIDTH``-bit K-row per beat (``K`` beats
+    total, no K_pad tail), and ``p_din`` is one raw ``N*out_width`` beat per vector (no
+    per-tile byte-alignment gaps, no N-pad tail columns). All K-padding, the SIMD-beat
+    fan-out (SF_tile bands/vector), and the N-tile pad-column drop happen in this wrapper
+    (an ``arow_reg``/``orow_reg`` shift-register pair, mirroring ``_generate_ws_shim`` and
+    ``_2op_grid_register_shim``), instead of in the HLS-side glue (see package.py's
+    ``_2op_gemm_ip_header``, now a pure bit-reinterpretation for this form too)."""
     fb = 1 if force_behavioral else 0
     N, M = p["n"], p["num_input_vectors"]
-    NTILE = N // nt
-    PE, SIMD, WW, ACCU = t["pe"], t["simd"], t["weight_width"], t["accu_width"]
+    K = p["k"]                                       # raw, unpadded total contraction dim
+    NTILE = N // nt                                   # unpadded per-N-tile column count
+    PE, SIMD, WW, ACCU, AW = t["pe"], t["simd"], t["weight_width"], t["accu_width"], t["activation_width"]
+    MW = t["mw"]
     NF = t["nf"]
     WB = t["weight_stream_width_ba"]
-    AB = t["input_stream_width_ba"]
-    PB = t["output_stream_width_ba"]     # narrow, post-requant per N-slice: PE*out_width
+    AB = t["input_stream_width_ba"]      # byte-aligned SIMD*AW core input (internal only)
+    outW = t["output_width"]
     raw_pb = PE * ACCU
-    BB = ((N * WW) + 7) // 8 * 8
-    A_TOTAL, PB_TOTAL = gk * AB, nt * PB   # requant sums the gk K-partials away
+    KPAD = gk * MW                                    # padded total K this grid reduces
+    ARAW = K * AW                                     # raw, unpadded external activation beat
+    BRAW = N * WW                                     # raw, unpadded external B beat (one K-row)
+    PRAW = N * outW                                   # raw, unpadded external result beat
     NTILES = nt * gk
     DEPTH = sf_tile * NF
-    run_total = M * NF
+    run_total = M                                     # one p_din beat per vector, unpadded
+    pad_a_bits = KPAD * AW - ARAW
 
     def _w(n):
         return max(1, (n - 1).bit_length())
+
+    # zero-extend the raw external activation row up to K_pad*AW (K-padding moved here
+    # from the HLS-side glue), latched once per vector into arow_reg (see RUN below).
+    arow_pad_expr = ("a_dout" if pad_a_bits == 0
+                     else "{" + "{%d{1'b0}}" % pad_a_bits + ", a_dout}")
+
+    # per-K-tile activation slice for the current SF_tile band (sf_cnt), zero-extended
+    # (byte-aligned) up to this tile's internal AB width -- purely combinational.
+    a_slices = []
+    for i in range(gk):
+        tile_pad = AB - SIMD * AW
+        expr = f"arow_reg[({i} * {MW} + sf_cnt * {SIMD}) * {AW} +: {SIMD * AW}]"
+        if tile_pad:
+            expr = "{" + "{%d{1'b0}}" % tile_pad + f", {expr}" + "}"
+        a_slices.append(f"    wire [{AB - 1}:0] a_slice_{i} = {expr};")
+    a_slices_decl = "\n".join(a_slices)
 
     # nt combinational words: wword_j packs N-slice j's column block nfc from the current band
     #   wword_j[(pe*SIMD+s)*WW +: WW] = band[s][(j*N_tile + nfc*PE + pe)*WW +: WW]
@@ -732,7 +863,14 @@ def _2op_grid_memstream_shim(t, p, module_name, force_behavioral, nt, gk, sf_til
         .DEPTH({DEPTH}), .WIDTH({WB}), .INIT_FILE(""), .RAM_STYLE("auto")
     ) wmem_{idx} (
         .clk(ap_clk), .rst(ap_rst),
-        .config_ce(ap_ce & (state != RUN) & (tic == {i})),
+        // config_ce freezes this memstream's replay pointer (see memstream.sv: when
+        // config_ce=0 the pointer free-runs/streams). It must stay high for EVERY
+        // tile throughout the whole multi-tile LOAD sequence (not just tile i's own
+        // tic==i window) -- otherwise a tile whose turn hasn't come yet starts
+        // streaming (and desyncs its replay pointer) while the other K-tiles are
+        // still being loaded, and the gk cores enter RUN pipeline-skewed relative to
+        // each other (out_tvalid never lines up, so &out_tvalid/p_write never fires).
+        .config_ce(ap_ce & (state != RUN)),
         .config_we(ap_ce & (state == WRITE) & (tic == {i})),
         .config_address(nfc * {sf_tile} + sfc), .config_d0(wword_{j}),
         .config_rack(), .config_q0(),
@@ -749,11 +887,20 @@ def _2op_grid_memstream_shim(t, p, module_name, force_behavioral, nt, gk, sf_til
     ) inst_{idx} (
         .ap_clk(ap_clk), .ap_clk2x(1'b0), .ap_rst_n(rst_n),
         .s_axis_weights_tdata(w_odat_{idx}), .s_axis_weights_tvalid(wgt_tvalid_{idx}), .s_axis_weights_tready(wgt_tready_{idx}),
-        .s_axis_input_tdata(a_dout[{(i + 1) * AB - 1}:{i * AB}]),
+        .s_axis_input_tdata(a_slice_{i}),
         .s_axis_input_tvalid(in_tvalid), .s_axis_input_tready(in_tready[{idx}]),
         .m_axis_output_tdata(out_tdata_raw_{idx}), .m_axis_output_tvalid(out_tvalid[{idx}]), .m_axis_output_tready(out_tready)
     );"""
     tiles = "\n".join(_tile(j, i) for j in range(nt) for i in range(gk))
+
+    # nf_cnt is needed whenever NF>1: to know, in the output accumulator below, which
+    # of the NF beats/vector is on the wire this cycle (for the orow_reg pad-drop/latch).
+    need_nf_cnt = NF > 1
+    if need_nf_cnt:
+        nf_cnt_decl, nf_cnt_seq = _nf_counter(NF, advance_cond="accept_beat", split=True)
+    else:
+        nf_cnt_decl, nf_cnt_seq = "", ""
+    nf_expr = "nf_cnt" if need_nf_cnt else "0"
 
     # Per output column (N-slice j, lane pe): sum the gk raw K-partials, then
     # requantize once (no bias -- two-operand GEMM never has one).
@@ -763,15 +910,34 @@ def _2op_grid_memstream_shim(t, p, module_name, force_behavioral, nt, gk, sf_til
             raw_exprs.append([
                 f"out_tdata_raw_{j * gk + i}[{pe_i * ACCU} +: {ACCU}]" for i in range(gk)])
     req_decls, req_regs = _requant_lanes(t, nt * PE, raw_exprs, None, "rq")
-    req_assign = "\n".join(
-        f"    assign p_din[{j * PB + pe_i * t['output_width']} +: {t['output_width']}] = "
-        f"{req_regs[j * PE + pe_i]};"
-        for j in range(nt) for pe_i in range(PE))
+
+    # ---- output side: latch the NF*nt per-column requant registers into one unpadded
+    # N*out_width beat, dropping each N-tile's pad tail columns (local_oc >= NTILE), and
+    # fire p_write once per vector (the last NF beat) -- mirrors _generate_ws_shim.
+    oc_src = {}
+    for j in range(nt):
+        for nf_i in range(NF):
+            for pe_i in range(PE):
+                local_oc = nf_i * PE + pe_i
+                if local_oc < NTILE:
+                    oc_src[j * NTILE + local_oc] = (req_regs[j * PE + pe_i], nf_i)
+    orow_bits = [(oc, reg, nf_i) for oc, (reg, nf_i) in sorted(oc_src.items())]
+    p_din_assign = "\n".join(
+        f"    assign p_din[{oc * outW} +: {outW}] = "
+        f"({nf_expr} == {nf_i}) ? {reg} : orow_reg[{oc * outW} +: {outW}];"
+        for oc, reg, nf_i in orow_bits)
+    orow_latch = "\n".join(
+        f"        if (accept_beat && {nf_expr} == {nf_i}) orow_reg[{oc * outW} +: {outW}] <= {reg};"
+        for oc, reg, nf_i in orow_bits if nf_i != NF - 1)   # last phase never needs latching
 
     return f"""// Generated by gemm-ip-gen (mvau target). General tiled two-operand (gemm_stream) shim:
 // {nt}x{gk} (N-tiles x K-tiles) MVU cores, each a runtime memstream (DEPTH=SF_tile*NF={DEPTH}).
 // Tile (j,i) reduces K-slice i (MW={t['mw']}) for N-slice j (N_tile={NTILE} cols); K-partials
 // summed + N-slices concatenated in the drain. B loaded per K-slice, replayed across M={M}.
+// Boundary is UNPADDED (matches hls4ml's own TDATA widths): a_dout is one raw K={K}*
+// ACTIVATION_WIDTH row/beat, b_dout is one raw N={N}*WEIGHT_WIDTH K-row/beat ({K} beats
+// total, K-padding to {KPAD} happens here), p_din is one raw N={N}*out_width beat/vector
+// (SF_tile fan-out + NF/N-tile stitching + pad-column drop happen here too).
 // Tile: MW={t['mw']} MH(N_tile)={NTILE} PE={PE} SIMD={SIMD} \
 SF_tile={sf_tile} NF={NF} N_TILES={nt} K_TILES={gk} core={t['compute_core']} ACCU={ACCU}
 module {module_name} (
@@ -784,16 +950,16 @@ module {module_name} (
     output wire                 ap_done,    // ap_ctrl_chain: held until ap_continue
     output wire                 ap_idle,    // ap_ctrl_chain: no invocation in flight/pending
 
-    // wide activation FIFO (input)  {A_TOTAL} = K_TILES * ceil(SIMD*ACTIVATION_WIDTH/8)*8
-    input  wire [{A_TOTAL - 1}:0] a_dout,
+    // activation FIFO (input)  {ARAW} = raw K*ACTIVATION_WIDTH, UNPADDED (one hls4ml row/beat)
+    input  wire [{ARAW - 1}:0] a_dout,
     input  wire                 a_empty_n,
     output wire                 a_read,
-    // B FIFO (input)                {BB} = ceil(N*WEIGHT_WIDTH/8)*8 (N-wide K-row beats)
-    input  wire [{BB - 1}:0] b_dout,
+    // B FIFO (input)           {BRAW} = raw N*WEIGHT_WIDTH, UNPADDED (one K-row/beat, {K} beats)
+    input  wire [{BRAW - 1}:0] b_dout,
     input  wire                 b_empty_n,
     output wire                 b_read,
-    // output FIFO (output)          {PB_TOTAL} = N_TILES * ceil(PE*out_width/8)*8 (post-requant, K-summed)
-    output wire [{PB_TOTAL - 1}:0] p_din,
+    // output FIFO (output)     {PRAW} = raw N*out_width, UNPADDED (post-requant, K-summed)
+    output wire [{PRAW - 1}:0] p_din,
     input  wire                 p_full_n,
     output wire                 p_write
 );
@@ -803,44 +969,65 @@ module {module_name} (
     reg  [2:0]            state = IDLE;
     reg                    done_r = 0;      // ap_done pending, cleared by ap_continue
     reg  [{_w(SIMD) - 1}:0]  sc = 0;    // lane within band (0..SIMD-1)
-    reg  [{_w(sf_tile) - 1}:0]  sfc = 0; // band within K-slice (0..SF_tile-1)
-    reg  [{_w(NF) - 1}:0]  nfc = 0;      // column block within band (0..NF-1)
+    reg  [{_w(sf_tile) - 1}:0]  sfc = 0; // band within K-slice (0..SF_tile-1), weight-load side
+    reg  [{_w(NF) - 1}:0]  nfc = 0;      // column block within band (0..NF-1), weight-load side
     reg  [{_w(gk) - 1}:0]  tic = 0;      // K-slice being loaded (0..gk-1)
     reg  [1:0]            dcnt = 0;
-    reg  [{_w(run_total) - 1}:0]  ocnt = 0;
-    reg  [{_w(M * sf_tile + 1) - 1}:0]  icnt = 0;  // A beats accepted this node (M*SF_tile)
+    reg  [{_w(run_total) - 1}:0]  ocnt = 0;   // output rows produced this node (0..M-1)
+    reg  [{_w(M + 1) - 1}:0]  icnt = 0;       // A rows accepted this node (0..M)
 
-    reg  [{BB - 1}:0]  band [0:{SIMD - 1}];   // SIMD N-wide K-rows of the current band
+    // global (tic,sfc,sc) row index into the K_pad={KPAD} grid; only rows < K={K} are real --
+    // the rest are internally zero-filled (K-padding moved here from the HLS-side glue).
+    wire [31:0] grow = tic * {MW} + sfc * {SIMD} + sc;
+    wire        row_real = grow < {K};
+
+    reg  [{BRAW - 1}:0]  band [0:{SIMD - 1}];   // SIMD raw N-wide K-rows of the current band
 
     assign ap_ready = (state == IDLE) & ~done_r & ap_start & ap_ce;
     assign ap_done  = done_r;
     assign ap_idle  = (state == IDLE) & ~done_r;
 
-    assign b_read = ap_ce & (state == FILL) & b_empty_n;
+    assign b_read = ap_ce & (state == FILL) & row_real & b_empty_n;
 
 {wwords}
 
     wire run = (state == RUN);
-    // gate on icnt too: stop pulling A beats once this node's M*SF_tile beats are
-    // accepted, so a queued next-node row isn't fed to the MVU against the current B.
-    wire in_open = run & (icnt != {M * sf_tile});
-    wire in_tvalid  = ap_ce & in_open & a_empty_n;
-    wire out_tready = ap_ce & p_full_n;
+
+    // ---- activation side: buffer one external (unpadded) row per vector, zero-filled
+    // to K_pad={KPAD}, and fan it out to the {sf_tile} SIMD-wide bands/vector each K-tile
+    // needs (own K-slice), one band per cycle in lockstep across all gk*nt tiles.
+    reg  [{KPAD * AW - 1}:0] arow_reg;
+    reg                  row_valid = 0;
+    reg  [{max(_w(sf_tile) - 1, 0)}:0] sf_cnt = 0;
+    wire [{KPAD * AW - 1}:0] arow_pad = {arow_pad_expr};
+    wire need_load = ~row_valid;
+    wire can_load  = ap_ce & run & need_load & a_empty_n & (icnt != {M});
+    assign a_read  = can_load;
+{a_slices_decl}
+
+    wire in_tvalid  = ap_ce & run & row_valid;
     wire [{NTILES - 1}:0] in_tready;
     wire [{NTILES - 1}:0] out_tvalid;
-    assign a_read  = ap_ce & in_open & (&in_tready);
-    assign p_write = ap_ce & (&out_tvalid) & p_full_n;   // count only real transfers
+    // nf_cnt (0..{NF - 1}, advancing on accept_beat) -- needed whenever NF>1, to know
+    // which of the NF beats/vector is on the wire this cycle (orow_reg pad-drop/latch).
+    // Declared here, ahead of its first use in out_tready/p_write below.
+{nf_cnt_decl}    wire out_tready  = ap_ce & (({nf_expr} != {NF - 1}) | p_full_n);
+    wire accept_beat = ap_ce & (&out_tvalid) & out_tready;
+    assign p_write   = accept_beat & ({nf_expr} == {NF - 1});   // one row/beat, unpadded
+{nf_cnt_seq}
 
     always @(posedge ap_clk) begin
         if (ap_rst) begin
-            state <= IDLE; done_r <= 0; sc <= 0; sfc <= 0; nfc <= 0; tic <= 0; dcnt <= 0; ocnt <= 0; icnt <= 0;
+            state <= IDLE; done_r <= 0; sc <= 0; sfc <= 0; nfc <= 0; tic <= 0; dcnt <= 0;
+            ocnt <= 0; icnt <= 0; row_valid <= 0; sf_cnt <= 0;
         end else if (ap_ce) begin
             if (ap_ready) begin
-                state <= FILL; sc <= 0; sfc <= 0; nfc <= 0; tic <= 0; dcnt <= 0; ocnt <= 0; icnt <= 0;
+                state <= FILL; sc <= 0; sfc <= 0; nfc <= 0; tic <= 0; dcnt <= 0;
+                ocnt <= 0; icnt <= 0; row_valid <= 0; sf_cnt <= 0;
             end else case (state)
                 IDLE: ;
-                FILL: if (b_read) begin
-                    band[sc] <= b_dout;
+                FILL: if (row_real ? b_read : 1'b1) begin
+                    band[sc] <= row_real ? b_dout : {{{BRAW}{{1'b0}}}};
                     if (sc == {SIMD - 1}) begin sc <= 0; nfc <= 0; state <= WRITE; end
                     else sc <= sc + 1'b1;
                 end
@@ -856,16 +1043,25 @@ module {module_name} (
                 end
                 DRAIN: begin
                     dcnt <= dcnt + 1'b1;
-                    if (dcnt == 2'd1) begin state <= RUN; ocnt <= 0; icnt <= 0; end
+                    if (dcnt == 2'd1) begin
+                        state <= RUN; ocnt <= 0; icnt <= 0; row_valid <= 0; sf_cnt <= 0;
+                    end
                 end
                 RUN: begin
-                    if (in_tvalid & (&in_tready)) icnt <= icnt + 1'b1;
                     if (p_write) begin
                         if (ocnt == {run_total - 1}) begin state <= IDLE; done_r <= 1'b1; end
                         else ocnt <= ocnt + 1'b1;
                     end
                 end
             endcase
+            // activation row buffer: load a fresh (zero-padded) row, else shift through
+            // its {sf_tile} SIMD-wide bands as each is accepted by every tile.
+            if (can_load) begin
+                arow_reg <= arow_pad; row_valid <= 1'b1; sf_cnt <= 0; icnt <= icnt + 1'b1;
+            end else if (row_valid & (&in_tready)) begin
+                if (sf_cnt == {sf_tile - 1}) begin row_valid <= 0; sf_cnt <= 0; end
+                else sf_cnt <= sf_cnt + 1'b1;
+            end
             if (done_r & ap_continue) done_r <= 1'b0;
         end
     end
@@ -874,10 +1070,18 @@ module {module_name} (
 
     // per-column requantize stage (no bias -- two-operand GEMM never has one): sum
     // the gk raw K-partials, shift + round-half-up + wrap to out_width (declared
-    // after the tile blocks so it never references an out_tdata_raw_i wire before
-    // its declaration)
+    // after the tile blocks so it never references an out_tdata_raw_i wire, or its
+    // nf_cnt counter's accept_beat/ap_ready, before their declaration)
 {req_decls}
-{req_assign}
+    // output accumulator: latch every phase but the last (which is driven live,
+    // combinationally, on the very cycle p_write fires) into the unpadded p_din beat.
+    reg [{PRAW - 1}:0] orow_reg;
+    always @(posedge ap_clk) begin
+        if (accept_beat) begin
+{orow_latch if orow_latch else "            // NF == 1: every column is driven live, nothing to latch"}
+        end
+    end
+{p_din_assign}
 endmodule
 """
 
@@ -886,23 +1090,51 @@ def _2op_grid_register_shim(t, p, module_name, force_behavioral, nt, gk):
     """Fully-spatial per-tile two-operand grid (DEPTH_tile = SF_tile*NF == 1): an nt×gk grid of
     MVU cores, each fed a single latched weight word (a memstream cannot be config-written at
     DEPTH=1). B is loaded per K-slice — the nt N-slice words latched in parallel — then replayed
-    from the registers across the M vectors. Activation is K-sliced (a_dout[i*AB +: AB]) and
-    broadcast across N-slices; partials are summed over K and concatenated over N in the drain.
-    Reduces to the K-tiled register path at nt=1."""
+    from the registers across the M vectors. Activation is K-sliced and broadcast across
+    N-slices; partials are summed over K and concatenated over N in the drain. Reduces to the
+    K-tiled register path at nt=1.
+
+    Boundary ports are UNPADDED and match hls4ml's own TDATA widths exactly: ``a_dout`` is
+    ``K*ACTIVATION_WIDTH`` bits (K = the real, unpadded contraction dimension -- one full row
+    per beat), ``b_dout`` is one raw ``N*WEIGHT_WIDTH``-bit K-row per beat (``K`` beats total,
+    no K_pad tail), and ``p_din`` is one raw ``N*out_width`` beat (no per-N-tile byte-alignment
+    gaps). All K-padding (zero-extend up to ``gk*MW``, both the activation fan-out into each
+    tile's byte-aligned SIMD slice and B's missing tail K-rows) now happens in this wrapper,
+    entirely combinationally / via extra internally-generated zero bands -- no extra external
+    beats, no extra pipeline cycles, matching the weight-stationary/K-tiled shims' HLS-side glue
+    (see package.py's ``_2op_gemm_ip_header``, now a pure bit-reinterpretation for this form)."""
     fb = 1 if force_behavioral else 0
     N, M = p["n"], p["num_input_vectors"]
+    K = p["k"]                                      # raw, unpadded total contraction dim
     NTILE = N // nt
-    PE, SIMD, WW, ACCU = t["pe"], t["simd"], t["weight_width"], t["accu_width"]
+    PE, SIMD, WW, ACCU, AW = t["pe"], t["simd"], t["weight_width"], t["accu_width"], t["activation_width"]
+    MW = t["mw"]
+    KPAD = gk * MW                                   # padded total K this grid actually reduces
     WB = t["weight_stream_width_ba"]
-    AB = t["input_stream_width_ba"]
-    PB = t["output_stream_width_ba"]     # narrow, post-requant per N-slice: PE*out_width
+    AB = t["input_stream_width_ba"]                  # per-tile byte-aligned SIMD*AW, internal only
     raw_pb = PE * ACCU
-    BB = ((N * WW) + 7) // 8 * 8
-    A_TOTAL, PB_TOTAL = gk * AB, nt * PB   # requant sums the gk K-partials away
+    ARAW = K * AW                                    # raw, unpadded external activation beat
+    BRAW = N * WW                                    # raw, unpadded external B beat (one K-row)
+    PRAW = N * t["output_width"]                     # raw, unpadded external result beat
     NTILES = nt * gk
+    pad_a_bits = KPAD * AW - ARAW
 
     def _w(n):
         return max(1, (n - 1).bit_length())
+
+    # zero-extend the raw external activation row up to the padded K_pad*AW width, then
+    # slice out each tile's mw*AW bits and re-pad (with zeros) up to that tile's internal,
+    # byte-aligned AB width -- purely combinational, no extra cycles.
+    arow_pad_expr = ("a_dout" if pad_a_bits == 0
+                     else "{" + "{%d{1'b0}}" % pad_a_bits + ", a_dout}")
+    a_slices = []
+    for i in range(gk):
+        tile_pad = AB - MW * AW
+        expr = f"arow_pad[{i * MW * AW} +: {MW * AW}]"
+        if tile_pad:
+            expr = "{" + "{%d{1'b0}}" % tile_pad + f", {expr}" + "}"
+        a_slices.append(f"    wire [{AB - 1}:0] a_slice_{i} = {expr};")
+    a_slices_decl = "\n".join(a_slices)
 
     # nt combinational words: wword_j packs N-slice j's PE columns from the band (NF=1)
     def _wword(j):
@@ -927,7 +1159,7 @@ def _2op_grid_register_shim(t, p, module_name, force_behavioral, nt, gk):
     ) inst_{idx} (
         .ap_clk(ap_clk), .ap_clk2x(1'b0), .ap_rst_n(rst_n),
         .s_axis_weights_tdata(wreg[{idx}]), .s_axis_weights_tvalid(ap_ce & run), .s_axis_weights_tready(wgt_tready_{idx}),
-        .s_axis_input_tdata(a_dout[{(i + 1) * AB - 1}:{i * AB}]),
+        .s_axis_input_tdata(a_slice_{i}),
         .s_axis_input_tvalid(in_tvalid), .s_axis_input_tready(in_tready[{idx}]),
         .m_axis_output_tdata(out_tdata_raw_{idx}), .m_axis_output_tvalid(out_tvalid[{idx}]), .m_axis_output_tready(out_tready)
     );"""
@@ -941,15 +1173,20 @@ def _2op_grid_register_shim(t, p, module_name, force_behavioral, nt, gk):
             raw_exprs.append([
                 f"out_tdata_raw_{j * gk + i}[{pe_i * ACCU} +: {ACCU}]" for i in range(gk)])
     req_decls, req_regs = _requant_lanes(t, nt * PE, raw_exprs, None, "rq")
+    # raw, unpadded layout: N-slice j occupies columns [j*NTILE, (j+1)*NTILE) with no
+    # inter-tile byte-alignment gap (PE == NTILE exactly in this fully-spatial form).
     req_assign = "\n".join(
-        f"    assign p_din[{j * PB + pe_i * t['output_width']} +: {t['output_width']}] = "
+        f"    assign p_din[{(j * NTILE + pe_i) * t['output_width']} +: {t['output_width']}] = "
         f"{req_regs[j * PE + pe_i]};"
         for j in range(nt) for pe_i in range(PE))
 
     return f"""// Generated by gemm-ip-gen (mvau target). Fully-spatial two-operand grid (DEPTH_tile=1):
 // {nt}x{gk} (N-tiles x K-tiles) MVU cores, each fed one latched weight word; B loaded per
 // K-slice (nt N-slices in parallel), replayed from registers across M={M}. K-partials summed +
-// N-slices concatenated in the drain. Tile: MW={t['mw']} MH(N_tile)={NTILE} PE={PE} SIMD={SIMD} \
+// N-slices concatenated in the drain. Boundary is UNPADDED (matches hls4ml's own TDATA
+// widths): a_dout is one raw K={K}*ACTIVATION_WIDTH row/beat, b_dout is one raw N={N}*
+// WEIGHT_WIDTH K-row/beat ({K} beats total, K-padding to {KPAD} happens here), p_din is one
+// raw N={N}*out_width beat. Tile: MW={t['mw']} MH(N_tile)={NTILE} PE={PE} SIMD={SIMD} \
 N_TILES={nt} K_TILES={gk} core={t['compute_core']} ACCU={ACCU}
 module {module_name} (
     input  wire                 ap_clk,
@@ -961,16 +1198,16 @@ module {module_name} (
     output wire                 ap_done,    // ap_ctrl_chain: held until ap_continue
     output wire                 ap_idle,    // ap_ctrl_chain: no invocation in flight/pending
 
-    // wide activation FIFO (input)  {A_TOTAL} = K_TILES * ceil(SIMD*ACTIVATION_WIDTH/8)*8
-    input  wire [{A_TOTAL - 1}:0] a_dout,
+    // activation FIFO (input)  {ARAW} = raw K*ACTIVATION_WIDTH, UNPADDED (one hls4ml row/beat)
+    input  wire [{ARAW - 1}:0] a_dout,
     input  wire                 a_empty_n,
     output wire                 a_read,
-    // B FIFO (input)                {BB} = ceil(N*WEIGHT_WIDTH/8)*8 (N-wide K-row beats)
-    input  wire [{BB - 1}:0] b_dout,
+    // B FIFO (input)           {BRAW} = raw N*WEIGHT_WIDTH, UNPADDED (one K-row/beat, {K} beats)
+    input  wire [{BRAW - 1}:0] b_dout,
     input  wire                 b_empty_n,
     output wire                 b_read,
-    // output FIFO (output)          {PB_TOTAL} = N_TILES * ceil(PE*out_width/8)*8 (post-requant, K-summed)
-    output wire [{PB_TOTAL - 1}:0] p_din,
+    // output FIFO (output)     {PRAW} = raw N*out_width, UNPADDED (post-requant, K-summed)
+    output wire [{PRAW - 1}:0] p_din,
     input  wire                 p_full_n,
     output wire                 p_write
 );
@@ -984,14 +1221,23 @@ module {module_name} (
     reg  [{_w(M) - 1}:0]  ocnt = 0;     // output beats seen this node (NF=1 -> M)
     reg  [{_w(M + 1) - 1}:0]  icnt = 0;     // A beats accepted this node (NF=1 -> M)
 
-    reg  [{BB - 1}:0]  band [0:{SIMD - 1}];   // SIMD N-wide K-rows of the current K-slice
+    reg  [{BRAW - 1}:0]  band [0:{SIMD - 1}];   // SIMD raw N-wide K-rows of the current K-slice
     reg  [{WB - 1}:0]  wreg [0:{NTILES - 1}]; // per-tile latched weight word
 
     assign ap_ready = (state == IDLE) & ~done_r & ap_start & ap_ce;
     assign ap_done  = done_r;
     assign ap_idle  = (state == IDLE) & ~done_r;
 
-    assign b_read = ap_ce & (state == FILL) & b_empty_n;
+    // global (ti,sc) row index into the K_pad={KPAD} grid; only rows < K={K} are real --
+    // the rest are internally zero-filled (K-padding moved here from the HLS-side glue).
+    wire [31:0] grow = ti * {MW} + sc;
+    wire        row_real = grow < {K};
+    assign b_read = ap_ce & (state == FILL) & row_real & b_empty_n;
+
+    // combinational zero-extend of the raw external activation row up to K_pad*AW, then
+    // per-tile re-slice into each tile's internal byte-aligned AB width (no extra cycles).
+    wire [{KPAD * AW - 1}:0] arow_pad = {arow_pad_expr};
+{a_slices_decl}
 
 {wwords}
 
@@ -1014,8 +1260,8 @@ module {module_name} (
                 state <= FILL; sc <= 0; ti <= 0; ocnt <= 0; icnt <= 0;
             end else case (state)
                 IDLE: ;
-                FILL: if (b_read) begin
-                    band[sc] <= b_dout;
+                FILL: if (row_real ? b_read : 1'b1) begin
+                    band[sc] <= row_real ? b_dout : {{{BRAW}{{1'b0}}}};
                     if (sc == {SIMD - 1}) begin sc <= 0; state <= LATCH; end
                     else sc <= sc + 1'b1;
                 end
@@ -1092,7 +1338,7 @@ def generate_two_operand_nt_shim(shape, module_name="mvau_core", force_behaviora
 
 
 def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_tiles, m,
-                      bias_codes=None):
+                      bias_codes=None, raw_k=None, raw_n=None):
     """Weight-stationary shim: ``n_tiles`` FINN ``memstream`` + ``mvu_vvu_axi``
     tiles stitched in RTL. Each memstream (baked from ``init_files[i]``) replaces
     the external weight FIFO for its N-column slice and drives its tile's
@@ -1103,15 +1349,31 @@ def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
     WMEM = NF*SF words per tile, re-streamed cyclically so every input vector
     re-reads the same weights.
 
+    Boundary ports are UNPADDED and match hls4ml's own TDATA widths exactly:
+    ``a_dout`` is ``raw_k*ACTIVATION_WIDTH`` bits (one full hls4ml row per beat,
+    no SIMD padding) and ``p_din`` is ``raw_n*out_width`` bits (no PE padding, no
+    N-tile-pad tail columns). All K-padding (zero-fill up to ``k_pad`` and the
+    SF-way fan-out into one SIMD-wide beat/cycle) and N-padding/stitching
+    (dropping each tile's pad tail columns and concatenating the ``n_tiles``
+    slices) now happen in this wrapper, in an ``arow_reg``/``orow_reg`` shift
+    register pair, instead of in the HLS-side glue (see ``package.py``'s
+    ``_gemm_ip_header``, now a pure bit-reinterpretation with no cycles of its
+    own). ``raw_k``/``raw_n`` default to the padded widths (no-op) for any
+    caller that does not supply them.
+
     Stitching (all tiles are identical modules fed identical activations with
     identical output backpressure, so they run in lockstep):
-      * one activation FIFO broadcasts to every tile; ``a_read`` advances it only
-        when every tile asserts ``tready`` (``&in_tready``).
+      * one activation register (loaded once per external row, zero-padded to
+        ``k_pad``) fans its ``SF`` SIMD-wide slices out to every tile one per
+        cycle; ``a_read`` pulls the next external row only once the current one
+        is fully drained.
       * each tile's raw ``PE*ACCU_WIDTH`` output goes through a per-lane requantize
-        stage (bias add, shift + round-half-up + wrap) narrowing it to ``PE*out_width``;
-        the ``n_tiles`` narrow results concatenate into one ``{n_tiles}*PB``-wide
-        ``p_din`` beat (tile ``i`` at ``[i*PB +: PB]``, ``PB`` now the narrow width);
-        ``p_write`` fires when every tile has a beat (``&out_tvalid``). Generalizes
+        stage (bias add, shift + round-half-up + wrap) narrowing it to
+        ``out_width``/lane; the ``NF`` per-vector beats and ``n_tiles`` N-slices
+        latch into one ``orow_reg`` (this cycle's last-``NF`` lanes bypass the
+        register and read the live combinational requant value, since ``p_din``
+        must be valid the same cycle ``p_write`` fires); ``p_write`` fires once
+        per external row, on the last of the ``NF`` beats. Generalizes
         temp_space/mvau-ws (cosim PASS)."""
     if not init_files or any(not f for f in init_files):
         raise ValueError("weight-stationary shim requires an init_file per tile "
@@ -1120,24 +1382,35 @@ def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
         raise ValueError(f"expected {n_tiles} init file(s), got {len(init_files)}")
     wmem = t["wmem"]
     accu = t["accu_width"]
-    pe, nf = t["pe"], t["nf"]
-    pb_total = n_tiles * pbits
-    blocks = "\n".join(
-        _ws_tile_block(t, fb, wbits, wmem, i, init_files[i]) for i in range(n_tiles))
+    aw, outw = t["activation_width"], t["output_width"]
+    pe, nf, sf, simd = t["pe"], t["nf"], t["sf"], t["simd"]
+    k_pad = t["mw"]                      # K padded to a multiple of SIMD (per-tile MW)
+    K = raw_k if raw_k is not None else k_pad
+    N = raw_n if raw_n is not None else n_tiles * t["mh"]
+    ntile_real = N // n_tiles            # unpadded per-tile column count
+    ABR = K * aw                         # raw, unpadded activation PORT width
+    APAD = k_pad * aw                    # zero-padded internal row-register width
+    PBR = N * outw                       # raw, unpadded result port width
 
-    # NF>1 means these PE lanes carry different output columns on different cycles
-    # (mvu_vvu_axi iterates the NF column blocks internally); a bias ROM then needs
-    # a runtime nf_cnt to pick the right code, not a compile-time lane index.
-    need_nf_cnt = bool(bias_codes) and nf > 1
-    nf_cnt_decl = _nf_counter(nf) if need_nf_cnt else ""
+    blocks = "\n".join(
+        _ws_tile_block(t, fb, wbits, wmem, i, init_files[i], act_expr="cur_slice")
+        for i in range(n_tiles))
+
+    # nf_cnt is needed whenever NF>1: to pick the right bias code (dynamic column,
+    # same lanes carry different columns across cycles) AND to know, in the output
+    # accumulator below, which of the NF beats is on the wire this cycle.
+    need_nf_cnt = nf > 1
+    if need_nf_cnt:
+        nf_cnt_decl, nf_cnt_seq = _nf_counter(nf, advance_cond="accept_beat", split=True)
+    else:
+        nf_cnt_decl, nf_cnt_seq = "", ""
     nf_expr = "nf_cnt" if need_nf_cnt else "0"
     raw_exprs = [f"out_tdata_{i}[{pe_i * accu} +: {accu}]"
                 for i in range(n_tiles) for pe_i in range(pe)]
     if bias_codes:
         # Bucket the N-long baked bias into each tile's own n_pad (=NF*PE) local
-        # lanes (bias_codes is real-column length; NTILE_REAL derives from it since
+        # lanes (bias_codes is real-column length; ntile_real derives from it since
         # all n_tiles are equal-width).
-        ntile_real = len(bias_codes) // n_tiles
         full_codes = []
         for i in range(n_tiles):
             full_codes += _wpack.bias_codes_for_tile(bias_codes, i, ntile_real, t["mh"])
@@ -1147,19 +1420,45 @@ def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
         full_codes, bias_idx = None, None
     req_decls, req_regs = _requant_lanes(t, n_tiles * pe, raw_exprs, full_codes, "rq",
                                          bias_index_exprs=bias_idx)
-    req_decls = nf_cnt_decl + req_decls
-    req_assign = "\n".join(
-        f"    assign p_din[{i * pbits + pe_i * t['output_width']} +: {t['output_width']}] = "
-        f"{req_regs[i * pe + pe_i]};"
-        for i in range(n_tiles) for pe_i in range(pe))
 
     def _w(n):
         return max(1, (n - 1).bit_length())
-    in_total = m * t["sf"]      # activation beats/node (matches feed_a's m*SF reads)
-    run_total = m * t["nf"]     # output beats/node (matches requant's m*NF reads)
+
+    # ---- output side: latch the NF*n_tiles per-column requant registers into one
+    # unpadded N*out_width beat, dropping each tile's pad tail columns (local_oc
+    # >= ntile_real), and fire p_write once per external row (the last NF beat). ----
+    oc_src = {}
+    for i in range(n_tiles):
+        for nf_i in range(nf):
+            for pe_i in range(pe):
+                local_oc = nf_i * pe + pe_i
+                if local_oc < ntile_real:
+                    oc = i * ntile_real + local_oc
+                    oc_src[oc] = (req_regs[i * pe + pe_i], nf_i)
+    orow_bits = []
+    for oc in range(N):
+        reg, nf_i = oc_src[oc]
+        live = f"(nf_cnt == {nf_i})" if need_nf_cnt else "1'b1"
+        orow_bits.append((oc, reg, nf_i, live))
+    p_din_assign = "\n".join(
+        f"    assign p_din[{oc * outw} +: {outw}] = {live} ? {reg} : orow_reg[{oc * outw} +: {outw}];"
+        for oc, reg, nf_i, live in orow_bits)
+    orow_latch = "\n".join(
+        f"        if (accept_beat && {nf_expr} == {nf_i}) orow_reg[{oc * outw} +: {outw}] <= {reg};"
+        for oc, reg, nf_i, live in orow_bits if nf_i != nf - 1)   # last phase never needs latching
+
+    in_total = m         # one external activation beat (one full row) per vector
+    run_total = m         # one external result beat (one full row) per vector
+    sf_bits = _w(sf)
+    pad_bits = (k_pad - K) * aw
+    arow_pad_expr = ("a_dout" if pad_bits == 0
+                     else "{" + "{%d{1'b0}}" % pad_bits + ", a_dout}")
     return f"""// Generated by gemm-ip-gen (mvau target). Weight-stationary shim: {n_tiles} FINN
 // MVU tile(s) -- each a memstream (baked weights) + mvu_vvu_axi -- stitched in RTL.
-// Shared activation broadcast in; per-tile outputs requantized then concatenated.
+// Boundary is UNPADDED (matches hls4ml's own TDATA widths): a_dout is one raw
+// K={K}*ACTIVATION_WIDTH row/beat (K-padding + the SF={sf}-way SIMD fan-out happen
+// here); p_din is one raw N={N}*out_width beat (N-tile stitching + pad-column drop
+// happen here too). See _generate_ws_shim's docstring.
 // Tile: MW(K)={t['mw']} MH(N/tile)={t['mh']} PE={t['pe']} SIMD={t['simd']} \
 core={t['compute_core']} ACCU={t['accu_width']} out_width={t['output_width']} WMEM={wmem} N_TILES={n_tiles}
 // Module name MUST equal the JSON c_function_name (Vitis instantiates by it).
@@ -1173,12 +1472,12 @@ module {module_name} (
     output wire                 ap_done,    // ap_ctrl_chain: held until ap_continue
     output wire                 ap_idle,    // ap_ctrl_chain: no invocation in flight/pending
 
-    // activation FIFO (input)  {abits} = ceil(SIMD*ACTIVATION_WIDTH/8)*8
-    input  wire [{abits - 1}:0] a_dout,
+    // activation FIFO (input)  {ABR} = raw K*ACTIVATION_WIDTH, UNPADDED (one hls4ml row/beat)
+    input  wire [{ABR - 1}:0] a_dout,
     input  wire                 a_empty_n,
     output wire                 a_read,
-    // output FIFO (output)     {pb_total} = N_TILES * ceil(PE*out_width/8)*8 (post-requant)
-    output wire [{pb_total - 1}:0] p_din,
+    // output FIFO (output)     {PBR} = raw N*out_width, UNPADDED (no N-tile pad tail)
+    output wire [{PBR - 1}:0] p_din,
     input  wire                 p_full_n,
     output wire                 p_write
 );
@@ -1188,40 +1487,65 @@ module {module_name} (
     localparam IDLE = 1'd0, RUN = 1'd1;
     reg                        state = IDLE;
     reg                        done_r = 0;
-    reg  [{_w(in_total + 1) - 1}:0]  icnt = 0;   // activation beats accepted this node
-    reg  [{_w(run_total + 1) - 1}:0]  ocnt = 0;   // output beats produced this node
+    reg  [{_w(in_total + 1) - 1}:0]  icnt = 0;   // external activation rows accepted this node
+    reg  [{_w(run_total + 1) - 1}:0]  ocnt = 0;   // external result rows produced this node
 
     assign ap_ready = (state == IDLE) & ~done_r & ap_start & ap_ce;
     assign ap_done  = done_r;
     assign ap_idle  = (state == IDLE) & ~done_r;
 
-    // gate on icnt too: stop pulling A beats once this node's {in_total} beats
+    // gate on icnt too: stop pulling A rows once this node's {in_total} rows
     // are accepted, even if the next node's rows are already queued in the FIFO.
     wire in_open = (state == RUN) & (icnt != {in_total});
 
-    // shared activation valid + output ready, broadcast to every tile
-    wire in_tvalid  = ap_ce & in_open & a_empty_n;
-    wire out_tready = ap_ce & p_full_n;
-    // per-tile handshakes: advance the activation FIFO only when all tiles accept,
-    // emit a beat only when all tiles have produced theirs (tiles run in lockstep).
+    // ---- activation side: buffer one external (unpadded) row, zero-filled to
+    // k_pad={k_pad}, and fan it out to the {sf}-deep SIMD-wide beats the MVU tiles
+    // need, one per cycle.
+    reg  [{APAD - 1}:0] arow_reg;
+    reg                  row_valid = 0;
+    reg  [{max(sf_bits - 1, 0)}:0] sf_cnt = 0;
+    wire [{APAD - 1}:0] arow_pad = {arow_pad_expr};
+    wire need_load = ~row_valid;
+    wire can_load  = ap_ce & in_open & need_load & a_empty_n;
+    assign a_read = can_load;
+    wire [{abits - 1}:0] cur_slice = arow_reg[sf_cnt * {abits} +: {abits}];
+    wire in_tvalid = ap_ce & row_valid;
+
+    // per-tile handshakes: every tile shares the same activation slice + output
+    // backpressure, so they run in lockstep (tiles are identical modules).
     wire [{n_tiles - 1}:0] in_tready;
     wire [{n_tiles - 1}:0] out_tvalid;
-    assign a_read  = ap_ce & in_open & (&in_tready);
-    assign p_write = ap_ce & (&out_tvalid) & p_full_n;   // count only real transfers
+    // nf_cnt (0..{nf - 1}, advancing on accept_beat) -- needed whenever NF>1, both
+    // to pick a dynamic bias code (in the per-lane requantize section below) and
+    // to know, here, which of the NF beats/vector is on the wire this cycle.
+    // Declared here, ahead of its first use in out_tready/p_write below.
+{nf_cnt_decl}    wire out_tready  = ap_ce & (({nf_expr} != {nf - 1}) | p_full_n);
+    wire accept_beat = ap_ce & (&out_tvalid) & out_tready;
+    assign p_write = accept_beat & ({nf_expr} == {nf - 1});   // one row/beat, unpadded
+{nf_cnt_seq}
 
     always @(posedge ap_clk) begin
         if (ap_rst) begin
             state <= IDLE; done_r <= 0; icnt <= 0; ocnt <= 0;
+            row_valid <= 0; sf_cnt <= 0;
         end else if (ap_ce) begin
             if (ap_ready) begin
                 state <= RUN; icnt <= 0; ocnt <= 0;
             end else if (state == RUN) begin
-                if (in_tvalid & (&in_tready)) icnt <= icnt + 1'b1;
+                if (can_load) icnt <= icnt + 1'b1;
                 if (p_write) begin
                     if (ocnt == {run_total - 1}) begin
                         state <= IDLE; done_r <= 1'b1;
                     end else ocnt <= ocnt + 1'b1;
                 end
+            end
+            // activation row buffer: load a fresh (zero-padded) row, else shift
+            // through its {sf} SIMD-wide slices as each is accepted by every tile.
+            if (can_load) begin
+                arow_reg <= arow_pad; row_valid <= 1'b1; sf_cnt <= 0;
+            end else if (row_valid & (&in_tready)) begin
+                if (sf_cnt == {sf - 1}) begin row_valid <= 0; sf_cnt <= 0; end
+                else sf_cnt <= sf_cnt + 1'b1;
             end
             if (done_r & ap_continue) done_r <= 1'b0;
         end
@@ -1230,9 +1554,17 @@ module {module_name} (
 {blocks}
     // per-lane requantize stage: bias add + shift/round-half-up/wrap to out_width
     // (declared after the tile blocks so it never references an out_tdata_i wire,
-    // or its optional nf_cnt counter's p_write/ap_ready, before their declaration
-    // -- the same declaration-order bug this target already had to fix once)
+    // or its nf_cnt counter's accept_beat/ap_ready, before their declaration --
+    // the same declaration-order bug this target already had to fix once)
 {req_decls}
-{req_assign}
+    // output accumulator: latch every phase but the last (which is driven live,
+    // combinationally, on the very cycle p_write fires) into the unpadded p_din beat.
+    reg [{PBR - 1}:0] orow_reg;
+    always @(posedge ap_clk) begin
+        if (accept_beat) begin
+{orow_latch if orow_latch else "            // NF == 1: every column is driven live, nothing to latch"}
+        end
+    end
+{p_din_assign}
 endmodule
 """

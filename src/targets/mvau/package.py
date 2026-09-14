@@ -17,10 +17,10 @@ import re
 import shutil
 from pathlib import Path
 
-import geometry as _geom
-import rtl as _rtl
-import golden as _golden
-import weightpack as _wpack
+from . import geometry as _geom
+from . import rtl as _rtl
+from . import golden as _golden
+from . import weightpack as _wpack
 
 _RTL_STATIC = Path(__file__).resolve().parent / "rtl_static"
 # memstream is the weight-stationary weight ROM (baked from <name>_weights.dat);
@@ -116,14 +116,16 @@ def cbits(plan):
 
 
 def _dataflow_top(name, plan):
-    """The DUT: feed -> blackbox -> pure unpack, in a dataflow region. Per vector:
-    NF beats in, one N-wide C-row beat out.
+    """The DUT: a straight passthrough into the blackbox, in a dataflow region.
+    One external activation row in, one external result row out -- per vector.
 
-    Bias and the shift/round/wrap to the output precision now happen inside
-    ``{name}_core`` (the RTL requant stage and its C twin, ``golden.py``), so the
-    beat this top reads is already the final, narrow, out_width-bit-per-lane code
-    -- this drain only slices lanes and drops the N-pad tail columns; no
-    arithmetic. bias_codes has moved with the arithmetic into the core twin.
+    All K-padding (zero-fill to k_pad, the SF-way SIMD fan-out) and N-padding
+    (N-tile stitching, dropping the pad tail columns) now happen INSIDE
+    ``{name}_core``'s RTL wrapper (and its C twin, ``golden.py``): the boundary
+    this top sees is already ``K*activation_width`` in / ``N*out_width`` out,
+    matching hls4ml's own unpadded TDATA widths exactly. So this top does no
+    repacking of its own -- it is only the dataflow region Vitis needs to drop
+    the RTL blackbox into.
 
     Weight-stationary: the blackbox bakes its weights (and bias) in the memstream,
     so the top has no weight input -- only activations flow in. Two-operand IPs
@@ -131,59 +133,24 @@ def _dataflow_top(name, plan):
     """
     t = plan["tile"]
     m = plan["num_input_vectors"]
-    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    PE, SF, NF = t["pe"], t["sf"], t["nf"]
-    NT, NTILE = plan["n_tiles"], plan["n_tile"]
-    PB_TOTAL = NT * PB   # concatenated result beat: the n_tiles tiles side by side
-    N, outW = plan["n"], plan["output_width"]
-    NTILE_REAL = N // NT   # unpadded per-tile column count; the interface presents only these
-    CB = cbits(plan)
-    abeats = m * SF
+    AW, N, outW = t["activation_width"], plan["n"], plan["output_width"]
+    K = plan["k"]
+    AB = K * AW      # raw, unpadded activation beat (one hls4ml row)
+    PB = N * outW    # raw, unpadded result beat (one hls4ml row)
     pad = ' ' * (len(name) + 6)
-    core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{pad}hls::stream<ap_uint<{PB_TOTAL}> >&);"
+    core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{pad}hls::stream<ap_uint<{PB}> >&);"
     indent = ' ' * (len(name) + 1)
-    top_sig = f"void {name}(hls::stream<ap_uint<{AB}> >& a_in,\n{indent}hls::stream<ap_uint<{CB}> >& c_out)"
-    feed_calls = (f"    feed_a(a_in, a_s);\n"
-                  f"    {name}_core(a_s, p_s);   // <-- FINN MVU RTL blackbox (weights + bias baked; already requantized)")
+    top_sig = f"void {name}(hls::stream<ap_uint<{AB}> >& a_in,\n{indent}hls::stream<ap_uint<{PB}> >& c_out)"
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 
 {core_decl}
 
-static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
-    for (int i = 0; i < {abeats}; i++) out.write(in.read());
-}}
-
-// Pure unpack: {name}_core already emits requantized out_width-bit-per-lane codes
-// (bias + shift + round-half-up + wrap all happened inside it). Slice one lane per
-// column and drop the N-pad tail columns; no arithmetic here.
-static void unpack(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
-    for (int vec = 0; vec < {m}; vec++) {{
-        ap_uint<{CB}> crow = 0;
-        for (int nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{PB_TOTAL}> ob = in.read();
-            for (int ti = 0; ti < {NT}; ti++)
-                for (int pe = 0; pe < {PE}; pe++) {{
-                    int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
-                    if (local_oc < {NTILE_REAL}) {{   // drop the N-pad tail columns
-                    int oc = ti * {NTILE_REAL} + local_oc;
-                    crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
-                        ob.range(ti * {PB} + pe * {outW} + {outW} - 1, ti * {PB} + pe * {outW});
-                    }}
-                }}
-        }}
-        out.write(crow);
-    }}
-}}
-
+// Pure passthrough: {name}_core's RTL wrapper does all K/N padding and the
+// row<->beat fan-out/stitching internally, so the boundary here is already
+// hls4ml's own unpadded row width on both sides -- {m} rows in, {m} rows out.
 {top_sig} {{
-#pragma HLS DATAFLOW
-    hls::stream<ap_uint<{AB}> > a_s;
-    hls::stream<ap_uint<{PB_TOTAL}> > p_s;
-#pragma HLS STREAM variable=a_s depth=4
-#pragma HLS STREAM variable=p_s depth=4
-{feed_calls}
-    unpack(p_s, c_out);
+    {name}_core(a_in, c_out);   // <-- FINN MVU RTL blackbox (weights + bias baked; already requantized)
 }}
 """
 
@@ -252,33 +219,31 @@ exit
 
 def _gemm_ip_header(name, plan):
     """The dedicated hls4ml-facing IP for one gemm config: an HLS C++ dataflow IP
-    with the internal FINN-MVU blackbox. Repacks hls4ml beats -> FINN beats, runs
-    the blackbox (which now bakes bias and does the shift/round/wrap to
-    ``out_width`` internally, matching the RTL requant stage), and pure-unpacks
-    its already-narrow beat -> hls4ml C row. The combined header routes
-    nnet::gemm_* to this by CONFIG_T::gemm_ip_id (template dispatch).
+    with the internal FINN-MVU blackbox. The blackbox's RTL wrapper now does ALL
+    K/N padding and row<->beat fan-out/stitching internally (see ``rtl.py``'s
+    ``_generate_ws_shim`` and its C twin in ``golden.py``), so its port widths are
+    already hls4ml's own unpadded ``data_T``/``res_T`` row widths
+    (``K*activation_width`` in, ``N*out_width`` out). The glue here is therefore a
+    PURE bit-reinterpretation -- one fully-unrolled concatenation per row, zero
+    additional pipeline cycles -- not a lane-by-lane repack/drain loop. The
+    combined header routes nnet::gemm_* to this by CONFIG_T::gemm_ip_id (template
+    dispatch).
 
     Weight-stationary only (weights + bias baked in the RTL memstream / bias ROM);
     two-operand IPs use ``_2op_gemm_ip_header``.
     """
     t = plan["tile"]
     m = plan["num_input_vectors"]
-    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    PE, SF, NF = t["pe"], t["sf"], t["nf"]
-    NT, NTILE = plan["n_tiles"], plan["n_tile"]
-    PB_TOTAL = NT * PB   # concatenated result beat: the n_tiles tiles side by side
     AW, K, N = t["activation_width"], plan["k"], plan["n"]
-    KPAD = plan["k_pad"]   # K padded to a multiple of SIMD; arow is KPAD-wide, pad lanes 0
-    NTILE_REAL = N // NT   # unpadded per-tile column count; the interface presents only these
     outW = plan["output_width"]
+    AB = K * AW      # raw, unpadded activation beat -- must equal data_T::size*AW
+    PB = N * outW    # raw, unpadded result beat -- must equal res_T::size*out_width
     core_hdr_pad = ' ' * (len(name) + 6)
-    core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{core_hdr_pad}hls::stream<ap_uint<{PB_TOTAL}> >&);"
-    # const_weights (weight-stationary): weights are baked in the RTL memstream, so no
-    # weight stream flows through the HLS side.
+    core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{core_hdr_pad}hls::stream<ap_uint<{PB}> >&);"
     ws_streams = (f"    hls::stream<ap_uint<{AB}> > a_s;\n"
-                  f"    hls::stream<ap_uint<{PB_TOTAL}> > p_s;\n"
-                  f"#pragma HLS STREAM variable=a_s depth={SF + 2}\n"
-                  f"#pragma HLS STREAM variable=p_s depth={NF + 2}")
+                  f"    hls::stream<ap_uint<{PB}> > p_s;\n"
+                  f"#pragma HLS STREAM variable=a_s depth=4\n"
+                  f"#pragma HLS STREAM variable=p_s depth=4")
     ws_calls = (f"    {name}_repack_a<data_T>(a_stream, a_s);\n"
                 f"    {name}_core(a_s, p_s);\n"
                 f"    {name}_drain<res_T, CONFIG_T>(p_s, res_stream);")
@@ -287,63 +252,56 @@ def _gemm_ip_header(name, plan):
 #include <hls_stream.h>
 #include <ap_int.h>
 
-// internal FINN-MVU blackbox (shim {name}_core.v; C twin {name}_core.cpp) -- bias (if
-// any) and the shift/round-half-up/wrap to out_width are baked/performed inside it.
+// internal FINN-MVU blackbox (shim {name}_core.v; C twin {name}_core.cpp) -- ALL
+// K/N padding, bias (if any), and the shift/round-half-up/wrap to out_width are
+// baked/performed inside it (RTL wrapper + its C twin), so its ports already sit
+// at hls4ml's own unpadded row widths.
 {core_decl}
 
 namespace nnet {{
 
-// Dedicated IP for gemm config M={m} K={K} N={N} (core={t['compute_core']},
-// PE={PE} SIMD={SF and t['simd']} SF={SF} NF={NF}). Baked geometry; templated on the
-// hls4ml stream/config types so the combined header can route to it by id.
+// Dedicated IP for gemm config M={m} K={K} N={N} (core={t['compute_core']}).
+// Baked geometry; templated on the hls4ml stream/config types so the combined
+// header can route to it by id.
 
-// repack: {m} rows of K={K} activations -> {m}*SF={m * SF} FINN beats of SIMD={t['simd']}.
+// Pure bit-reinterpretation: hls4ml delivers one full, unpadded K-wide row per
+// beat (data_T::size == K by construction -- enforced below) -- reinterpret it as
+// one K*AW-bit word via a single fully-unrolled concatenation. No lane-by-lane
+// pipelined loop, no padding: {name}_core's RTL wrapper does the K-padding.
 template <class data_T>
 void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > &a_s) {{
+    static_assert(data_T::size == {K},
+        "{name}: hls4ml must deliver one full, unpadded K-wide row per stream beat");
     for (unsigned mm = 0; mm < {m}; mm++) {{
-        ap_int<{AW}> arow[{KPAD}];
-        #pragma HLS ARRAY_PARTITION variable=arow complete
-        for (unsigned i = 0; i < {KPAD}; i++) {{
+        data_T beat = a_stream.read();
+        ap_uint<{AB}> ab;
+        for (unsigned j = 0; j < {K}; j++) {{
             #pragma HLS UNROLL
-            arow[i] = 0;   // zero-fill the K-pad lanes (their weights are 0 -> bit-exact)
+            ab.range(j * {AW} + {AW} - 1, j * {AW}) = beat[j].range({AW} - 1, 0);
         }}
-        for (unsigned kp = 0; kp < {K} / data_T::size; kp++) {{
-            data_T beat = a_stream.read();
-            for (unsigned j = 0; j < data_T::size; j++) arow[kp * data_T::size + j] = beat[j].range({AW} - 1, 0);
-        }}
-        for (unsigned sf = 0; sf < {SF}; sf++) {{
-            ap_uint<{AB}> ab = 0;
-            for (unsigned s = 0; s < {t['simd']}; s++)
-                ab.range(s * {AW} + {AW} - 1, s * {AW}) = (ap_uint<{AW}>)arow[sf * {t['simd']} + s];
-            a_s.write(ab);
-        }}
+        a_s.write(ab);
     }}
 }}
 
-// Pure unpack: {name}_core already emits requantized out_width-bit-per-lane codes
-// (bias, if any, and the shift/round-half-up/wrap to out_width all happened inside
-// it -- see golden.py's core twin and the RTL requant stage). This drain only
-// slices one out_width lane per column and drops the N-pad tail columns; the code
-// is loaded via .range() (raw bit pattern), never a value-preserving conversion,
-// since the value is already rounded/wrapped and re-converting would corrupt it.
+// Pure bit-reinterpretation: {name}_core's RTL wrapper already emits one full,
+// unpadded N-wide row of requantized out_width-bit-per-lane codes per beat (bias,
+// shift, round-half-up, wrap, N-tile stitching and pad-column drop all happened
+// inside it -- see golden.py's core twin and the RTL requant stage). Slice one
+// lane per column via a single fully-unrolled loop; loaded via .range() (raw bit
+// pattern), never a value-preserving conversion, since the value is already
+// rounded/wrapped and re-converting would corrupt it.
 template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream) {{
+void {name}_drain(hls::stream<ap_uint<{PB}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
     for (unsigned mm = 0; mm < {m}; mm++) {{
+        ap_uint<{PB}> ob = p_s.read();
         res_T crow;
-        for (unsigned nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{PB_TOTAL}> ob = p_s.read();
-            for (unsigned ti = 0; ti < {NT}; ti++)     // tile ti lane pe -> global column
-                for (unsigned pe = 0; pe < {PE}; pe++) {{
-                    unsigned local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
-                    if (local_oc < {NTILE_REAL}) {{        // drop the N-pad tail columns
-                    unsigned oc = ti * {NTILE_REAL} + local_oc;
-                    ap_uint<{outW}> raw = ob.range(ti * {PB} + pe * {outW} + {outW} - 1, ti * {PB} + pe * {outW});
-                    result_t tmp;
-                    tmp.range() = raw;     // load the already-requantized bit pattern as-is
-                    crow[oc] = tmp;
-                    }}
-                }}
+        for (unsigned oc = 0; oc < {N}; oc++) {{
+            #pragma HLS UNROLL
+            ap_uint<{outW}> raw = ob.range(oc * {outW} + {outW} - 1, oc * {outW});
+            result_t tmp;
+            tmp.range() = raw;     // load the already-requantized bit pattern as-is
+            crow[oc] = tmp;
         }}
         res_stream.write(crow);
     }}
@@ -365,158 +323,119 @@ void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream
 
 
 def _kt_dataflow_top(name, plan):
-    """DUT for the K-tiled blackbox (fully-spatial per-tile, SF=NF=1). The activation
-    arrives as one wide beat of ``KT*AB`` (all K_pad activations); the blackbox now sums
-    the ``KT`` per-tile partials, bakes bias, and shift/round/wraps to ``out_width``
-    internally, so it emits one beat of ``NT*PB`` (one out_width lane per column,
-    K-tiling summed away). This top is a pure unpack (no arithmetic) -- the K-tiling
-    counterpart of the single-tile top."""
+    """DUT for the K-tiled blackbox: a straight passthrough into the blackbox, in a
+    dataflow region. One external activation row in, one external result row out --
+    per vector.
+
+    All K-padding (zero-fill to the grid's total k_pad, the per-tile SF_tile-way SIMD
+    fan-out), the K-tile partial-sum, bias bake, and N-padding (N-tile stitching,
+    dropping the pad tail columns) now happen INSIDE ``{name}_core``'s RTL wrapper
+    (and its C twin, ``golden.py``): the boundary this top sees is already
+    ``K*activation_width`` in / ``N*out_width`` out, matching hls4ml's own unpadded
+    TDATA widths exactly -- the K-tiling counterpart of ``_dataflow_top``."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
-    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    PE, NF, MW = t["pe"], t["nf"], t["mw"]
-    SFT = MW // t["simd"]
-    KT, NT = plan["k_tiles"], plan["n_tiles"]
-    A_TOTAL, PB_TOTAL = KT * AB, NT * PB
-    N, outW = plan["n"], plan["output_width"]
-    NTILE = N // NT   # unpadded per-tile column count; the interface presents only these
-    CB = cbits(plan)
+    AW, N, outW = t["activation_width"], plan["n"], plan["output_width"]
+    K = plan["k"]
+    AB = K * AW      # raw, unpadded activation beat (one hls4ml row)
+    PB = N * outW    # raw, unpadded result beat (one hls4ml row)
     pad = ' ' * (len(name) + 6)
+    core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{pad}hls::stream<ap_uint<{PB}> >&);"
     indent = ' ' * (len(name) + 1)
-    apmax = _apmaxw(A_TOTAL)
-    return f"""#define AP_INT_MAX_W {apmax}   // wide K-tiled activation beat (KT*AB={A_TOTAL}) may exceed the 1024-bit default
+    apmax = _apmaxw(max(AB, PB))
+    top_sig = f"void {name}(hls::stream<ap_uint<{AB}> >& a_in,\n{indent}hls::stream<ap_uint<{PB}> >& c_out)"
+    return f"""#define AP_INT_MAX_W {apmax}   // raw K-wide activation row may exceed the 1024-bit default
 #include <hls_stream.h>
 #include <ap_int.h>
 
-void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&,
-{pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
+{core_decl}
 
-static void feed_a(hls::stream<ap_uint<{A_TOTAL}> >& in, hls::stream<ap_uint<{A_TOTAL}> >& out) {{
-    for (int i = 0; i < {m * SFT}; i++) out.write(in.read());
-}}
-
-// Pure unpack: {name}_core already summed the {KT} K-tile partials, added bias (if
-// any) and shift/round-half-up/wrapped to out_width. Slice one lane per column and
-// drop the N-pad tail columns; no arithmetic here.
-static void unpack(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
-    for (int vec = 0; vec < {m}; vec++) {{
-        ap_uint<{CB}> crow = 0;
-        for (int nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{PB_TOTAL}> ob = in.read();
-            for (int j = 0; j < {NT}; j++)
-            for (int pe = 0; pe < {PE}; pe++) {{
-                int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
-                if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
-                int oc = j * {NTILE} + local_oc;
-                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
-                    ob.range(j * {PB} + pe * {outW} + {outW} - 1, j * {PB} + pe * {outW});
-                }}
-            }}
-        }}
-        out.write(crow);
-    }}
-}}
-
-void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in,
-{indent}hls::stream<ap_uint<{CB}> >& c_out) {{
-#pragma HLS DATAFLOW
-    hls::stream<ap_uint<{A_TOTAL}> > a_s;
-    hls::stream<ap_uint<{PB_TOTAL}> > p_s;
-#pragma HLS STREAM variable=a_s depth=4
-#pragma HLS STREAM variable=p_s depth=4
-    feed_a(a_in, a_s);
-    {name}_core(a_s, p_s);   // <-- FINN MVU RTL blackbox ({KT} K-tiles, already summed + requantized)
-    unpack(p_s, c_out);
+// Pure passthrough: {name}_core's RTL wrapper does all K/N padding, the K-tile
+// partial-sum, and the row<->beat fan-out/stitching internally, so the boundary
+// here is already hls4ml's own unpadded row width on both sides -- {m} rows in,
+// {m} rows out.
+{top_sig} {{
+    {name}_core(a_in, c_out);   // <-- FINN MVU RTL blackbox (K-tiles summed, weights + bias baked; already requantized)
 }}
 """
 
 
 def _kt_gemm_ip_header(name, plan):
-    """hls4ml-facing IP for a K-tiled gemm config (fully-spatial per-tile). Repacks the
-    K activations into one wide ``KT*AB`` beat, runs the blackbox (which sums the KT
-    partials, bakes bias, and requantizes internally), and pure-unpacks its already-
-    narrow ``NT*PB`` beat -- the K-tiling twin of ``_gemm_ip_header``."""
+    """hls4ml-facing IP for a K-tiled gemm config. The blackbox's RTL wrapper now does
+    ALL K/N padding, the K-tile partial-sum, and row<->beat fan-out/stitching internally
+    (see ``rtl.py``'s ``_generate_kt_shim`` and its C twin in ``golden.py``), so its port
+    widths are already hls4ml's own unpadded ``data_T``/``res_T`` row widths
+    (``K*activation_width`` in, ``N*out_width`` out). The glue here is therefore a PURE
+    bit-reinterpretation -- one fully-unrolled concatenation per row, zero additional
+    pipeline cycles -- the K-tiling twin of ``_gemm_ip_header``."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
-    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    PE, NF, MW, SIMD = t["pe"], t["nf"], t["mw"], t["simd"]
-    SFT = MW // SIMD
-    KT, NT = plan["k_tiles"], plan["n_tiles"]
-    A_TOTAL, PB_TOTAL = KT * AB, NT * PB
     AW, K, N = t["activation_width"], plan["k"], plan["n"]
-    NTILE = N // NT
-    KPAD = plan["k_pad"]
     outW = plan["output_width"]
+    AB = K * AW      # raw, unpadded activation beat -- must equal data_T::size*AW
+    PB = N * outW    # raw, unpadded result beat -- must equal res_T::size*out_width
     core_hdr_pad = ' ' * (len(name) + 6)
-    apmax = _apmaxw(A_TOTAL)
+    apmax = _apmaxw(max(AB, PB))
+    KT = plan["k_tiles"]
     return f"""#ifndef {name.upper()}_GEMM_IP_H_
 #define {name.upper()}_GEMM_IP_H_
 #ifndef AP_INT_MAX_W
-#define AP_INT_MAX_W {apmax}   // wide K-tiled activation beat (KT*AB={A_TOTAL}) may exceed the 1024-bit default
+#define AP_INT_MAX_W {apmax}   // raw K-wide activation row may exceed the 1024-bit default
 #endif
 #include <hls_stream.h>
 #include <ap_int.h>
 
-// internal FINN-MVU blackbox (K-tiled shim {name}_core.v; C twin {name}_core.cpp) -- sums
-// the {KT} K-tile partials, bakes bias (if any), and shift/round-half-up/wraps to
-// out_width internally.
-void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&,
-{core_hdr_pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
+// internal FINN-MVU blackbox (K-tiled grid shim {name}_core.v; C twin {name}_core.cpp) --
+// ALL K/N padding, the {KT}-way K-tile partial-sum, bias (if any), and the
+// shift/round-half-up/wrap to out_width are baked/performed inside it (RTL wrapper +
+// its C twin), so its ports already sit at hls4ml's own unpadded row widths.
+void {name}_core(hls::stream<ap_uint<{AB}> >&,
+{core_hdr_pad}hls::stream<ap_uint<{PB}> >&);
 
 namespace nnet {{
 
 // Dedicated K-tiled IP for gemm config M={m} K={K} N={N} (core={t['compute_core']},
-// KT={KT} K-tiles of SIMD={t['simd']} each, PE={t['pe']} full-N). Baked geometry.
+// KT={KT} K-tiles). Baked geometry; templated on the hls4ml stream/config types so
+// the combined header can route to it by id.
 
-// repack: {m} rows of K={K} activations -> {m} wide beats of KT*AB (all K_pad lanes,
-// pad lanes 0 -> bit-exact; tile ti reads lanes [ti*AB +: AB]).
+// Pure bit-reinterpretation: hls4ml delivers one full, unpadded K-wide row per beat
+// (data_T::size == K by construction -- enforced below) -- reinterpret it as one
+// K*AW-bit word via a single fully-unrolled concatenation. No lane-by-lane pipelined
+// loop, no padding: {name}_core's RTL wrapper does the K-padding and K-tile split.
 template <class data_T>
-void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{A_TOTAL}> > &a_s) {{
+void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > &a_s) {{
+    static_assert(data_T::size == {K},
+        "{name}: hls4ml must deliver one full, unpadded K-wide row per stream beat");
     for (unsigned mm = 0; mm < {m}; mm++) {{
-        ap_int<{AW}> arow[{KPAD}];
-        #pragma HLS ARRAY_PARTITION variable=arow complete
-        for (unsigned i = 0; i < {KPAD}; i++) {{
+        data_T beat = a_stream.read();
+        ap_uint<{AB}> ab;
+        for (unsigned j = 0; j < {K}; j++) {{
             #pragma HLS UNROLL
-            arow[i] = 0;   // zero-fill the K-pad lanes (their weights are 0 -> bit-exact)
+            ab.range(j * {AW} + {AW} - 1, j * {AW}) = beat[j].range({AW} - 1, 0);
         }}
-        for (unsigned kp = 0; kp < {K} / data_T::size; kp++) {{
-            data_T beat = a_stream.read();
-            for (unsigned j = 0; j < data_T::size; j++) arow[kp * data_T::size + j] = beat[j].range({AW} - 1, 0);
-        }}
-        // emit SF_tile beats/vector; band sf carries each tile's SIMD lanes at [ti*AB +: AB]
-        for (unsigned sf = 0; sf < {SFT}; sf++) {{
-            ap_uint<{A_TOTAL}> ab = 0;
-            for (unsigned ti = 0; ti < {KT}; ti++)
-                for (unsigned s = 0; s < {SIMD}; s++)
-                    ab.range(ti * {AB} + s * {AW} + {AW} - 1, ti * {AB} + s * {AW}) =
-                        (ap_uint<{AW}>)arow[ti * {MW} + sf * {SIMD} + s];
-            a_s.write(ab);
-        }}
+        a_s.write(ab);
     }}
 }}
 
-// Pure unpack: {name}_core already summed the {KT} K-tile partials, added bias (if
-// any), and shift/round-half-up/wrapped to out_width. Slice one out_width lane per
-// column and drop the N-pad tail columns; loaded via .range() (raw bit pattern),
-// never a value-preserving conversion, since it is already rounded/wrapped.
+// Pure bit-reinterpretation: {name}_core's RTL wrapper already emits one full,
+// unpadded N-wide row of requantized out_width-bit-per-lane codes per beat (the
+// {KT} K-tile partials summed, bias, shift, round-half-up, wrap, N-tile stitching
+// and pad-column drop all happened inside it -- see golden.py's core twin and the
+// RTL requant stage). Slice one lane per column via a single fully-unrolled loop;
+// loaded via .range() (raw bit pattern), never a value-preserving conversion,
+// since the value is already rounded/wrapped and re-converting would corrupt it.
 template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &res_stream) {{
+void {name}_drain(hls::stream<ap_uint<{PB}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
     for (unsigned mm = 0; mm < {m}; mm++) {{
+        ap_uint<{PB}> ob = p_s.read();
         res_T crow;
-        for (unsigned nf = 0; nf < {NF}; nf++) {{     // NF partial beats/vector, PE columns each
-            ap_uint<{PB_TOTAL}> ob = p_s.read();
-            for (unsigned j = 0; j < {NT}; j++)
-            for (unsigned pe = 0; pe < {PE}; pe++) {{
-                unsigned local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
-                if (local_oc < {NTILE}) {{             // drop the N-pad tail columns
-                unsigned oc = j * {NTILE} + local_oc;
-                ap_uint<{outW}> raw = ob.range(j * {PB} + pe * {outW} + {outW} - 1, j * {PB} + pe * {outW});
-                result_t tmp;
-                tmp.range() = raw;
-                crow[oc] = tmp;
-                }}
-            }}
+        for (unsigned oc = 0; oc < {N}; oc++) {{
+            #pragma HLS UNROLL
+            ap_uint<{outW}> raw = ob.range(oc * {outW} + {outW} - 1, oc * {outW});
+            result_t tmp;
+            tmp.range() = raw;     // load the already-requantized bit pattern as-is
+            crow[oc] = tmp;
         }}
         res_stream.write(crow);
     }}
@@ -528,8 +447,8 @@ void {name}_drain(hls::stream<ap_uint<{PB_TOTAL}> > &p_s, hls::stream<res_T> &re
 template <class data_T, class res_T, typename CONFIG_T>
 void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream) {{
 #pragma HLS DATAFLOW
-    hls::stream<ap_uint<{A_TOTAL}> > a_s;
-    hls::stream<ap_uint<{PB_TOTAL}> > p_s;
+    hls::stream<ap_uint<{AB}> > a_s;
+    hls::stream<ap_uint<{PB}> > p_s;
 #pragma HLS STREAM variable=a_s depth=4
 #pragma HLS STREAM variable=p_s depth=4
     {name}_repack_a<data_T>(a_stream, a_s);
@@ -573,21 +492,22 @@ static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >&
 
 // Pure unpack (no bias -- two-operand GEMM never has one): {name}_core already
 // shift/round-half-up/wrapped each lane to out_width. Beat nf lane pe holds output
-// column nf*PE+pe.
+// column nf*PE+pe. Walks one beat (one p_s.read()) per loop iteration -- rather
+// than NF reads per row inside one iteration -- so a PIPELINE II=1 loop can
+// actually schedule at II=1 per beat (II=NF per row, same throughput either way).
 static void unpack(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
-    for (int vec = 0; vec < {m}; vec++) {{
-        ap_uint<{CB}> crow = 0;
-        for (int nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{PB}> ob = in.read();
-            for (int pe = 0; pe < {PE}; pe++) {{
-                int oc = nf * {PE} + pe;
-                if (oc < {N}) {{   // drop the N-pad tail columns (untiled: n_tile == n)
-                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
-                    ob.range(pe * {outW} + {outW} - 1, pe * {outW});
-                }}
+    ap_uint<{CB}> crow = 0;
+    for (int bt = 0; bt < {m * NF}; bt++) {{
+        int nf = bt % {NF};
+        ap_uint<{PB}> ob = in.read();
+        for (int pe = 0; pe < {PE}; pe++) {{
+            int oc = nf * {PE} + pe;
+            if (oc < {N}) {{   // drop the N-pad tail columns (untiled: n_tile == n)
+            crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
+                ob.range(pe * {outW} + {outW} - 1, pe * {outW});
             }}
         }}
-        out.write(crow);
+        if (nf == {NF} - 1) out.write(crow);
     }}
 }}
 
@@ -604,6 +524,64 @@ void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in
     feed_b(b_in, b_s);
     {name}_core(a_s, b_s, p_s);   // <-- FINN MVU RTL blackbox (B loaded+replayed in-core; already requantized)
     unpack(p_s, c_out);
+}}
+"""
+
+
+def _2op_reg_dataflow_top(name, plan):
+    """DUT for the fully-spatial two-operand grid blackbox (register shim, unpadded
+    boundary): pure passthrough of the raw K*AW activation row and the K raw N*WW
+    B-row beats into the core, one raw N*out_width result row out per vector. All
+    K-padding, K-tile summation and N-tile stitching happen inside {name}_core's RTL
+    wrapper (see rtl.py's ``_2op_grid_register_shim`` and its C twin in golden.py)."""
+    t = plan["tile"]
+    m = plan["num_input_vectors"]
+    AW, N, outW, WW = t["activation_width"], plan["n"], plan["output_width"], t["weight_width"]
+    K = plan["k"]
+    ARAW = K * AW
+    BRAW = N * WW
+    PRAW = N * outW
+    pad = ' ' * (len(name) + 6)
+    indent = ' ' * (len(name) + 1)
+    apmax = _apmaxw(max(ARAW, BRAW, PRAW))
+    top_sig = (f"void {name}(hls::stream<ap_uint<{ARAW}> >& a_in,\n"
+               f"{indent}hls::stream<ap_uint<{BRAW}> >& b_in,\n"
+               f"{indent}hls::stream<ap_uint<{PRAW}> >& c_out)")
+    return f"""#define AP_INT_MAX_W {apmax}   // raw K-wide activation row may exceed the 1024-bit default
+#include <hls_stream.h>
+#include <ap_int.h>
+
+void {name}_core(hls::stream<ap_uint<{ARAW}> >&, hls::stream<ap_uint<{BRAW}> >&,
+{pad}hls::stream<ap_uint<{PRAW}> >&);
+
+static void feed_a(hls::stream<ap_uint<{ARAW}> >& in, hls::stream<ap_uint<{ARAW}> >& out) {{
+    for (int i = 0; i < {m}; i++) out.write(in.read());
+}}
+static void feed_b(hls::stream<ap_uint<{BRAW}> >& in, hls::stream<ap_uint<{BRAW}> >& out) {{
+    for (int i = 0; i < {K}; i++) out.write(in.read());
+}}
+static void drain_c(hls::stream<ap_uint<{PRAW}> >& in, hls::stream<ap_uint<{PRAW}> >& out) {{
+    for (int i = 0; i < {m}; i++) out.write(in.read());
+}}
+
+// Pure passthrough: {name}_core's RTL wrapper does all K/N padding, the K-tile
+// partial-sum and the N-tile stitching internally, so the boundary here is already
+// hls4ml's own unpadded row width on both sides -- {m} rows in, {m} rows out. The
+// blackbox's output cannot bind directly to the top-level c_out argument (Vitis
+// rejects passing a top-level interface stream straight into a blackbox port), so
+// drain_c copies it through an internal buffer, same as feed_a/feed_b on the input side.
+{top_sig} {{
+#pragma HLS DATAFLOW
+    hls::stream<ap_uint<{ARAW}> > a_s;
+    hls::stream<ap_uint<{BRAW}> > b_s;
+    hls::stream<ap_uint<{PRAW}> > p_s;
+#pragma HLS STREAM variable=a_s depth=4
+#pragma HLS STREAM variable=b_s depth=4
+#pragma HLS STREAM variable=p_s depth=4
+    feed_a(a_in, a_s);
+    feed_b(b_in, b_s);
+    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU RTL blackbox (K-tiles summed, B in-core; already requantized)
+    drain_c(p_s, c_out);
 }}
 """
 
@@ -644,22 +622,24 @@ static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >&
 
 // Pure unpack (no bias): {name}_core already summed the gk K-partials per column and
 // shift/round-half-up/wrapped to out_width. Concatenate the nt N-slices; no arithmetic.
+// Walks one beat (one p_s.read()) per loop iteration -- rather than NF reads per row
+// inside one iteration -- so a PIPELINE II=1 loop can actually schedule at II=1 per
+// beat (II=NF per row, same throughput either way).
 static void unpack(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
-    for (int vec = 0; vec < {m}; vec++) {{
-        ap_uint<{CB}> crow = 0;
-        for (int nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{PB_TOTAL}> ob = in.read();
-            for (int j = 0; j < {nt}; j++)
-            for (int pe = 0; pe < {PE}; pe++) {{
-                int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
-                if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
-                int oc = j * {NTILE} + local_oc;
-                crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
-                    ob.range(j * {PB} + pe * {outW} + {outW} - 1, j * {PB} + pe * {outW});
-                }}
+    ap_uint<{CB}> crow = 0;
+    for (int bt = 0; bt < {m * NF}; bt++) {{
+        int nf = bt % {NF};
+        ap_uint<{PB_TOTAL}> ob = in.read();
+        for (int j = 0; j < {nt}; j++)
+        for (int pe = 0; pe < {PE}; pe++) {{
+            int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
+            if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
+            int oc = j * {NTILE} + local_oc;
+            crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
+                ob.range(j * {PB} + pe * {outW} + {outW} - 1, j * {PB} + pe * {outW});
             }}
         }}
-        out.write(crow);
+        if (nf == {NF} - 1) out.write(crow);
     }}
 }}
 
@@ -680,13 +660,148 @@ void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in, hls::stream<ap_uint<{BB}> >&
 """
 
 
+def _2op_register_form(plan):
+    """True for the fully-spatial (DEPTH_tile = SF_tile*NF == 1) grid shim
+    (``_2op_grid_register_shim``) -- the only two-operand RTL form with an UNPADDED
+    boundary today; see ``golden.py``'s twin of the same name."""
+    t = plan["tile"]
+    return t["sf"] == 1 and t["nf"] == 1
+
+
+def _2op_reg_gemm_ip_header(name, plan):
+    """hls4ml-facing two-operand IP for the fully-spatial grid form (register shim):
+    the RTL wrapper does ALL K/N padding, the K-tile partial-sum, and N-tile
+    stitching internally (see rtl.py's ``_2op_grid_register_shim`` and its C twin in
+    golden.py), so its ports already sit at hls4ml's own unpadded row widths
+    (``K*activation_width`` A in, one raw ``N*weight_width`` K-row B beat, ``N*out_width``
+    C out). The glue here is therefore a PURE bit-reinterpretation on both operands --
+    no lane-by-lane repack/drain loop, no padding."""
+    t = plan["tile"]
+    m = plan["num_input_vectors"]
+    AW, WW, K, N = t["activation_width"], t["weight_width"], plan["k"], plan["n"]
+    outW = plan["output_width"]
+    ARAW = K * AW
+    BRAW = N * WW
+    PRAW = N * outW
+    core_pad = ' ' * (len(name) + 6)
+    apmax = _apmaxw(max(ARAW, BRAW, PRAW))
+    guard = (f"#ifndef AP_INT_MAX_W\n#define AP_INT_MAX_W {apmax}\n#endif\n"
+             if max(ARAW, BRAW, PRAW) > 1024 else "")
+    return f"""#ifndef {name.upper()}_GEMM_IP_H_
+#define {name.upper()}_GEMM_IP_H_
+{guard}#include <hls_stream.h>
+#include <ap_int.h>
+
+// internal FINN-MVU blackbox (fully-spatial two-operand grid shim {name}_core.v; C twin
+// {name}_core.cpp) -- ALL K/N padding, the K-tile partial-sum, and the shift/round-half-
+// up/wrap to out_width are baked/performed inside it, so its ports already sit at
+// hls4ml's own unpadded row widths.
+void {name}_core(hls::stream<ap_uint<{ARAW}> >&, hls::stream<ap_uint<{BRAW}> >&,
+{core_pad}hls::stream<ap_uint<{PRAW}> >&);
+
+namespace nnet {{
+
+// Dedicated two-operand IP for gemm config M={m} K={K} N={N} (core={t['compute_core']}).
+// B MUST arrive row-major: data1_T::size == N, one K-row per beat (SecondOperandRowMajor).
+
+// Pure bit-reinterpretation: hls4ml delivers one full, unpadded K-wide row per beat
+// (data0_T::size == K by construction -- enforced below) -- reinterpret it via a single
+// fully-unrolled concatenation. No padding: {name}_core's RTL wrapper does the K-padding.
+template <class data0_T>
+void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{ARAW}> > &a_s) {{
+    static_assert(data0_T::size == {K},
+        "{name}: hls4ml must deliver one full, unpadded K-wide row per stream beat");
+    for (unsigned mm = 0; mm < {m}; mm++) {{
+        data0_T beat = a_stream.read();
+        ap_uint<{ARAW}> ab;
+        for (unsigned j = 0; j < {K}; j++) {{
+            #pragma HLS UNROLL
+            ab.range(j * {AW} + {AW} - 1, j * {AW}) = beat[j].range({AW} - 1, 0);
+        }}
+        a_s.write(ab);
+    }}
+}}
+
+// Pure bit-reinterpretation: one raw, unpadded N-wide K-row beat per hls4ml beat
+// (data1_T::size == N by construction -- enforced below); {name}_core's RTL wrapper
+// does the K_pad tail-row zero-fill internally, so only the {K} real rows are sent.
+template <class data1_T>
+void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BRAW}> > &b_s) {{
+    static_assert(data1_T::size == {N},
+        "{name}: hls4ml must deliver one full, unpadded N-wide K-row per stream beat");
+    for (unsigned k = 0; k < {K}; k++) {{
+        data1_T beat = b_stream.read();
+        ap_uint<{BRAW}> bb;
+        for (unsigned n = 0; n < {N}; n++) {{
+            #pragma HLS UNROLL
+            bb.range(n * {WW} + {WW} - 1, n * {WW}) = beat[n].range({WW} - 1, 0);
+        }}
+        b_s.write(bb);
+    }}
+}}
+
+// Pure bit-reinterpretation: {name}_core's RTL wrapper already emits one full,
+// unpadded N-wide row of requantized out_width-bit-per-lane codes per beat (the
+// K-tile partials summed, shift, round-half-up, wrap and N-tile stitching all
+// happened inside it). Loaded via .range() (raw bit pattern), never a value-
+// preserving conversion, since the value is already rounded/wrapped. Two-operand
+// GEMM never carries a real bias (has_bias is always False by construction).
+template <class res_T, typename CONFIG_T>
+void {name}_drain(hls::stream<ap_uint<{PRAW}> > &p_s, hls::stream<res_T> &res_stream) {{
+    typedef typename res_T::value_type result_t;
+    for (unsigned mm = 0; mm < {m}; mm++) {{
+        ap_uint<{PRAW}> ob = p_s.read();
+        res_T crow;
+        for (unsigned oc = 0; oc < {N}; oc++) {{
+            #pragma HLS UNROLL
+            ap_uint<{outW}> raw = ob.range(oc * {outW} + {outW} - 1, oc * {outW});
+            result_t tmp;
+            tmp.range() = raw;
+            crow[oc] = tmp;
+        }}
+        res_stream.write(crow);
+    }}
+}}
+
+// The dedicated IP: hls4ml io_stream two-operand GEMM -> internal MVU blackbox.
+// Two-operand GEMM never has a real bias, so hls4ml's call site carries no bias
+// parameter at all -- there is only ever this one signature.
+template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
+void {name}_gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
+{' ' * (len(name) + 17)}hls::stream<res_T> &res_stream) {{
+#pragma HLS DATAFLOW
+    hls::stream<ap_uint<{ARAW}> > a_s;
+    hls::stream<ap_uint<{BRAW}> > b_s;
+    hls::stream<ap_uint<{PRAW}> > p_s;
+#pragma HLS STREAM variable=a_s depth=4
+#pragma HLS STREAM variable=b_s depth={K + 2}
+#pragma HLS STREAM variable=p_s depth=4
+    {name}_repack_a<data0_T>(a_stream, a_s);
+    {name}_repack_b<data1_T>(b_stream, b_s);
+    {name}_core(a_s, b_s, p_s);
+    {name}_drain<res_T, CONFIG_T>(p_s, res_stream);
+}}
+
+}} // namespace nnet
+#endif
+"""
+
+
 def _2op_gemm_ip_header(name, plan):
     """hls4ml-facing two-operand IP: ``<name>_gemm_stream<data0_T,data1_T,res_T,CONFIG_T>``
     (repack A -> shim activations, repack B -> shim N-wide K-row beats, internal MVU blackbox,
     requant drain). Requires B streamed **row-major** (data1_T::size == N, one K-row per beat);
     hls4ml must set SecondOperandRowMajor=True to route here. Handles the three shim forms:
-    kt (K-tiled register / fully-spatial, wide activation, summed partials), nt (N-tiled memstream,
-    broadcast activation, concatenated), single (temporal memstream)."""
+    kt (K-tiled register / fully-spatial, wide activation, summed partials), nt/kt memstream
+    grid (any per-tile fold, still wide-activation + summed/concatenated), single (temporal
+    memstream, no tiling). The fully-spatial (register) form AND the memstream grid form
+    (nt>1 or k_tiles>1) both now have an UNPADDED RTL boundary (``_2op_grid_register_shim``
+    / ``_2op_grid_memstream_shim`` in rtl.py do ALL K/N padding, SIMD fan-out, K-tile
+    partial-sum, and N-tile stitching internally) -- both dispatch to the same
+    ``_2op_reg_gemm_ip_header`` bit-reinterpretation. Only the remaining untiled single-tile
+    temporal-fold form (n_tiles==1, k_tiles==1) keeps the older, padded-boundary body below."""
+    if _2op_register_form(plan) or plan["n_tiles"] > 1 or plan.get("k_tiles", 1) > 1:
+        return _2op_reg_gemm_ip_header(name, plan)
     t = plan["tile"]
     m = plan["num_input_vectors"]
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
@@ -763,6 +878,7 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
     # operand GEMM never carries a real bias (has_bias is always False by
     # construction). Loaded via .range() (raw bit pattern), never a value-preserving
     # conversion, since the value is already rounded/wrapped.
+    flat_drain = False
     if kt_form:
         drain_body = f"""        ap_uint<{p_width}> ob = p_s.read();
         for (unsigned oc = 0; oc < {N}; oc++) {{
@@ -781,17 +897,45 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
                 }}
             }}"""
     else:
-        drain_body = f"""        for (unsigned nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{p_width}> ob = p_s.read();
-            for (unsigned pe = 0; pe < {PE}; pe++) {{
-                unsigned local_oc = nf * {PE} + pe;
-                if (local_oc < {N}) {{   // drop the N-pad tail columns (n_tiles==1 here)
-                unsigned oc = local_oc;
-                ap_uint<{outW}> raw = ob.range(pe * {outW} + {outW} - 1, pe * {outW});
-                result_t tmp; tmp.range() = raw; crow[oc] = tmp;
-                }}
+        # NF>1 here means the drain must read NF beats per output row. Reading all NF
+        # beats inside a single PIPELINE II=1 loop iteration is unschedulable at II=1
+        # (Vitis emits HLS-200-880 and silently falls back to II=NF per row anyway --
+        # same throughput, but the [verify] step flags the warning as a failure), so
+        # instead the flat_drain path below walks one beat per loop iteration
+        # (trip count m*NF) and only fires res_stream.write on the last beat of each
+        # row -- true II=1 per beat, II=NF per row, identical lane placement/pad-drop.
+        flat_drain = True
+        drain_body = f"""        unsigned nf = bt % {NF};
+        ap_uint<{p_width}> ob = p_s.read();
+        for (unsigned pe = 0; pe < {PE}; pe++) {{
+            unsigned local_oc = nf * {PE} + pe;
+            if (local_oc < {N}) {{   // drop the N-pad tail columns (n_tiles==1 here)
+            unsigned oc = local_oc;
+            ap_uint<{outW}> raw = ob.range(pe * {outW} + {outW} - 1, pe * {outW});
+            result_t tmp; tmp.range() = raw; crow[oc] = tmp;
             }}
-        }}"""
+        }}
+        if (nf == {NF} - 1) res_stream.write(crow);"""
+
+    if flat_drain:
+        drain_fn = f"""template <class res_T, typename CONFIG_T>
+void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream) {{
+    typedef typename res_T::value_type result_t;
+    res_T crow;
+    for (unsigned bt = 0; bt < {m * NF}; bt++) {{
+{drain_body}
+    }}
+}}"""
+    else:
+        drain_fn = f"""template <class res_T, typename CONFIG_T>
+void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream) {{
+    typedef typename res_T::value_type result_t;
+    for (unsigned mm = 0; mm < {m}; mm++) {{
+        res_T crow;
+{drain_body}
+        res_stream.write(crow);
+    }}
+}}"""
 
     return f"""#ifndef {name.upper()}_GEMM_IP_H_
 #define {name.upper()}_GEMM_IP_H_
@@ -825,15 +969,7 @@ void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BB}> >
 // pure unpack drain: no bias for two-operand GEMM (has_bias is always False by
 // construction) -- {name}_core already requantized each lane to out_width; this
 // only slices lanes and loads them via .range() (raw bit pattern).
-template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream) {{
-    typedef typename res_T::value_type result_t;
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        res_T crow;
-{drain_body}
-        res_stream.write(crow);
-    }}
-}}
+{drain_fn}
 
 // The dedicated IP: hls4ml io_stream two-operand GEMM -> internal MVU blackbox.
 // Two-operand GEMM never has a real bias, so hls4ml's call site carries no bias
@@ -929,10 +1065,19 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     (pkg / "rtl_static").mkdir(parents=True, exist_ok=True)
 
     force_behavioral = bool(cfg.get("force_behavioral", False))
+    # Both the fully-spatial grid (SF=NF=1) and the memstream grid (nt>1 or k_tiles>1,
+    # any per-tile fold) now present an UNPADDED RTL boundary -- see rtl.py's
+    # _2op_grid_register_shim / _2op_grid_memstream_shim -- so both use the same pure-
+    # passthrough dataflow top. Only the untiled single-tile temporal fold (nt==1,
+    # k_tiles==1) keeps the older, padded-boundary top.
+    grid_form = nt > 1 or kt > 1
+    reg_form = _2op_register_form(plan)
     if nt > 1:
-        shim, top_src = (_rtl.generate_two_operand_nt_shim, _2op_kt_dataflow_top(name, plan))
+        shim = _rtl.generate_two_operand_nt_shim
+        top_src = _2op_reg_dataflow_top(name, plan) if (reg_form or grid_form) else _2op_kt_dataflow_top(name, plan)
     elif use_kt:
-        shim, top_src = (_rtl.generate_two_operand_kt_shim, _2op_kt_dataflow_top(name, plan))
+        shim = _rtl.generate_two_operand_kt_shim
+        top_src = _2op_reg_dataflow_top(name, plan) if (reg_form or grid_form) else _2op_kt_dataflow_top(name, plan)
     else:
         shim, top_src = (_rtl.generate_two_operand_shim, _2op_dataflow_top(name, plan))
     (pkg / f"{name}_core.v").write_text(_with_timescale(
@@ -1088,7 +1233,8 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
         _rtl.generate_shim(shape, module_name=f"{name}_core",
                            force_behavioral=force_behavioral, tile=t,
                            weights_in_core=True, init_files=init_files,
-                           n_tiles=NT, k_tiles=KT, bias_codes=bias_codes)))
+                           n_tiles=NT, k_tiles=KT, bias_codes=bias_codes,
+                           raw_k=plan["k"], raw_n=plan["n"])))
     (pkg / f"{name}_core.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_core_twin(shape, func_name=f"{name}_core", plan=plan,
                                    baked_weights=B, bias_codes=bias_codes)))
@@ -1253,7 +1399,7 @@ def _resolve_manifest_plan(it):
 
 def _reuse_factor_warnings(plan):
     """hls4ml's ReuseFactor-legalization warning text (see run_atlas_flow.py's
-    ``_snap_reuse_factor`` for the generic target); ``resolve_fold`` already renders
+    ``_snap_reuse_factor`` for the v-generic target); ``resolve_fold`` already renders
     the warning strings (with the layer name baked in via the ``name`` config key)."""
     return plan.get("fold_warnings", [])
 
