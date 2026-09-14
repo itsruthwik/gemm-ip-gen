@@ -18,17 +18,16 @@ share the guard ``GEMM_IP_COMBINED_H_`` (so the second was skipped) and both def
 ``gemm_stream_const_weights`` (an ODR clash) — the blackbox IP was never actually called.
 """
 
-import sys
-from pathlib import Path
+# Reuse the Vitis generic target's soft compute templates verbatim (single source
+# of truth) -- the only tool a mixed per-layer design can combine with an IP target
+# today (mvau is Vitis-only too).
+from targets.v_generic import hls as _ghls
 
-# Reuse the generic target's soft compute templates verbatim (single source of truth).
-_generic_dir = str(Path(__file__).resolve().parents[1] / "targets" / "generic")
-if _generic_dir not in sys.path:
-    sys.path.insert(0, _generic_dir)
-import hls as _ghls  # noqa: E402
-
-# Targets whose layers are behavioral (no per-IP blackbox header) and so ride the soft
-# dispatch primary rather than a specialization.
+# Target names whose layers are behavioral (no per-IP blackbox header) and so ride
+# the soft dispatch primary rather than a specialization. There is now exactly one
+# user-facing behavioral target name ("generic") regardless of tool (vitis/catapult);
+# kept as a set (rather than a bare string) so a future second behavioral name is a
+# one-line add, not a rework.
 _BEHAVIORAL_TARGETS = {"generic"}
 
 
@@ -91,11 +90,11 @@ def unified_combined_header(layers):
         "        a_stream, b_stream, res_stream);\n"
         "}\n")
 
-    # The soft primary (generic fallback) is built from _GEMM_IP_COMBINED_FUNCS, whose
-    # kernels reference gemm_rf<CONFIG_T> and gemm_ip_has_bias<CONFIG_T::gemm_ip_id>. The
-    # single-target generic combined_header prepends both traits before that body; the mixed
-    # merge must do the same, keyed on each layer's manifest fields. (gemm_strategy is not
-    # needed: combine.py uses the latency kernels directly, not the strategy dispatcher.)
+    # The soft primary (generic fallback) is built from _GEMM_IP_COMBINED_FUNCS (the
+    # generic target's resource core), whose kernels reference gemm_rf<CONFIG_T> and
+    # gemm_ip_has_bias<CONFIG_T::gemm_ip_id>. The single-target generic combined_header
+    # prepends both traits before that body; the mixed merge must do the same, keyed on
+    # each layer's manifest fields.
     trait_items = [{"gemm_ip_index": l["id"], "has_bias": l.get("has_bias"),
                     "reuse_factor": l.get("reuse_factor"),
                     "gemm_k": l.get("gemm_k"), "gemm_n": l.get("gemm_n")} for l in layers]

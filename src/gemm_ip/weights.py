@@ -15,17 +15,9 @@ testbench uses (``pack_b_chunk``), so the baked ROM is byte-identical to the bea
 sequence the external port would have received — cosim stays bit-exact.
 """
 
-import sys as _sys
 from pathlib import Path
 
 import numpy as np
-
-
-def _ts_dir_on_path():
-    ts_dir = str(Path(__file__).resolve().parent.parent / "targets" / "tensor_slice")
-    if ts_dir not in _sys.path:
-        _sys.path.insert(0, ts_dir)
-
 
 def load_weight_dat(path, n, k, layout="column_major"):
     """Load an hls4ml raw-int weight ``.dat`` as ``B`` shaped ``[K, N]``.
@@ -65,8 +57,7 @@ def build_weight_rom(B, m, n, k):
     exact ``for chunk: for t`` order the RUN loop consumes (see ``_gen_all_stimulus``
     in ``golden.py``). ``B`` is ``[K, N]``.
     """
-    _ts_dir_on_path()
-    from golden import pack_b_chunk  # noqa: F401
+    from targets.tensor_slice.golden import pack_b_chunk
 
     grid_cols = (n + 7) // 8
     k_chunks = (k + 7) // 8
@@ -104,8 +95,7 @@ def build_weight_rom_k_spatial(B, m, n, k, k_spatial):
     """
     if k_spatial == 1:
         return build_weight_rom(B, m, n, k)
-    _ts_dir_on_path()
-    from golden import pack_b_k_spatial_narrow  # noqa: F401
+    from targets.tensor_slice.golden import pack_b_k_spatial_narrow
 
     k_chunks = (k + 7) // 8
     passes = -(-k_chunks // k_spatial)

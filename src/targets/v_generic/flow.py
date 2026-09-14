@@ -1,4 +1,4 @@
-"""generic target: behavioral-HLS GEMM for Vitis, bound to the Target contract.
+"""v-generic target: behavioral-HLS GEMM for Vitis, bound to the Target contract.
 
 No RTL blackbox / hardblock — Vitis HLS synthesizes the emitted C++ directly. The
 four func types (stream / array x weighted / const_weights) are the hls4ml Vitis seam
@@ -10,76 +10,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-_targets_root = str(Path(__file__).resolve().parent.parent)
-if _targets_root not in sys.path:
-    sys.path.insert(0, _targets_root)
-_here = str(Path(__file__).resolve().parent)
-if _here not in sys.path:
-    sys.path.insert(0, _here)
+from ..base import Target
+from . import hls as _hls
+from . import golden as _golden
+from . import package as _package
 
-from base import Target  # noqa: E402
-import hls as _hls  # noqa: E402
-import golden as _golden  # noqa: E402
-import package as _package  # noqa: E402
-
-
-def _valid_reuse_factors(n_in, n_out):
-    """hls4ml's reuse-factor rules (fpga_backend._validate_reuse_factor), verbatim:
-    rf must divide n_in*n_out; below n_in the multiplier count must be a multiple of
-    n_out; above n_in, rf must be a multiple of n_in."""
-    import math
-    valid = []
-    for rf in range(1, n_in * n_out + 1):
-        multfactor = min(n_in, rf)
-        multiplier_limit = int(math.ceil((n_in * n_out) / float(multfactor)))
-        ok = ((multiplier_limit % n_out) == 0) or (rf >= n_in)
-        ok = ok and (((rf % n_in) == 0) or (rf < n_in))
-        ok = ok and (((n_in * n_out) % rf) == 0)
-        if ok:
-            valid.append(rf)
-    return valid
-
-
-def _closest_reuse_factor(valid_rf, chosen_rf):
-    """hls4ml's get_closest_reuse_factor: nearest valid value, smaller on ties."""
-    from bisect import bisect_left
-    pos = bisect_left(valid_rf, chosen_rf)
-    if pos == 0:
-        return valid_rf[0]
-    if pos == len(valid_rf):
-        return valid_rf[-1]
-    before, after = valid_rf[pos - 1], valid_rf[pos]
-    return before if (after - chosen_rf) >= (chosen_rf - before) else after
-
-
-def _snap_reuse_factor(item):
-    """Legalize a manifest item's ReuseFactor against hls4ml's validation rules.
-
-    ReuseFactor is a pure pass-through from hls4ml's HLSConfig into the manifest
-    (no ATLASConfig knob for it) -- but hls4ml's init_dense skips
-    set_closest_reuse_factor for Strategy=GEMM layers, so the raw HLSConfig value
-    reaches this manifest unvalidated; the generic resource core then builds the
-    remainder regime with a non-dividing block factor (several x the area of the
-    snapped point). So the generic target legalizes it itself here: snap, print
-    hls4ml's own warning, keep the request as reuse_factor_requested. The combined
-    header reads the snapped value from the manifest (gemm_rf<CONFIG_T>) instead of
-    hls4ml's CONFIG_T::reuse_factor.
-    """
-    name = item.get("name", "?")
-    n_in = int(item.get("gemm_k", item.get("k", item.get("n_in", 0))) or 0)
-    n_out = int(item.get("gemm_n", item.get("n", item.get("n_out", 0))) or 0)
-    chosen = int(item.get("reuse_factor", 1) or 1)
-    item["reuse_factor_requested"] = chosen
-    if n_in <= 0 or n_out <= 0:
-        return
-    valid = _valid_reuse_factors(n_in, n_out)
-    if chosen in valid:
-        return
-    closest = _closest_reuse_factor(valid, chosen)
-    print(f'WARNING: Invalid ReuseFactor={chosen} in layer "{name}".'
-          f'Using ReuseFactor={closest} instead. Valid ReuseFactor(s): '
-          f'{",".join(map(str, valid))}.')
-    item["reuse_factor"] = closest
+from gemm_ip.behavioral import geometry as _behavioral_geometry
+from gemm_ip.behavioral import snap_reuse_factor as _snap_reuse_factor  # noqa: F401
 
 
 class GenericTarget(Target):
@@ -88,19 +25,15 @@ class GenericTarget(Target):
     # The combined header reads either ROM order straight from CONFIG_T (weights_row_major).
     weight_layouts = ("column_major", "row_major")
 
-    knobs = [
-        {"name": "Strategy", "key": "strategy", "type": "enum",
-         "choices": ("latency", "resource"), "default": "latency",
-         "description": "which generic kernel body to emit"},
-    ]
+    # Resource-only target: no per-layer knobs (see jojo-track/open/generic-vitis-target).
+    knobs = []
 
     def geometry(self, shape):
-        m, k, n = shape
-        return {"gemm_m": m, "gemm_k": k, "gemm_n": n, "n_in": k, "n_out": n}
+        return _behavioral_geometry(shape)
 
     def emit_rtl(self, shape, **kwargs):
         raise NotImplementedError(
-            "generic is a behavioral-HLS target: Vitis HLS generates the RTL from "
+            "generic (vitis) is a behavioral-HLS target: Vitis HLS generates the RTL from "
             "C++; there is no hand-written RTL. Use emit_behavioral() / package().")
 
     def emit_behavioral(self, shape, name="gemm_generic", **kwargs):
@@ -179,8 +112,8 @@ class GenericTarget(Target):
         return items
 
     def combined_header(self, items):
-        # Shape-generic: one templated definition covers every layer. items drives
-        # the compile-time gemm_strategy<id> dispatch (latency vs resource per layer).
+        # Shape-generic: one templated (resource-only) definition covers every layer.
+        # items still drives the per-layer gemm_rf / gemm_ip_has_bias traits.
         return _hls.combined_header(items)
 
     def integration_manifest(self, items):

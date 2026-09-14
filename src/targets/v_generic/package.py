@@ -1,4 +1,4 @@
-"""Assemble a `generic` behavioral-HLS GEMM package for Vitis HLS.
+"""Assemble a `v-generic` behavioral-HLS GEMM package for Vitis HLS.
 
 No RTL blackbox: the package is plain synthesizable C++ that Vitis HLS turns into
 RTL. Emits, per ``<name>``: nnet_types.h, <name>_gemm_ip.h (the four funcs),
@@ -6,15 +6,10 @@ RTL. Emits, per ``<name>``: nnet_types.h, <name>_gemm_ip.h (the four funcs),
 (weight-stationary ROM), and run_vitis.tcl (csim + csynth, no -blackbox).
 """
 
-import sys
 from pathlib import Path
 
-_here = str(Path(__file__).resolve().parent)
-if _here not in sys.path:
-    sys.path.insert(0, _here)
-
-import hls as _hls  # noqa: E402
-import golden as _golden  # noqa: E402
+from . import hls as _hls
+from . import golden as _golden
 
 DEFAULT_PART = "xcvu13p-flga2577-2-e"
 
@@ -48,11 +43,11 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
                          input_precision=None, weight_precision=None,
                          output_precision=None, bias_precision=None,
                          accum_precision=None, part=DEFAULT_PART, clock_period_ns=5,
-                         strategy="latency", reuse_factor=1,
+                         reuse_factor=1,
                          has_bias=None, bias=None,
                          **_ignored):
     if interface not in ("stream", "array"):
-        raise ValueError(f"generic target: unsupported interface '{interface}'")
+        raise ValueError(f"generic (vitis) target: unsupported interface '{interface}'")
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -79,7 +74,7 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
 
     (pkg_dir / "nnet_types.h").write_text(_hls.nnet_types_header())
     (pkg_dir / f"{name}_gemm_ip.h").write_text(
-        _hls.gemm_ip_header(name, strategy=strategy, has_bias=kernel_has_bias))
+        _hls.gemm_ip_header(name, has_bias=kernel_has_bias))
     if weights_in_core:
         B = weight_matrix if weight_matrix is not None else _default_weight_matrix(k, n)
         (pkg_dir / f"{name}_weights.h").write_text(_hls.weights_header(name, m, k, n, B))
@@ -95,7 +90,7 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
         input_precision=input_precision, weight_precision=weight_precision,
         output_precision=output_precision, bias_precision=bias_precision,
         accum_precision=accum_precision, weights_in_core=weights_in_core,
-        strategy=strategy, reuse_factor=reuse_factor))
+        reuse_factor=reuse_factor))
     (pkg_dir / f"{name}_top.cpp").write_text(
         _hls.top_cpp(name, m, k, n, interface, weights_in_core))
     (pkg_dir / f"{name}_tb.cpp").write_text(
@@ -104,5 +99,5 @@ def generate_generic_pkg(m, k, n, name, output_dir, interface="array",
 
     print(f"Generated {pkg_dir}  (generic vitis: M={m}, K={k}, N={n}, "
           f"interface={interface}, weights_in_core={weights_in_core}, "
-          f"strategy={strategy}, reuse_factor={reuse_factor})")
+          f"reuse_factor={reuse_factor})")
     return pkg_dir

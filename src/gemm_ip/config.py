@@ -6,15 +6,9 @@ list of GEMM items. Target-specific tile geometry (``grid_rows`` / ``grid_cols``
 is sourced from the active target's geometry module.
 """
 
-import sys as _sys
-from pathlib import Path as _Path
-
 from gemm_ip.common import _safe_name
 
-_ts_dir = str(_Path(__file__).resolve().parent.parent / "targets" / "tensor_slice")
-if _ts_dir not in _sys.path:
-    _sys.path.insert(0, _ts_dir)
-from geometry import grid_rows, grid_cols  # noqa: E402
+from targets.tensor_slice.geometry import grid_rows, grid_cols
 
 
 def normalize_gemm_config(cfg):
@@ -93,9 +87,8 @@ def _normalize_config_items(cfg):
             item.setdefault("protocol", {})
             item.setdefault("gemm_ip_id", item.get("name"))
             item.setdefault("gemm_ip_index", None)
-            # Resource/throughput knobs hls4ml emits per GEMM (honored by the
-            # generic/behavioral target; the RTL targets have their own tiling).
-            item.setdefault("strategy", "latency")
+            # ReuseFactor hls4ml emits per GEMM (honored by the generic behavioral
+            # target; the RTL targets have their own tiling).
             item.setdefault("reuse_factor", 1)
         return cfg
     if isinstance(cfg, dict):
@@ -104,7 +97,6 @@ def _normalize_config_items(cfg):
             cfg.setdefault("protocol", {})
             cfg.setdefault("gemm_ip_id", cfg.get("name"))
             cfg.setdefault("gemm_ip_index", None)
-            cfg.setdefault("strategy", "latency")
             cfg.setdefault("reuse_factor", 1)
             return [cfg]
         items = []
@@ -119,7 +111,6 @@ def _normalize_config_items(cfg):
                 "protocol": item.get("protocol", {}),
                 "gemm_ip_id": item.get("gemm_ip_id", name),
                 "gemm_ip_index": item.get("gemm_ip_index"),
-                "strategy": item.get("strategy", "latency"),
                 "reuse_factor": item.get("reuse_factor", 1),
                 "fold_axis": item.get("fold_axis"),
                 "output_precision": item.get("output_precision"),

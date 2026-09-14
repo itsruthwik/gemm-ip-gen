@@ -1,15 +1,17 @@
 # gemm-ip-gen
 
-Generates GEMM IP blackbox packages for hardblock **targets**. A target is one
-hardblock welded to a single HLS tool; the only target today is `tensor_slice`
-(an INT8 GEMM hardblock, tool: Catapult). Each package contains the RTL core, an
-hls4ml-native C++ wrapper, and a Catapult synthesis script. A combined dispatch
-header is emitted when multiple packages are generated together.
+Generates GEMM IP blackbox / behavioral packages for hardblock **targets**:
+`tensor_slice` (an INT8 GEMM hardblock, tool: Catapult), `generic` (a
+resource-only behavioral-HLS soft kernel, tool: Vitis or Catapult), and `mvau`
+(FINN's RTL MVU blackboxed into a Vitis dataflow top). Each package contains
+the RTL core (or synthesizable C++, for `generic`), an hls4ml-native C++
+wrapper, and the tool's synthesis script. A combined dispatch header is
+emitted when multiple packages are generated together.
 
 ## Layout
 
 The framework core is thin and target-agnostic; each hardblock is a
-self-contained plugin under `src/targets/`:
+self-contained plugin package under `src/targets/`:
 
 ```text
 src/
@@ -17,16 +19,22 @@ src/
   targets/
     base.py         the Target contract
     tensor_slice/   geometry, rtl, golden, package, flow, tb/, run_rtl_tests
+    v_generic/      generic's Vitis implementation (tool=vitis)
+    c_generic/      generic's Catapult implementation (tool=catapult)
+    mvau/           FINN MVU blackbox (tool=vitis)
 ```
 
-A **target** = one hardblock + its single HLS tool (one tool per hardblock — no
-hardblock×tool matrix, no shared protocol/shim layer). A target's `flow.py`
-implements the `Target` contract (`geometry`, `emit_rtl`, `emit_behavioral`,
-`golden`, `package`, `verify`, `rtl_test`) by delegating to its sibling modules,
-and registers under a name in `gemm_ip/registry.py`. The CLI picks one with
-`--target` (default: `tensor_slice`). Adding a hardblock is a new
-`src/targets/<name>/` directory plus a name in the registry — the core and other
-targets are untouched.
+A **target** = one hardblock + the HLS tool(s) it's welded to. A target's
+`flow.py` implements the `Target` contract (`geometry`, `emit_rtl`,
+`emit_behavioral`, `golden`, `package`, `verify`, `rtl_test`) by delegating to
+its sibling modules (plain relative imports within the package), and
+registers under a user-facing name in `gemm_ip/registry.py`. There is exactly
+one user-facing `generic` target name; the registry resolves `(target, tool)`
+to the concrete implementation package (`v_generic` for `("generic",
+"vitis")`, `c_generic` for `("generic", "catapult")`). The CLI picks a target
+with `--target` (default: `generic`) and a tool with `--tool` (default:
+`vitis`). Adding a hardblock is a new `src/targets/<name>/` subpackage plus an
+entry in the registry — the core and other targets are untouched.
 
 ## Quick start
 
@@ -39,8 +47,14 @@ source .venv/bin/activate
 # Already have an environment? Editable install only
 pip install -e .
 
-# Generate a single package (default target: tensor_slice)
+# Generate a single package (default target: generic, default tool: vitis)
 python -m gemm_ip --m 8 --k 8 --n 8 --name gemm_8x8x8 --output_dir ./output
+
+# tensor_slice (tool is always catapult for this target)
+python -m gemm_ip --target tensor_slice --m 8 --k 8 --n 8 --name gemm_8x8x8 --output_dir ./output
+
+# generic under Catapult
+python -m gemm_ip --target generic --tool catapult --m 8 --k 8 --n 8 --name gemm_8x8x8 --output_dir ./output
 
 # From config file
 python -m gemm_ip --config gemm_config.json --output_dir ./output

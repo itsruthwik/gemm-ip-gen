@@ -1,12 +1,16 @@
-"""C++ self-checking csim testbench emitter for the `generic` Vitis target.
+"""C++ self-checking csim testbench emitter, tool-neutral, shared by every
+behavioral-HLS GEMM target (``generic`` on Vitis or Catapult).
 
 Deterministic small-integer stimulus (exactly representable, no overflow for the
 default precisions), a double golden reference, and a 0.5 tolerance compare. The
-top's return code is what Vitis ``csim_design`` checks: 0 = pass.
+top's return code is what the tool's csim step checks: 0 = pass.
 
 For const_weights packages the golden reads the same baked ROM the IP uses
 (``<name>_weight_cols_rom`` from ``<name>_weights.h``), so it matches by
 construction regardless of the baked values.
+
+Historically this lived at ``targets/generic/golden.py``; both generic implementations import it from here.
+imports it through that path's thin re-export shim so nothing there changed.
 """
 
 

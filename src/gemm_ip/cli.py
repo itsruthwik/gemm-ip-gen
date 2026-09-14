@@ -3,7 +3,7 @@ Unified CLI entry point for gemm-ip-gen.
 
 Usage::
 
-    # tensor_slice (the default target)
+    # generic (the default target, Vitis by default; pass --tool catapult for c_generic)
     python -m gemm_ip --m 8 --k 8 --n 8 --name gemm_8x8x8
 
     # From config file
@@ -21,8 +21,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate GEMM IP blackbox packages for a hardblock target"
     )
-    parser.add_argument("--target", choices=TARGETS, default="tensor_slice",
-                        help="Hardblock target (default: tensor_slice)")
+    parser.add_argument("--target", choices=TARGETS,
+                        default="generic",
+                        help="Hardblock target (default: generic)")
+    parser.add_argument("--tool", choices=("vitis", "catapult"), default="vitis",
+                        help="HLS tool the target is welded to (default: vitis); "
+                             "selects which concrete implementation 'generic' "
+                             "resolves to (v_generic / c_generic).")
     parser.add_argument("--describe", type=str, metavar="TARGET",
                         help="Print JSON capability metadata {name, tool} for TARGET "
                              "and exit (the target->tool source of truth for callers "
@@ -56,9 +61,6 @@ def main():
                              "tensor_slice: 'k' (default, phase 1 K-partition), 'm' "
                              "(fold-M row-tile groups) or 'n' (fold-N column-tile groups), "
                              "each issued as back-to-back frames.")
-    parser.add_argument("--strategy", type=str, default="latency",
-                        help="generic target: GEMM kernel strategy, 'latency' (default) "
-                             "or 'resource' (case-insensitive); validated where consumed.")
     parser.add_argument("--part", type=str, default=None,
                         help="FPGA part (selects the DSP core; e.g. xcve2802... -> DSP58).")
     parser.add_argument("--weight-precision", type=str, default="fixed<8,4>",
@@ -82,7 +84,7 @@ def main():
         return
     if args.describe:
         from gemm_ip.registry import load_target
-        t = load_target(args.describe)
+        t = load_target(args.describe, args.tool)
         print(json.dumps({"name": t.name, "tool": t.tool, "knobs": t.knobs}))
         return
 
@@ -92,7 +94,7 @@ def main():
 def _run(args):
     from gemm_ip.registry import load_target
 
-    target = load_target(args.target)
+    target = load_target(args.target, args.tool)
 
     if args.config:
         from gemm_ip import weights as _weights
