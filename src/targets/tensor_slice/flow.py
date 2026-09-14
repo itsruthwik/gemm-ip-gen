@@ -8,30 +8,19 @@ regression). The heavy modules (``package`` pulls in ``gemm_ip.quant``;
 module stays cheap and free of core dependencies.
 """
 
-import sys
-from pathlib import Path
-
-# base.py is one level up (src/targets/); the sibling modules are alongside.
-_targets_root = str(Path(__file__).resolve().parent.parent)
-if _targets_root not in sys.path:
-    sys.path.insert(0, _targets_root)
-_here = str(Path(__file__).resolve().parent)
-if _here not in sys.path:
-    sys.path.insert(0, _here)
-
-from base import Target  # noqa: E402
-import geometry as _geom  # noqa: E402
-import rtl as _rtl  # noqa: E402
-import golden as _golden  # noqa: E402
+from ..base import Target
+from . import geometry as _geom
+from . import rtl as _rtl
+from . import golden as _golden
 
 
 def _package():
-    import package
+    from . import package
     return package
 
 
 def _run_rtl_tests():
-    import run_rtl_tests
+    from . import run_rtl_tests
     return run_rtl_tests
 
 

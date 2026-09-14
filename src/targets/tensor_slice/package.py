@@ -16,15 +16,16 @@ from pathlib import Path
 from gemm_ip.common import _is_ac_integer_type
 from gemm_ip.quant import _frac_bits, _operand_bits, _output_bits, _accum_shift_bits
 
-# geometry is a sibling target module; put this dir on the path and import by
-# name (the same idiom the RTL loaders below use).
-_here = str(Path(__file__).resolve().parent)
-if _here not in sys.path:
-    sys.path.insert(0, _here)
-from geometry import (  # noqa: E402
-    LANE_WIDTH, _ceil_div, k_chunks as _geom_k_chunks, k_passes as _geom_k_passes,
-    resolve_reuse_factor, latency_first_out, a_stream_width, b_stream_width,
-)
+from . import geometry as _geometry
+
+LANE_WIDTH = _geometry.LANE_WIDTH
+_ceil_div = _geometry._ceil_div
+_geom_k_chunks = _geometry.k_chunks
+_geom_k_passes = _geometry.k_passes
+resolve_reuse_factor = _geometry.resolve_reuse_factor
+latency_first_out = _geometry.latency_first_out
+a_stream_width = _geometry.a_stream_width
+b_stream_width = _geometry.b_stream_width
 
 # Combinational delay (ns) Catapult must budget for any cycle that touches the
 # blackbox boundary. The structural grid registers its inputs and outputs, but
@@ -78,7 +79,8 @@ def dead_cycles(m, k, n, grid_cols, k_spatial=1):
 def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_spatial=1,
                       input_precision=None, weight_precision=None, clock_period_ns=None,
                       n_frames=1, weight_rom=None, m_passes=1, logical_m=None,
-                      n_passes=1, logical_n=None, out_width=16, bias_codes=None, s1=0):
+                      n_passes=1, logical_n=None, out_width=16, bias_codes=None, s1=0,
+                      a_zero_point=0, b_zero_point=0):
     # Weight-stationary (const-weight) mode: weights live in the RTL wrapper ROM,
     # so the ccore run() drops the b_cols port (matching the ROM wrapper), and the
     # csim-only behavioral branch bakes the same per-beat words into an internal
@@ -287,6 +289,26 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         f".slc<8>((k_chunk % {ks}) * 64 + k_lane * 8)"
         if ks > 1
         else f"b_buf[s][k_chunk * {n} + actual_col].slc<8>(ct * 64 + k_lane * 8)"
+    )
+
+    # Weight-stationary + A_ZERO_POINT: package.py already folded
+    # A_ZERO_POINT * colsum(B) into bias_codes (the column sums are
+    # compile-time constants once B is baked into the ROM), so suppress the
+    # a_zp accumulate term here to avoid double-counting it. The feed-side
+    # bit-7 flip (a_el's actual value) is unaffected -- that still happens
+    # via {name}_to_gemm_int8 regardless of weights_in_core.
+    _azp = 0 if weights_in_core else int(a_zero_point)
+    _bzp = int(b_zero_point)
+    _zp_terms = []
+    if _azp:
+        _zp_terms.append(f"{_azp} * b_el")
+    if _bzp:
+        _zp_terms.append(f"{_bzp} * a_el")
+    if _azp and _bzp:
+        _zp_terms.append(f"{_azp * _bzp}")
+    zp_correction_emit = (
+        "".join(f"                                acc += {t};\n" for t in _zp_terms)
+        if _zp_terms else ""
     )
 
     # ---- Weight-stationary vs. two-stream: b_cols plumbing inserts -------------
@@ -1094,7 +1116,11 @@ class {name}_ccore {{
                                 ac_int<8, true> a_el = {a_el_expr};
                                 ac_int<8, true> b_el = {b_el_expr};
                                 acc += a_el * b_el;
-                            }}
+                                // Zero-point correction (see {name}_to_gemm_int8): a_el/b_el
+                                // are the signed codes actually fed into the multiply this
+                                // iteration; adding these terms makes acc exactly the ideal
+                                // unsigned/mixed-sign product accumulation.
+{zp_correction_emit}                            }}
                         }}
                         ac_int<16, true> bias_el = {bias_el_expr};
 {core_requant_emit}
@@ -1122,8 +1148,17 @@ ac_int<8, true> {name}_to_gemm_int8(const src_T &value) {{
     // of an ac_fixed operand and destroy it. slc<8>(0) reinterprets the low 8
     // mantissa bits as a signed int8 code; the drain rescales by 2^-(fa+fb).
     static_assert(src_T::width <= 8, "tensor_slice int8 core: operand wider than 8 bits");
-    static_assert(src_T::sign || src_T::width <= 7, "tensor_slice int8 core: unsigned operand needs width <= 7 (bit 7 would be read as the sign)");
-    return static_cast<ac_int<8, true> >(value.template slc<8>(0));
+    // The tensor_slice_int8 black box is always driven as a signed int8 core.
+    // An unsigned 8-bit operand is offset by its zero point (128): flip bit 7
+    // of the 8-bit code (u -> u-128 in two's complement), which is exactly the
+    // signed code the core expects; the accumulate site below corrects the
+    // cross terms this offset introduces. Unsigned operands narrower than 8
+    // bits need no offset (bit 7 is never set) and pass through unchanged.
+    ac_int<8, false> raw = value.template slc<8>(0);
+    if (!src_T::sign && src_T::width == 8) {{
+        raw ^= 0x80;
+    }}
+    return static_cast<ac_int<8, true> >(raw);
 }}
 
 {entries_block}
@@ -1495,7 +1530,7 @@ def _const_weights_brom_cpp(b_bits, grid_cols, weight_rom):
 def gen_inst_cpp(name, m, k, n, interface="stream",
                  requant_shift=0, weight_matrix=None,
                  out_width=16):
-    from geometry import grid_rows, grid_cols
+    grid_rows, grid_cols = _geometry.grid_rows, _geometry.grid_cols
     weights_in_core = weight_matrix is not None
     if weights_in_core and interface == "array":
         # Weight-stationary array (io_parallel): array ports, no external weight port.
@@ -1632,12 +1667,12 @@ solution design set {name}_inst -top
 go analyze
 go compile
 
-solution library add nangate-45nm_beh -- -rtlsyntool DesignCompiler -vendor Nangate -technology 045nm
-solution library add ccs_sample_mem
-solution library add ccs_sample_rom
+solution library add mgc_Xilinx-KINTEX-u-2_beh -- -rtlsyntool Vivado -manufacturer Xilinx -family KINTEX-u -speed -2 -part xcku115-flvb2104-2-i
+solution library add Xilinx_RAMS
+solution library add Xilinx_ROMS
 go libraries
 
-directive set -CLOCKS {{clk {{-CLOCK_PERIOD 10.0 -CLOCK_EDGE rising -CLOCK_UNCERTAINTY 0.0 -CLOCK_HIGH_TIME 5.0 -RESET_SYNC_NAME rst -RESET_ASYNC_NAME arst_n -RESET_KIND both -RESET_SYNC_ACTIVE high -RESET_ASYNC_ACTIVE low}}}}
+directive set -CLOCKS {{clk {{-CLOCK_PERIOD 5.0 -CLOCK_EDGE rising -CLOCK_UNCERTAINTY 0.0 -CLOCK_HIGH_TIME 2.5 -RESET_SYNC_NAME rst -RESET_ASYNC_NAME arst_n -RESET_KIND both -RESET_SYNC_ACTIVE high -RESET_ASYNC_ACTIVE low}}}}
 
 {map_lines}
 
@@ -2005,22 +2040,39 @@ def _check_operand_fits_int8_core(name, operand_label, precision):
     """Raise ValueError if `precision` cannot be losslessly read as the
     tensor_slice int8 core's ac_int<8,true> operand.
 
-    A signed operand fits with width <= 8 (sign bit is bit 7). An unsigned
-    operand only fits with width <= 7, because the {name}_to_gemm_int8
-    conversion reinterprets bit 7 as the sign bit; an unsigned value with bit
-    7 set (e.g. 2.0 in ufixed<8,2>) would silently become negative.
+    Both signed and unsigned operands fit with width <= 8. The tensor_slice
+    int8 core is always driven as a signed int8 core; an unsigned 8-bit
+    operand is handled via a zero-point offset (see ``_operand_zero_point``):
+    the {name}_to_gemm_int8 conversion flips bit 7 (u -> u-128) at the feed,
+    and the accumulation is corrected afterward, so bit 7 no longer needs to
+    be reserved as a true sign bit for unsigned operands.
     """
     bits = _operand_bits(precision)
     if bits is None:
         return
     width, signed = bits
-    fits = width <= 8 if signed else width <= 7
+    fits = width <= 8
     if not fits:
         raise ValueError(
             f"{name}: {operand_label} precision '{precision}' does not fit the "
-            "tensor_slice int8 core: signed operands need width <= 8, unsigned "
-            "<= 7; bit 7 of an unsigned 8-bit code would be read as the sign"
+            "tensor_slice int8 core: signed and unsigned operands both need "
+            "width <= 8"
         )
+
+
+def _operand_zero_point(precision):
+    """Zero point for an operand read by the tensor_slice int8 core.
+
+    128 when the operand is unsigned AND exactly 8 bits wide (bit 7 would
+    otherwise be misread as the sign bit by the always-signed core); 0
+    otherwise (signed operands, or unsigned operands narrower than 8 bits,
+    need no offset).
+    """
+    bits = _operand_bits(precision)
+    if bits is None:
+        return 0
+    width, signed = bits
+    return 128 if (not signed and width == 8) else 0
 
 
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
@@ -2032,11 +2084,23 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     _check_operand_fits_int8_core(name, "input_precision", input_precision)
     _check_operand_fits_int8_core(name, "weight_precision", weight_precision)
+    a_zero_point = _operand_zero_point(input_precision)
+    b_zero_point = _operand_zero_point(weight_precision)
     fold_axis = str(fold_axis).lower()
     resolved = resolve_reuse_factor(k, reuse_factor, name, fold_axis=fold_axis, m=m, n=n)
     for w in resolved["warnings"]:
         print(w, file=sys.stderr)
     k_spatial = resolved["k_spatial"]
+    if k_spatial != 1 and (a_zero_point or b_zero_point):
+        raise NotImplementedError(
+            f"{name}: a zero-pointed operand (a_zero_point={a_zero_point}, "
+            f"b_zero_point={b_zero_point}) with k_spatial={k_spatial} (a "
+            "ReuseFactor that partitions K) is not supported: the structural "
+            "K-spatial RTL emitter does not yet carry the zero-point running-sum "
+            "correction across partitions. Use ReuseFactor=1 (chunked, "
+            "k_spatial==1) with a zero-pointed operand, or a signed/narrower "
+            "operand with this ReuseFactor."
+        )
     passes = resolved["passes"]
     rf_legalized = resolved["reuse_factor"]
     fold_m = fold_axis == "m"
@@ -2112,6 +2176,18 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
               "the phase-1 sim model folds the whole contraction before rounding, "
               "so this double-rounds against the per-partition synth behavior -- "
               "see jojo-track/open/tensor-slice-bias-in-rtl.", file=sys.stderr)
+    if s1 > 0 and (a_zero_point or b_zero_point):
+        raise ValueError(
+            f"{name}: a zero-pointed operand (a_zero_point={a_zero_point}, "
+            f"b_zero_point={b_zero_point}) requires in-slice pre-round shift "
+            f"S1==0 (got S1={s1}). The zero-point correction must be added "
+            "before the slice's own internal rounding, at the same scale the "
+            "raw contraction is computed at; since the correction cannot reach "
+            "inside the tensor_slice_int8 black box, S1 must be 0 whenever a "
+            "zero point is nonzero. Reduce accum_precision so no in-slice "
+            "pre-rounding is needed, or use signed/narrower-than-8-bit "
+            "operands instead."
+        )
     s2 = _total_shift - s1
     # gen_inst_cpp/gen_tb's own self-check reference is a single-round
     # formula (gemm_acc rounded once by the TOTAL shift). Identical to the
@@ -2147,6 +2223,34 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
                 f"intermediate scale (2^{_intermediate_frac} fractional bits) -- "
                 "reduce the bias magnitude or accum_precision's fractional bits.")
 
+    # Weight-stationary (const-weight) + zero-pointed A: the column sums of
+    # B are compile-time constants (B is baked into the ROM at package time),
+    # so fold A_ZERO_POINT * colsum(B[:, col]) directly into bias_codes here
+    # rather than adding any RTL correction logic for this term.
+    if weights_in_core and a_zero_point:
+        if bias_codes is None:
+            bias_codes = [0] * (n_passes * core_n if fold_n else core_n)
+        _cols = weight_matrix.shape[1] if hasattr(weight_matrix, "shape") else len(weight_matrix[0])
+        for _col in range(_cols):
+            _colsum = sum(int(weight_matrix[_row][_col]) for _row in range(k))
+            bias_codes[_col] += a_zero_point * _colsum
+        _bad = [c for c in bias_codes if not (-32768 <= c <= 32767)]
+        if _bad:
+            raise RuntimeError(
+                f"{name}: bias code(s) {_bad} (after folding the A-zero-point "
+                "weight-stationary column-sum correction) do not fit the 16-bit "
+                "stage-2 intermediate scale -- reduce the zero-pointed operand's "
+                "magnitude or the weight matrix magnitude.")
+    if weights_in_core and b_zero_point:
+        raise NotImplementedError(
+            f"{name}: weight-stationary packaging with a zero-pointed "
+            "weight/B operand (b_zero_point != 0) is not supported: the "
+            "weight ROM bytes themselves would need the same bit-7 zero-point "
+            "flip applied at ROM-build time (gemm_ip.weights), which this "
+            "target does not do. Use a signed (or <8-bit unsigned) "
+            "weight_precision for weight-stationary packages."
+        )
+
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2157,15 +2261,16 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     grid_cols = (core_n + 7) // 8
 
     # The combined core (ifndef SYNTHESIS) lives in the rtl sibling module.
-    ts_dir = str(Path(__file__).resolve().parent)
-    if ts_dir not in sys.path:
-        sys.path.insert(0, ts_dir)
-    from rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
+    from . import rtl as _rtl
+    generate_combined_core_verilog = _rtl.generate_combined_core_verilog
+    generate_k_spatial_combined_core_verilog = _rtl.generate_k_spatial_combined_core_verilog
     if k_spatial == 1:
         grid_v = generate_combined_core_verilog(core_m, k, core_n, module_name=f"{name}_core",
                                                 out_width=out_bits, s1=s1, s2=s2,
                                                 weight_rom=weight_rom, n_passes=n_passes,
-                                                bias_codes=bias_codes)
+                                                bias_codes=bias_codes,
+                                                a_zero_point=a_zero_point, b_zero_point=b_zero_point,
+                                                a_zero_point_correct=(0 if weights_in_core else None))
     else:
         print(
             f"WARNING: {name}: ReuseFactor={rf_legalized} partitions K into "
@@ -2178,6 +2283,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             core_m, k, core_n, module_name=f"{name}_core", k_spatial=k_spatial,
             out_width=out_bits, s1=s1, s2=s2, weight_rom=weight_rom,
             n_passes=n_passes, bias_codes=bias_codes,
+            a_zero_point=a_zero_point, b_zero_point=b_zero_point,
         )
     header_text = gen_public_header(
         name, core_m, k, core_n, grid_rows, grid_cols,
@@ -2195,6 +2301,8 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         out_width=out_bits,
         s1=s1,
         bias_codes=bias_codes,
+        a_zero_point=a_zero_point,
+        b_zero_point=b_zero_point,
     )
     _assert_core_port_widths(name, header_text, grid_v, weights_in_core=weights_in_core)
     _assert_core_first_out(name, core_m, k, core_n, k_spatial, grid_v)

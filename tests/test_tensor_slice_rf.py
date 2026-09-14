@@ -5,7 +5,6 @@ RF is purely "number of passes over K" -- never a cycle count or an
 initiation interval. See geometry.resolve_reuse_factor / package
 pass 2 for the full model.
 """
-import importlib.util
 import json
 import shutil
 import sys
@@ -17,35 +16,10 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from targets.tensor_slice import geometry as _geom  # noqa: E402
+from targets.tensor_slice import package as _pkg  # noqa: E402
+
 _SCRATCH_ROOT = Path("/mnt/vault0/rsunketa/atlas/temp_space/ts-rf/pytest")
-
-
-def _load_tensor_slice_module(modname):
-    """Load a tensor_slice sibling module under a unique name, sidestepping
-    the geometry/package name collision with other targets on sys.path
-    (see test_tensor_slice_operand_guard.py's loader for the same trick)."""
-    tdir = str(_SRC / "targets" / "tensor_slice")
-    saved_path = list(sys.path)
-    saved_modules = {k: sys.modules.get(k) for k in ("geometry", "package", "rtl", "golden")}
-    sys.path.insert(0, tdir)
-    for stale in ("geometry", "package", "rtl", "golden"):
-        sys.modules.pop(stale, None)
-    try:
-        spec = importlib.util.spec_from_file_location(f"_ts_{modname}", Path(tdir) / f"{modname}.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    finally:
-        sys.path[:] = saved_path
-        for stale, prev in saved_modules.items():
-            if prev is None:
-                sys.modules.pop(stale, None)
-            else:
-                sys.modules[stale] = prev
-
-
-_geom = _load_tensor_slice_module("geometry")
-_pkg = _load_tensor_slice_module("package")
 
 resolve_reuse_factor = _geom.resolve_reuse_factor
 k_chunks = _geom.k_chunks
@@ -146,27 +120,11 @@ def _random_weight_matrix(k, n, seed=0):
 
 
 def _with_tensor_slice_on_path(fn, *args, **kwargs):
-    """Run *fn* with the tensor_slice dir first on sys.path and its sibling
-    module names (geometry/package/rtl/golden) cleared, so gemm_ip.weights'
-    ``from golden import ...`` (etc.) resolves to tensor_slice's own siblings
-    instead of whatever other target's same-named module another test left in
-    sys.modules (the tensor_slice/mvau collision noted in
-    test_tensor_slice_operand_guard.py's loader)."""
-    tdir = str(_SRC / "targets" / "tensor_slice")
-    saved_path = list(sys.path)
-    saved_modules = {k: sys.modules.get(k) for k in ("geometry", "package", "rtl", "golden")}
-    sys.path.insert(0, tdir)
-    for stale in ("geometry", "package", "rtl", "golden"):
-        sys.modules.pop(stale, None)
-    try:
-        return fn(*args, **kwargs)
-    finally:
-        sys.path[:] = saved_path
-        for stale, prev in saved_modules.items():
-            if prev is None:
-                sys.modules.pop(stale, None)
-            else:
-                sys.modules[stale] = prev
+    """Run *fn* directly. Kept only so the other test modules that import this
+    helper (test_tensor_slice_requant_shift.py, test_tensor_slice_unit_tb.py)
+    don't need their own call-site changes -- tensor_slice's siblings are now
+    plain relative imports, so no sys.path/sys.modules juggling is needed."""
+    return fn(*args, **kwargs)
 
 
 @pytest.mark.parametrize("reuse_factor,expect_replay_size", [
@@ -205,28 +163,10 @@ def test_generate_catapult_pkg_manifest_fields_via_flow(scratch_dir):
     """The batch manifest path (flow.normalize_config + gen_integration_manifest)
     carries the new RF fields end to end."""
 
-    tdir = str(_SRC / "targets" / "tensor_slice")
-    saved_path = list(sys.path)
-    saved_modules = {k: sys.modules.get(k) for k in ("geometry", "package", "rtl", "golden", "flow", "base")}
-    sys.path.insert(0, str(_SRC / "targets"))
-    sys.path.insert(0, tdir)
-    for stale in ("geometry", "package", "rtl", "golden", "flow", "base"):
-        sys.modules.pop(stale, None)
-    try:
-        spec = importlib.util.spec_from_file_location("_ts_flow", Path(tdir) / "flow.py")
-        flow_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(flow_mod)
-        target = flow_mod.TARGET
-        items = [{"name": "l0", "m": 8, "k": 24, "n": 8, "reuse_factor": 2}]
-        norm = target.normalize_config(items)
-        manifest = json.loads(target.integration_manifest(norm))
-    finally:
-        sys.path[:] = saved_path
-        for stale, prev in saved_modules.items():
-            if prev is None:
-                sys.modules.pop(stale, None)
-            else:
-                sys.modules[stale] = prev
+    from targets.tensor_slice.flow import TARGET as target
+    items = [{"name": "l0", "m": 8, "k": 24, "n": 8, "reuse_factor": 2}]
+    norm = target.normalize_config(items)
+    manifest = json.loads(target.integration_manifest(norm))
 
     core = manifest["cores"][0]
     for key in ("reuse_factor_requested", "reuse_factor", "effective_reuse",
@@ -316,36 +256,18 @@ def test_resolve_reuse_factor_fold_axis_m_pins_k_fields_at_rf1():
 
 
 def test_flow_normalize_config_fold_axis_m_fields(scratch_dir):
-    tdir = str(_SRC / "targets" / "tensor_slice")
-    saved_path = list(sys.path)
-    saved_modules = {k: sys.modules.get(k) for k in ("geometry", "package", "rtl", "golden", "flow", "base")}
-    sys.path.insert(0, str(_SRC / "targets"))
-    sys.path.insert(0, tdir)
-    for stale in ("geometry", "package", "rtl", "golden", "flow", "base"):
-        sys.modules.pop(stale, None)
-    try:
-        spec = importlib.util.spec_from_file_location("_ts_flow_m", Path(tdir) / "flow.py")
-        flow_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(flow_mod)
-        target = flow_mod.TARGET
-        items = [{"name": "l0", "m": 20, "k": 24, "n": 16, "reuse_factor": 2, "fold_axis": "m"}]
-        norm = target.normalize_config(items)
-        manifest = json.loads(target.integration_manifest(norm))
-        k_items = [{"name": "l1", "m": 20, "k": 24, "n": 16, "reuse_factor": 2}]
-        k_norm = target.normalize_config(k_items)
-        k_manifest = json.loads(target.integration_manifest(k_norm))
-        # The runner emits the dict form (name -> layer); the shared normalizer
-        # must forward fold_axis through that path too.
-        d_norm = target.normalize_config({"l2": {
-            "type": "Gemm", "n_in": 24, "n_out": 16, "gemm_m": 20,
-            "reuse_factor": 2, "fold_axis": "m"}})
-    finally:
-        sys.path[:] = saved_path
-        for stale, prev in saved_modules.items():
-            if prev is None:
-                sys.modules.pop(stale, None)
-            else:
-                sys.modules[stale] = prev
+    from targets.tensor_slice.flow import TARGET as target
+    items = [{"name": "l0", "m": 20, "k": 24, "n": 16, "reuse_factor": 2, "fold_axis": "m"}]
+    norm = target.normalize_config(items)
+    manifest = json.loads(target.integration_manifest(norm))
+    k_items = [{"name": "l1", "m": 20, "k": 24, "n": 16, "reuse_factor": 2}]
+    k_norm = target.normalize_config(k_items)
+    k_manifest = json.loads(target.integration_manifest(k_norm))
+    # The runner emits the dict form (name -> layer); the shared normalizer
+    # must forward fold_axis through that path too.
+    d_norm = target.normalize_config({"l2": {
+        "type": "Gemm", "n_in": 24, "n_out": 16, "gemm_m": 20,
+        "reuse_factor": 2, "fold_axis": "m"}})
 
     item = norm[0]
     assert item["fold_axis"] == "m"
@@ -482,34 +404,16 @@ def test_resolve_reuse_factor_fold_axis_n_pins_k_fields_at_rf1():
 
 
 def test_flow_normalize_config_fold_axis_n_fields(scratch_dir):
-    tdir = str(_SRC / "targets" / "tensor_slice")
-    saved_path = list(sys.path)
-    saved_modules = {k: sys.modules.get(k) for k in ("geometry", "package", "rtl", "golden", "flow", "base")}
-    sys.path.insert(0, str(_SRC / "targets"))
-    sys.path.insert(0, tdir)
-    for stale in ("geometry", "package", "rtl", "golden", "flow", "base"):
-        sys.modules.pop(stale, None)
-    try:
-        spec = importlib.util.spec_from_file_location("_ts_flow_n", Path(tdir) / "flow.py")
-        flow_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(flow_mod)
-        target = flow_mod.TARGET
-        items = [{"name": "l0", "m": 20, "k": 24, "n": 20, "reuse_factor": 2, "fold_axis": "n"}]
-        norm = target.normalize_config(items)
-        manifest = json.loads(target.integration_manifest(norm))
-        k_items = [{"name": "l1", "m": 20, "k": 24, "n": 20, "reuse_factor": 2}]
-        k_norm = target.normalize_config(k_items)
-        k_manifest = json.loads(target.integration_manifest(k_norm))
-        d_norm = target.normalize_config({"l2": {
-            "type": "Gemm", "n_in": 24, "n_out": 20, "gemm_m": 20,
-            "reuse_factor": 2, "fold_axis": "n"}})
-    finally:
-        sys.path[:] = saved_path
-        for stale, prev in saved_modules.items():
-            if prev is None:
-                sys.modules.pop(stale, None)
-            else:
-                sys.modules[stale] = prev
+    from targets.tensor_slice.flow import TARGET as target
+    items = [{"name": "l0", "m": 20, "k": 24, "n": 20, "reuse_factor": 2, "fold_axis": "n"}]
+    norm = target.normalize_config(items)
+    manifest = json.loads(target.integration_manifest(norm))
+    k_items = [{"name": "l1", "m": 20, "k": 24, "n": 20, "reuse_factor": 2}]
+    k_norm = target.normalize_config(k_items)
+    k_manifest = json.loads(target.integration_manifest(k_norm))
+    d_norm = target.normalize_config({"l2": {
+        "type": "Gemm", "n_in": 24, "n_out": 20, "gemm_m": 20,
+        "reuse_factor": 2, "fold_axis": "n"}})
 
     item = norm[0]
     assert item["fold_axis"] == "n"

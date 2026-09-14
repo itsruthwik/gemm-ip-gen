@@ -7,8 +7,9 @@
 # run_rtl_tests.py (--cases, --seeds, --keep).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="$HERE/../../../.venv/bin/python"
+SRC="$(cd "$HERE/../.." && pwd)"
+PY="$SRC/../.venv/bin/python"
 if [[ ! -x "$PY" ]]; then
     PY="$(command -v python3)"
 fi
-exec "$PY" "$HERE/run_rtl_tests.py" "$@"
+exec env PYTHONPATH="$SRC:${PYTHONPATH:-}" "$PY" -m targets.tensor_slice.run_rtl_tests "$@"

@@ -19,10 +19,10 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from test_tensor_slice_operand_guard import _load_tensor_slice_package
+from test_tensor_slice_operand_guard import _pkg as _tensor_slice_pkg
 from test_tensor_slice_rf import _with_tensor_slice_on_path
 
-_generate_catapult_pkg = _load_tensor_slice_package().generate_catapult_pkg
+_generate_catapult_pkg = _tensor_slice_pkg.generate_catapult_pkg
 
 AC_INCLUDE = "/home/tools/siemens/catapult/Mgc_home/shared/include"
 LD_LIBRARY_PATH_EXTRA = (

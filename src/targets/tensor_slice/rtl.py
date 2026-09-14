@@ -15,7 +15,8 @@ Key design:
 import argparse
 from pathlib import Path
 
-from geometry import tail_mask_hex, vm, total_cycles as _total_cycles
+from . import geometry as _geometry
+tail_mask_hex, vm, _total_cycles = _geometry.tail_mask_hex, _geometry.vm, _geometry.total_cycles
 
 
 # ── Two-stage requant, shared by every sim/synth emitter below ────────────────
@@ -152,11 +153,92 @@ def _stage2_function(s2, out_width, func_name="stage2"):
     )
 
 
+_ZERO_POINT_COMMENT = (
+    "    // signedness mode: the tensor_slice_int8 black box is driven as signed\n"
+    "    // int8. Unsigned 8-bit operands are offset by the zero point (bit-7 flip\n"
+    "    // at the feed, = u-128) and corrected after accumulation (zero_point *\n"
+    "    // sum of the other operand). If the slice exposes a native unsigned mode\n"
+    "    // (slice_dtype pins), set the zero point to 0 and drive that mode instead."
+)
+
+
+def _zero_point_params_block(a_zero_point, b_zero_point):
+    """Module parameter declarations + doc comment for A_ZERO_POINT/B_ZERO_POINT."""
+    return (
+        f"{_ZERO_POINT_COMMENT}\n"
+        f"    parameter integer A_ZERO_POINT = {int(a_zero_point)};\n"
+        f"    parameter integer B_ZERO_POINT = {int(b_zero_point)};\n"
+    )
+
+
+def _lane_flip_mask(width, zero_point):
+    """Verilog literal that XORs bit 7 of every packed 8-bit lane across a
+    ``width``-bit word when ``zero_point`` is nonzero (all-zero -- folds
+    away -- otherwise)."""
+    if not zero_point or width <= 0:
+        return f"{max(width, 1)}'d0"
+    mask_int = int("80" * (width // 8), 16) if width % 8 == 0 else (1 << (width - 1))
+    return f"{width}'h{mask_int:x}"
+
+
+def _lane_flip(zero_point):
+    """Verilog XOR suffix that flips bit 7 of every packed 8-bit lane when
+    ``zero_point`` is nonzero (u -> u-128, the same conversion the C++
+    ``{name}_to_gemm_int8`` helper performs)."""
+    return " ^ 8'h80" if zero_point else ""
+
+
+def _lane_flip_mask_masked(width, zero_point, mask_signal):
+    """Like ``_lane_flip_mask``, but gates every lane's bit-7 flip on that
+    lane's bit in ``mask_signal`` (expected 8 bits wide, one bit per K lane
+    within the current chunk -- e.g. ``current_k_mask``).
+
+    K < 8-per-chunk cases (the common tail chunk, and any chunk in a K < 8
+    GEMM) present zero-code padding on the lanes beyond the real K width.
+    The plain (unconditional) ``_lane_flip_mask`` XORs bit 7 of EVERY lane,
+    including those padding lanes: a padding zero code (0) becomes -128 once
+    flipped, instead of staying 0. Whether that silently pollutes the
+    product depends on the tensor_slice_int8 black box's own K-masking
+    (``validity_mask_a_cols_b_rows``/``current_k_mask``) doing its job
+    end-to-end; feeding a mathematically wrong operand code into a black box
+    and relying on it never being read is fragile. Masking the flip itself
+    by the SAME per-lane validity mask the slice is given keeps padding
+    lanes at raw, unflipped 0 -- multiplying by 0 (not -128) regardless of
+    whether/how the slice's own masking gates the MAC.
+    """
+    if not zero_point or width <= 0:
+        return f"{max(width, 1)}'d0"
+    n_lanes = width // 8
+    lanes = [f"({mask_signal}[{i % 8}] ? 8'h80 : 8'h00)" for i in range(n_lanes - 1, -1, -1)]
+    return "{" + ", ".join(lanes) + "}"
+
+
 def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
                          s1=0, s2=0, out_width=16, weight_rom=None, emit_rom=True,
                          n_passes=1, bias_codes=None, emit_bias_rom=True,
-                         bias_rom_name="bias_rom"):
+                         bias_rom_name="bias_rom", a_zero_point=0, b_zero_point=0,
+                         a_zero_point_correct=None, b_zero_point_correct=None):
+    """``a_zero_point``/``b_zero_point`` always drive the feed-side bit-7 flip
+    (and the A_ZERO_POINT/B_ZERO_POINT module parameters). ``a_zero_point_correct``/
+    ``b_zero_point_correct`` (default: same as the respective zero point) drive
+    the post-accumulation correction term ONLY; a caller that already folded a
+    zero point's correction elsewhere (e.g. package.py folds a weight-stationary
+    A_ZERO_POINT * colsum(B) into the compile-time bias instead) passes 0 here
+    to avoid double-counting it while the feed-side flip still happens.
+    """
     has_bias = bias_codes is not None
+    a_flip = _lane_flip(a_zero_point)
+    b_flip = _lane_flip(b_zero_point)
+    _azp = int(a_zero_point if a_zero_point_correct is None else a_zero_point_correct)
+    _bzp = int(b_zero_point if b_zero_point_correct is None else b_zero_point_correct)
+    _zp_terms = []
+    if _azp:
+        _zp_terms.append(f"{_azp} * bmat[s * {k} + kk][actual_col]")
+    if _bzp:
+        _zp_terms.append(f"{_bzp} * amat[s * {m} + actual_row][kk]")
+    if _azp and _bzp:
+        _zp_terms.append(str(_azp * _bzp))
+    zp_correction = "".join(f" + ({t})" for t in _zp_terms)
     bias_rom_block = _bias_rom_block(bias_codes, bias_rom_name) if (has_bias and emit_bias_rom) else ""
     # Two-stage requant (jojo-track/open/tensor-slice-bias-in-rtl, phase 1):
     # stage 1 rounds/wraps the FULL contraction (in-slice and cross-chunk
@@ -245,14 +327,14 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
                         for (lane = 0; lane < 8; lane = lane + 1) begin
                             kk = cc_chunk * 8 + lane;
                             if (kk < {k})
-                                amat[ws * {m} + cc_beat][kk] = a_rows[(cc_beat / 8) * 64 + lane * 8 +: 8];
+                                amat[ws * {m} + cc_beat][kk] = a_rows[(cc_beat / 8) * 64 + lane * 8 +: 8]{a_flip};
                         end
                     end
                     if (cc_beat < {n}) begin
                         for (lane = 0; lane < 8; lane = lane + 1) begin
                             kk = cc_chunk * 8 + lane;
                             if (kk < {k})
-                                bmat[ws * {k} + kk][cc_beat] = b_cols[(cc_beat / 8) * 64 + lane * 8 +: 8];
+                                bmat[ws * {k} + kk][cc_beat] = b_cols[(cc_beat / 8) * 64 + lane * 8 +: 8]{b_flip};
                         end
                     end"""
     if full_k_spatial:
@@ -262,14 +344,14 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
                         for (kk = 0; kk < {k}; kk = kk + 1) begin
                             cc_chunk = kk / 8;
                             lane = kk % 8;
-                            amat[ws * {m} + cc_beat][kk] = a_rows[cc_chunk * 64 + lane * 8 +: 8];
+                            amat[ws * {m} + cc_beat][kk] = a_rows[cc_chunk * 64 + lane * 8 +: 8]{a_flip};
                         end
                     end
                     if (cc_beat < {n}) begin
                         for (kk = 0; kk < {k}; kk = kk + 1) begin
                             cc_chunk = kk / 8;
                             lane = kk % 8;
-                            bmat[ws * {k} + kk][cc_beat] = b_cols[cc_chunk * 64 + lane * 8 +: 8];
+                            bmat[ws * {k} + kk][cc_beat] = b_cols[cc_chunk * 64 + lane * 8 +: 8]{b_flip};
                         end
                     end"""
     elif general_k_spatial:
@@ -285,7 +367,7 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
                             for (lane = 0; lane < 8; lane = lane + 1) begin
                                 kk = cc_chunk * 8 + lane;
                                 if (kk < {k})
-                                    amat[ws * {m} + cc_beat][kk] = a_rows[p_idx * 64 + lane * 8 +: 8];
+                                    amat[ws * {m} + cc_beat][kk] = a_rows[p_idx * 64 + lane * 8 +: 8]{a_flip};
                             end
                         end
                     end
@@ -295,7 +377,7 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
                             for (lane = 0; lane < 8; lane = lane + 1) begin
                                 kk = cc_chunk * 8 + lane;
                                 if (kk < {k})
-                                    bmat[ws * {k} + kk][cc_beat] = b_cols[p_idx * 64 + lane * 8 +: 8];
+                                    bmat[ws * {k} + kk][cc_beat] = b_cols[p_idx * 64 + lane * 8 +: 8]{b_flip};
                             end
                         end
                     end"""
@@ -337,6 +419,7 @@ module {module_name}(
     output reg                    out_valid,
     output reg                    out_last
 );
+{_zero_point_params_block(a_zero_point, b_zero_point)}
 {sim_rom_block}
     wire [{c_width-1}:0] behav_c_row;
     wire                 behav_out_valid;
@@ -486,7 +569,7 @@ module {behav_name}(
                                     // 2, not folded into the raw accumulation).
                                     acc = 32'sd0;
                                     for (kk = 0; kk < {k}; kk = kk + 1)
-                                        acc = acc + (amat[s * {m} + actual_row][kk] * bmat[s * {k} + kk][actual_col]);
+                                        acc = acc + (amat[s * {m} + actual_row][kk] * bmat[s * {k} + kk][actual_col]){zp_correction};
                                     sat = {_sat_call};
                                 end else begin
                                     sat = {out_width}'sd0;
@@ -615,13 +698,22 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1):
 def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="chained", debug=False,
                            weight_rom=None, emit_rom=True, n_passes=1,
                            s1=0, s2=0, out_width=16, bias_codes=None, emit_bias_rom=True,
-                           bias_rom_name="bias_rom"):
+                           bias_rom_name="bias_rom", a_zero_point=0, b_zero_point=0,
+                           a_zero_point_correct=None, b_zero_point_correct=None):
+    """See ``generate_sim_verilog`` for the ``*_correct`` override contract:
+    ``a_zero_point``/``b_zero_point`` always drive the a_rows_q/b_cols_q
+    feed-side bit-7 flip and the A_ZERO_POINT/B_ZERO_POINT module parameters;
+    ``a_zero_point_correct``/``b_zero_point_correct`` (default: same value)
+    drive the running-sum post-accumulation correction only.
+    """
     has_bias = bias_codes is not None
     bias_rom_block = _bias_rom_block(bias_codes, bias_rom_name) if (has_bias and emit_bias_rom) else ""
     _fold_n_bias = bool(has_bias and n_passes and int(n_passes) > 1)
     _bias_grp_decl, _bias_grp_body = (
         _fold_n_bias_group_decl(n_passes) if _fold_n_bias else ("", "")
     )
+    _azp = int(a_zero_point if a_zero_point_correct is None else a_zero_point_correct)
+    _bzp = int(b_zero_point if b_zero_point_correct is None else b_zero_point_correct)
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
 
@@ -738,6 +830,53 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
         _bias_expr_synth = (lambda c, lane: _bias_lane(bias_rom_name, str(c * 8 + lane)))
     else:
         _bias_expr_synth = (lambda c, lane: "16'sd0")
+    # ── Zero-point correction (streamed operands) ───────────────────────────
+    # A_ZERO_POINT nonzero: correction for output column j is
+    # A_ZERO_POINT * sum_k b[k][j] -- a per-column running sum of the signed
+    # B codes actually fed this frame (post bit-7-flip), accumulated as the
+    # slice consumes each K chunk, reset once per frame.
+    # B_ZERO_POINT nonzero: correction for output row i is
+    # B_ZERO_POINT * sum_k a[i][k], looked up by the row currently on the
+    # output wire (out_row_count) since (unlike the per-column correction)
+    # the physical row varies at emit time, not at generation time.
+    # Both nonzero: also add A_ZERO_POINT * B_ZERO_POINT * K once per element
+    # (folded into row_zp_corr below, so every (row, col) sees it exactly once).
+    _zp_col_decl = ""
+    _zp_col_reset = ""
+    _zp_col_acc = ""
+    if _azp:
+        _zp_col_decl = f"    reg signed [15:0] colsum_b [0:{grid_cols * 8 - 1}];\n"
+        _zp_col_reset = "".join(
+            f"                        colsum_b[{j}] <= 16'sd0;\n" for j in range(grid_cols * 8))
+        _zp_col_acc = "".join(
+            f"                        if (beat_count < 16'd8 && current_k_mask[{lane}]) colsum_b[{c * 8 + lane}] <= "
+            f"colsum_b[{c * 8 + lane}] + $signed(b_data_0_{c}[{lane}*8 +: 8]);\n"
+            for c in range(grid_cols) for lane in range(8))
+    _zp_row_decl = ""
+    _zp_row_reset = ""
+    _zp_row_acc = ""
+    if _bzp:
+        _zp_row_decl = f"    reg signed [15:0] rowsum_a [0:{grid_rows * 8 - 1}];\n"
+        _zp_row_reset = "".join(
+            f"                        rowsum_a[{i}] <= 16'sd0;\n" for i in range(grid_rows * 8))
+        _zp_row_acc = "".join(
+            f"                        if (beat_count < 16'd8 && current_k_mask[{lane}]) rowsum_a[{r * 8 + lane}] <= "
+            f"rowsum_a[{r * 8 + lane}] + $signed(a_data_{r}_0[{lane}*8 +: 8]);\n"
+            for r in range(grid_rows) for lane in range(8))
+    _row_corr_terms = []
+    if _bzp:
+        _row_corr_terms.append(f"{_bzp} * rowsum_a[out_row_count]")
+    if _azp and _bzp:
+        _row_corr_terms.append(str(_azp * _bzp * k))
+    row_zp_corr_decl = (
+        f"    wire signed [31:0] row_zp_corr = {' + '.join(_row_corr_terms)};\n"
+        if _row_corr_terms else ""
+    )
+    row_zp_corr_term = " + row_zp_corr" if _row_corr_terms else ""
+
+    def _col_zp_corr_term(c, lane):
+        return f" + ({_azp} * colsum_b[{c * 8 + lane}])" if _azp else ""
+
     row_avail_decl = []
     row_data_decl = []
     for r in range(grid_rows):
@@ -746,7 +885,7 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
         for c in range(grid_cols):
             lanes = ", ".join(
                 f"stage2($signed(c_data_{r}_{c}[{lane}*16 +: 16]), "
-                f"{_bias_expr_synth(c, lane)})"
+                f"{_bias_expr_synth(c, lane)}{_col_zp_corr_term(c, lane)}{row_zp_corr_term})"
                 for lane in range(7, -1, -1)
             )
             tiles.append("{" + lanes + "}")
@@ -811,6 +950,7 @@ module {module_name}(
     output reg                    out_valid,
     output reg                    out_last
 );
+{_zero_point_params_block(a_zero_point, b_zero_point)}
 {w_rom_block}
 {bias_rom_block}
 {stage2_fn}
@@ -831,6 +971,7 @@ module {module_name}(
     reg row_take;
 {_bias_grp_decl}
 {"    reg [15:0] out_grp;" if _fold_n_bias else ""}
+{_zp_col_decl}{_zp_row_decl}{row_zp_corr_decl}
 
     // ── Input pipeline stage ────────────────────────────────────────────────
     // Register the whole input bundle (en-gated, so the core stays self-timed),
@@ -848,8 +989,14 @@ module {module_name}(
             preload_valid_q <= 1'b0;
             in_valid_q      <= 1'b0;
         end else if (en) begin
-            a_rows_q        <= a_rows;
-            b_cols_q        <= {b_cols_q_src};
+            // Flip is gated by current_k_mask (this cycle's chunk validity,
+            // computed from the SAME pre-edge chunk_idx that decides which
+            // chunk the a_rows/b_cols beat on the wire right now belongs
+            // to): padding K lanes (mask bit clear -- always zero-code on
+            // the wire) are left unflipped, so they stay raw 0 instead of
+            // becoming -128. See _lane_flip_mask_masked.
+            a_rows_q        <= a_rows ^ {_lane_flip_mask_masked(a_width, int(a_zero_point), 'current_k_mask')};
+            b_cols_q        <= {b_cols_q_src} ^ {_lane_flip_mask_masked(b_width, int(b_zero_point), 'current_k_mask')};
             preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;
         end
@@ -921,7 +1068,7 @@ module {module_name}(
                         preload_d <= 1'b1;
                         transaction_active <= 1'b1;
 {"                        out_grp <= bias_grp_ctr;" if _fold_n_bias else ""}
-                        state <= S_PRELOAD;
+{_zp_col_reset}{_zp_row_reset}                        state <= S_PRELOAD;
                     end
                 end
 
@@ -934,7 +1081,7 @@ module {module_name}(
                         beat_count <= beat_count + 16'd1;
                         if (beat_count + 16'd1 == INPUT_BEATS)
                             state <= S_WAIT;
-                    end
+{_zp_col_acc}{_zp_row_acc}                    end
 
                     if (emit_phase && row_take) begin
                         c_row <= row_mux;
@@ -999,7 +1146,8 @@ def _split_after_first_endmodule(text):
 
 def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out_bits=None,
                                    s1=0, s2=0, out_width=None, weight_rom=None, n_passes=1,
-                                   bias_codes=None):
+                                   bias_codes=None, a_zero_point=0, b_zero_point=0,
+                                   a_zero_point_correct=None, b_zero_point_correct=None):
     """Generate a single {module_name}.v with ifndef SYNTHESIS guard.
 
     ``ifndef SYNTHESIS`` — behavioral simulation model (wrapper + behav_grid).
@@ -1043,10 +1191,16 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
     if weight_rom is not None or has_bias:
         sim_top = generate_sim_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width,
                                        weight_rom=weight_rom, emit_rom=False,
-                                       bias_codes=bias_codes, emit_bias_rom=True)
+                                       bias_codes=bias_codes, emit_bias_rom=True,
+                                       a_zero_point=a_zero_point, b_zero_point=b_zero_point,
+                                       a_zero_point_correct=a_zero_point_correct,
+                                       b_zero_point_correct=b_zero_point_correct)
         synth_top = generate_synth_verilog(m, k, n, module_name, weight_rom=weight_rom, emit_rom=False,
                                            s1=s1, s2=s2, out_width=out_width,
-                                           bias_codes=bias_codes, emit_bias_rom=False)
+                                           bias_codes=bias_codes, emit_bias_rom=False,
+                                           a_zero_point=a_zero_point, b_zero_point=b_zero_point,
+                                           a_zero_point_correct=a_zero_point_correct,
+                                           b_zero_point_correct=b_zero_point_correct)
         b_width = ((n + 7) // 8) * 64
         input_beats = max(m, n)
         header, syn_body = _split_module(synth_top, module_name)   # header incl. 'module..);'
@@ -1071,8 +1225,14 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
         )
         return out
 
-    sim_top = generate_sim_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width)
-    synth_top = generate_synth_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width)
+    sim_top = generate_sim_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width,
+                                   a_zero_point=a_zero_point, b_zero_point=b_zero_point,
+                                   a_zero_point_correct=a_zero_point_correct,
+                                   b_zero_point_correct=b_zero_point_correct)
+    synth_top = generate_synth_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width,
+                                       a_zero_point=a_zero_point, b_zero_point=b_zero_point,
+                                       a_zero_point_correct=a_zero_point_correct,
+                                       b_zero_point_correct=b_zero_point_correct)
 
     lines = []
     lines.append("// Auto-generated by rtl.py")
@@ -1524,14 +1684,22 @@ def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_s
 
 def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, out_bits=None,
                                             s1=0, s2=0, out_width=None, weight_rom=None, n_passes=1,
-                                            bias_codes=None):
+                                            bias_codes=None, a_zero_point=0, b_zero_point=0):
     if out_width is None:
         out_width = out_bits if out_bits is not None else 8
     if k_spatial == 1:
         return generate_combined_core_verilog(m, k, n, module_name, out_width=out_width,
                                               s1=s1, s2=s2,
                                               weight_rom=weight_rom, n_passes=n_passes,
-                                              bias_codes=bias_codes)
+                                              bias_codes=bias_codes,
+                                              a_zero_point=a_zero_point, b_zero_point=b_zero_point)
+    if a_zero_point or b_zero_point:
+        raise NotImplementedError(
+            f"{module_name}: k_spatial={k_spatial} structural K-spatial RTL "
+            "does not implement the zero-point running-sum correction across "
+            "partitions; only k_spatial==1 (chunked) supports a zero-pointed "
+            "operand today."
+        )
     _k_spatial_partitions(k, k_spatial)
     # Weight-stationary and/or bias: each branch emits its OWN ROM(s). Unlike
     # the chunked combined core -- which splits the two modules apart to hoist
