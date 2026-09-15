@@ -265,6 +265,33 @@ CASES = {
     "i_2op_col_major_qk_memstream": lambda work, seed, **kw: _build_2op_case(
         work, "i", (16, 12, 16), seed, "ms", pe=16, simd=6, mode=1,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    # ── resolve_fold-driven single-tile cases (VERIFY-ONLY additions) ──
+    # Unlike e-i above (hand-picked pe=/simd=, bypassing resolve_fold), these specify
+    # fold_axis + reuse_factor so geometry.resolve_fold actually derives (PE, SIMD),
+    # the way a real manifest drives it. Each lands on the single-tile untiled
+    # dynamic_load_2op shim (DEPTH=NF*SF>=2, k_tiles=1 default, n_tiles=1) -- see
+    # geometry.fold_plan for the resolved numbers noted per case.
+    "j_2op_foldn_memstream": lambda work, seed, **kw: _build_2op_case(
+        # (m,k,n)=(4,4,8) RF=2 fold_axis=n -> PE=4 SIMD=4 SF=1 NF=2 (DEPTH=NF=2)
+        work, "j", (4, 4, 8), seed, "ms", reuse_factor=2, fold_axis="n",
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "k_2op_foldn_col_major_memstream": lambda work, seed, **kw: _build_2op_case(
+        work, "k", (4, 4, 8), seed, "ms", reuse_factor=2, fold_axis="n", mode=1,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "l_2op_foldk_memstream": lambda work, seed, **kw: _build_2op_case(
+        # (m,k,n)=(4,9,4) RF=2 fold_axis=k -> PE=4 SIMD=5 SF=2 NF=1 (DEPTH=SF=2, k_pad=10)
+        work, "l", (4, 9, 4), seed, "ms", reuse_factor=2, fold_axis="k",
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "m_2op_foldk_col_major_memstream": lambda work, seed, **kw: _build_2op_case(
+        work, "m", (4, 9, 4), seed, "ms", reuse_factor=2, fold_axis="k", mode=1,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "n_2op_foldkn_memstream": lambda work, seed, **kw: _build_2op_case(
+        # (m,k,n)=(4,9,8) RF=2 fold_axis=kn -> PE=4 SIMD=5 SF=2 NF=2 (DEPTH=4, k_pad=10)
+        work, "n", (4, 9, 8), seed, "ms", reuse_factor=2, fold_axis="kn",
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "o_2op_foldkn_col_major_memstream": lambda work, seed, **kw: _build_2op_case(
+        work, "o", (4, 9, 8), seed, "ms", reuse_factor=2, fold_axis="kn", mode=1,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
 }
 
 RTL_STATIC_DIR = HERE / "rtl_static"

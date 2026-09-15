@@ -462,3 +462,64 @@ def test_two_operand_k_tiling_csim_matches_golden(tmp_path):
                     str(pkg / "gemm_2op_kt2_core.cpp")], check=True)
     out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
     assert "MVAU_PKG PASS" in out
+
+
+# ── Two-operand single-tile shim (dynamic_load_2op), fold chosen by resolve_fold ──
+#
+# VERIFY-ONLY: cases e-i in run_rtl_tests.py and the _gen_2op tests above all drive
+# generate_two_operand_shim with hand-picked pe=/simd=, bypassing resolve_fold. These
+# cases instead specify fold_axis + reuse_factor (no pe/simd, k_tiles=1 default) so
+# the plan is resolved the way a real manifest would drive it, landing on the
+# single-tile untiled shim (nt=1, k_tiles=1, DEPTH=NF*SF>=2) for each fold axis and
+# both B-layout modes. Geometries were chosen (see geometry.fold_plan) so:
+#   fold-n RF=2:  (m,k,n)=(4,4,8)  -> pe=4 simd=4 sf=1 nf=2 (DEPTH=NF=2)
+#   fold-k RF=2:  (m,k,n)=(4,9,4)  -> pe=4 simd=5 sf=2 nf=1 (DEPTH=SF=2, k_pad=10)
+#   fold-kn RF=2: (m,k,n)=(4,9,8)  -> pe=4 simd=5 sf=2 nf=2 (DEPTH=SF*NF=4, k_pad=10)
+# all confirmed single_tile=True (use_kt=False, nt=1) at collection time.
+
+from targets.mvau import geometry as _geom_check  # noqa: E402
+
+
+def _csim_check_2op(tmp_path, pkg, name):
+    import subprocess
+    vitis_inc = "/mnt/vault1/tools/AMD/Vitis_HLS/2024.1/include"
+    if not Path(vitis_inc).is_dir():
+        pytest.skip("Vitis HLS headers not available in this environment")
+    exe = tmp_path / f"{name}_exe"
+    subprocess.run(["g++", "-std=c++14", f"-I{vitis_inc}", "-o", str(exe),
+                    str(pkg / f"{name}_tb.cpp"), str(pkg / f"{name}_top.cpp"),
+                    str(pkg / f"{name}_core.cpp")], check=True)
+    out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
+    assert "MVAU_PKG PASS" in out
+
+
+@pytest.mark.parametrize("mode_kw,mode_tag", [
+    (dict(second_operand_row_major=True), "rowmajor"),
+    (dict(second_operand_row_major=False), "colmajor"),
+])
+@pytest.mark.parametrize("shape,extra", [
+    ((4, 4, 8), dict(reuse_factor=2, fold_axis="n")),   # PE=4 SIMD=4 SF=1 NF=2 (DEPTH=NF=2)
+    ((4, 9, 4), dict(reuse_factor=2, fold_axis="k")),   # PE=4 SIMD=5 SF=2 NF=1 (DEPTH=SF=2)
+    ((4, 9, 8), dict(reuse_factor=2, fold_axis="kn")),  # PE=4 SIMD=5 SF=2 NF=2 (DEPTH=SF*NF=4)
+])
+def test_two_operand_single_tile_resolve_fold_csim_matches_golden(
+        tmp_path, shape, extra, mode_kw, mode_tag):
+    axis = extra["fold_axis"]
+    name = f"gemm_2op_rf_{axis}_{mode_tag}"
+    plan = _geom_check.fold_plan(*shape, **_CFG, weights_in_core=False,
+                                  **extra, **mode_kw)
+    tile = plan["tile"]
+    # Confirm this geometry actually resolved (via resolve_fold, no explicit pe/simd)
+    # onto the single-tile untiled shim (DEPTH=NF*SF>=2), not the register/grid form.
+    assert plan["n_tiles"] == 1 and plan.get("k_tiles", 1) == 1
+    assert tile["sf"] * tile["nf"] >= 2
+    assert not (tile["sf"] == 1 and tile["nf"] == 1)
+
+    t = load_target("mvau")
+    cfg = dict(_CFG, name=name, output_dir=str(tmp_path), weights_in_core=False,
+               **extra, **mode_kw)
+    pkg = Path(t.package(shape, cfg))
+    t.verify(pkg)
+    v = (pkg / f"{name}_core.v").read_text()
+    assert "dynamic_load_2op" in v
+    _csim_check_2op(tmp_path, pkg, name)
