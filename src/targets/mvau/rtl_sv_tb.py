@@ -319,17 +319,19 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
 
     fsm_debug_process = ""
     if fsm_debug and kind != "ws":
+        # NOTE: the two-operand ("ms") shim no longer has an IDLE/FILL/WRITE/DRAIN/RUN
+        # state register (dynamic_load_2op replaces that FSM) -- only a run_r/done_r
+        # pair. FSM_WRITE (there is no WRITE phase to load B into anymore; B streams
+        # into the loader independently of ap_ctrl) is dropped; FSM_RUN stamps
+        # run_r's rising edge instead of a state-register transition.
         fsm_debug_process = """\
   // ---- fsm_debug: extra latency-breakdown stamps ----
-  reg [2:0] dbg_prev_state = 3'd0;
+  reg dbg_prev_run = 1'b0;
   always @(posedge ap_clk) begin
-    if (ap_rst) dbg_prev_state <= 3'd0;
+    if (ap_rst) dbg_prev_run <= 1'b0;
     else begin
-      if (dut.state !== dbg_prev_state) begin
-        if (dut.state == 3'd2) $display("FSM_WRITE cyc=%0d", cyc);
-        if (dut.state == 3'd4) $display("FSM_RUN cyc=%0d", cyc);
-      end
-      dbg_prev_state <= dut.state;
+      if (dut.run_r && !dbg_prev_run) $display("FSM_RUN cyc=%0d", cyc);
+      dbg_prev_run <= dut.run_r;
     end
   end
   always @(posedge ap_clk)

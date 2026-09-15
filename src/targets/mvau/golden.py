@@ -371,38 +371,66 @@ int main() {{
 
 
 def _2op_core_twin(p, t, func_name):
-    """Two-operand C twin (NF=1 single tile): both A and B are runtime streams. Reads B
-    as ``K`` N-wide K-row beats (``b[pe]=B[k][pe]``) into residency, then per input vector
-    reads ``SF`` activation beats and emits one out_width-bit-per-lane requantized output
-    beat -- two-operand GEMM never has a real bias (has_bias is always False by
-    construction), so the per-lane pipeline is just shift + round-half-up + wrap, matching
-    the RTL requant stage."""
+    """Two-operand C twin (single-tile temporal fold, DEPTH=NF*SF>=2): both A and B are
+    runtime streams. B arrives at the ``dynamic_load_2op`` loader's own NARROW beat
+    width -- PE-wide (Mode A, mode=0) or SIMD-wide (Mode B, mode=1) -- in the loader's
+    writer order (see rtl_static/dynamic_load_2op.sv): Mode A = nf-fast/simd-mid/sf-slow
+    (SIMD*N_TLS beats), Mode B (transposed) = sf-fast/pe-mid/nf-slow (PE*N_TLS beats).
+    Then per input vector reads ``SF`` activation beats and emits one
+    out_width-bit-per-lane requantized output beat -- two-operand GEMM never has a real
+    bias (has_bias is always False by construction), so the per-lane pipeline is just
+    shift + round-half-up + wrap, matching the RTL requant stage."""
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     WW, AW, ACCU = t["weight_width"], t["activation_width"], t["accu_width"]
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
     N, K, M = p["n"], p["k_pad"], p["num_input_vectors"]
-    BB = ((N * WW) + 7) // 8 * 8
+    mode = p.get("mode", 0)
+    LANES_RAW = PE if mode == 0 else SIMD
+    BB = ((LANES_RAW * WW) + 7) // 8 * 8
     outW = p["output_width"]
     shift = p["product_frac"] - p["output_frac"]
     actt = _act_ctype(t["signed_activations"], AW)
     pad = ' ' * (len(func_name) + 6)
     req = _requant_block(shift, outW, "(long)acc", "q", ' ' * 16)
+    if mode == 0:
+        # Mode A: SIMD*N_TLS beats; nf-fast/simd-mid/sf-slow; beat = PE-wide, lane pe
+        # holds W[nf*PE+pe][sf*SIMD+simd].
+        load_body = f"""    for (int sf = 0; sf < {SF}; sf++)
+        for (int simd = 0; simd < {SIMD}; simd++)
+            for (int nf = 0; nf < {NF}; nf++) {{
+                ap_uint<{BB}> bb = b.read();
+                int k = sf * {SIMD} + simd;
+                for (int pe = 0; pe < {PE}; pe++) {{
+                    int o = nf * {PE} + pe;
+                    if (o < {N}) W[o][k] = bb.range(pe * {WW} + {WW} - 1, pe * {WW});
+                }}
+            }}"""
+    else:
+        # Mode B (transposed): PE*N_TLS beats; sf-fast/pe-mid/nf-slow; beat = SIMD-wide,
+        # lane s holds W[nf*PE+pe][sf*SIMD+s].
+        load_body = f"""    for (int nf = 0; nf < {NF}; nf++)
+        for (int pe = 0; pe < {PE}; pe++)
+            for (int sf = 0; sf < {SF}; sf++) {{
+                ap_uint<{BB}> bb = b.read();
+                int o = nf * {PE} + pe;
+                for (int s = 0; s < {SIMD}; s++) {{
+                    int k = sf * {SIMD} + s;
+                    if (o < {N}) W[o][k] = bb.range(s * {WW} + {WW} - 1, s * {WW});
+                }}
+            }}"""
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 
-// Two-operand C twin of {func_name} (FINN MVU: PE={PE} SIMD={SIMD} SF={SF} NF={NF}). B is a
-// runtime stream (N-wide K-row beats), buffered then replayed across M vectors; A streams
-// per vector. Vitis substitutes the RTL for csynth/cosim. Per lane: integer matmul, shift +
-// round-half-up + wrap to out_width (no bias -- two-operand GEMM never has one).
+// Two-operand C twin of {func_name} (FINN MVU: PE={PE} SIMD={SIMD} SF={SF} NF={NF},
+// loader MODE={mode}). B is a runtime stream at the loader's narrow beat width,
+// buffered then replayed across M vectors; A streams per vector. Vitis substitutes
+// the RTL for csynth/cosim. Per lane: integer matmul, shift + round-half-up + wrap to
+// out_width (no bias -- two-operand GEMM never has one).
 void {func_name}(hls::stream<ap_uint<{AB}> >& a,
 {pad}hls::stream<ap_uint<{BB}> >& b,
 {pad}hls::stream<ap_uint<{PB}> >& p) {{
     ap_int<{WW}> W[{N}][{K}];              // W[o][k] = B[k][o]
-    for (int k = 0; k < {K}; k++) {{
-        ap_uint<{BB}> bb = b.read();       // one N-wide K-row: bb[o] = B[k][o]
-        for (int o = 0; o < {N}; o++)
-            W[o][k] = bb.range(o * {WW} + {WW} - 1, o * {WW});
-    }}
+{load_body}
     for (int vec = 0; vec < {M}; vec++) {{
         {actt} x[{K}];
         for (int sf = 0; sf < {SF}; sf++) {{
@@ -430,8 +458,9 @@ void {func_name}(hls::stream<ap_uint<{AB}> >& a,
 
 
 def _2op_tb(p, t, top_name, func_name, seed, n_nodes=6):
-    """Two-operand self-checking TB (no bias): feed synthetic A (M×K) and B (K×N, as N-wide
-    K-row beats), golden = integer matmul + affine requant, compare the requantized C rows.
+    """Two-operand self-checking TB (no bias): feed synthetic A (M×K) and B (K×N, as
+    Mode-A N-wide K-row beats or Mode-B K-wide column beats per ``p["mode"]``), golden =
+    integer matmul + affine requant, compare the requantized C rows.
 
     ``n_nodes`` distinct (A,B) pairs are queued back-to-back -- all writes (per node, B
     then A, in the existing per-node order) happen before any call -- then the top is
@@ -442,7 +471,9 @@ def _2op_tb(p, t, top_name, func_name, seed, n_nodes=6):
     WW, AW = t["weight_width"], t["activation_width"]
     AB = t["input_stream_width_ba"]
     N, K, M = p["n"], p["k_pad"], p["num_input_vectors"]
-    BB = ((N * WW) + 7) // 8 * 8
+    mode = p.get("mode", 0)
+    WROW = N if mode == 0 else K   # top-level (hls4ml-facing) wide-beat element count
+    BB = ((WROW * WW) + 7) // 8 * 8
     outW = p["output_width"]
     req_shift = p["product_frac"] - p["output_frac"]
     CB = ((N * outW) + 7) // 8 * 8
@@ -452,6 +483,22 @@ def _2op_tb(p, t, top_name, func_name, seed, n_nodes=6):
     wmod, amod = min(7, 2 * wrange + 1), min(7, arange + 1)
     woff = wrange if wmod == 2 * wrange + 1 else 3
     aoff = 3 if signed else 0
+    if mode == 0:
+        # Mode A: K beats, each an N-wide K-row (b[o] = B[k][o]).
+        b_feed = f"""        for (int k = 0; k < {K}; k++) {{
+            ap_uint<{BB}> bb = 0;
+            for (int o = 0; o < {N}; o++)
+                bb.range(o * {WW} + {WW} - 1, o * {WW}) = (ap_uint<{WW}>)(ap_int<{WW}>)Bm[n][k][o];
+            b_in.write(bb);
+        }}"""
+    else:
+        # Mode B: N beats, each a K-wide column (b[k] = B[k][o]), natural column order.
+        b_feed = f"""        for (int o = 0; o < {N}; o++) {{
+            ap_uint<{BB}> bb = 0;
+            for (int k = 0; k < {K}; k++)
+                bb.range(k * {WW} + {WW} - 1, k * {WW}) = (ap_uint<{WW}>)(ap_int<{WW}>)Bm[n][k][o];
+            b_in.write(bb);
+        }}"""
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 #include <cstdio>
@@ -471,7 +518,8 @@ static long requant_ref(long acc) {{
     return q;
 }}
 
-// two-operand tile: N={N} K={K} PE={PE} SIMD={SIMD} SF={SF} NF=1, M={M} vectors, no bias.
+// two-operand tile: N={N} K={K} PE={PE} SIMD={SIMD} SF={SF} NF=1, M={M} vectors, no bias,
+// loader MODE={mode}.
 #define NN {NN}
 
 int main() {{
@@ -492,13 +540,8 @@ int main() {{
                 golden[n][v][o] = requant_ref(acc);
             }}
 
-        // B first: K beats, each an N-wide K-row (b[o] = B[k][o])
-        for (int k = 0; k < {K}; k++) {{
-            ap_uint<{BB}> bb = 0;
-            for (int o = 0; o < {N}; o++)
-                bb.range(o * {WW} + {WW} - 1, o * {WW}) = (ap_uint<{WW}>)(ap_int<{WW}>)Bm[n][k][o];
-            b_in.write(bb);
-        }}
+        // B first (order/shape depends on mode)
+{b_feed}
         // then A: M vectors, SF beats of SIMD activations each
         for (int v = 0; v < {M}; v++)
             for (int sf = 0; sf < {SF}; sf++) {{

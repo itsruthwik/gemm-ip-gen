@@ -136,8 +136,11 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, **plan_kw):
     return module_name, [work / f"{module_name}.v"]
 
 
-def _build_2op_case(work, name, shape, seed, kind, backpressure=True, fsm_debug=False, **plan_kw):
-    """kind: 'reg' (SF=NF=1) or 'ms' (SF*NF>=2, untiled)."""
+def _build_2op_case(work, name, shape, seed, kind, backpressure=True, fsm_debug=False,
+                    mode=0, **plan_kw):
+    """kind: 'reg' (SF=NF=1) or 'ms' (SF*NF>=2, untiled). ``mode`` (ms only): 0 = row-major
+    (dynamic_load_2op MODE=0), 1 = col-major (MODE=1) -- selects the loader's narrow B
+    beat layout/order (see rtl.py's generate_two_operand_shim)."""
     plan = _find_case_plan(shape, **plan_kw)
     t = plan["tile"]
     module_name = f"{name}_core"
@@ -173,18 +176,40 @@ def _build_2op_case(work, name, shape, seed, kind, backpressure=True, fsm_debug=
         signed = bool(t["signed_activations"])
         shift = plan["product_frac"] - plan["output_frac"]
         core_v = _rtl.generate_two_operand_shim(shape, module_name=module_name,
-                                                force_behavioral=True, tile=t, plan=plan)
+                                                force_behavioral=True, tile=t, plan=plan,
+                                                mode=mode)
         (work / f"{module_name}.v").write_text(core_v)
 
         ab_bits = t["input_stream_width_ba"]
-        bb_bits = ((N * WW) + 7) // 8 * 8
+        # dynamic_load_2op's own NARROW input beat -- PE-wide (mode 0) or SIMD-wide
+        # (mode 1) -- fed directly (no wide-beat gearbox at this RTL-level harness; that
+        # lives in the HLS feed_b process for the real package, see package.py).
+        lanes_raw = PE if mode == 0 else SIMD
+        bb_bits = ((lanes_raw * WW) + 7) // 8 * 8
         pb_bits = t["output_stream_width_ba"]
         a_words, b_words, exp_words = [], [], []
         for node in range(N_NODES):
             Bm = _tb.synth_b_stream(K_pad, N, WW, seed, node)   # [K_pad][N]
             X = _tb.synth_activations(plan["num_input_vectors"], K_pad, AW, signed, seed, node)
-            for kk in range(K_pad):
-                b_words.append(_tb.pack_beat(Bm[kk], WW))
+            # B beats in the loader's own writer order (see rtl_static/dynamic_load_2op.sv):
+            #   mode 0 (row-major): nf-fast/simd-mid/sf-slow, PE-wide beat = Bm[sf*SIMD+simd][nf*PE+pe]
+            #   mode 1 (col-major, transposed): sf-fast/pe-mid/nf-slow, SIMD-wide beat = Bm[sf*SIMD+s][nf*PE+pe]
+            if mode == 0:
+                for sf in range(SF):
+                    for simd in range(SIMD):
+                        kk = sf * SIMD + simd
+                        for nf in range(NF):
+                            lane = [Bm[kk][nf * PE + pe] if nf * PE + pe < N else 0
+                                    for pe in range(PE)]
+                            b_words.append(_tb.pack_beat(lane, WW))
+            else:
+                for nf in range(NF):
+                    for pe in range(PE):
+                        oc = nf * PE + pe
+                        for sf in range(SF):
+                            lane = [Bm[sf * SIMD + s][oc] if oc < N else 0
+                                    for s in range(SIMD)]
+                            b_words.append(_tb.pack_beat(lane, WW))
             for v in range(plan["num_input_vectors"]):
                 for sf in range(SF):
                     lane = X[v][sf * SIMD:(sf + 1) * SIMD]
@@ -234,12 +259,19 @@ CASES = {
     "g_2op_qk_memstream": lambda work, seed, **kw: _build_2op_case(
         work, "g", (16, 12, 16), seed, "ms", pe=16, simd=6,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "h_2op_col_major_memstream": lambda work, seed, **kw: _build_2op_case(
+        work, "h", (2, 8, 4), seed, "ms", pe=4, simd=4, mode=1,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "i_2op_col_major_qk_memstream": lambda work, seed, **kw: _build_2op_case(
+        work, "i", (16, 12, 16), seed, "ms", pe=16, simd=6, mode=1,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
 }
 
 RTL_STATIC_DIR = HERE / "rtl_static"
 STATIC_SOURCES = [
     "mvu_vvu_axi.sv", "replay_buffer.sv", "memstream.sv",
     "mvu_pkg.sv", "mvu.sv", "add_multi.sv", "mvu_vvu_8sx9_dsp58.sv",
+    "dynamic_load_2op.sv",
 ]
 
 

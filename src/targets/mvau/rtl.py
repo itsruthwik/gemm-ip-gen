@@ -674,22 +674,31 @@ endmodule
 
 
 def generate_two_operand_shim(shape, module_name="mvau_core", force_behavioral=True,
-                              tile=None, plan=None, **plan_kwargs):
+                              tile=None, plan=None, mode=0, **plan_kwargs):
     """Emit the two-operand (``gemm_stream``) shim: A and B both runtime activation
-    streams. B takes the MVU weight port, loaded at runtime into ``memstream`` via its
-    addressed config-write port, then replayed across the M rows of A (B-stationary).
+    streams. B takes the MVU weight port, loaded at runtime into the forked
+    ``dynamic_load_2op`` module (2-bank ping-pong, see
+    ``rtl_static/dynamic_load_2op.sv``), then replayed across the M rows of A
+    (B-stationary). ``mode`` selects the B layout: 0 = row-major (Mode A, the
+    module's PE-wide input beat, one SIMD lane per beat) or 1 = col-major
+    (Mode B, the module's SIMD-wide input beat, one PE lane per beat). The
+    module's ``odat`` is the exact PE*SIMD*WEIGHT_WIDTH MVU weight word --
+    feeds ``s_axis_weights_tdata`` directly, no hand packing needed.
 
-    The HLS wrapper is a pure passthrough for both operands; all matmul mechanics stay
-    in RTL. B arrives as **N-wide beats in K-row order** (row-major ``B[k][:]``). The load
-    FSM buffers a band of SIMD consecutive K-rows (all N columns), then emits the NF
-    memstream words for that band (one per PE-column block) at strided address
-    ``nf*SF+sf``, bit ``(pe*SIMD+s)*WW`` = ``B[sf*SIMD+s][nf*PE+pe]``.
+    The B FIFO here carries the module's own NARROW input beat (PE-wide for
+    Mode A / SIMD-wide for Mode B) -- the wide-beat-to-narrow-beat gearbox
+    (``feed_b``) lives on the HLS side (see package.py), not in this shim.
 
-    Scope: single tile, any (PE, SIMD, SF, NF); no N/K-tiling. The controller runs
-    FILL (gather SIMD rows; config_ce held high so the stream pointer stays at 0) ->
-    WRITE (config_we the NF words of the band) -> ... -> DRAIN (let the last write
-    commit) -> RUN (config_ce low, activations stream, memstream replays across M),
-    then reloads for the next node. NF=1 collapses WRITE to a single word per band."""
+    ap_ctrl bookkeeping (``ocnt``/``run_total``) is retained per plan V1: no
+    overlap/always-live loader (that's V2) -- each node's A/weight-consumption
+    handshakes are gated on a ``run_r`` register set by ``ap_start`` and cleared
+    once ``run_total`` output beats have been produced. B beats may stream into
+    the loader at any time (gated only by the module's own ``irdy``/guard
+    logic), which is a side effect of the module's design, not new shim logic.
+
+    Scope: single tile, any (PE, SIMD, SF, NF); no N/K-tiling. The fully-spatial
+    DEPTH==1 case (one weight word/vector) is served by the K-tiled register
+    shim with gk=1, routed in generate_two_operand_pkg."""
     t = tile if tile is not None else _geom.resolve_plan(shape, **plan_kwargs)["tile"]
     p = plan if plan is not None else _geom.resolve_plan(shape, **plan_kwargs)
     fb = 1 if force_behavioral else 0
@@ -697,43 +706,36 @@ def generate_two_operand_shim(shape, module_name="mvau_core", force_behavioral=T
     M = p["num_input_vectors"]
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     WW, ACCU = t["weight_width"], t["accu_width"]
-    WB = t["weight_stream_width_ba"]     # memstream word width (PE*SIMD*WW, byte-aligned)
+    WB = t["weight_stream_width_ba"]     # MVU weight-port word width (PE*SIMD*WW, byte-aligned)
     AB = t["input_stream_width_ba"]      # activation beat (SIMD*AW)
     PB = t["output_stream_width_ba"]     # output beat (PE*ACCU)
-    BB = ((N * WW) + 7) // 8 * 8         # B beat: N weight codes, byte-aligned
     DEPTH = NF * SF
-    # This shim serves the temporal-fold case (DEPTH = NF*SF >= 2). The fully-spatial
-    # DEPTH==1 case (one weight word/vector) is served by the K-tiled register shim with
-    # gk=1 (a memstream cannot be config-written at DEPTH=1), routed in generate_two_operand_pkg.
     if DEPTH < 2:
         raise NotImplementedError(
             "single-tile two-operand shim requires DEPTH=NF*SF>=2; the fully-spatial "
             "DEPTH==1 case is handled by the K-tiled register shim (gk=1).")
     run_total = M * NF                    # output beats per node (NF beats per vector)
 
+    # Narrow B beat: dynamic_load_2op's idat width -- PE-wide (Mode A) or SIMD-wide
+    # (Mode B), byte-aligned for the ap_fifo/AXIS boundary. The raw (unaligned) width
+    # is what actually connects to the module; any byte-alignment pad bits above it
+    # are don't-cares (feed_b never sets them) and are simply dropped here.
+    LANES_RAW = PE if mode == 0 else SIMD
+    BW_RAW = LANES_RAW * WW
+    BW = ((BW_RAW + 7) // 8) * 8
+
     def _w(n):                            # bit-width to hold values 0..n-1
         return max(1, (n - 1).bit_length())
-    wa_decl = ""
-    cfg_we_expr = "ap_ce & (state == WRITE)"
-    cfg_addr_expr = f"nfc * {SF} + sfc"
-    write_body = f"""                WRITE: begin      // emit the NF words of this band, one per cycle
-                    if (nfc == {NF - 1}) begin
-                        nfc <= 0;
-                        if (sfc == {SF - 1}) begin sfc <= 0; state <= DRAIN; dcnt <= 0; end
-                        else begin sfc <= sfc + 1'b1; state <= FILL; end
-                    end else nfc <= nfc + 1'b1;
-                end"""
-    fill_reset = "sc <= 0; nfc <= 0; state <= WRITE;"
-    # combinational pack of the current band's word for column block nfc:
-    #   wword[(pe*SIMD+s)*WW +: WW] = band[s][(nfc*PE+pe)*WW +: WW]
-    fill = "\n".join(
-        f"        wword[{(pe * SIMD + s) * WW} +: {WW}] = band[{s}][nfc*{PE * WW} + {pe * WW} +: {WW}];"
-        for pe in range(PE) for s in range(SIMD))
     raw_bits = PE * ACCU
+    # pad odat (exactly PE*SIMD*WW bits) up to the byte-aligned MVU weight-port width WB
+    odat_pad = WB - PE * SIMD * WW
+    w_odat_expr = ("w_odat_raw" if odat_pad == 0
+                   else f"{{{odat_pad}'b0, w_odat_raw}}")
     req_decls, req_regs = _requant_lanes(
         t, PE, [f"out_tdata_raw[{i * ACCU} +: {ACCU}]" for i in range(PE)], None, "rq")
     return f"""// Generated by gemm-ip-gen (mvau target). Two-operand (gemm_stream) shim:
-// A + B both runtime streams; B loaded into memstream at runtime, replayed across M.
+// A + B both runtime streams; B loaded at runtime into dynamic_load_2op (2-bank
+// ping-pong), replayed across M. MODE={mode} (0=row-major/A, 1=col-major/B).
 // Tile: MW(K)={t['mw']} MH(N)={N} PE={PE} SIMD={SIMD} SF={SF} NF={NF} \
 core={t['compute_core']} ACCU={ACCU} DEPTH={DEPTH} M={M}
 // Module name MUST equal the JSON c_function_name (Vitis instantiates by it).
@@ -751,8 +753,9 @@ module {module_name} (
     input  wire [{AB - 1}:0] a_dout,
     input  wire                 a_empty_n,
     output wire                 a_read,
-    // B FIFO (input)           {BB} = ceil(N*WEIGHT_WIDTH/8)*8 (one N-wide K-row per beat)
-    input  wire [{BB - 1}:0] b_dout,
+    // B FIFO (input)           {BW} = ceil({LANES_RAW}*WEIGHT_WIDTH/8)*8 (dynamic_load_2op's
+    // narrow input beat -- the wide-beat gearbox lives in the HLS feed_b process)
+    input  wire [{BW - 1}:0] b_dout,
     input  wire                 b_empty_n,
     output wire                 b_read,
     // output FIFO (output)     {PB} = ceil(PE*out_width/8)*8 (post-requant; no bias -- two-operand)
@@ -761,45 +764,23 @@ module {module_name} (
     output wire                 p_write
 );
     wire rst_n = ~ap_rst;
-    localparam [2:0] IDLE = 3'd0, FILL = 3'd1, WRITE = 3'd2, DRAIN = 3'd3, RUN = 3'd4;
 
-    reg  [2:0]            state = IDLE;
+    reg                    run_r = 0;       // node RUN phase active
     reg                    done_r = 0;      // ap_done pending, cleared by ap_continue
-    reg  [{_w(SIMD) - 1}:0]  sc = 0;    // lane within band (0..SIMD-1)
-    reg  [{_w(SF) - 1}:0]  sfc = 0;     // band index (0..SF-1)
-    reg  [{_w(NF) - 1}:0]  nfc = 0;     // column block within band (0..NF-1)
-    reg  [1:0]            dcnt = 0;     // drain counter
     reg  [{_w(run_total) - 1}:0]  ocnt = 0;   // output beats seen this node
     reg  [{_w(M * SF + 1) - 1}:0]  icnt = 0;       // A beats accepted this node (M*SF)
-{wa_decl}
-    // band buffer: SIMD consecutive N-wide K-rows (all columns), refilled per band
-    reg  [{BB - 1}:0]  band [0:{SIMD - 1}];
 
-    assign ap_ready = (state == IDLE) & ~done_r & ap_start & ap_ce;
+    assign ap_ready = ~run_r & ~done_r & ap_start & ap_ce;
     assign ap_done  = done_r;
-    assign ap_idle  = (state == IDLE) & ~done_r;
+    assign ap_idle  = ~run_r & ~done_r;
 
-    // b handshake: consume a B beat only while filling a band
-    assign b_read = ap_ce & (state == FILL) & b_empty_n;
-
-    // current memstream word for column block nfc, packed from the buffered band
-    reg  [{WB - 1}:0]  wword;
-    always @* begin
-        wword = {{{WB}{{1'b0}}}};
-{fill}
-    end
-
-    // memstream config-write load port (config_ce held through FILL/WRITE/DRAIN so the
-    // stream pointer stays frozen at 0 until RUN; config_we pulses one word per WRITE cycle)
-    wire        cfg_ce = ap_ce & (state == FILL || state == WRITE || state == DRAIN);
-    wire        cfg_we = {cfg_we_expr};
-    wire [31:0] cfg_addr = {cfg_addr_expr};   // memstream word address
-    wire [{WB - 1}:0] cfg_d0 = wword;
-
-    // ---- weight ROM (runtime-loaded), MVU core, run-phase handshakes ----
-    wire [{WB - 1}:0] w_odat;
-    wire              w_ovld, w_ordy, wgt_tvalid, wgt_tready;
-    wire              in_tvalid, in_tready, out_tvalid, out_tready;
+    // ---- weight loader (runtime-loaded, double-buffered), MVU core, run-phase handshakes ----
+    wire                          ld_ivld, ld_irdy;
+    wire [{BW_RAW - 1}:0]         ld_idat = b_dout[{BW_RAW - 1}:0];
+    wire                          w_ovld, w_ordy;
+    wire [{PE * SIMD * WW - 1}:0] w_odat_raw;
+    wire                          wgt_tvalid, wgt_tready;
+    wire                          in_tvalid, in_tready, out_tvalid, out_tready;
     wire [{raw_bits - 1}:0] out_tdata_raw;   // raw PE*ACCU_WIDTH beat straight off the core
 
     // per-lane requantize stage (no bias -- two-operand GEMM never has one): shift +
@@ -809,50 +790,43 @@ module {module_name} (
 
     always @(posedge ap_clk) begin
         if (ap_rst) begin
-            state <= IDLE; done_r <= 0; sc <= 0; sfc <= 0; nfc <= 0; dcnt <= 0; ocnt <= 0; icnt <= 0;
+            run_r <= 0; done_r <= 0; ocnt <= 0; icnt <= 0;
         end else if (ap_ce) begin
             if (ap_ready) begin
-                state <= FILL; sc <= 0; sfc <= 0; nfc <= 0; dcnt <= 0; ocnt <= 0; icnt <= 0;
-            end else case (state)
-                IDLE: ;
-                FILL: if (b_read) begin
-                    band[sc] <= b_dout;
-                    if (sc == {SIMD - 1}) begin {fill_reset} end
-                    else sc <= sc + 1'b1;
+                run_r <= 1'b1; ocnt <= 0; icnt <= 0;
+            end else if (run_r) begin
+                if (in_tvalid & in_tready) icnt <= icnt + 1'b1;
+                if (p_write) begin
+                    if (ocnt == {run_total - 1}) begin run_r <= 1'b0; done_r <= 1'b1; end
+                    else ocnt <= ocnt + 1'b1;
                 end
-{write_body}
-                DRAIN: begin
-                    dcnt <= dcnt + 1'b1;
-                    if (dcnt == 2'd1) begin state <= RUN; ocnt <= 0; icnt <= 0; end
-                end
-                RUN: begin
-                    if (in_tvalid & in_tready) icnt <= icnt + 1'b1;
-                    if (p_write) begin
-                        if (ocnt == {run_total - 1}) begin state <= IDLE; done_r <= 1'b1; end
-                        else ocnt <= ocnt + 1'b1;
-                    end
-                end
-            endcase
+            end
             if (done_r & ap_continue) done_r <= 1'b0;
         end
     end
 
-    memstream #(
-        .DEPTH({DEPTH}), .WIDTH({WB}), .INIT_FILE(""), .RAM_STYLE("auto")
-    ) wmem (
-        .clk(ap_clk), .rst(ap_rst),
-        .config_ce(cfg_ce), .config_we(cfg_we), .config_address(cfg_addr), .config_d0(cfg_d0),
-        .config_rack(), .config_q0(),
-        .ordy(w_ordy), .ovld(w_ovld), .odat(w_odat)
+    // b handshake: dynamic_load_2op accepts B beats whenever it has room (its own
+    // writer FSM/guard, not gated by ap_ctrl -- filling ahead of a node's RUN phase
+    // is safe by construction and simply a side effect of always-open b_read).
+    assign ld_ivld = ap_ce & b_empty_n;
+    assign b_read  = ld_ivld & ld_irdy;
+
+    dynamic_load_2op #(
+        .PE({PE}), .SIMD({SIMD}), .WEIGHT_WIDTH({WW}),
+        .MH({N}), .MW({t['mw']}), .N_REPS({M}), .MODE({mode}),
+        .RAM_STYLE("distributed")
+    ) loader (
+        .ap_clk(ap_clk), .ap_rst_n(rst_n),
+        .ivld(ld_ivld), .irdy(ld_irdy), .idat(ld_idat),
+        .ovld(w_ovld), .ordy(w_ordy), .odat(w_odat_raw)
     );
 
-    // RUN-phase AXIS binding (frozen during LOAD/DRAIN so the core stays idle)
-    wire run = (state == RUN);
+    // RUN-phase AXIS binding (frozen outside run_r so the core stays idle)
     // gate the A handshake on icnt too: stop pulling A beats once this node's M*SF
     // beats are accepted, even if the next node's rows are already queued in the FIFO.
-    wire in_open = run & (icnt != {M * SF});
-    assign wgt_tvalid = ap_ce & run & w_ovld;
-    assign w_ordy     = ap_ce & run & wgt_tready;
+    wire in_open = run_r & (icnt != {M * SF});
+    assign wgt_tvalid = ap_ce & run_r & w_ovld;
+    assign w_ordy     = ap_ce & run_r & wgt_tready;
     assign in_tvalid  = ap_ce & in_open & a_empty_n;
     assign a_read     = ap_ce & in_open & in_tready;
     assign out_tready = ap_ce & p_full_n;
@@ -870,7 +844,7 @@ module {module_name} (
         .ap_clk(ap_clk),
         .ap_clk2x(1'b0),
         .ap_rst_n(rst_n),
-        .s_axis_weights_tdata(w_odat),
+        .s_axis_weights_tdata({w_odat_expr}),
         .s_axis_weights_tvalid(wgt_tvalid),
         .s_axis_weights_tready(wgt_tready),
         .s_axis_input_tdata(a_dout),
@@ -882,6 +856,7 @@ module {module_name} (
     );
 endmodule
 """
+
 
 
 def _2op_grid_memstream_shim(t, p, module_name, force_behavioral, nt, gk, sf_tile):

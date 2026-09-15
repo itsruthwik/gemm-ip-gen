@@ -27,7 +27,8 @@ _RTL_STATIC = Path(__file__).resolve().parent / "rtl_static"
 # always vendored -- the const_weights path instantiates it, the two-operand shims
 # (see _2op_* emitters) leave it uninstantiated.
 _STATIC_SOURCES = ["mvu_vvu_axi.sv", "replay_buffer.sv", "memstream.sv",
-                   "mvu_pkg.sv", "mvu.sv", "add_multi.sv", "mvu_vvu_8sx9_dsp58.sv"]
+                   "mvu_pkg.sv", "mvu.sv", "add_multi.sv", "mvu_vvu_8sx9_dsp58.sv",
+                   "dynamic_load_2op.sv"]
 _WEIGHTS_DAT = "{name}_weights.dat"   # per-IP memstream $readmemh init, in rtl_static/
 # XSIM requires all-or-none `timescale across the design. The vendored FINN cores and the
 # generated shim carry none (fine standalone), but the hls4ml RTL they integrate with does
@@ -492,33 +493,91 @@ void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream
 
 
 def _2op_dataflow_top(name, plan):
-    """DUT for the two-operand blackbox (NF=1 single tile): pure passthrough of both A and
-    B streams into the core, then the affine requant drain (no bias; act×act product scale
-    ``fa+fb``). B is buffered/replayed inside the RTL, so the top just forwards its beats."""
+    """DUT for the two-operand blackbox (single-tile temporal fold, DEPTH=NF*SF>=2):
+    passthrough of A, the affine requant drain (no bias; act×act product scale
+    ``fa+fb``), and a ``feed_b`` gearbox that reindexes hls4ml's wide B beat down to
+    ``dynamic_load_2op``'s narrow input beat -- AT MOST a 1-wide-beat register, no
+    reorder buffer (see jojo-track/defer/mvau-two-operand-dynamic-load/plan.md,
+    "Input width gearbox").
+
+    Mode A (``mode=0``, row-major B): one N-wide K-row arrives per beat (K beats
+    total); feed_b holds it in a 1xN register and drains it PE at a time, NF
+    sub-beats (nf=0..NF-1, nf-fast) -- matches the loader's Mode A writer
+    (nf-fast/simd-mid/sf-slow: rows arrive in natural k=sf*SIMD+simd order).
+
+    Mode B (``mode=1``, col-major B): one K-wide column arrives per beat (N beats
+    total, natural column order c=nf*PE+pe, pe-fast/nf-slow); feed_b holds it in a
+    1xK register and drains it SIMD at a time, SF sub-beats (sf=0..SF-1, sf-fast)
+    -- matches the loader's Mode B (transposed) writer (sf-fast/pe-mid/nf-slow)."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    PE, SF, NF = t["pe"], t["sf"], t["nf"]
+    PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     N, WW = plan["n"], t["weight_width"]
-    BB = ((N * WW) + 7) // 8 * 8
     K = plan["k_pad"]
     outW = plan["output_width"]
     CB = cbits(plan)
-    abeats, bbeats = m * SF, K
+    abeats = m * SF
     pad = ' ' * (len(name) + 6)
     indent = ' ' * (len(name) + 1)
+    mode = plan.get("mode", 0)
+
+    LANES_RAW = PE if mode == 0 else SIMD
+    BWn = ((LANES_RAW * WW + 7) // 8) * 8   # narrow beat into the core (module idat width)
+
+    if mode == 0:
+        # Mode A: wide beat = one N-wide K-row (K beats); drain NF PE-wide sub-beats
+        # per row (nf-fast), lane pe = row bits [(nf*PE+pe)*WW +: WW].
+        WROW, WROW_BEATS, SUBBEATS = N, K, NF
+        feed_b_body = f"""static void feed_b(hls::stream<ap_uint<{((WROW * WW + 7) // 8) * 8}> >& in,
+                    hls::stream<ap_uint<{BWn}> >& out) {{
+    for (int k = 0; k < {WROW_BEATS}; k++) {{
+        ap_uint<{((WROW * WW + 7) // 8) * 8}> row = in.read();   // 1xN register (one arriving wide beat)
+        for (int nf = 0; nf < {SUBBEATS}; nf++) {{
+#pragma HLS PIPELINE II=1
+            ap_uint<{BWn}> nb = 0;
+            for (int pe = 0; pe < {PE}; pe++) {{
+#pragma HLS UNROLL
+                nb.range(pe * {WW} + {WW} - 1, pe * {WW}) =
+                    row.range((nf * {PE} + pe) * {WW} + {WW} - 1, (nf * {PE} + pe) * {WW});
+            }}
+            out.write(nb);
+        }}
+    }}
+}}"""
+    else:
+        # Mode B: wide beat = one K-wide column (N beats, natural column order
+        # c=nf*PE+pe pe-fast); drain SF SIMD-wide sub-beats per column (sf-fast),
+        # lane s = column bits [(sf*SIMD+s)*WW +: WW].
+        WROW, WROW_BEATS, SUBBEATS = K, N, SF
+        feed_b_body = f"""static void feed_b(hls::stream<ap_uint<{((WROW * WW + 7) // 8) * 8}> >& in,
+                    hls::stream<ap_uint<{BWn}> >& out) {{
+    for (int c = 0; c < {WROW_BEATS}; c++) {{
+        ap_uint<{((WROW * WW + 7) // 8) * 8}> col = in.read();   // 1xK register (one arriving wide beat)
+        for (int sf = 0; sf < {SUBBEATS}; sf++) {{
+#pragma HLS PIPELINE II=1
+            ap_uint<{BWn}> nb = 0;
+            for (int s = 0; s < {SIMD}; s++) {{
+#pragma HLS UNROLL
+                nb.range(s * {WW} + {WW} - 1, s * {WW}) =
+                    col.range((sf * {SIMD} + s) * {WW} + {WW} - 1, (sf * {SIMD} + s) * {WW});
+            }}
+            out.write(nb);
+        }}
+    }}
+}}"""
+    BB_top = ((WROW * WW + 7) // 8) * 8   # top-level (hls4ml-facing) wide-beat width
+
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 
-void {name}_core(hls::stream<ap_uint<{AB}> >&, hls::stream<ap_uint<{BB}> >&,
+void {name}_core(hls::stream<ap_uint<{AB}> >&, hls::stream<ap_uint<{BWn}> >&,
 {pad}hls::stream<ap_uint<{PB}> >&);
 
 static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
     for (int i = 0; i < {abeats}; i++) out.write(in.read());
 }}
-static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >& out) {{
-    for (int i = 0; i < {bbeats}; i++) out.write(in.read());
-}}
+{feed_b_body}
 
 // Pure unpack (no bias -- two-operand GEMM never has one): {name}_core already
 // shift/round-half-up/wrapped each lane to out_width. Beat nf lane pe holds output
@@ -541,11 +600,11 @@ static void unpack(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >&
     }}
 }}
 
-void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in,
+void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB_top}> >& b_in,
 {indent}hls::stream<ap_uint<{CB}> >& c_out) {{
 #pragma HLS DATAFLOW
     hls::stream<ap_uint<{AB}> > a_s;
-    hls::stream<ap_uint<{BB}> > b_s;
+    hls::stream<ap_uint<{BWn}> > b_s;
     hls::stream<ap_uint<{PB}> > p_s;
 #pragma HLS STREAM variable=a_s depth=4
 #pragma HLS STREAM variable=b_s depth=4
@@ -838,7 +897,13 @@ def _2op_gemm_ip_header(name, plan):
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
     AW, WW = t["activation_width"], t["weight_width"]
     N, K, KPAD = plan["n"], plan["k"], plan["k_pad"]
-    BB = ((N * WW) + 7) // 8 * 8
+    mode = plan.get("mode", 0)
+    # BB: the dynamic_load_2op loader's own NARROW input beat (core-side, module idat
+    # width) -- PE-wide (Mode A) or SIMD-wide (Mode B). The hls4ml-facing wide beat
+    # (data1_T, N-wide row / K-wide column) is reindexed down to this by repack_b below
+    # (the HLS feed_b gearbox), never materializing more than one arriving wide beat.
+    LANES_RAW = PE if mode == 0 else SIMD
+    BB = ((LANES_RAW * WW) + 7) // 8 * 8
     NT_, NTILE = plan["n_tiles"], plan["n_tile"]
     KT_ = plan.get("k_tiles", 1)
     outW = plan["output_width"]
@@ -967,6 +1032,63 @@ void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res
     }}
 }}"""
 
+    # repack B: reindex hls4ml's wide beat down to the loader's narrow beat (the HLS
+    # feed_b gearbox -- see rtl.py's dynamic_load_2op instantiation and
+    # jojo-track/defer/mvau-two-operand-dynamic-load/plan.md, "Input width gearbox").
+    # Materializes AT MOST one arriving wide beat (a 1xN or 1xK register), never a
+    # reorder buffer. Padding (K -> KPAD rows for Mode A, N -> PE*NF columns for Mode
+    # B) is a zero-filled pass with no stream read, matching the old zero-pad semantics
+    # bit-exact.
+    if mode == 0:
+        # Mode A: KPAD row-slots (K real + zero-pad), each split into NF PE-wide
+        # sub-beats (nf-fast) -- matches the loader's Mode A writer order.
+        repack_b = f"""template <class data1_T>
+void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BB}> > &b_s) {{
+    static_assert(data1_T::size == {N},
+        "{name}: hls4ml must deliver one N-wide K-row per beat (row-major B)");
+    for (unsigned k = 0; k < {KPAD}; k++) {{
+        ap_uint<{N * WW}> row = 0;
+        if (k < {K}) {{
+            data1_T beat = b_stream.read();
+            for (unsigned n = 0; n < {N}; n++)
+                row.range(n * {WW} + {WW} - 1, n * {WW}) = beat[n].range({WW} - 1, 0);
+        }}
+        for (unsigned nf = 0; nf < {NF}; nf++) {{
+            ap_uint<{BB}> nb = 0;
+            for (unsigned pe = 0; pe < {PE}; pe++)
+                nb.range(pe * {WW} + {WW} - 1, pe * {WW}) =
+                    row.range((nf * {PE} + pe) * {WW} + {WW} - 1, (nf * {PE} + pe) * {WW});
+            b_s.write(nb);
+        }}
+    }}
+}}"""
+        b_s_depth = KPAD * NF + 2
+    else:
+        # Mode B: PE*NF column-slots (N real + zero-pad), each split into SF SIMD-wide
+        # sub-beats (sf-fast) -- matches the loader's (transposed) Mode B writer order;
+        # natural column order c=nf*PE+pe (pe-fast) matches hls4ml's own beat order.
+        repack_b = f"""template <class data1_T>
+void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BB}> > &b_s) {{
+    static_assert(data1_T::size == {K},
+        "{name}: hls4ml must deliver one K-wide column per beat (col-major B)");
+    for (unsigned c = 0; c < {PE * NF}; c++) {{
+        ap_uint<{KPAD * WW}> col = 0;
+        if (c < {N}) {{
+            data1_T beat = b_stream.read();
+            for (unsigned k = 0; k < {K}; k++)
+                col.range(k * {WW} + {WW} - 1, k * {WW}) = beat[k].range({WW} - 1, 0);
+        }}
+        for (unsigned sf = 0; sf < {SF}; sf++) {{
+            ap_uint<{BB}> nb = 0;
+            for (unsigned s = 0; s < {SIMD}; s++)
+                nb.range(s * {WW} + {WW} - 1, s * {WW}) =
+                    col.range((sf * {SIMD} + s) * {WW} + {WW} - 1, (sf * {SIMD} + s) * {WW});
+            b_s.write(nb);
+        }}
+    }}
+}}"""
+        b_s_depth = PE * NF * SF + 2
+
     return f"""#ifndef {name.upper()}_GEMM_IP_H_
 #define {name.upper()}_GEMM_IP_H_
 {guard}#include <hls_stream.h>
@@ -980,21 +1102,13 @@ void {name}_core(hls::stream<ap_uint<{a_width}> >&, hls::stream<ap_uint<{BB}> >&
 namespace nnet {{
 
 // Dedicated two-operand IP for gemm config M={m} K={K} N={N} (core={t['compute_core']}).
-// B MUST arrive row-major: data1_T::size == N, one K-row per beat (SecondOperandRowMajor).
+// B layout selected by SecondOperandRowMajor: MODE={mode} -- row-major (data1_T::size ==
+// N, one K-row per beat) when True/unset, col-major (data1_T::size == K, one N-column
+// per beat) when False.
 
 {repack_a}
 
-// repack B: {K} row-major K-row beats (N-wide) -> shim beats, zero-padded K -> {KPAD}.
-template <class data1_T>
-void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BB}> > &b_s) {{
-    for (unsigned k = 0; k < {K}; k++) {{
-        data1_T beat = b_stream.read();
-        ap_uint<{BB}> bb = 0;
-        for (unsigned n = 0; n < {N}; n++) bb.range(n * {WW} + {WW} - 1, n * {WW}) = beat[n].range({WW} - 1, 0);
-        b_s.write(bb);
-    }}
-    for (unsigned k = {K}; k < {KPAD}; k++) b_s.write(0);   // zero-pad K -> K_pad (bit-exact)
-}}
+{repack_b}
 
 // pure unpack drain: no bias for two-operand GEMM (has_bias is always False by
 // construction) -- {name}_core already requantized each lane to out_width; this
@@ -1012,7 +1126,7 @@ void {name}_gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_
     hls::stream<ap_uint<{BB}> > b_s;
     hls::stream<ap_uint<{p_width}> > p_s;
 #pragma HLS STREAM variable=a_s depth={SF + 2}
-#pragma HLS STREAM variable=b_s depth={KPAD + 2}
+#pragma HLS STREAM variable=b_s depth={b_s_depth}
 #pragma HLS STREAM variable=p_s depth={NF + 2}
     {name}_repack_a<data0_T>(a_stream, a_s);
     {name}_repack_b<data1_T>(b_stream, b_s);
@@ -1070,16 +1184,13 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     of A. No baked weights; no bias. MVP: single tile, NF=1 (PE=N), any SF."""
     if cfg.get("interface") == "array":
         raise ValueError(f"mvau two-operand does not support io_parallel for '{name}'.")
-    # The mvau two-operand IP consumes B row-major (N-wide beats, one contraction row per
-    # beat). A manifest that explicitly routes a col-major two-operand node here is a
-    # misconfiguration -- hls4ml must set SecondOperandRowMajor=True. (Absent == standalone
-    # generation, which is row-major by construction, so only reject an explicit False.)
-    if cfg.get("second_operand_row_major") is False:
-        raise ValueError(
-            f"mvau two-operand IP '{name}' requires SecondOperandRowMajor=True (B row-major, "
-            "N-wide beats); the manifest declares col-major B. Set SecondOperandRowMajor on the "
-            "hls4ml layer, or route this node to the generic/soft target.")
+    # V1 mode selector (locked 2026-09-14): reuse SecondOperandRowMajor as the loader
+    # layout knob, no new JSON key. True/unset (standalone generation is row-major by
+    # construction) -> Mode A (row-major B, N-wide beats); explicit False -> Mode B
+    # (col-major B, K-wide beats) via the forked dynamic_load_2op loader's MODE=1.
+    mode = 0 if cfg.get("second_operand_row_major") is not False else 1
     plan = _resolve_plan(shape, cfg)
+    plan["mode"] = mode
     t = plan["tile"]
     kt = plan.get("k_tiles", 1)
     nt = plan["n_tiles"]
@@ -1102,6 +1213,16 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     # k_tiles==1) keeps the older, padded-boundary top.
     grid_form = nt > 1 or kt > 1
     reg_form = _2op_register_form(plan)
+    single_tile = not (nt > 1 or use_kt)
+    if mode == 1 and not single_tile:
+        # Mode B (col-major B) is implemented for the untiled single-tile temporal-fold
+        # shim only (this item's V1 scope); the grid/register/K-tiled forms still
+        # require row-major B.
+        raise NotImplementedError(
+            f"mvau two-operand IP '{name}': col-major B (SecondOperandRowMajor=False) is "
+            "only supported by the untiled single-tile shim (DEPTH=NF*SF>=2, no N/K "
+            "tiling); this node folds to a grid/register/K-tiled form. Set "
+            "SecondOperandRowMajor=True, or route this node to the generic/soft target.")
     if nt > 1:
         shim = _rtl.generate_two_operand_nt_shim
         top_src = _2op_reg_dataflow_top(name, plan) if (reg_form or grid_form) else _2op_kt_dataflow_top(name, plan)
@@ -1110,9 +1231,10 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
         top_src = _2op_reg_dataflow_top(name, plan) if (reg_form or grid_form) else _2op_kt_dataflow_top(name, plan)
     else:
         shim, top_src = (_rtl.generate_two_operand_shim, _2op_dataflow_top(name, plan))
+    shim_kwargs = {"mode": mode} if shim is _rtl.generate_two_operand_shim else {}
     (pkg / f"{name}_core.v").write_text(_with_timescale(
         shim(shape, module_name=f"{name}_core",
-             force_behavioral=force_behavioral, tile=t, plan=plan)))
+             force_behavioral=force_behavioral, tile=t, plan=plan, **shim_kwargs)))
     (pkg / f"{name}_core.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_2op_core_twin(shape, func_name=f"{name}_core", plan=plan)))
     (pkg / f"{name}_top.cpp").write_text(_with_ap_int_max_w(top_src))
