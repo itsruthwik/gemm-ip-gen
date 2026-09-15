@@ -136,95 +136,74 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, **plan_kw):
     return module_name, [work / f"{module_name}.v"]
 
 
-def _build_2op_case(work, name, shape, seed, kind, backpressure=True, fsm_debug=False,
+def _build_2op_case(work, name, shape, seed, kind=None, backpressure=True, fsm_debug=False,
                     mode=0, **plan_kw):
-    """kind: 'reg' (SF=NF=1) or 'ms' (SF*NF>=2, untiled). ``mode`` (ms only): 0 = row-major
-    (dynamic_load_2op MODE=0), 1 = col-major (MODE=1) -- selects the loader's narrow B
-    beat layout/order (see rtl.py's generate_two_operand_shim)."""
+    """Single-tile two-operand case (``dynamic_load_2op``), any depth including the
+    fully-spatial DEPTH==1 case (SF=NF=1) -- 2-op only ever folds within one MVU
+    tile (see jojo-track/defer/mvau-two-operand-dynamic-load/plan.md's "Cleanup:
+    collapse 2-op to a single dynamic_load_2op tile"). ``kind`` is accepted for
+    backward-compat call sites and ignored. ``mode``: 0 = row-major (dynamic_load_2op
+    MODE=0), 1 = col-major (MODE=1) -- selects the loader's narrow B beat
+    layout/order (see rtl.py's generate_two_operand_shim)."""
     plan = _find_case_plan(shape, **plan_kw)
     t = plan["tile"]
     module_name = f"{name}_core"
 
-    if kind == "reg":
-        N, K = plan["n"], plan["k"]
-        WW, AW, outW = t["weight_width"], t["activation_width"], t["output_width"]
-        signed = bool(t["signed_activations"])
-        shift = plan["product_frac"] - plan["output_frac"]
-        core_v = _rtl.generate_two_operand_kt_shim(shape, module_name=module_name,
-                                                    force_behavioral=True, tile=t, plan=plan,
-                                                    k_tiles=1)
-        (work / f"{module_name}.v").write_text(core_v)
+    N, K_pad = plan["n"], plan["k_pad"]
+    PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
+    WW, AW, outW, ACCU = t["weight_width"], t["activation_width"], t["output_width"], t["accu_width"]
+    signed = bool(t["signed_activations"])
+    shift = plan["product_frac"] - plan["output_frac"]
+    core_v = _rtl.generate_two_operand_shim(shape, module_name=module_name,
+                                            force_behavioral=True, tile=t, plan=plan,
+                                            mode=mode)
+    (work / f"{module_name}.v").write_text(core_v)
 
-        a_words, b_words, exp_words = [], [], []
-        for node in range(N_NODES):
-            Bm = _tb.synth_b_stream(K, N, WW, seed, node)
-            X = _tb.synth_activations(plan["num_input_vectors"], K, AW, signed, seed, node)
-            for kk in range(K):
-                b_words.append(_tb.pack_beat(Bm[kk], WW))
-            for v in range(plan["num_input_vectors"]):
-                a_words.append(_tb.pack_beat(X[v], AW))
+    ab_bits = t["input_stream_width_ba"]
+    # dynamic_load_2op's own NARROW input beat -- PE-wide (mode 0) or SIMD-wide
+    # (mode 1) -- fed directly (no wide-beat gearbox at this RTL-level harness; that
+    # lives in the HLS feed_b process for the real package, see package.py).
+    lanes_raw = PE if mode == 0 else SIMD
+    bb_bits = ((lanes_raw * WW) + 7) // 8 * 8
+    pb_bits = t["output_stream_width_ba"]
+    a_words, b_words, exp_words = [], [], []
+    for node in range(N_NODES):
+        Bm = _tb.synth_b_stream(K_pad, N, WW, seed, node)   # [K_pad][N]
+        X = _tb.synth_activations(plan["num_input_vectors"], K_pad, AW, signed, seed, node)
+        # B beats in the loader's own writer order (see rtl_static/dynamic_load_2op.sv):
+        #   mode 0 (row-major): nf-fast/simd-mid/sf-slow, PE-wide beat = Bm[sf*SIMD+simd][nf*PE+pe]
+        #   mode 1 (col-major, transposed): sf-fast/pe-mid/nf-slow, SIMD-wide beat = Bm[sf*SIMD+s][nf*PE+pe]
+        if mode == 0:
+            for sf in range(SF):
+                for simd in range(SIMD):
+                    kk = sf * SIMD + simd
+                    for nf in range(NF):
+                        lane = [Bm[kk][nf * PE + pe] if nf * PE + pe < N else 0
+                                for pe in range(PE)]
+                        b_words.append(_tb.pack_beat(lane, WW))
+        else:
+            for nf in range(NF):
+                for pe in range(PE):
+                    oc = nf * PE + pe
+                    for sf in range(SF):
+                        lane = [Bm[sf * SIMD + s][oc] if oc < N else 0
+                                for s in range(SIMD)]
+                        b_words.append(_tb.pack_beat(lane, WW))
+        for v in range(plan["num_input_vectors"]):
+            for sf in range(SF):
+                lane = X[v][sf * SIMD:(sf + 1) * SIMD]
+                a_words.append(_tb.pack_beat(lane, AW))
+            for nf in range(NF):
                 row = []
-                for o in range(N):
-                    acc = sum(Bm[kk][o] * X[v][kk] for kk in range(K))
-                    row.append(_tb.requant_ref(acc, shift, outW))
+                for pe in range(PE):
+                    oc = nf * PE + pe
+                    if oc < N:
+                        acc = sum(Bm[kk][oc] * X[v][kk] for kk in range(K_pad))
+                        row.append(_tb.requant_ref(acc, shift, outW))
+                    else:
+                        row.append(0)
                 exp_words.append(_tb.pack_beat(row, outW))
-        ab, bb, pb = K * AW, N * WW, N * outW
-    else:
-        N, K_pad = plan["n"], plan["k_pad"]
-        PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
-        WW, AW, outW, ACCU = t["weight_width"], t["activation_width"], t["output_width"], t["accu_width"]
-        signed = bool(t["signed_activations"])
-        shift = plan["product_frac"] - plan["output_frac"]
-        core_v = _rtl.generate_two_operand_shim(shape, module_name=module_name,
-                                                force_behavioral=True, tile=t, plan=plan,
-                                                mode=mode)
-        (work / f"{module_name}.v").write_text(core_v)
-
-        ab_bits = t["input_stream_width_ba"]
-        # dynamic_load_2op's own NARROW input beat -- PE-wide (mode 0) or SIMD-wide
-        # (mode 1) -- fed directly (no wide-beat gearbox at this RTL-level harness; that
-        # lives in the HLS feed_b process for the real package, see package.py).
-        lanes_raw = PE if mode == 0 else SIMD
-        bb_bits = ((lanes_raw * WW) + 7) // 8 * 8
-        pb_bits = t["output_stream_width_ba"]
-        a_words, b_words, exp_words = [], [], []
-        for node in range(N_NODES):
-            Bm = _tb.synth_b_stream(K_pad, N, WW, seed, node)   # [K_pad][N]
-            X = _tb.synth_activations(plan["num_input_vectors"], K_pad, AW, signed, seed, node)
-            # B beats in the loader's own writer order (see rtl_static/dynamic_load_2op.sv):
-            #   mode 0 (row-major): nf-fast/simd-mid/sf-slow, PE-wide beat = Bm[sf*SIMD+simd][nf*PE+pe]
-            #   mode 1 (col-major, transposed): sf-fast/pe-mid/nf-slow, SIMD-wide beat = Bm[sf*SIMD+s][nf*PE+pe]
-            if mode == 0:
-                for sf in range(SF):
-                    for simd in range(SIMD):
-                        kk = sf * SIMD + simd
-                        for nf in range(NF):
-                            lane = [Bm[kk][nf * PE + pe] if nf * PE + pe < N else 0
-                                    for pe in range(PE)]
-                            b_words.append(_tb.pack_beat(lane, WW))
-            else:
-                for nf in range(NF):
-                    for pe in range(PE):
-                        oc = nf * PE + pe
-                        for sf in range(SF):
-                            lane = [Bm[sf * SIMD + s][oc] if oc < N else 0
-                                    for s in range(SIMD)]
-                            b_words.append(_tb.pack_beat(lane, WW))
-            for v in range(plan["num_input_vectors"]):
-                for sf in range(SF):
-                    lane = X[v][sf * SIMD:(sf + 1) * SIMD]
-                    a_words.append(_tb.pack_beat(lane, AW))
-                for nf in range(NF):
-                    row = []
-                    for pe in range(PE):
-                        oc = nf * PE + pe
-                        if oc < N:
-                            acc = sum(Bm[kk][oc] * X[v][kk] for kk in range(K_pad))
-                            row.append(_tb.requant_ref(acc, shift, outW))
-                        else:
-                            row.append(0)
-                    exp_words.append(_tb.pack_beat(row, outW))
-        ab, bb, pb = ab_bits, bb_bits, pb_bits
+    ab, bb, pb = ab_bits, bb_bits, pb_bits
 
     a_dat, b_dat, exp_dat = work / f"{name}_a.dat", work / f"{name}_b.dat", work / f"{name}_exp.dat"
     _tb.write_dat(a_dat, a_words, (ab + 3) // 4)
@@ -251,19 +230,24 @@ CASES = {
         work, "d", (2, 16, 4), seed, pe=4, simd=4, k_tiles=2,
         backpressure=kw.get("backpressure", True)),
     "e_2op_register": lambda work, seed, **kw: _build_2op_case(
-        work, "e", (2, 4, 4), seed, "reg", pe=4, simd=4,
+        work, "e", (2, 4, 4), seed, pe=4, simd=4,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "e2_2op_register_col_major": lambda work, seed, **kw: _build_2op_case(
+        # DEPTH==1 (SF=NF=1), Mode B: the RF=1 Mode-B gap the DEPTH==1 port onto
+        # dynamic_load_2op was meant to close (see plan.md's "Cleanup" step 2).
+        work, "e2", (2, 4, 4), seed, pe=4, simd=4, mode=1,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "f_2op_memstream": lambda work, seed, **kw: _build_2op_case(
-        work, "f", (2, 8, 4), seed, "ms", pe=4, simd=4,
+        work, "f", (2, 8, 4), seed, pe=4, simd=4,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "g_2op_qk_memstream": lambda work, seed, **kw: _build_2op_case(
-        work, "g", (16, 12, 16), seed, "ms", pe=16, simd=6,
+        work, "g", (16, 12, 16), seed, pe=16, simd=6,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "h_2op_col_major_memstream": lambda work, seed, **kw: _build_2op_case(
-        work, "h", (2, 8, 4), seed, "ms", pe=4, simd=4, mode=1,
+        work, "h", (2, 8, 4), seed, pe=4, simd=4, mode=1,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "i_2op_col_major_qk_memstream": lambda work, seed, **kw: _build_2op_case(
-        work, "i", (16, 12, 16), seed, "ms", pe=16, simd=6, mode=1,
+        work, "i", (16, 12, 16), seed, pe=16, simd=6, mode=1,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     # ── resolve_fold-driven single-tile cases (VERIFY-ONLY additions) ──
     # Unlike e-i above (hand-picked pe=/simd=, bypassing resolve_fold), these specify
@@ -273,24 +257,24 @@ CASES = {
     # geometry.fold_plan for the resolved numbers noted per case.
     "j_2op_foldn_memstream": lambda work, seed, **kw: _build_2op_case(
         # (m,k,n)=(4,4,8) RF=2 fold_axis=n -> PE=4 SIMD=4 SF=1 NF=2 (DEPTH=NF=2)
-        work, "j", (4, 4, 8), seed, "ms", reuse_factor=2, fold_axis="n",
+        work, "j", (4, 4, 8), seed, reuse_factor=2, fold_axis="n",
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "k_2op_foldn_col_major_memstream": lambda work, seed, **kw: _build_2op_case(
-        work, "k", (4, 4, 8), seed, "ms", reuse_factor=2, fold_axis="n", mode=1,
+        work, "k", (4, 4, 8), seed, reuse_factor=2, fold_axis="n", mode=1,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "l_2op_foldk_memstream": lambda work, seed, **kw: _build_2op_case(
         # (m,k,n)=(4,9,4) RF=2 fold_axis=k -> PE=4 SIMD=5 SF=2 NF=1 (DEPTH=SF=2, k_pad=10)
-        work, "l", (4, 9, 4), seed, "ms", reuse_factor=2, fold_axis="k",
+        work, "l", (4, 9, 4), seed, reuse_factor=2, fold_axis="k",
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "m_2op_foldk_col_major_memstream": lambda work, seed, **kw: _build_2op_case(
-        work, "m", (4, 9, 4), seed, "ms", reuse_factor=2, fold_axis="k", mode=1,
+        work, "m", (4, 9, 4), seed, reuse_factor=2, fold_axis="k", mode=1,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "n_2op_foldkn_memstream": lambda work, seed, **kw: _build_2op_case(
         # (m,k,n)=(4,9,8) RF=2 fold_axis=kn -> PE=4 SIMD=5 SF=2 NF=2 (DEPTH=4, k_pad=10)
-        work, "n", (4, 9, 8), seed, "ms", reuse_factor=2, fold_axis="kn",
+        work, "n", (4, 9, 8), seed, reuse_factor=2, fold_axis="kn",
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "o_2op_foldkn_col_major_memstream": lambda work, seed, **kw: _build_2op_case(
-        work, "o", (4, 9, 8), seed, "ms", reuse_factor=2, fold_axis="kn", mode=1,
+        work, "o", (4, 9, 8), seed, reuse_factor=2, fold_axis="kn", mode=1,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
 }
 

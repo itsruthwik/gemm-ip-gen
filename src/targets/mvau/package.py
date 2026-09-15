@@ -617,280 +617,14 @@ void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB_top}> >& 
 """
 
 
-def _2op_reg_dataflow_top(name, plan):
-    """DUT for the fully-spatial two-operand grid blackbox (register shim, unpadded
-    boundary): pure passthrough of the raw K*AW activation row and the K raw N*WW
-    B-row beats into the core, one raw N*out_width result row out per vector. All
-    K-padding, K-tile summation and N-tile stitching happen inside {name}_core's RTL
-    wrapper (see rtl.py's ``_2op_grid_register_shim`` and its C twin in golden.py)."""
-    t = plan["tile"]
-    m = plan["num_input_vectors"]
-    AW, N, outW, WW = t["activation_width"], plan["n"], plan["output_width"], t["weight_width"]
-    K = plan["k"]
-    ARAW = K * AW
-    BRAW = N * WW
-    PRAW = N * outW
-    pad = ' ' * (len(name) + 6)
-    indent = ' ' * (len(name) + 1)
-    apmax = _apmaxw(max(ARAW, BRAW, PRAW))
-    top_sig = (f"void {name}(hls::stream<ap_uint<{ARAW}> >& a_in,\n"
-               f"{indent}hls::stream<ap_uint<{BRAW}> >& b_in,\n"
-               f"{indent}hls::stream<ap_uint<{PRAW}> >& c_out)")
-    return f"""#define AP_INT_MAX_W {apmax}   // raw K-wide activation row may exceed the 1024-bit default
-#include <hls_stream.h>
-#include <ap_int.h>
-
-void {name}_core(hls::stream<ap_uint<{ARAW}> >&, hls::stream<ap_uint<{BRAW}> >&,
-{pad}hls::stream<ap_uint<{PRAW}> >&);
-
-static void feed_a(hls::stream<ap_uint<{ARAW}> >& in, hls::stream<ap_uint<{ARAW}> >& out) {{
-    for (int i = 0; i < {m}; i++) out.write(in.read());
-}}
-static void feed_b(hls::stream<ap_uint<{BRAW}> >& in, hls::stream<ap_uint<{BRAW}> >& out) {{
-    for (int i = 0; i < {K}; i++) out.write(in.read());
-}}
-static void drain_c(hls::stream<ap_uint<{PRAW}> >& in, hls::stream<ap_uint<{PRAW}> >& out) {{
-    for (int i = 0; i < {m}; i++) out.write(in.read());
-}}
-
-// Pure passthrough: {name}_core's RTL wrapper does all K/N padding, the K-tile
-// partial-sum and the N-tile stitching internally, so the boundary here is already
-// hls4ml's own unpadded row width on both sides -- {m} rows in, {m} rows out. The
-// blackbox's output cannot bind directly to the top-level c_out argument (Vitis
-// rejects passing a top-level interface stream straight into a blackbox port), so
-// drain_c copies it through an internal buffer, same as feed_a/feed_b on the input side.
-{top_sig} {{
-#pragma HLS DATAFLOW
-    hls::stream<ap_uint<{ARAW}> > a_s;
-    hls::stream<ap_uint<{BRAW}> > b_s;
-    hls::stream<ap_uint<{PRAW}> > p_s;
-#pragma HLS STREAM variable=a_s depth=4
-#pragma HLS STREAM variable=b_s depth=4
-#pragma HLS STREAM variable=p_s depth=4
-    feed_a(a_in, a_s);
-    feed_b(b_in, b_s);
-    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU RTL blackbox (K-tiles summed, B in-core; already requantized)
-    drain_c(p_s, c_out);
-}}
-"""
-
-
-def _2op_kt_dataflow_top(name, plan):
-    """DUT for the K-tiled two-operand blackbox: passthrough of the wide A beat + the B
-    stream into the core, then the summing requant drain (sum the gk per-tile partials per
-    column, accumulator widened to accu_sum; no bias; act×act scale fa+fb)."""
-    t = plan["tile"]
-    m = plan["num_input_vectors"]
-    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    PE, NF, MW = t["pe"], t["nf"], t["mw"]
-    SFT = MW // t["simd"]
-    gk, nt = plan["k_tiles"], plan["n_tiles"]
-    A_TOTAL, PB_TOTAL = gk * AB, nt * PB
-    N, WW = plan["n"], t["weight_width"]
-    NTILE = N // nt
-    BB = ((N * WW) + 7) // 8 * 8
-    K = plan["k_pad"]
-    outW = plan["output_width"]
-    CB = cbits(plan)
-    apmax = _apmaxw(A_TOTAL)
-    pad = ' ' * (len(name) + 6)
-    indent = ' ' * (len(name) + 1)
-    return f"""#define AP_INT_MAX_W {apmax}   // wide grid activation beat (gk*AB={A_TOTAL}) may exceed the 1024-bit default
-#include <hls_stream.h>
-#include <ap_int.h>
-
-void {name}_core(hls::stream<ap_uint<{A_TOTAL}> >&, hls::stream<ap_uint<{BB}> >&,
-{pad}hls::stream<ap_uint<{PB_TOTAL}> >&);
-
-static void feed_a(hls::stream<ap_uint<{A_TOTAL}> >& in, hls::stream<ap_uint<{A_TOTAL}> >& out) {{
-    for (int i = 0; i < {m * SFT}; i++) out.write(in.read());
-}}
-static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >& out) {{
-    for (int i = 0; i < {K}; i++) out.write(in.read());
-}}
-
-// Pure unpack (no bias): {name}_core already summed the gk K-partials per column and
-// shift/round-half-up/wrapped to out_width. Concatenate the nt N-slices; no arithmetic.
-// Walks one beat (one p_s.read()) per loop iteration -- rather than NF reads per row
-// inside one iteration -- so a PIPELINE II=1 loop can actually schedule at II=1 per
-// beat (II=NF per row, same throughput either way).
-static void unpack(hls::stream<ap_uint<{PB_TOTAL}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
-    ap_uint<{CB}> crow = 0;
-    for (int bt = 0; bt < {m * NF}; bt++) {{
-        int nf = bt % {NF};
-        ap_uint<{PB_TOTAL}> ob = in.read();
-        for (int j = 0; j < {nt}; j++)
-        for (int pe = 0; pe < {PE}; pe++) {{
-            int local_oc = nf * {PE} + pe;   // 0..n_pad-1 within this tile
-            if (local_oc < {NTILE}) {{        // drop the N-pad tail columns
-            int oc = j * {NTILE} + local_oc;
-            crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
-                ob.range(j * {PB} + pe * {outW} + {outW} - 1, j * {PB} + pe * {outW});
-            }}
-        }}
-        if (nf == {NF} - 1) out.write(crow);
-    }}
-}}
-
-void {name}(hls::stream<ap_uint<{A_TOTAL}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in,
-{indent}hls::stream<ap_uint<{CB}> >& c_out) {{
-#pragma HLS DATAFLOW
-    hls::stream<ap_uint<{A_TOTAL}> > a_s;
-    hls::stream<ap_uint<{BB}> > b_s;
-    hls::stream<ap_uint<{PB_TOTAL}> > p_s;
-#pragma HLS STREAM variable=a_s depth=4
-#pragma HLS STREAM variable=b_s depth=4
-#pragma HLS STREAM variable=p_s depth=4
-    feed_a(a_in, a_s);
-    feed_b(b_in, b_s);
-    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU K-tiled blackbox (gk partials summed, B in-core, already requantized)
-    unpack(p_s, c_out);
-}}
-"""
-
-
-def _2op_register_form(plan):
-    """True for the fully-spatial (DEPTH_tile = SF_tile*NF == 1) grid shim
-    (``_2op_grid_register_shim``) -- the only two-operand RTL form with an UNPADDED
-    boundary today; see ``golden.py``'s twin of the same name."""
-    t = plan["tile"]
-    return t["sf"] == 1 and t["nf"] == 1
-
-
-def _2op_reg_gemm_ip_header(name, plan):
-    """hls4ml-facing two-operand IP for the fully-spatial grid form (register shim):
-    the RTL wrapper does ALL K/N padding, the K-tile partial-sum, and N-tile
-    stitching internally (see rtl.py's ``_2op_grid_register_shim`` and its C twin in
-    golden.py), so its ports already sit at hls4ml's own unpadded row widths
-    (``K*activation_width`` A in, one raw ``N*weight_width`` K-row B beat, ``N*out_width``
-    C out). The glue here is therefore a PURE bit-reinterpretation on both operands --
-    no lane-by-lane repack/drain loop, no padding."""
-    t = plan["tile"]
-    m = plan["num_input_vectors"]
-    AW, WW, K, N = t["activation_width"], t["weight_width"], plan["k"], plan["n"]
-    outW = plan["output_width"]
-    ARAW = K * AW
-    BRAW = N * WW
-    PRAW = N * outW
-    core_pad = ' ' * (len(name) + 6)
-    apmax = _apmaxw(max(ARAW, BRAW, PRAW))
-    guard = (f"#ifndef AP_INT_MAX_W\n#define AP_INT_MAX_W {apmax}\n#endif\n"
-             if max(ARAW, BRAW, PRAW) > 1024 else "")
-    return f"""#ifndef {name.upper()}_GEMM_IP_H_
-#define {name.upper()}_GEMM_IP_H_
-{guard}#include <hls_stream.h>
-#include <ap_int.h>
-
-// internal FINN-MVU blackbox (fully-spatial two-operand grid shim {name}_core.v; C twin
-// {name}_core.cpp) -- ALL K/N padding, the K-tile partial-sum, and the shift/round-half-
-// up/wrap to out_width are baked/performed inside it, so its ports already sit at
-// hls4ml's own unpadded row widths.
-void {name}_core(hls::stream<ap_uint<{ARAW}> >&, hls::stream<ap_uint<{BRAW}> >&,
-{core_pad}hls::stream<ap_uint<{PRAW}> >&);
-
-namespace nnet {{
-
-// Dedicated two-operand IP for gemm config M={m} K={K} N={N} (core={t['compute_core']}).
-// B MUST arrive row-major: data1_T::size == N, one K-row per beat (SecondOperandRowMajor).
-
-// Pure bit-reinterpretation: hls4ml delivers one full, unpadded K-wide row per beat
-// (data0_T::size == K by construction -- enforced below) -- reinterpret it via a single
-// fully-unrolled concatenation. No padding: {name}_core's RTL wrapper does the K-padding.
-template <class data0_T>
-void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{ARAW}> > &a_s) {{
-    static_assert(data0_T::size == {K},
-        "{name}: hls4ml must deliver one full, unpadded K-wide row per stream beat");
-{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
-{_glue_pipeline_loop(m)}        data0_T beat = a_stream.read();
-        ap_uint<{ARAW}> ab;
-        for (unsigned j = 0; j < {K}; j++) {{
-            #pragma HLS UNROLL
-            ab.range(j * {AW} + {AW} - 1, j * {AW}) = beat[j].range({AW} - 1, 0);
-        }}
-        a_s.write(ab);
-    }}
-}}
-
-// Pure bit-reinterpretation: one raw, unpadded N-wide K-row beat per hls4ml beat
-// (data1_T::size == N by construction -- enforced below); {name}_core's RTL wrapper
-// does the K_pad tail-row zero-fill internally, so only the {K} real rows are sent.
-template <class data1_T>
-void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BRAW}> > &b_s) {{
-    static_assert(data1_T::size == {N},
-        "{name}: hls4ml must deliver one full, unpadded N-wide K-row per stream beat");
-    for (unsigned k = 0; k < {K}; k++) {{
-        data1_T beat = b_stream.read();
-        ap_uint<{BRAW}> bb;
-        for (unsigned n = 0; n < {N}; n++) {{
-            #pragma HLS UNROLL
-            bb.range(n * {WW} + {WW} - 1, n * {WW}) = beat[n].range({WW} - 1, 0);
-        }}
-        b_s.write(bb);
-    }}
-}}
-
-// Pure bit-reinterpretation: {name}_core's RTL wrapper already emits one full,
-// unpadded N-wide row of requantized out_width-bit-per-lane codes per beat (the
-// K-tile partials summed, shift, round-half-up, wrap and N-tile stitching all
-// happened inside it). Loaded via .range() (raw bit pattern), never a value-
-// preserving conversion, since the value is already rounded/wrapped. Two-operand
-// GEMM never carries a real bias (has_bias is always False by construction).
-template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{PRAW}> > &p_s, hls::stream<res_T> &res_stream) {{
-    typedef typename res_T::value_type result_t;
-{_drain_pipeline_fn(m, t)}    for (unsigned mm = 0; mm < {m}; mm++) {{
-{_glue_pipeline_loop(m)}        ap_uint<{PRAW}> ob = p_s.read();
-        res_T crow;
-        for (unsigned oc = 0; oc < {N}; oc++) {{
-            #pragma HLS UNROLL
-            ap_uint<{outW}> raw = ob.range(oc * {outW} + {outW} - 1, oc * {outW});
-            result_t tmp;
-            tmp.range() = raw;
-            crow[oc] = tmp;
-        }}
-        res_stream.write(crow);
-    }}
-}}
-
-// The dedicated IP: hls4ml io_stream two-operand GEMM -> internal MVU blackbox.
-// Two-operand GEMM never has a real bias, so hls4ml's call site carries no bias
-// parameter at all -- there is only ever this one signature.
-template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
-void {name}_gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
-{' ' * (len(name) + 17)}hls::stream<res_T> &res_stream) {{
-#pragma HLS DATAFLOW
-    hls::stream<ap_uint<{ARAW}> > a_s;
-    hls::stream<ap_uint<{BRAW}> > b_s;
-    hls::stream<ap_uint<{PRAW}> > p_s;
-#pragma HLS STREAM variable=a_s depth=4
-#pragma HLS STREAM variable=b_s depth={K + 2}
-#pragma HLS STREAM variable=p_s depth=4
-    {name}_repack_a<data0_T>(a_stream, a_s);
-    {name}_repack_b<data1_T>(b_stream, b_s);
-    {name}_core(a_s, b_s, p_s);
-    {name}_drain<res_T, CONFIG_T>(p_s, res_stream);
-}}
-
-}} // namespace nnet
-#endif
-"""
-
-
 def _2op_gemm_ip_header(name, plan):
     """hls4ml-facing two-operand IP: ``<name>_gemm_stream<data0_T,data1_T,res_T,CONFIG_T>``
-    (repack A -> shim activations, repack B -> shim N-wide K-row beats, internal MVU blackbox,
-    requant drain). Requires B streamed **row-major** (data1_T::size == N, one K-row per beat);
-    hls4ml must set SecondOperandRowMajor=True to route here. Handles the three shim forms:
-    kt (K-tiled register / fully-spatial, wide activation, summed partials), nt/kt memstream
-    grid (any per-tile fold, still wide-activation + summed/concatenated), single (temporal
-    memstream, no tiling). The fully-spatial (register) form AND the memstream grid form
-    (nt>1 or k_tiles>1) both now have an UNPADDED RTL boundary (``_2op_grid_register_shim``
-    / ``_2op_grid_memstream_shim`` in rtl.py do ALL K/N padding, SIMD fan-out, K-tile
-    partial-sum, and N-tile stitching internally) -- both dispatch to the same
-    ``_2op_reg_gemm_ip_header`` bit-reinterpretation. Only the remaining untiled single-tile
-    temporal-fold form (n_tiles==1, k_tiles==1) keeps the older, padded-boundary body below."""
-    if _2op_register_form(plan) or plan["n_tiles"] > 1 or plan.get("k_tiles", 1) > 1:
-        return _2op_reg_gemm_ip_header(name, plan)
+    (repack A -> shim activations, repack B -> the loader's narrow beat via the HLS
+    feed_b gearbox, internal MVU blackbox, requant drain). Single-tile only -- 2-op
+    only ever folds within one MVU tile (no N/K-tiling; see
+    jojo-track/defer/mvau-two-operand-dynamic-load/plan.md's "Cleanup: collapse 2-op
+    to a single dynamic_load_2op tile"), any depth including the fully-spatial
+    DEPTH==1 case (SF=NF=1), both B-layout modes (``SecondOperandRowMajor``)."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
     AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
@@ -904,48 +638,15 @@ def _2op_gemm_ip_header(name, plan):
     # (the HLS feed_b gearbox), never materializing more than one arriving wide beat.
     LANES_RAW = PE if mode == 0 else SIMD
     BB = ((LANES_RAW * WW) + 7) // 8 * 8
-    NT_, NTILE = plan["n_tiles"], plan["n_tile"]
-    KT_ = plan.get("k_tiles", 1)
     outW = plan["output_width"]
-    nt_form = NT_ > 1
-    kt_form = (not nt_form) and (KT_ > 1 or (SF == 1 and NF == 1))
-    gk = KT_ if kt_form else 1
-    # The core now sums any K-tile partials and requantizes internally, so its beat is
-    # always PE*out_width per N-slice -- kt_form no longer multiplies by gk.
-    if kt_form:
-        a_width, p_width = gk * AB, PB
-    elif nt_form:
-        a_width, p_width = AB, NT_ * PB
-    else:
-        a_width, p_width = AB, PB
+    a_width, p_width = AB, PB
     apmax = _apmaxw(max(a_width, p_width))
     guard = (f"#ifndef AP_INT_MAX_W\n#define AP_INT_MAX_W {apmax}\n#endif\n"
              if max(a_width, p_width) > 1024 else "")
     core_pad = ' ' * (len(name) + 6)
 
-    # repack A: kt packs one wide K_pad beat/vector; single/nt pack SF SIMD-beats/vector.
-    if kt_form:
-        repack_a = f"""template <class data0_T>
-void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{a_width}> > &a_s) {{
-{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
-{_glue_pipeline_loop(m)}        ap_int<{AW}> arow[{KPAD}];
-        #pragma HLS ARRAY_PARTITION variable=arow complete
-        for (unsigned i = 0; i < {KPAD}; i++) {{
-            #pragma HLS UNROLL
-            arow[i] = 0;
-        }}
-        for (unsigned kp = 0; kp < {K} / data0_T::size; kp++) {{
-            data0_T beat = a_stream.read();
-            for (unsigned j = 0; j < data0_T::size; j++) arow[kp * data0_T::size + j] = beat[j].range({AW} - 1, 0);
-        }}
-        ap_uint<{a_width}> ab = 0;
-        for (unsigned kk = 0; kk < {KPAD}; kk++)
-            ab.range(kk * {AW} + {AW} - 1, kk * {AW}) = (ap_uint<{AW}>)arow[kk];
-        a_s.write(ab);
-    }}
-}}"""
-    else:
-        repack_a = f"""template <class data0_T>
+    # repack A: pack SF SIMD-wide beats/vector (SF==1 -> one beat/vector).
+    repack_a = f"""template <class data0_T>
 void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> > &a_s) {{
 {_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
 {_glue_pipeline_loop(m)}        ap_int<{AW}> arow[{KPAD}];
@@ -967,44 +668,23 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
     }}
 }}"""
 
-    # Pure unpack (no arithmetic): {name}_core already summed any K-tile partials and
-    # shift/round-half-up/wrapped each lane to out_width. kt sums are gone (already
-    # done in-core); nt concatenates N-slices; the untiled form walks NF beats. Two-
-    # operand GEMM never carries a real bias (has_bias is always False by
-    # construction). Loaded via .range() (raw bit pattern), never a value-preserving
-    # conversion, since the value is already rounded/wrapped.
-    flat_drain = False
-    if kt_form:
-        drain_body = f"""        ap_uint<{p_width}> ob = p_s.read();
-        for (unsigned oc = 0; oc < {N}; oc++) {{
-            ap_uint<{outW}> raw = ob.range(oc * {outW} + {outW} - 1, oc * {outW});
-            result_t tmp; tmp.range() = raw; crow[oc] = tmp;
-        }}"""
-    elif nt_form:
-        NTILE_REAL = N // NT_   # unpadded per-tile column count; the interface presents only these
-        drain_body = f"""        ap_uint<{p_width}> ob = p_s.read();
-        for (unsigned ti = 0; ti < {NT_}; ti++)
-            for (unsigned pe = 0; pe < {PE}; pe++) {{
-                if (pe < {NTILE_REAL}) {{   // drop the N-pad tail columns
-                unsigned oc = ti * {NTILE_REAL} + pe;
-                ap_uint<{outW}> raw = ob.range(ti * {PB} + pe * {outW} + {outW} - 1, ti * {PB} + pe * {outW});
-                result_t tmp; tmp.range() = raw; crow[oc] = tmp;
-                }}
-            }}"""
-    else:
-        # NF>1 here means the drain must read NF beats per output row. Reading all NF
-        # beats inside a single PIPELINE II=1 loop iteration is unschedulable at II=1
-        # (Vitis emits HLS-200-880 and silently falls back to II=NF per row anyway --
-        # same throughput, but the [verify] step flags the warning as a failure), so
-        # instead the flat_drain path below walks one beat per loop iteration
-        # (trip count m*NF) and only fires res_stream.write on the last beat of each
-        # row -- true II=1 per beat, II=NF per row, identical lane placement/pad-drop.
-        flat_drain = True
-        drain_body = f"""        unsigned nf = bt % {NF};
+    # Pure unpack (no arithmetic): {name}_core already shift/round-half-up/wrapped
+    # each lane to out_width. Two-operand GEMM never carries a real bias (has_bias is
+    # always False by construction). Loaded via .range() (raw bit pattern), never a
+    # value-preserving conversion, since the value is already rounded/wrapped.
+    #
+    # NF>1 here means the drain must read NF beats per output row. Reading all NF
+    # beats inside a single PIPELINE II=1 loop iteration is unschedulable at II=1
+    # (Vitis emits HLS-200-880 and silently falls back to II=NF per row anyway --
+    # same throughput, but the [verify] step flags the warning as a failure), so this
+    # walks one beat per loop iteration (trip count m*NF) and only fires
+    # res_stream.write on the last beat of each row -- true II=1 per beat, II=NF per
+    # row (NF==1 -> one beat per row, same as before).
+    drain_body = f"""        unsigned nf = bt % {NF};
         ap_uint<{p_width}> ob = p_s.read();
         for (unsigned pe = 0; pe < {PE}; pe++) {{
             unsigned local_oc = nf * {PE} + pe;
-            if (local_oc < {N}) {{   // drop the N-pad tail columns (n_tiles==1 here)
+            if (local_oc < {N}) {{   // drop the N-pad tail columns
             unsigned oc = local_oc;
             ap_uint<{outW}> raw = ob.range(pe * {outW} + {outW} - 1, pe * {outW});
             result_t tmp; tmp.range() = raw; crow[oc] = tmp;
@@ -1012,23 +692,12 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> >
         }}
         if (nf == {NF} - 1) res_stream.write(crow);"""
 
-    if flat_drain:
-        drain_fn = f"""template <class res_T, typename CONFIG_T>
+    drain_fn = f"""template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
     res_T crow;
     for (unsigned bt = 0; bt < {m * NF}; bt++) {{
 {drain_body}
-    }}
-}}"""
-    else:
-        drain_fn = f"""template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream) {{
-    typedef typename res_T::value_type result_t;
-{_drain_pipeline_fn(m, t)}    for (unsigned mm = 0; mm < {m}; mm++) {{
-{_glue_pipeline_loop(m)}        res_T crow;
-{drain_body}
-        res_stream.write(crow);
     }}
 }}"""
 
@@ -1179,9 +848,13 @@ def _2op_blackbox_json(name, t, n, ww, tiles=1, resources=None):
 def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     """Emit a two-operand (``gemm_stream``) mvau blackbox package into ``<output_dir>/<name>/``.
 
-    Both operands are runtime streams: A activations, B (= the MVU weight matrix) fed as
-    N-wide K-row beats and loaded into ``memstream`` at runtime, replayed across the M rows
-    of A. No baked weights; no bias. MVP: single tile, NF=1 (PE=N), any SF."""
+    Both operands are runtime streams: A activations, B (= the MVU weight matrix)
+    loaded at runtime into the forked ``dynamic_load_2op`` module (double-buffered
+    ping-pong), replayed across the M rows of A. No baked weights; no bias. 2-op
+    only ever folds within ONE MVU tile -- no N/K-tiling (see
+    jojo-track/defer/mvau-two-operand-dynamic-load/plan.md's "Cleanup: collapse
+    2-op to a single dynamic_load_2op tile"); any depth (including the
+    fully-spatial DEPTH==1 case), both B-layout modes."""
     if cfg.get("interface") == "array":
         raise ValueError(f"mvau two-operand does not support io_parallel for '{name}'.")
     # V1 mode selector (locked 2026-09-14): reuse SecondOperandRowMajor as the loader
@@ -1194,52 +867,27 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     t = plan["tile"]
     kt = plan.get("k_tiles", 1)
     nt = plan["n_tiles"]
-    # Shim selection:
-    #   grid shim (nt>1 or gk>1): an nt×gk grid of MVU cores (memstream per tile, DEPTH>=2),
-    #     activation K-sliced + broadcast over N-slices, partials summed over K + concatenated
-    #     over N. Also serves the fully-spatial single tile (SF=NF=1) via the register path.
-    #   memstream single-tile shim: the untiled temporal fold (DEPTH=NF*SF>=2).
-    use_kt = (kt > 1) or (t["sf"] == 1 and t["nf"] == 1)
+    if nt > 1 or kt > 1:
+        # 2-op dropped N/K-tiling entirely (untested/unused in practice -- see the
+        # plan's "Cleanup" section); a config that still asks for it is a bug upstream.
+        raise NotImplementedError(
+            f"mvau two-operand IP '{name}': n_tiles/k_tiles>1 is not supported (2-op "
+            "only ever folds within one MVU tile). Got n_tiles={nt} k_tiles={kt}.")
     part = cfg.get("part") or "xcvu13p-flga2577-2-e"
     clock_ns = cfg.get("clock_period_ns") or 5
     pkg = Path(output_dir) / name
     (pkg / "rtl_static").mkdir(parents=True, exist_ok=True)
 
     force_behavioral = bool(cfg.get("force_behavioral", False))
-    # Both the fully-spatial grid (SF=NF=1) and the memstream grid (nt>1 or k_tiles>1,
-    # any per-tile fold) now present an UNPADDED RTL boundary -- see rtl.py's
-    # _2op_grid_register_shim / _2op_grid_memstream_shim -- so both use the same pure-
-    # passthrough dataflow top. Only the untiled single-tile temporal fold (nt==1,
-    # k_tiles==1) keeps the older, padded-boundary top.
-    grid_form = nt > 1 or kt > 1
-    reg_form = _2op_register_form(plan)
-    single_tile = not (nt > 1 or use_kt)
-    if mode == 1 and not single_tile:
-        # Mode B (col-major B) is implemented for the untiled single-tile temporal-fold
-        # shim only (this item's V1 scope); the grid/register/K-tiled forms still
-        # require row-major B.
-        raise NotImplementedError(
-            f"mvau two-operand IP '{name}': col-major B (SecondOperandRowMajor=False) is "
-            "only supported by the untiled single-tile shim (DEPTH=NF*SF>=2, no N/K "
-            "tiling); this node folds to a grid/register/K-tiled form. Set "
-            "SecondOperandRowMajor=True, or route this node to the generic/soft target.")
-    if nt > 1:
-        shim = _rtl.generate_two_operand_nt_shim
-        top_src = _2op_reg_dataflow_top(name, plan) if (reg_form or grid_form) else _2op_kt_dataflow_top(name, plan)
-    elif use_kt:
-        shim = _rtl.generate_two_operand_kt_shim
-        top_src = _2op_reg_dataflow_top(name, plan) if (reg_form or grid_form) else _2op_kt_dataflow_top(name, plan)
-    else:
-        shim, top_src = (_rtl.generate_two_operand_shim, _2op_dataflow_top(name, plan))
-    shim_kwargs = {"mode": mode} if shim is _rtl.generate_two_operand_shim else {}
+    shim, top_src = _rtl.generate_two_operand_shim, _2op_dataflow_top(name, plan)
     (pkg / f"{name}_core.v").write_text(_with_timescale(
         shim(shape, module_name=f"{name}_core",
-             force_behavioral=force_behavioral, tile=t, plan=plan, **shim_kwargs)))
+             force_behavioral=force_behavioral, tile=t, plan=plan, mode=mode)))
     (pkg / f"{name}_core.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_2op_core_twin(shape, func_name=f"{name}_core", plan=plan)))
     (pkg / f"{name}_top.cpp").write_text(_with_ap_int_max_w(top_src))
     (pkg / f"{name}.json").write_text(
-        _2op_blackbox_json(name, t, plan["n"], t["weight_width"], tiles=kt * nt,
+        _2op_blackbox_json(name, t, plan["n"], t["weight_width"], tiles=1,
                            resources=plan.get("resources")))
     (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,

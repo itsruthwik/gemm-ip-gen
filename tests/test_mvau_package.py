@@ -358,110 +358,50 @@ def test_n_padded_package_generates_and_verifies(tmp_path, shape, extra):
 def _gen_2op(tmp_path, shape, name, **extra):
     t = load_target("mvau")
     cfg = dict(_CFG, name=name, output_dir=str(tmp_path),
-               weights_in_core=False, second_operand_row_major=True, **extra)
+               weights_in_core=False, second_operand_row_major=True)
+    cfg.update(extra)
     pkg = Path(t.package(shape, cfg))
     t.verify(pkg)
     return pkg
 
 
-def test_two_operand_register_form_unpadded_boundary(tmp_path):
-    # M=4 K=4 N=4, RF=1 -> fully-spatial (PE=SIMD=4, SF=NF=1): no padding needed at
-    # all, so before/after this refactor the boundary widths coincide -- exactly the
-    # geometry mha_tiny's QK^T / A.V two-operand GEMMs route through in practice.
-    pkg = _gen_2op(tmp_path, (4, 4, 4), "gemm_2op_reg", reuse_factor=1)
-    v = (pkg / "gemm_2op_reg_core.v").read_text()
-    assert "input  wire [31:0] a_dout" in v    # K*AW = 4*8, unpadded
-    assert "input  wire [31:0] b_dout" in v    # N*WEIGHT_WIDTH = 4*8, unpadded
-    assert "output wire [63:0] p_din" in v     # N*out_width = 4*16, unpadded
+def test_two_operand_depth1_unpadded_boundary(tmp_path):
+    # M=4 K=4 N=4, RF=1 -> fully-spatial (PE=SIMD=4, SF=NF=1, DEPTH=NF*SF=1): the
+    # single-tile dynamic_load_2op shim now serves this depth too (the old
+    # register-form grid shim is gone -- see the "Cleanup: collapse 2-op to a single
+    # dynamic_load_2op tile" plan). No padding needed at all, so the boundary widths
+    # are unpadded -- exactly the geometry mha_tiny's QK^T / A.V two-operand GEMMs
+    # route through in practice.
+    pkg = _gen_2op(tmp_path, (4, 4, 4), "gemm_2op_d1", reuse_factor=1)
+    v = (pkg / "gemm_2op_d1_core.v").read_text()
+    assert "dynamic_load_2op" in v
+    assert "input  wire [31:0] a_dout" in v    # SIMD*AW = 4*8, unpadded (SF=1)
+    assert "input  wire [31:0] b_dout" in v    # PE*WEIGHT_WIDTH = 4*8 (loader's narrow beat)
+    assert "output wire [63:0] p_din" in v     # PE*ACCU raw (post-requant it's PE*out_width)
 
-    top = (pkg / "gemm_2op_reg_top.cpp").read_text()
-    assert "feed_a" in top and "static void unpack(" not in top   # passthrough, no drain math
+    top = (pkg / "gemm_2op_d1_top.cpp").read_text()
+    assert "feed_a" in top and "feed_b" in top
 
-    ip_hdr = (pkg / "gemm_2op_reg_gemm_ip.h").read_text()
+    ip_hdr = (pkg / "gemm_2op_d1_gemm_ip.h").read_text()
     assert "static_assert" in ip_hdr and "_repack_a" in ip_hdr and "_repack_b" in ip_hdr
-    assert "data0_T::size == 4" in ip_hdr and "data1_T::size == 4" in ip_hdr
+    assert "data1_T::size == 4" in ip_hdr   # repack_b's row-major (Mode A) static_assert
+
+    _csim_check_2op(tmp_path, pkg, "gemm_2op_d1")
 
 
-def test_two_operand_k_tiling_unpadded_boundary_and_grid_stitched_in_rtl(tmp_path):
-    # K=9 folded (fold_axis="k", RF=2) -> SIMD=5, k_pad=10; k_tiles=2 splits into 2
-    # fully-spatial MVU cores (MW=5 each) reducing a K-slice, summed in RTL -- K is
-    # NOT a multiple of k_tiles*MW's real span (real K=9 < k_pad=10), so this
-    # exercises the K-padding this refactor moved from HLS into the RTL wrapper.
-    pkg = _gen_2op(tmp_path, (4, 9, 4), "gemm_2op_kt", reuse_factor=2,
-                   fold_axis="k", k_tiles=2)
-    v = (pkg / "gemm_2op_kt_core.v").read_text()
-    assert v.count("mvu_vvu_axi #(") == 2
-    assert "input  wire [71:0] a_dout" in v    # K*AW = 9*8, unpadded (raw K, not k_pad=10)
-    assert "input  wire [31:0] b_dout" in v    # N*WEIGHT_WIDTH = 4*8, unpadded, K=9 beats
-    assert "output wire [63:0] p_din" in v     # N*out_width = 4*16, unpadded
-    assert "arow_pad" in v and "row_real" in v  # K-padding now lives in the wrapper
+def test_two_operand_depth1_col_major_csim_matches_golden(tmp_path):
+    # Same geometry (DEPTH==1, SF=NF=1) but Mode B (col-major B) -- closes the RF=1
+    # Mode-B gap the DEPTH==1 port onto dynamic_load_2op was meant to close.
+    pkg = _gen_2op(tmp_path, (4, 4, 4), "gemm_2op_d1b", reuse_factor=1,
+                   second_operand_row_major=False)
+    v = (pkg / "gemm_2op_d1b_core.v").read_text()
+    assert "dynamic_load_2op" in v and ".MODE(1)" in v
 
-    ip_hdr = (pkg / "gemm_2op_kt_gemm_ip.h").read_text()
-    assert "static_assert" in ip_hdr
-    assert "data0_T::size == 9" in ip_hdr and "data1_T::size == 4" in ip_hdr
+    ip_hdr = (pkg / "gemm_2op_d1b_gemm_ip.h").read_text()
+    assert "data0_T::size == 4" not in ip_hdr   # repack_a has no static_assert
+    assert "data1_T::size == 4" in ip_hdr        # repack_b's col-major static_assert (data1_T::size==K)
 
-
-# ── Two-operand (gemm_stream) memstream grid (SF_tile*NF >= 2): UNPADDED boundary ─
-
-def test_two_operand_memstream_k_tiling_unpadded_boundary_and_grid_stitched_in_rtl(tmp_path):
-    # K=18 folded (fold_axis="k", RF=4) -> SIMD=5, PE=4, k_pad=20; k_tiles=2 splits
-    # into 2 MVU cores each MW=10, SF_tile=2 NF=1 (SF_tile*NF=2 >= 2 -> the memstream
-    # grid form, not the fully-spatial register form). K=18 is NOT a multiple of
-    # k_tiles*MW's real span (real K=18 < k_pad=20), so this exercises the K-padding
-    # this refactor moved from HLS into the RTL wrapper, plus the SF_tile=2 SIMD
-    # fan-out (arow_reg) this refactor also moved into the RTL wrapper.
-    pkg = _gen_2op(tmp_path, (4, 18, 4), "gemm_2op_mskt", reuse_factor=4,
-                   fold_axis="k", k_tiles=2)
-    v = (pkg / "gemm_2op_mskt_core.v").read_text()
-    assert v.count("mvu_vvu_axi #(") == 2
-    assert v.count("memstream #(") == 2
-    assert "input  wire [143:0] a_dout" in v    # K*AW = 18*8, unpadded (raw K, not k_pad=20)
-    assert "input  wire [31:0] b_dout" in v     # N*WEIGHT_WIDTH = 4*8, unpadded, K=18 beats
-    assert "output wire [63:0] p_din" in v      # N*out_width = 4*16, unpadded
-    assert "arow_reg" in v and "row_real" in v  # K-padding + SF_tile fan-out live in the wrapper
-
-    ip_hdr = (pkg / "gemm_2op_mskt_gemm_ip.h").read_text()
-    assert "static_assert" in ip_hdr
-    assert "data0_T::size == 18" in ip_hdr and "data1_T::size == 4" in ip_hdr
-
-    top = (pkg / "gemm_2op_mskt_top.cpp").read_text()
-    assert "feed_a" in top and "static void unpack(" not in top   # passthrough, no drain math
-
-
-def test_two_operand_memstream_k_tiling_csim_matches_golden(tmp_path):
-    # Compile the C twin (behavioral stand-in for the RTL) against its own TB and
-    # confirm the independent golden matmul + requant reference matches exactly,
-    # including the real K-padding path (K=18 < k_pad=20) and the SF_tile=2 fan-out.
-    import subprocess
-    pkg = _gen_2op(tmp_path, (4, 18, 4), "gemm_2op_mskt2", reuse_factor=4,
-                   fold_axis="k", k_tiles=2)
-    vitis_inc = "/mnt/vault1/tools/AMD/Vitis_HLS/2024.1/include"
-    if not Path(vitis_inc).is_dir():
-        pytest.skip("Vitis HLS headers not available in this environment")
-    exe = tmp_path / "op2_mskt_tb"
-    subprocess.run(["g++", "-std=c++14", f"-I{vitis_inc}", "-o", str(exe),
-                    str(pkg / "gemm_2op_mskt2_tb.cpp"), str(pkg / "gemm_2op_mskt2_top.cpp"),
-                    str(pkg / "gemm_2op_mskt2_core.cpp")], check=True)
-    out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
-    assert "MVAU_PKG PASS" in out
-
-
-def test_two_operand_k_tiling_csim_matches_golden(tmp_path):
-    # Compile the C twin (behavioral stand-in for the RTL) against its own TB and
-    # confirm the independent golden matmul + requant reference matches exactly,
-    # including the real K-padding path (K=9 < k_pad=10).
-    import subprocess
-    pkg = _gen_2op(tmp_path, (4, 9, 4), "gemm_2op_kt2", reuse_factor=2,
-                   fold_axis="k", k_tiles=2)
-    vitis_inc = "/mnt/vault1/tools/AMD/Vitis_HLS/2024.1/include"
-    if not Path(vitis_inc).is_dir():
-        pytest.skip("Vitis HLS headers not available in this environment")
-    exe = tmp_path / "op2_kt_tb"
-    subprocess.run(["g++", "-std=c++14", f"-I{vitis_inc}", "-o", str(exe),
-                    str(pkg / "gemm_2op_kt2_tb.cpp"), str(pkg / "gemm_2op_kt2_top.cpp"),
-                    str(pkg / "gemm_2op_kt2_core.cpp")], check=True)
-    out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout
-    assert "MVAU_PKG PASS" in out
+    _csim_check_2op(tmp_path, pkg, "gemm_2op_d1b")
 
 
 # ── Two-operand single-tile shim (dynamic_load_2op), fold chosen by resolve_fold ──

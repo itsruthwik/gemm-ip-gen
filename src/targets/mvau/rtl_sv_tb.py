@@ -2,30 +2,27 @@
 driven with real xvlog/xelab/xsim (see run_rtl_tests.py).
 
 Unlike golden.py (which emits a C++ TB for Vitis HLS csim/cosim), this module
-drives the *raw shim* Verilog (rtl.generate_shim / generate_two_operand_shim /
-generate_two_operand_kt_shim) directly at the RTL level with a hand-written SV
-TB, exactly the way tensor_slice/golden.py drives its combined core with an
-iverilog TB. The three port "shapes" actually emitted (see rtl.py, confirmed
-by reading generated .v output under temp_space/mvau-ws and the mvu_vvu_axi
-shim sources):
+drives the *raw shim* Verilog (rtl.generate_shim / generate_two_operand_shim)
+directly at the RTL level with a hand-written SV TB, exactly the way
+tensor_slice/golden.py drives its combined core with an iverilog TB. The two
+port "shapes" actually emitted (see rtl.py, confirmed by reading generated .v
+output under temp_space/mvau-ws and the mvu_vvu_axi shim sources):
 
   ws       -- weight-stationary: ap_ctrl_chain + a_dout/a_empty_n/a_read +
               p_din/p_full_n/p_write. One raw K-wide beat in, one raw N-wide
               beat out, per vector. No weight port (baked memstream).
-  2op_reg  -- two-operand, fully-spatial (SF=NF=1, "register form"): same
-              ap_ctrl_chain + a_*/p_* as ws, PLUS b_dout/b_empty_n/b_read.
-              B fed as K raw N*WW-bit beats (one K-row/beat) *once per node*,
-              before A's M raw-K-wide beats.
-  2op_ms   -- two-operand, "memstream form" (SF*NF>=2, untiled): same port
-              names as 2op_reg, but B is K_pad beats of byte-aligned N*WW bits,
-              A is SF beats/vector of byte-aligned SIMD*AW bits, P is NF
-              beats/vector of byte-aligned PE*out_width bits.
+  2op      -- two-operand, single-tile (``dynamic_load_2op``, any depth incl.
+              the fully-spatial DEPTH==1 case): same ap_ctrl_chain + a_*/p_*
+              as ws, PLUS b_dout/b_empty_n/b_read. B is the loader's own
+              narrow beat (PE-wide Mode A / SIMD-wide Mode B), A is SF
+              beats/vector of byte-aligned SIMD*AW bits, P is NF beats/vector
+              of byte-aligned PE*out_width bits (SF==NF==1 -> one beat each).
 
 Stimulus/expected values reuse the exact deterministic generators golden.py's
-C-twin testbenches use (``_ws_tb``/``_2op_reg_tb``/``_2op_tb`` in golden.py):
-same seeded formulas for X and (for two-operand) B, same round-half-up/wrap
-requant reference -- just re-evaluated here in Python instead of emitted as
-C++, so the RTL-level SV TB and the HLS-level C++ TB check the same numbers.
+C-twin testbenches use (``_ws_tb``/``_2op_tb`` in golden.py): same seeded
+formulas for X and (for two-operand) B, same round-half-up/wrap requant
+reference -- just re-evaluated here in Python instead of emitted as C++, so
+the RTL-level SV TB and the HLS-level C++ TB check the same numbers.
 Weight-stationary baked weights reuse ``package._synth_weights`` (the same
 deterministic weight matrix ``generate_mvau_pkg`` bakes when no real weights
 are supplied).
@@ -58,7 +55,7 @@ def synth_activations(m, k, aw, signed, seed, node=0):
 
 
 def synth_b_stream(k, n, ww, seed, node=0):
-    """Same deterministic Bm[k][o] formula as golden.py's _2op_reg_tb/_2op_tb."""
+    """Same deterministic Bm[k][o] formula as golden.py's _2op_tb."""
     wrange = (1 << (ww - 1)) - 1
     wmod = min(7, 2 * wrange + 1)
     off = wrange if wmod == 2 * wrange + 1 else 3
