@@ -1,2 +1,8 @@
-Vendored from FINN finn-rtllib/mvu at commit 39f0c9a6b (branch main).
-Do not edit; regenerate by re-copying from that pinned commit.
+Vendored from ref/finn/finn-rtllib/mvu/ in this repo (ref/finn checkout at commit
+38c42bf95abbdad493db0b0f5053060074698908).
+
+This replaces the file set previously vendored from FINN finn-rtllib/mvu at commit
+39f0c9a6b (branch main), which is kept here for provenance history only.
+
+Do not edit; regenerate by re-copying from ref/finn/finn-rtllib/mvu/ (or a newer
+pinned commit, updating this file accordingly).

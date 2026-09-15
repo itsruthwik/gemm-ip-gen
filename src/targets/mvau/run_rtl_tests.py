@@ -239,7 +239,7 @@ CASES = {
 RTL_STATIC_DIR = HERE / "rtl_static"
 STATIC_SOURCES = [
     "mvu_vvu_axi.sv", "replay_buffer.sv", "memstream.sv",
-    "mvu_4sx4u.sv", "mvu_8sx8u_dsp48.sv", "mvu_vvu_8sx9_dsp58.sv",
+    "mvu_pkg.sv", "mvu.sv", "add_multi.sv", "mvu_vvu_8sx9_dsp58.sv",
 ]
 
 

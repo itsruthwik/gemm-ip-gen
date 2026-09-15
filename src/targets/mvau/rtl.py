@@ -233,7 +233,7 @@ module {module_name} (
 
     mvu_vvu_axi #(
         .IS_MVU({t['is_mvu']}),
-        .COMPUTE_CORE("{t['compute_core']}"),
+        .VERSION(3),
         .MW({t['mw']}), .MH({t['mh']}), .PE({t['pe']}), .SIMD({t['simd']}),
         .ACTIVATION_WIDTH({t['activation_width']}), .WEIGHT_WIDTH({t['weight_width']}),
         .ACCU_WIDTH({t['accu_width']}),
@@ -413,7 +413,7 @@ def _mvu_inst(t, fb, i, act_expr="a_dout"):
     """
     return f"""    mvu_vvu_axi #(
         .IS_MVU({t['is_mvu']}),
-        .COMPUTE_CORE("{t['compute_core']}"),
+        .VERSION(3),
         .MW({t['mw']}), .MH({t['mh']}), .PE({t['pe']}), .SIMD({t['simd']}),
         .ACTIVATION_WIDTH({t['activation_width']}), .WEIGHT_WIDTH({t['weight_width']}),
         .ACCU_WIDTH({t['accu_width']}),
@@ -860,7 +860,7 @@ module {module_name} (
 
     mvu_vvu_axi #(
         .IS_MVU({t['is_mvu']}),
-        .COMPUTE_CORE("{t['compute_core']}"),
+        .VERSION(3),
         .MW({t['mw']}), .MH({N}), .PE({t['pe']}), .SIMD({SIMD}),
         .ACTIVATION_WIDTH({t['activation_width']}), .WEIGHT_WIDTH({WW}),
         .ACCU_WIDTH({ACCU}),
@@ -978,7 +978,7 @@ def _2op_grid_memstream_shim(t, p, module_name, force_behavioral, nt, gk, sf_til
     assign wgt_tvalid_{idx} = ap_ce & run & w_ovld_{idx};
     assign w_ordy_{idx}     = ap_ce & run & wgt_tready_{idx};
     mvu_vvu_axi #(
-        .IS_MVU({t['is_mvu']}), .COMPUTE_CORE("{t['compute_core']}"),
+        .IS_MVU({t['is_mvu']}), .VERSION(3),
         .MW({t['mw']}), .MH({NTILE}), .PE({PE}), .SIMD({SIMD}),
         .ACTIVATION_WIDTH({t['activation_width']}), .WEIGHT_WIDTH({WW}), .ACCU_WIDTH({ACCU}),
         .NARROW_WEIGHTS({t['narrow_weights']}), .SIGNED_ACTIVATIONS({t['signed_activations']}),
@@ -1250,7 +1250,7 @@ def _2op_grid_register_shim(t, p, module_name, force_behavioral, nt, gk):
         return f"""    wire                 wgt_tready_{idx};
     wire [{raw_pb - 1}:0] out_tdata_raw_{idx};   // raw PE*ACCU_WIDTH beat straight off this tile's core
     mvu_vvu_axi #(
-        .IS_MVU({t['is_mvu']}), .COMPUTE_CORE("{t['compute_core']}"),
+        .IS_MVU({t['is_mvu']}), .VERSION(3),
         .MW({t['mw']}), .MH({NTILE}), .PE({PE}), .SIMD({SIMD}), .ACCU_WIDTH({ACCU}),
         .ACTIVATION_WIDTH({t['activation_width']}), .WEIGHT_WIDTH({WW}),
         .NARROW_WEIGHTS({t['narrow_weights']}), .SIGNED_ACTIVATIONS({t['signed_activations']}),

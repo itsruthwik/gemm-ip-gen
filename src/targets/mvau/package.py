@@ -27,7 +27,7 @@ _RTL_STATIC = Path(__file__).resolve().parent / "rtl_static"
 # always vendored -- the const_weights path instantiates it, the two-operand shims
 # (see _2op_* emitters) leave it uninstantiated.
 _STATIC_SOURCES = ["mvu_vvu_axi.sv", "replay_buffer.sv", "memstream.sv",
-                   "mvu_4sx4u.sv", "mvu_8sx8u_dsp48.sv", "mvu_vvu_8sx9_dsp58.sv"]
+                   "mvu_pkg.sv", "mvu.sv", "add_multi.sv", "mvu_vvu_8sx9_dsp58.sv"]
 _WEIGHTS_DAT = "{name}_weights.dat"   # per-IP memstream $readmemh init, in rtl_static/
 # XSIM requires all-or-none `timescale across the design. The vendored FINN cores and the
 # generated shim carry none (fine standalone), but the hls4ml RTL they integrate with does

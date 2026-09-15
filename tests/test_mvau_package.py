@@ -62,7 +62,7 @@ def test_shim_module_name_matches_c_function(tmp_path):
     pkg = _gen(tmp_path, (4, 4, 4), "gemm_4x4x4", reuse_factor=1)
     v = (pkg / "gemm_4x4x4_core.v").read_text()
     assert "module gemm_4x4x4_core (" in v
-    assert 'COMPUTE_CORE("mvu_vvu_8sx9_dsp58")' in v
+    assert ".VERSION(3)" in v
     assert "ap_ce" in v and "~ap_rst" in v   # active-high reset + CE stall
 
 
