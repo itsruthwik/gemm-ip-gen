@@ -45,6 +45,20 @@ def _glue_pipeline_fn(m):
     return "    #pragma HLS PIPELINE II=1\n" if int(m) == 1 else ""
 
 
+
+def _drain_pipeline_fn(m, t):
+    """Function-level PIPELINE for the drain only when the node is one row AND
+    the core emits one output beat per cycle (SF*NF == 1). Measured on the fc
+    set: at RF 1 the unpipelined drain's per-frame handshake caps the interval
+    at 2 (fc_tiny 1 -> 2 without it), but at RF >= 2 the interval is already
+    the core's RF and a function-pipelined (flushable) drain instead adds SF-1
+    cycles to every frame's latency (fc_large 18 -> 25). Loop-level pipelining
+    for M > 1 nodes is unaffected."""
+    if int(m) != 1:
+        return ""
+    return "    #pragma HLS PIPELINE II=1\n" if int(t["sf"]) * int(t["nf"]) == 1 else ""
+
+
 def _glue_pipeline_loop(m):
     """Loop-level PIPELINE for the row loop when a node is M > 1 rows: one row
     per cycle inside the frame; the per-frame handshake is amortised over M."""
@@ -309,7 +323,7 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > 
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PB}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
-{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_drain_pipeline_fn(m, t)}    for (unsigned mm = 0; mm < {m}; mm++) {{
 {_glue_pipeline_loop(m)}        ap_uint<{PB}> ob = p_s.read();
         res_T crow;
         for (unsigned oc = 0; oc < {N}; oc++) {{
@@ -443,7 +457,7 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > 
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PB}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
-{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_drain_pipeline_fn(m, t)}    for (unsigned mm = 0; mm < {m}; mm++) {{
 {_glue_pipeline_loop(m)}        ap_uint<{PB}> ob = p_s.read();
         res_T crow;
         for (unsigned oc = 0; oc < {N}; oc++) {{
@@ -765,7 +779,7 @@ void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BRAW}>
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PRAW}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
-{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_drain_pipeline_fn(m, t)}    for (unsigned mm = 0; mm < {m}; mm++) {{
 {_glue_pipeline_loop(m)}        ap_uint<{PRAW}> ob = p_s.read();
         res_T crow;
         for (unsigned oc = 0; oc < {N}; oc++) {{
@@ -946,7 +960,7 @@ void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res
         drain_fn = f"""template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
-{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_drain_pipeline_fn(m, t)}    for (unsigned mm = 0; mm < {m}; mm++) {{
 {_glue_pipeline_loop(m)}        res_T crow;
 {drain_body}
         res_stream.write(crow);
