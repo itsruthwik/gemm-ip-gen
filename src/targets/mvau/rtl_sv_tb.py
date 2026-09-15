@@ -111,8 +111,13 @@ module tb;
 {bw_localparam}
   reg ap_clk = 0, ap_rst = 1;
   reg ap_ce = 1;
-  reg ap_start = 0, ap_continue = 0;
+  reg ap_start = 0;
   wire ap_ready, ap_done, ap_idle;
+  // ap_continue: ack a pending completion the instant ap_done is seen -- legal
+  // under ap_ctrl_chain (the caller may assert ap_continue any cycle ap_done is
+  // high) and lets a run of several already-pending done_pending completions
+  // drain one per cycle without a separate driver process.
+  wire ap_continue = ap_done;
 
   reg  [AW-1:0] a_dout;
   reg           a_empty_n = 0;
@@ -197,31 +202,51 @@ module tb;
     end
   end
 
-  // ---- top-level: drive ap_start/ap_continue per node ----
-  integer node;
-  integer ready_cyc, done_cyc, first_start_cyc, last_done_cyc;
+  // ---- top-level: pipelined driver ----
+  // ap_start is held high for as long as nodes remain (the dataflow-region
+  // contract the decoupled handshake relies on) instead of being dropped and
+  // re-raised per node; a node's ap_ready pulse is consumed the same cycle it
+  // fires (ap_ready is a combinational pulse, so no waiting is needed once
+  // ap_start is up). A separate always block acks ap_done as soon as it's
+  // seen (see the ap_continue assign above) and stamps each node's done cycle
+  // -- decoupled from the ready stamps below, since with pipelining a node's
+  // ap_done can land many cycles after (or, with enough MAX_INFLIGHT headroom,
+  // even before) the NEXT node's ap_ready.
+  integer ready_count = 0, done_count = 0;
+  integer ready_cyc_arr [0:NNODES-1];
+  integer done_cyc_arr  [0:NNODES-1];
+  integer first_start_cyc = 0, last_done_cyc = 0;
   real per_node_cyc;
+
   initial begin
-    ap_start = 0; ap_continue = 0;
+    ap_start = 0;
     @(negedge ap_rst);
     repeat (3) @(posedge ap_clk);
-    for (node = 0; node < NNODES; node = node + 1) begin
-      @(posedge ap_clk); #1;
-      ap_start = 1;
-      if (node == 0) first_start_cyc = cyc;
-      while (!ap_ready) @(posedge ap_clk);
-      ready_cyc = cyc;
-      @(posedge ap_clk); #1;
-      ap_start = 0;
-      while (!ap_done) @(posedge ap_clk);
-      done_cyc = cyc;
-      last_done_cyc = cyc;
-      $display("NODE %0d ready=%0d done=%0d", node, ready_cyc, done_cyc);
-      @(posedge ap_clk); #1;
-      ap_continue = 1;
-      @(posedge ap_clk); #1;
-      ap_continue = 0;
+    @(posedge ap_clk); #1;
+    first_start_cyc = cyc;
+    ap_start = 1;   // held high until all NNODES nodes have been accepted
+  end
+
+  always @(posedge ap_clk) begin
+    if (!ap_rst && ap_start && ap_ready && ready_count < NNODES) begin
+      ready_cyc_arr[ready_count] = cyc;
+      $display("NODE %0d ready=%0d", ready_count, cyc);
+      ready_count = ready_count + 1;
+      if (ready_count == NNODES) ap_start <= 1'b0;
     end
+  end
+
+  always @(posedge ap_clk) begin
+    if (!ap_rst && ap_done && done_count < NNODES) begin
+      done_cyc_arr[done_count] = cyc;
+      last_done_cyc = cyc;
+      $display("NODE %0d done=%0d", done_count, cyc);
+      done_count = done_count + 1;
+    end
+  end
+
+  initial begin
+    wait (done_count == NNODES);
     per_node_cyc = (last_done_cyc - first_start_cyc) * 1.0 / NNODES;
     $display("CYCLES nodes=%0d first_start=%0d last_done=%0d per_node=%0.3f",
               NNODES, first_start_cyc, last_done_cyc, per_node_cyc);

@@ -35,6 +35,22 @@ _WEIGHTS_DAT = "{name}_weights.dat"   # per-IP memstream $readmemh init, in rtl_
 _TIMESCALE = "`timescale 1ns / 1ps\n"
 
 
+
+def _glue_pipeline_fn(m):
+    """Function-level PIPELINE for the repack/drain glue when a node is one row
+    (M == 1): Vitis removes the single-trip row loop, so a loop-level pragma is
+    dropped and the process stays an unpipelined ap_ctrl_chain leaf that costs a
+    start/done handshake per frame. Pipelining the whole function makes it a
+    flushable pipeline (II 1 across frames)."""
+    return "    #pragma HLS PIPELINE II=1\n" if int(m) == 1 else ""
+
+
+def _glue_pipeline_loop(m):
+    """Loop-level PIPELINE for the row loop when a node is M > 1 rows: one row
+    per cycle inside the frame; the per-frame handshake is amortised over M."""
+    return "" if int(m) == 1 else "        #pragma HLS PIPELINE II=1\n"
+
+
 def _with_timescale(text):
     return text if "`timescale" in text else _TIMESCALE + text
 
@@ -272,8 +288,8 @@ template <class data_T>
 void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > &a_s) {{
     static_assert(data_T::size == {K},
         "{name}: hls4ml must deliver one full, unpadded K-wide row per stream beat");
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        data_T beat = a_stream.read();
+{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_glue_pipeline_loop(m)}        data_T beat = a_stream.read();
         ap_uint<{AB}> ab;
         for (unsigned j = 0; j < {K}; j++) {{
             #pragma HLS UNROLL
@@ -293,8 +309,8 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > 
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PB}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        ap_uint<{PB}> ob = p_s.read();
+{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_glue_pipeline_loop(m)}        ap_uint<{PB}> ob = p_s.read();
         res_T crow;
         for (unsigned oc = 0; oc < {N}; oc++) {{
             #pragma HLS UNROLL
@@ -406,8 +422,8 @@ template <class data_T>
 void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > &a_s) {{
     static_assert(data_T::size == {K},
         "{name}: hls4ml must deliver one full, unpadded K-wide row per stream beat");
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        data_T beat = a_stream.read();
+{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_glue_pipeline_loop(m)}        data_T beat = a_stream.read();
         ap_uint<{AB}> ab;
         for (unsigned j = 0; j < {K}; j++) {{
             #pragma HLS UNROLL
@@ -427,8 +443,8 @@ void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > 
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PB}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        ap_uint<{PB}> ob = p_s.read();
+{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_glue_pipeline_loop(m)}        ap_uint<{PB}> ob = p_s.read();
         res_T crow;
         for (unsigned oc = 0; oc < {N}; oc++) {{
             #pragma HLS UNROLL
@@ -711,8 +727,8 @@ template <class data0_T>
 void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{ARAW}> > &a_s) {{
     static_assert(data0_T::size == {K},
         "{name}: hls4ml must deliver one full, unpadded K-wide row per stream beat");
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        data0_T beat = a_stream.read();
+{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_glue_pipeline_loop(m)}        data0_T beat = a_stream.read();
         ap_uint<{ARAW}> ab;
         for (unsigned j = 0; j < {K}; j++) {{
             #pragma HLS UNROLL
@@ -749,8 +765,8 @@ void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BRAW}>
 template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{PRAW}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        ap_uint<{PRAW}> ob = p_s.read();
+{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_glue_pipeline_loop(m)}        ap_uint<{PRAW}> ob = p_s.read();
         res_T crow;
         for (unsigned oc = 0; oc < {N}; oc++) {{
             #pragma HLS UNROLL
@@ -832,8 +848,8 @@ def _2op_gemm_ip_header(name, plan):
     if kt_form:
         repack_a = f"""template <class data0_T>
 void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{a_width}> > &a_s) {{
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        ap_int<{AW}> arow[{KPAD}];
+{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_glue_pipeline_loop(m)}        ap_int<{AW}> arow[{KPAD}];
         #pragma HLS ARRAY_PARTITION variable=arow complete
         for (unsigned i = 0; i < {KPAD}; i++) {{
             #pragma HLS UNROLL
@@ -852,8 +868,8 @@ void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{a_widt
     else:
         repack_a = f"""template <class data0_T>
 void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> > &a_s) {{
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        ap_int<{AW}> arow[{KPAD}];
+{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_glue_pipeline_loop(m)}        ap_int<{AW}> arow[{KPAD}];
         #pragma HLS ARRAY_PARTITION variable=arow complete
         for (unsigned i = 0; i < {KPAD}; i++) {{
             #pragma HLS UNROLL
@@ -930,8 +946,8 @@ void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res
         drain_fn = f"""template <class res_T, typename CONFIG_T>
 void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream) {{
     typedef typename res_T::value_type result_t;
-    for (unsigned mm = 0; mm < {m}; mm++) {{
-        res_T crow;
+{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
+{_glue_pipeline_loop(m)}        res_T crow;
 {drain_body}
         res_stream.write(crow);
     }}

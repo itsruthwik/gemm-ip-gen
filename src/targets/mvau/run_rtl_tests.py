@@ -295,16 +295,19 @@ def run_case(case_name, seed=1, keep=False, env=None, backpressure=True, fsm_deb
 
     result = {"stage": "xsim", "log": log}
     ok = False
-    nodes = []
+    ready_by_node, done_by_node = {}, {}
     fsm_write, fsm_run, a_beats_log, p_beats_log = [], [], [], []
     for line in log.splitlines():
-        if "NODE " in line and "ready=" in line and "done=" in line:
+        if line.startswith("NODE ") and "ready=" in line:
+            # NODE <i> ready=<c> -- the pipelined driver's ready stamp (per-node
+            # input-side completion; may fire many cycles before that node's
+            # own done stamp, since nodes are now allowed to overlap)
             parts = line.split()
-            # NODE <i> ready=<c> done=<c>
-            i = int(parts[1])
-            ready = int(parts[2].split("=", 1)[1])
-            done = int(parts[3].split("=", 1)[1])
-            nodes.append({"node": i, "ready": ready, "done": done})
+            ready_by_node[int(parts[1])] = int(parts[2].split("=", 1)[1])
+        elif line.startswith("NODE ") and "done=" in line:
+            # NODE <i> done=<c> -- the ap_continue-ack process's done stamp
+            parts = line.split()
+            done_by_node[int(parts[1])] = int(parts[2].split("=", 1)[1])
         elif "CYCLES nodes=" in line:
             fields = dict(tok.split("=", 1) for tok in line.split()[1:])
             result["cycles"] = {
@@ -325,8 +328,21 @@ def run_case(case_name, seed=1, keep=False, env=None, backpressure=True, fsm_deb
             result["result_line"] = line.strip()
             ok = "PASS" in line and r.returncode == 0
             break
+    nodes = [{"node": i, "ready": ready_by_node[i], "done": done_by_node.get(i)}
+             for i in sorted(ready_by_node)]
     if nodes:
         result["node_cycles"] = nodes
+        # steady-state per-node interval: ready[i+1]-ready[i] over the last few
+        # nodes (skips the pipeline's fill-up transient on the first couple of
+        # nodes, once MAX_INFLIGHT nodes are overlapped back-to-back).
+        readys = [n["ready"] for n in nodes]
+        if len(readys) >= 2:
+            tail = readys[-min(3, len(readys)):]
+            gaps = [b - a for a, b in zip(tail, tail[1:])]
+            if "cycles" not in result:
+                result["cycles"] = {}
+            result["cycles"]["steady_state_interval"] = sum(gaps) / len(gaps)
+            result["cycles"]["steady_state_gaps"] = gaps
     if nodes and (fsm_write or fsm_run or a_beats_log or p_beats_log):
         # fsm_debug: bucket each stamp by the [ready(node), ready(node+1)) interval
         # it falls in, so per-node WRITE/RUN entry + last A/P beat can be reported.

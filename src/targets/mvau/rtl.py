@@ -98,7 +98,7 @@ def _requant_lanes(t, n_lanes, raw_exprs, bias_codes, reg_prefix, bias_index_exp
 def generate_shim(shape, module_name="mvau_core", force_behavioral=True,
                   tile=None, weights_in_core=False, init_file=None,
                   init_files=None, n_tiles=1, k_tiles=1, bias_codes=None,
-                  raw_k=None, raw_n=None, **plan_kwargs):
+                  raw_k=None, raw_n=None, max_inflight=None, **plan_kwargs):
     """Emit the shim Verilog wrapping ``mvu_vvu_axi`` for one MVU tile.
 
     ``module_name`` must match the blackbox C function name. ``force_behavioral``
@@ -134,10 +134,10 @@ def generate_shim(shape, module_name="mvau_core", force_behavioral=True,
         if k_tiles > 1:
             return _generate_kt_shim(t, module_name, fb, wbits, abits, pbits,
                                      init_files, n_tiles, k_tiles, m, bias_codes=bias_codes,
-                                     raw_k=raw_k, raw_n=raw_n)
+                                     raw_k=raw_k, raw_n=raw_n, max_inflight=max_inflight)
         return _generate_ws_shim(t, module_name, fb, wbits, abits, pbits,
                                  init_files, n_tiles, m, bias_codes=bias_codes,
-                                 raw_k=raw_k, raw_n=raw_n)
+                                 raw_k=raw_k, raw_n=raw_n, max_inflight=max_inflight)
     if n_tiles != 1:
         raise NotImplementedError(
             "streamed (two-operand) shim does not support N-tiling yet; "
@@ -276,17 +276,134 @@ def _nf_counter(nf, reg_name="nf_cnt", advance_cond="p_write", split=False):
     def _w(n):
         return max(1, (n - 1).bit_length())
     decl = f"    reg [{_w(nf) - 1}:0] {reg_name} = 0;   // which of the {nf} per-vector column blocks is on the beat\n"
+    # Self-wrapping purely off *advance_cond* (a real output-side transfer): with the
+    # decoupled handshake, ap_ready is now an input-side event (fires when the current
+    # node's LAST input beat is taken, which can be cycles ahead of -- or, with enough
+    # inflight headroom, even after -- this node's output phase finishes), so it is no
+    # longer a valid moment to zero this output-phase counter. Every {nf} accepted
+    # output beats already brings it back to 0 on its own.
     always_block = f"""    always @(posedge ap_clk) begin
         if (ap_rst) {reg_name} <= 0;
         else if (ap_ce) begin
-            if (ap_ready) {reg_name} <= 0;
-            else if ({advance_cond}) {reg_name} <= ({reg_name} == {nf - 1}) ? 0 : {reg_name} + 1'b1;
+            if ({advance_cond}) {reg_name} <= ({reg_name} == {nf - 1}) ? 0 : {reg_name} + 1'b1;
         end
     end
 """
     if split:
         return decl, always_block
     return decl + always_block
+
+
+
+def _inflight_for(t, run_total, max_inflight=None):
+    """Nodes the wrapper may hold between input accepted and output drained.
+    Explicit value wins; otherwise enough that a node's fill latency (plus the
+    requant/drain pipeline) never stalls admission: with one-row nodes (fc
+    layers, run_total == 1) the core takes ~latency cycles per node, so the cap
+    must cover latency / run_total nodes plus one. Clamped to [2, 8]."""
+    if max_inflight is not None:
+        return int(max_inflight)
+    import math
+    need = math.ceil((t["latency_cycles"] + 6) / max(1, run_total)) + 1
+    return max(2, min(8, need))
+
+
+def _decoupled_ctrl(in_total, run_total, in_advance, out_advance, max_inflight=2):
+    """Shared ap_ctrl_chain decoupled handshake/FSM, one node = *in_total* input
+    beats in / *run_total* output beats out. Used by both the weight-stationary
+    (``_generate_ws_shim``) and K-tiled (``_generate_kt_shim``) wrappers so this
+    logic is written once; the 2-op emitters keep their own (unrelated) FSMs.
+
+    Unlike the old IDLE/RUN FSM (which only re-armed ap_ready after the current
+    node's last output beat was written AND ap_continue had cleared ap_done --
+    so consecutive nodes could never overlap), this has no state register at
+    all: the input and output sides run off their own free-running per-node
+    beat counters (*icnt*/*ocnt*, each wrapping 0..total-1) and a small
+    ``inflight`` counter caps how many nodes may have their input accepted
+    before their output has fully drained (``MAX_INFLIGHT``, default 2 --
+    enough to keep the core fed back-to-back with zero idle cycles between
+    nodes, since the next node's first input beat can be accepted the very
+    cycle the current node's last input beat is taken).
+
+    Protocol (Vitis ap_ctrl_chain-legal: ap_ready is a pulse and may occur
+    before ap_done of the same invocation, ap_start held high by the caller
+    for as long as invocations remain):
+      * ``in_open  = ap_start & ap_ce & (inflight < MAX_INFLIGHT)`` -- no FSM
+        state gating; callers AND this into their own a_empty_n/backpressure
+        gating exactly as before.
+      * on the input beat where ``icnt == in_total-1`` and *in_advance* (a real,
+        backpressure-gated input transfer) fires: pulse ``ap_ready`` that same
+        cycle (combinational -- Vitis requires it land no later than the beat
+        that completes the invocation) and bump ``inflight``.
+      * on the output beat where ``ocnt == run_total-1`` and *out_advance*
+        fires: drop ``inflight`` and bump ``done_pending``.
+      * ``ap_done = (done_pending != 0)``; ``ap_continue`` while ``ap_done``
+        drops one pending completion. ``ap_idle`` = nothing in flight or
+        pending.
+      * the same-cycle increment/decrement case (an *in_advance* and
+        *out_advance* completion landing together, or a new completion and an
+        ``ap_continue`` landing together) is a net no-op, not two separate
+        +1/-1 updates.
+
+    xvlog enforces declare-before-use even for plain wires, so this can't be one
+    self-contained block: *in_advance*/*out_advance* (e.g. ``can_load``/``p_write``)
+    are themselves declared by the caller in between the counters and the rest of
+    the handshake. Returns ``(early_decls, late_decls, in_open_name)``:
+    *early_decls* (localparams + the icnt/ocnt/inflight/done_pending regs + the
+    ``in_open`` wire -- everything callers' own *in_advance* wiring needs) goes
+    where the old IDLE/RUN FSM used to sit; *late_decls* (the ap_ready/ap_done/
+    ap_idle assigns + the always block) goes after *in_advance* and *out_advance*
+    are themselves declared (where the old FSM's always block used to sit).
+    ``in_open_name`` is always ``"in_open"``, returned for documentation at call
+    sites.
+    """
+    def _w(n):
+        return max(1, (n - 1).bit_length())
+    icnt_w = _w(in_total)
+    ocnt_w = _w(run_total)
+    io_w = _w(max_inflight + 1)
+    early_decls = f"""    // ---- ap_ctrl_chain decoupled handshake: input and output sides run off
+    // independent free-running per-node beat counters; up to MAX_INFLIGHT nodes
+    // may have their input accepted before their output has fully drained, so
+    // consecutive nodes overlap with no idle gap. See _decoupled_ctrl's docstring.
+    localparam MAX_INFLIGHT = {max_inflight};
+    reg [{icnt_w - 1}:0] icnt = 0;             // input beats accepted this node, wraps at {in_total}
+    reg [{ocnt_w - 1}:0] ocnt = 0;             // output beats produced this node, wraps at {run_total}
+    reg [{io_w - 1}:0] inflight = 0;           // nodes with input accepted, output not yet fully drained
+    reg [{io_w - 1}:0] done_pending = 0;       // completed nodes awaiting ap_continue
+
+    wire in_open = ap_start & ap_ce & (inflight < MAX_INFLIGHT);
+"""
+    late_decls = f"""    // ---- ap_ctrl_chain decoupled handshake, part 2 (needs {in_advance!r}/{out_advance!r}
+    // declared above): see _decoupled_ctrl's docstring.
+    wire in_last_beat  = ({in_advance}) & (icnt == {in_total - 1});
+    wire out_last_beat = ({out_advance}) & (ocnt == {run_total - 1});
+    wire continue_ack  = ap_done & ap_continue;
+
+    assign ap_ready = in_last_beat;
+    assign ap_done  = (done_pending != 0);
+    assign ap_idle  = (inflight == 0) & (done_pending == 0);
+
+    always @(posedge ap_clk) begin
+        if (ap_rst) begin
+            icnt <= 0; ocnt <= 0; inflight <= 0; done_pending <= 0;
+        end else if (ap_ce) begin
+            if ({in_advance}) icnt <= in_last_beat  ? {icnt_w}'d0 : icnt + 1'b1;
+            if ({out_advance}) ocnt <= out_last_beat ? {ocnt_w}'d0 : ocnt + 1'b1;
+            case ({{in_last_beat, out_last_beat}})
+                2'b10: inflight <= inflight + 1'b1;
+                2'b01: inflight <= inflight - 1'b1;
+                default: ; // 2'b00 no-op, 2'b11 (same-cycle in+out) net no-op
+            endcase
+            case ({{out_last_beat, continue_ack}})
+                2'b10: done_pending <= done_pending + 1'b1;
+                2'b01: done_pending <= done_pending - 1'b1;
+                default: ; // 2'b00 no-op, 2'b11 (new completion + ack) net no-op
+            endcase
+        end
+    end
+"""
+    return early_decls, late_decls, "in_open"
 
 
 def _mvu_inst(t, fb, i, act_expr="a_dout"):
@@ -350,7 +467,7 @@ def _ws_tile_block(t, fb, wbits, wmem, i, init_file, act_expr="a_dout", label=No
 
 
 def _generate_kt_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_tiles, k_tiles, m,
-                      bias_codes=None, raw_k=None, raw_n=None):
+                      bias_codes=None, raw_k=None, raw_n=None, max_inflight=None):
     """K-tiled (and combined N+K) weight-stationary grid shim: an ``n_tiles``x``k_tiles`` grid
     of MVU cores. Tile (j,i) reduces K-slice i (MW=K_pad/k_tiles) for N-slice j (MH=N_tile),
     each a baked ``memstream`` (DEPTH = wmem = SF_tile*NF) holding that (j,i) weight block.
@@ -456,6 +573,9 @@ def _generate_kt_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
     pad_bits = (k_pad - K) * aw
     arow_pad_expr = ("a_dout" if pad_bits == 0
                      else "{" + "{%d{1'b0}}" % pad_bits + ", a_dout}")
+    ctrl_decls, ctrl_late, _ = _decoupled_ctrl(in_total, run_total, in_advance="can_load",
+                                               out_advance="p_write",
+                                               max_inflight=_inflight_for(t, run_total, max_inflight))
     return f"""// Generated by gemm-ip-gen (mvau target). Weight-stationary grid shim:
 // {n_tiles}x{k_tiles} (N-tiles x K-tiles) MVU cores; tile (j,i) reduces K-slice i (MW={mw})
 // for N-slice j ({t['mh']} cols). Boundary is UNPADDED (matches hls4ml's own TDATA widths):
@@ -487,21 +607,7 @@ module {module_name} (
 );
     wire rst_n = ~ap_rst;
 
-    // ---- ap_ctrl_chain invocation-level FSM: IDLE <-> RUN, one node/invocation ----
-    localparam IDLE = 1'd0, RUN = 1'd1;
-    reg                        state = IDLE;
-    reg                        done_r = 0;
-    reg  [{_w(in_total + 1) - 1}:0]  icnt = 0;   // external activation rows accepted this node
-    reg  [{_w(run_total + 1) - 1}:0]  ocnt = 0;   // external result rows produced this node
-
-    assign ap_ready = (state == IDLE) & ~done_r & ap_start & ap_ce;
-    assign ap_done  = done_r;
-    assign ap_idle  = (state == IDLE) & ~done_r;
-
-    // gate on icnt too: stop pulling A rows once this node's {in_total} rows
-    // are accepted, even if the next node's rows are already queued in the FIFO.
-    wire in_open = (state == RUN) & (icnt != {in_total});
-
+{ctrl_decls}
     // ---- activation side: buffer one external (unpadded) row, zero-filled to the
     // grid's total k_pad={k_pad}, and fan it out to the {sf_tile} SIMD-wide beats every
     // tile needs, one per cycle (every K-tile advances in lockstep, reading its own
@@ -509,16 +615,20 @@ module {module_name} (
     reg  [{APAD - 1}:0] arow_reg;
     reg                  row_valid = 0;
     reg  [{max(sf_bits - 1, 0)}:0] sf_cnt = 0;
-    wire [{APAD - 1}:0] arow_pad = {arow_pad_expr};
-    wire need_load = ~row_valid;
-    wire can_load  = ap_ce & in_open & need_load & a_empty_n;
-    assign a_read = can_load;
-    wire in_tvalid = ap_ce & row_valid;
-
     // per-tile handshakes: every tile in the grid shares the same sf_cnt-selected
     // activation slice + output backpressure, so they all run in lockstep.
     wire [{ntiles - 1}:0] in_tready;
     wire [{ntiles - 1}:0] out_tvalid;
+    wire [{APAD - 1}:0] arow_pad = {arow_pad_expr};
+    // look ahead to the cycle a row is about to fully drain (its last SIMD-wide
+    // slice accepted by every tile) so the next row can be loaded the SAME
+    // cycle, back-to-back -- without this, SF=1 configs would waste one bubble
+    // cycle/row (need_load only true the cycle AFTER row_valid clears).
+    wire row_draining = row_valid & (&in_tready) & (sf_cnt == {sf_tile - 1});
+    wire need_load = ~row_valid | row_draining;
+    wire can_load  = ap_ce & in_open & need_load & a_empty_n;
+    assign a_read = can_load;
+    wire in_tvalid = ap_ce & row_valid;
     // nf_cnt (0..{nf - 1}, advancing on accept_beat) -- needed whenever NF>1, both
     // to pick a dynamic bias code (in the per-lane requantize section below) and
     // to know, here, which of the NF beats/vector is on the wire this cycle.
@@ -527,31 +637,20 @@ module {module_name} (
     wire accept_beat = ap_ce & (&out_tvalid) & out_tready;
     assign p_write = accept_beat & ({nf_expr} == {nf - 1});   // one row/beat, unpadded
 {nf_cnt_seq}
-
+{ctrl_late}
+    // activation row buffer sequencing -- independent of the ctrl FSM above (a
+    // node's row buffer only cares whether ITS beats are still arriving; it does
+    // not need to know how many other nodes are inflight/pending).
     always @(posedge ap_clk) begin
         if (ap_rst) begin
-            state <= IDLE; done_r <= 0; icnt <= 0; ocnt <= 0;
             row_valid <= 0; sf_cnt <= 0;
         end else if (ap_ce) begin
-            if (ap_ready) begin
-                state <= RUN; icnt <= 0; ocnt <= 0;
-            end else if (state == RUN) begin
-                if (can_load) icnt <= icnt + 1'b1;
-                if (p_write) begin
-                    if (ocnt == {run_total - 1}) begin
-                        state <= IDLE; done_r <= 1'b1;
-                    end else ocnt <= ocnt + 1'b1;
-                end
-            end
-            // activation row buffer: load a fresh (zero-padded) row, else shift
-            // through its {sf_tile} SIMD-wide slices as each is accepted by every tile.
             if (can_load) begin
                 arow_reg <= arow_pad; row_valid <= 1'b1; sf_cnt <= 0;
             end else if (row_valid & (&in_tready)) begin
                 if (sf_cnt == {sf_tile - 1}) begin row_valid <= 0; sf_cnt <= 0; end
                 else sf_cnt <= sf_cnt + 1'b1;
             end
-            if (done_r & ap_continue) done_r <= 1'b0;
         end
     end
 
@@ -1338,7 +1437,7 @@ def generate_two_operand_nt_shim(shape, module_name="mvau_core", force_behaviora
 
 
 def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_tiles, m,
-                      bias_codes=None, raw_k=None, raw_n=None):
+                      bias_codes=None, raw_k=None, raw_n=None, max_inflight=None):
     """Weight-stationary shim: ``n_tiles`` FINN ``memstream`` + ``mvu_vvu_axi``
     tiles stitched in RTL. Each memstream (baked from ``init_files[i]``) replaces
     the external weight FIFO for its N-column slice and drives its tile's
@@ -1453,6 +1552,9 @@ def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
     pad_bits = (k_pad - K) * aw
     arow_pad_expr = ("a_dout" if pad_bits == 0
                      else "{" + "{%d{1'b0}}" % pad_bits + ", a_dout}")
+    ctrl_decls, ctrl_late, _ = _decoupled_ctrl(in_total, run_total, in_advance="can_load",
+                                               out_advance="p_write",
+                                               max_inflight=_inflight_for(t, run_total, max_inflight))
     return f"""// Generated by gemm-ip-gen (mvau target). Weight-stationary shim: {n_tiles} FINN
 // MVU tile(s) -- each a memstream (baked weights) + mvu_vvu_axi -- stitched in RTL.
 // Boundary is UNPADDED (matches hls4ml's own TDATA widths): a_dout is one raw
@@ -1483,38 +1585,28 @@ module {module_name} (
 );
     wire rst_n = ~ap_rst;
 
-    // ---- ap_ctrl_chain invocation-level FSM: IDLE <-> RUN, one node/invocation ----
-    localparam IDLE = 1'd0, RUN = 1'd1;
-    reg                        state = IDLE;
-    reg                        done_r = 0;
-    reg  [{_w(in_total + 1) - 1}:0]  icnt = 0;   // external activation rows accepted this node
-    reg  [{_w(run_total + 1) - 1}:0]  ocnt = 0;   // external result rows produced this node
-
-    assign ap_ready = (state == IDLE) & ~done_r & ap_start & ap_ce;
-    assign ap_done  = done_r;
-    assign ap_idle  = (state == IDLE) & ~done_r;
-
-    // gate on icnt too: stop pulling A rows once this node's {in_total} rows
-    // are accepted, even if the next node's rows are already queued in the FIFO.
-    wire in_open = (state == RUN) & (icnt != {in_total});
-
+{ctrl_decls}
     // ---- activation side: buffer one external (unpadded) row, zero-filled to
     // k_pad={k_pad}, and fan it out to the {sf}-deep SIMD-wide beats the MVU tiles
     // need, one per cycle.
     reg  [{APAD - 1}:0] arow_reg;
     reg                  row_valid = 0;
     reg  [{max(sf_bits - 1, 0)}:0] sf_cnt = 0;
-    wire [{APAD - 1}:0] arow_pad = {arow_pad_expr};
-    wire need_load = ~row_valid;
-    wire can_load  = ap_ce & in_open & need_load & a_empty_n;
-    assign a_read = can_load;
-    wire [{abits - 1}:0] cur_slice = arow_reg[sf_cnt * {abits} +: {abits}];
-    wire in_tvalid = ap_ce & row_valid;
-
     // per-tile handshakes: every tile shares the same activation slice + output
     // backpressure, so they run in lockstep (tiles are identical modules).
     wire [{n_tiles - 1}:0] in_tready;
     wire [{n_tiles - 1}:0] out_tvalid;
+    wire [{APAD - 1}:0] arow_pad = {arow_pad_expr};
+    // look ahead to the cycle a row is about to fully drain (its last SIMD-wide
+    // slice accepted by every tile) so the next row can be loaded the SAME
+    // cycle, back-to-back -- without this, SF=1 configs would waste one bubble
+    // cycle/row (need_load only true the cycle AFTER row_valid clears).
+    wire row_draining = row_valid & (&in_tready) & (sf_cnt == {sf - 1});
+    wire need_load = ~row_valid | row_draining;
+    wire can_load  = ap_ce & in_open & need_load & a_empty_n;
+    assign a_read = can_load;
+    wire [{abits - 1}:0] cur_slice = arow_reg[sf_cnt * {abits} +: {abits}];
+    wire in_tvalid = ap_ce & row_valid;
     // nf_cnt (0..{nf - 1}, advancing on accept_beat) -- needed whenever NF>1, both
     // to pick a dynamic bias code (in the per-lane requantize section below) and
     // to know, here, which of the NF beats/vector is on the wire this cycle.
@@ -1523,31 +1615,20 @@ module {module_name} (
     wire accept_beat = ap_ce & (&out_tvalid) & out_tready;
     assign p_write = accept_beat & ({nf_expr} == {nf - 1});   // one row/beat, unpadded
 {nf_cnt_seq}
-
+{ctrl_late}
+    // activation row buffer sequencing -- independent of the ctrl FSM above (a
+    // node's row buffer only cares whether ITS beats are still arriving; it does
+    // not need to know how many other nodes are inflight/pending).
     always @(posedge ap_clk) begin
         if (ap_rst) begin
-            state <= IDLE; done_r <= 0; icnt <= 0; ocnt <= 0;
             row_valid <= 0; sf_cnt <= 0;
         end else if (ap_ce) begin
-            if (ap_ready) begin
-                state <= RUN; icnt <= 0; ocnt <= 0;
-            end else if (state == RUN) begin
-                if (can_load) icnt <= icnt + 1'b1;
-                if (p_write) begin
-                    if (ocnt == {run_total - 1}) begin
-                        state <= IDLE; done_r <= 1'b1;
-                    end else ocnt <= ocnt + 1'b1;
-                end
-            end
-            // activation row buffer: load a fresh (zero-padded) row, else shift
-            // through its {sf} SIMD-wide slices as each is accepted by every tile.
             if (can_load) begin
                 arow_reg <= arow_pad; row_valid <= 1'b1; sf_cnt <= 0;
             end else if (row_valid & (&in_tready)) begin
                 if (sf_cnt == {sf - 1}) begin row_valid <= 0; sf_cnt <= 0; end
                 else sf_cnt <= sf_cnt + 1'b1;
             end
-            if (done_r & ap_continue) done_r <= 1'b0;
         end
     end
 
