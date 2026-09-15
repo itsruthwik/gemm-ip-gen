@@ -107,9 +107,14 @@ void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR 
     // bound (at N=128 a 2-port RAM c_row capped the reuse loop at II=64).
     #pragma HLS ARRAY_PARTITION variable=c_row complete dim=0
     #pragma HLS ARRAY_PARTITION variable=a_row complete dim=0
-    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     typename CONFIG_T::accum_t acc[CONFIG_T::gemm_n];
     #pragma HLS ARRAY_PARTITION variable=acc complete
+    // Mirror hls4ml's Vitis nnet_dense_resource override: pin the accumulate add to
+    // fabric so Versal Vitis HLS does not fuse the multiply-accumulate into a
+    // multi-cycle DSP58 dot-product primitive (which silently diverges from the C
+    // model in cosim), and bind each product to a plain DSP multiplier below.
+    // TODO: Ruthwik check again
+    #pragma HLS bind_op variable=acc op=add impl=fabric
 
     GRR_LEQ_INIT: for (int iacc = 0; iacc < nout; iacc++) {
         #pragma HLS UNROLL
@@ -128,7 +133,10 @@ void gemm_row_resource_rf_leq_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR 
             // recurrence already tracks (in_index, out_index) == (k, n) for the
             // pair weights[w_index] semantically belongs to, so no decode of
             // w_index itself is needed (only used here for its own recurrence).
-            acc[out_index] += (typename CONFIG_T::accum_t)(a_row[in_index] * (ROW_MAJOR ? weight_cols[in_index][out_index] : weight_cols[out_index][in_index]));
+            typename CONFIG_T::accum_t mult = (typename CONFIG_T::accum_t)(a_row[in_index] * (ROW_MAJOR ? weight_cols[in_index][out_index] : weight_cols[out_index][in_index]));
+            // TODO: Ruthwik check again
+            #pragma HLS bind_op variable=mult op=mul impl=dsp
+            acc[out_index] += mult;
             w_index += rufactor;
             in_index += rufactor;
             if (in_index >= nin) in_index = ir;
@@ -158,9 +166,14 @@ void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[ROW_MA
     // bound (at N=128 a 2-port RAM c_row capped the reuse loop at II=64).
     #pragma HLS ARRAY_PARTITION variable=c_row complete dim=0
     #pragma HLS ARRAY_PARTITION variable=a_row complete dim=0
-    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     typename CONFIG_T::accum_t acc[CONFIG_T::gemm_n];
     #pragma HLS ARRAY_PARTITION variable=acc complete
+    // Mirror hls4ml's Vitis nnet_dense_resource override: pin the accumulate add to
+    // fabric so Versal Vitis HLS does not fuse the multiply-accumulate into a
+    // multi-cycle DSP58 dot-product primitive (which silently diverges from the C
+    // model in cosim), and bind each product to a plain DSP multiplier below.
+    // TODO: Ruthwik check again
+    #pragma HLS bind_op variable=acc op=add impl=fabric
 
     GRR_REM0_INIT: for (int iacc = 0; iacc < nout; iacc++) {
         #pragma HLS UNROLL
@@ -185,7 +198,10 @@ void gemm_row_resource_rf_gt_nin_rem0(a_row_T &a_row, b_col_T weight_cols[ROW_MA
             #pragma HLS UNROLL
             // in_index is fixed for the whole MultLoop (one k per ir); out_index
             // is the tracked n. weights[w_index] -> weight_cols[out_index][in_index].
-            acc[out_index] += (typename CONFIG_T::accum_t)(a_row[in_index] * (ROW_MAJOR ? weight_cols[in_index][out_index] : weight_cols[out_index][in_index]));
+            typename CONFIG_T::accum_t mult = (typename CONFIG_T::accum_t)(a_row[in_index] * (ROW_MAJOR ? weight_cols[in_index][out_index] : weight_cols[out_index][in_index]));
+            // TODO: Ruthwik check again
+            #pragma HLS bind_op variable=mult op=mul impl=dsp
+            acc[out_index] += mult;
             w_index += rufactor;
             if (w_index >= nin * nout) break;
             out_index += outscale;
@@ -217,9 +233,12 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ?
     // bound (at N=128 a 2-port RAM c_row capped the reuse loop at II=64).
     #pragma HLS ARRAY_PARTITION variable=c_row complete dim=0
     #pragma HLS ARRAY_PARTITION variable=a_row complete dim=0
-    #pragma HLS ALLOCATION operation instances=mul limit=gemm_rf<CONFIG_T>::multiplier_limit
     typename CONFIG_T::accum_t acc[CONFIG_T::gemm_n];
     #pragma HLS ARRAY_PARTITION variable=acc complete
+    // NB: unlike the rf<=nin kernels, here acc accumulates the already-reduced mult[]
+    // partials (not a product directly), so acc's add has no adjacent multiply to fuse
+    // into a DSP58 dot-product -- the fabric pin goes on the mult[] reduction and the
+    // dsp pin on tmpmult below, matching hls4ml's own rf_gt_nin dense_resource kernel.
 
     GRR_GT_INIT: for (int iacc = 0; iacc < nout; iacc++) {
         #pragma HLS UNROLL
@@ -232,6 +251,8 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ?
                                                                + gemm_rf<CONFIG_T>::reuse_factor - 1)
                                                               / gemm_rf<CONFIG_T>::reuse_factor];
         #pragma HLS ARRAY_PARTITION variable=tmpmult complete
+        // TODO: Ruthwik check again
+        #pragma HLS bind_op variable=tmpmult op=mul impl=dsp
 
         GRR_GT_MULT: for (int im = 0; im < block_factor; im++) {
             #pragma HLS UNROLL
@@ -250,6 +271,8 @@ void gemm_row_resource_rf_gt_nin(a_row_T &a_row, b_col_T weight_cols[ROW_MAJOR ?
                                                                / ((gemm_rf<CONFIG_T>::reuse_factor < CONFIG_T::gemm_k)
                                                                   ? gemm_rf<CONFIG_T>::reuse_factor : CONFIG_T::gemm_k)];
         #pragma HLS ARRAY_PARTITION variable=mult complete
+        // TODO: Ruthwik check again
+        #pragma HLS bind_op variable=mult op=add impl=fabric
 
         GRR_GT_RESETMULT: for (int imult = 0; imult < multiplier_limit; imult++) {
             #pragma HLS UNROLL
