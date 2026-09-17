@@ -269,7 +269,7 @@ endmodule
 
 def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
                    a_dat, exp_dat, bb=None, b_beats=None, b_dat=None,
-                   backpressure=True, fsm_debug=False):
+                   backpressure=True, fsm_debug=False, sustained_output_stall=False):
     """Build the SV TB text. ``kind`` is 'ws' (no B port) or '2op' (has B port).
 
     ``backpressure`` (default True, unchanged behaviour): random a_empty_n /
@@ -278,6 +278,10 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
     remains (no artificial stalling), so measured cycles reflect only the
     wrapper/core's own pipeline cost.
 
+    ``sustained_output_stall`` keeps A (and B, if present) flowing and stalls
+    P for eight cycles immediately after its first produced beat.  It is a
+    deterministic output-queue stress schedule, used for the SF=1 regression.
+
     ``fsm_debug`` (2op only): emit extra $display stamps -- FSM_WRITE/FSM_RUN
     (cycle the DUT's internal ``state`` register enters WRITE/RUN, via the
     hierarchical ``dut.state`` reference -- only meaningful for the memstream
@@ -285,7 +289,34 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
     A_BEAT (cycle each A beat is accepted) and P_BEAT (cycle each P beat is
     written).
     """
-    if backpressure:
+    if sustained_output_stall:
+        a_empty_process = """
+  // Keep the core fed while the output queue is deliberately stalled.
+  always @(posedge ap_clk) begin
+    if (ap_rst) a_empty_n <= 0;
+    else a_empty_n <= (a_idx < A_BEATS);
+  end"""
+        p_full_process = """
+  // After one accepted result, block eight output cycles.  An SF=1 core emits
+  // each cycle here, which must fit its pipeline drain without queue overflow.
+  integer oq_stall_cycles = 0;
+  reg oq_stall_started = 0;
+  always @(posedge ap_clk) begin
+    if (ap_rst) begin
+      p_full_n <= 0;
+      oq_stall_cycles <= 0;
+      oq_stall_started <= 0;
+    end else if (!oq_stall_started) begin
+      p_full_n <= 1'b1;
+      if (p_write) oq_stall_started <= 1'b1;
+    end else if (oq_stall_cycles < 8) begin
+      p_full_n <= 1'b0;
+      oq_stall_cycles <= oq_stall_cycles + 1;
+    end else begin
+      p_full_n <= 1'b1;
+    end
+  end"""
+    elif backpressure:
         a_empty_process = """\
   always @(posedge ap_clk) begin
     if (ap_rst) a_empty_n <= 0;

@@ -346,8 +346,12 @@ module mvu_vvu_axi #(
 			VERSION == 3? 3 + (SEGMENTLEN == 0? 0 : ((SIMD+2)/3 -1)/SEGMENTLEN) :
 			/* else */    3 + $clog2(SIMD+1) + (SIMD == 1);
 
-		// This is conservative and could be divided by a guaranteed minimum output interval, e.g. MW/SIMD.
-		localparam int unsigned  MAX_IN_FLIGHT = CORE_PIPELINE_DEPTH;
+		// The free-running core can emit every cycle when SF==1.  Once output
+		// backpressure is observed, OLock closes admission one cycle later, so
+		// one more already-admitted result can join the core pipeline drain.
+		// Retain FINN's existing bound for SF>1, where the output interval
+		// provides that credit naturally.
+		localparam int unsigned  MAX_IN_FLIGHT = CORE_PIPELINE_DEPTH + (SF == 1 ? 1 : 0);
 		typedef logic [PE-1:0][ACCU_WIDTH-1:0]  output_t;
 
 		logic signed [$clog2(MAX_IN_FLIGHT+1):0]  OPtr = '1;	// -1 | 0, 1, ..., MAX_IN_FLIGHT

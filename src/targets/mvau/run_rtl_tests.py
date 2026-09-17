@@ -79,7 +79,8 @@ def _round_bits(n):
 
 # ── case builders: each returns (workdir, module_name, sv_files, kind, tb_args) ──
 
-def _build_ws_case(work, name, shape, seed, backpressure=True, **plan_kw):
+def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_stall=False,
+                   **plan_kw):
     plan = _find_case_plan(shape, **plan_kw)
     t = plan["tile"]
     N, K, K_pad = plan["n"], plan["k"], plan["k_pad"]
@@ -131,7 +132,8 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, **plan_kw):
     _tb.write_dat(exp_dat, exp_words, (pb + 3) // 4)
 
     sv_tb = _tb.generate_sv_tb("ws", module_name, ab, pb, len(a_words), len(exp_words),
-                               N_NODES, str(a_dat), str(exp_dat), backpressure=backpressure)
+                               N_NODES, str(a_dat), str(exp_dat), backpressure=backpressure,
+                               sustained_output_stall=sustained_output_stall)
     (work / "tb.sv").write_text(sv_tb)
     return module_name, [work / f"{module_name}.v"]
 
@@ -229,6 +231,11 @@ CASES = {
     "d_ktiled_ws": lambda work, seed, **kw: _build_ws_case(
         work, "d", (2, 16, 4), seed, pe=4, simd=4, k_tiles=2,
         backpressure=kw.get("backpressure", True)),
+    # SF=1/NF=2 DSP58 path.  Continuous input plus the deterministic eight-cycle
+    # output stall catches the free-running core's one-cycle-late OLock credit.
+    "p_sf1_output_queue": lambda work, seed, **kw: _build_ws_case(
+        work, "p", (4, 16, 16), seed, pe=8, simd=16,
+        backpressure=False, sustained_output_stall=True),
     "e_2op_register": lambda work, seed, **kw: _build_2op_case(
         work, "e", (2, 4, 4), seed, pe=4, simd=4,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
@@ -337,6 +344,10 @@ def run_case(case_name, seed=1, keep=False, env=None, backpressure=True, fsm_deb
     (work / "xsim.log").write_text(log)
 
     result = {"stage": "xsim", "log": log}
+    # A SystemVerilog $error does not necessarily make xsim return nonzero, and
+    # the testbench can otherwise reach its golden-data PASS banner afterward.
+    # Keep the core's queue-overflow assertion a hard regression failure.
+    result["queue_overflow"] = "Overflowing output queue." in log
     ok = False
     ready_by_node, done_by_node = {}, {}
     fsm_write, fsm_run, a_beats_log, p_beats_log = [], [], [], []
@@ -369,7 +380,7 @@ def run_case(case_name, seed=1, keep=False, env=None, backpressure=True, fsm_deb
             p_beats_log.append(int(line.split("cyc=", 1)[1]))
         if "TEST_RESULT:" in line:
             result["result_line"] = line.strip()
-            ok = "PASS" in line and r.returncode == 0
+            ok = "PASS" in line and r.returncode == 0 and not result["queue_overflow"]
             break
     nodes = [{"node": i, "ready": ready_by_node[i], "done": done_by_node.get(i)}
              for i in sorted(ready_by_node)]
