@@ -170,7 +170,9 @@ and this file's fold-M section above for the row-fold analogue.
    `S_IDLE -> S_PRELOAD -> S_RUN` arm live, not to load coefficients.
 2. For each K chunk:
    - pulse `start_mat_mul` on the first A/B beat of that chunk
-   - assert `pe_reset` only on chunk 0
+   - assert `pe_reset` on chunk 0 to clear accumulators (cold start only --
+     `pe_reset` no longer has any role at end-of-output; see *Output
+     Collector* below)
    - drive `validity_mask_a_cols_b_rows` and `final_mat_mul_size` for that chunk
    - feed `max(M,N)` row/column beats
 3. Intermediate outputs from non-final K chunks are ignored.
@@ -217,21 +219,48 @@ structurally is a separate item.
 
 ## Output Collector
 
-Output readout is gated by the tensor-slice `op[0]` (`out_ctrl`) input, with
+Output readout is gated by a three-bit tensor-slice `op` input, with
 **zero parking storage**:
 
-- `op[0] = 1` — the tile HOLDS its completed result internally (including after
-  intermediate K chunks) and emits nothing.
-- `op[0] = 0` — the tile shifts one result row per cycle onto `c_data_out`,
-  qualified by `c_data_available`.
+- `op[0]` (`out_ctrl`, level) — `1` HOLDS the tile's completed result
+  internally (including after intermediate K chunks) and emits nothing; `0`
+  shifts one result row per cycle onto `c_data_out`, qualified by
+  `c_data_available`. Readout sources a **shadow bank**, not the live PE
+  accumulators, so a drain in progress never observes a result the array is
+  still computing.
+- `op[1]` (`drain_stop`, 1-cycle pulse) — terminates the remaining
+  masked/padded tail of the current drain burst early. It has no effect on
+  the accumulators or on shadow contents.
+- `op[2]` (`shadow_swap`, 1-cycle pulse) — snapshots the final PE
+  accumulators into the shadow bank and clears the accumulators in the same
+  cycle, freeing the array to start the next group's `start_mat_mul` before
+  the shadow bank has finished draining.
+
+Splitting drain control (`op[1]`/`op[2]`) out of `pe_reset` decouples drain
+from the accumulator lifecycle: one group can drain from its shadow bank
+while the next group is already computing into the (now-cleared) live
+accumulators. Legacy free-run (no shadow bank in use, no drain-stop) is
+`op = 3'b000`.
 
 All tiles in the grid finish together, so the column tiles of one tile-row
 concatenate as pure wiring. The wrapper holds every tile-row (`op[0] = 1`) and
-releases them one at a time in row-major order for their 8-row bursts.
+releases them one at a time in row-major order for their 8-row bursts,
+pulsing `op[1]` to cut a burst short and `op[2]` once the group's final K
+chunk lands.
 
 This replaced an earlier per-tile delay-line alignment pyramid, whose shift
 registers cost sum-of-delays x 129 FFs (~6.2k on a 2x2 grid, ~29k on 4x2). That
 pyramid — and its unused buffered-synth generator — has since been removed.
+
+The `op`/`pe_reset` pins live only on the synth branch's `tensor_slice_int8`
+black-box instantiation (see *Tensor-Slice Assumption* below); the
+behavioral sim model and the C behavioral core are grid-level
+compute-at-emit models that realize the same compute/drain overlap through
+their own frame/slot schedulers and carry no `op` state. Local regression is
+therefore compile-check only for the `op` contract itself; functional
+validation of the pins is deferred to the separate hardblock project's
+cosim. See `wrapper_run_loop.md` for the multi-frame feed/capture schedule
+this overlap builds on.
 
 ## Tensor-Slice Assumption
 
@@ -248,7 +277,25 @@ each slice as a black box:
 - internally skew/diagonalize row/column inputs for its systolic array
 - preserve PE accumulators across repeated `start_mat_mul` operations when
   `pe_reset` is not asserted
-- emit final accumulated `c_data` after the last K chunk
+- on `op[2]` (`shadow_swap`), snapshot the final accumulated result into an
+  internal shadow bank and clear the accumulators, so the next group's
+  `start_mat_mul` can begin immediately
+- gate readout by `op[0]` (`out_ctrl`) from the shadow bank, independent of
+  the live accumulators' state (see *Output Collector* above)
+- on `op[1]` (`drain_stop`), cut the remaining masked/padded drain burst
+  short, with no effect on accumulators or shadow contents
+- `pe_reset` clears the PE accumulators only (cold start / error recovery);
+  it does not touch drain or the shadow bank and is not asserted at
+  end-of-output
+
+This is a **model-level contract, not an in-repo implementation**: the
+`tensor_slice_int8` hardblock is a separate project, and neither the
+behavioral sim model (`behav_grid`) nor the C behavioral core in
+`package.py` instantiates it or drives these pins -- both are grid-level
+compute-at-emit models whose own frame/slot schedulers realize the same
+compute/drain overlap without an `op` port. Validating the pins themselves
+against real hardblock RTL is out of scope for this repo's regression;
+that happens in the hardblock project's cosim.
 
 The generated wrapper does not change the tensor-slice port list and does not
 inline or concatenate tensor-slice RTL.

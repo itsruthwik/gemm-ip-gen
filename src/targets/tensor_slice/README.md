@@ -16,7 +16,9 @@ The slice is intended for int8 tensor matmul mode:
 
 - `slice_dtype = 2'b00`
 - `slice_mode = 1'b0`
-- `op = 3'b000`
+- `op` is the 3-bit output/drain control described under
+  [Output control (`op` pins)](#output-control-op-pins); `op = 3'b000` is the
+  legacy free-run encoding (hold nothing, no drain-stop, no shadow swap)
 
 Control behavior:
 
@@ -37,6 +39,42 @@ Masking support:
 - `validity_mask_a_rows`: spatial row mask
 - `validity_mask_b_cols`: spatial column mask
 - `validity_mask_a_cols_b_rows`: temporal inner-dimension mask
+
+## Output control (`op` pins)
+
+The slice's 3-bit `op` port is the readout/drain interface. Each bit is an
+independent control, and the wrapper drives all three; `pe_reset` is reserved
+for accumulator lifecycle only and never doubles as a drain control.
+
+| bit | name | kind | meaning |
+|-----|------|------|---------|
+| `op[0]` | `out_ctrl` | level | `1` holds the completed result inside the tile (emits nothing); `0` shifts one result row per cycle onto `c_data_out`, qualified by `c_data_available`. Readout sources the **shadow bank**, not the live accumulators. |
+| `op[1]` | `drain_stop` | 1-cycle pulse | Terminates the remaining masked/padded tail of the current drain burst. Does **not** touch accumulators or the shadow contents beyond ending the burst. |
+| `op[2]` | `shadow_swap` | 1-cycle pulse | Snapshots the final PE accumulators into the shadow output bank **and** clears the accumulators, freeing the array to begin the next group immediately. |
+
+`pe_reset` is a plain accumulator clear (cold start / error recovery). It has
+no effect on an in-progress drain and is not pulsed at end-of-output.
+
+How the wrapper uses them:
+
+- **Row-major readout.** All grid tiles finish together, so the column tiles of
+  one tile-row concatenate as pure wiring. The wrapper holds every tile-row with
+  `op[0] = 1` and releases them one at a time in row-major order (`op[0] = 0`)
+  for their 8-row bursts, with zero parking storage.
+- **Tail truncation.** When a tile-row has emitted all its *logical* rows, the
+  wrapper pulses `op[1]` to drop the padded remainder of that burst instead of
+  clocking out masked rows. This replaces the old scheme of asserting `pe_reset`
+  at end-of-output (which conflated drain-abort with accumulator clear).
+- **Group hand-off / overlap.** When a group's compute completes (after its last
+  K pass), the wrapper pulses `op[2]` to capture that group's results into the
+  shadow bank and free the accumulators. The next M/N group then feeds and
+  accumulates on the live array while the previous group drains from the shadow
+  bank — one group computing and one draining concurrently (single shadow bank =
+  double buffering). This is what lets M/N-group folding pipeline rather than
+  serialize drain behind compute.
+
+See `docs/rtl_contract.md`'s Output Collector and Tensor-Slice Assumption
+sections for the full contract.
 
 ## Grid-Level Latency
 

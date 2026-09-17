@@ -94,30 +94,15 @@ def resolve_fold_m(m, reuse_factor, name=None):
     Returns a dict: mg, m_passes, grid_rows, grid_rows_pad,
     reuse_factor_requested, reuse_factor (legalized), warnings (list[str]).
     """
-    gr = grid_rows(m)
-    rf_req = int(reuse_factor)
-    warnings = []
-    rf_use = rf_req
-    if rf_use < 1:
-        rf_use = 1
-    if rf_use > gr:
-        who = f" for layer {name}" if name is not None else ""
-        warnings.append(
-            f"WARNING: Invalid ReuseFactor={rf_req}{who}. "
-            f"Using ReuseFactor={gr} instead. Valid ReuseFactor(s): 1..{gr}."
-        )
-        rf_use = gr
-    mg = _ceil_div(gr, rf_use)
-    m_passes = _ceil_div(gr, mg)
-    grid_rows_pad = m_passes * mg
+    f = _resolve_axis_fold(m, reuse_factor, name)
     return {
-        "mg": mg,
-        "m_passes": m_passes,
-        "grid_rows": gr,
-        "grid_rows_pad": grid_rows_pad,
-        "reuse_factor_requested": rf_req,
-        "reuse_factor": m_passes,
-        "warnings": warnings,
+        "mg": f["group"],
+        "m_passes": f["passes"],
+        "grid_rows": f["chunks"],
+        "grid_rows_pad": f["chunks_pad"],
+        "reuse_factor_requested": f["reuse_factor_requested"],
+        "reuse_factor": f["reuse_factor"],
+        "warnings": f["warnings"],
     }
 
 
@@ -137,30 +122,120 @@ def resolve_fold_n(n, reuse_factor, name=None):
     Returns a dict: cg, n_passes, grid_cols, grid_cols_pad,
     reuse_factor_requested, reuse_factor (legalized), warnings (list[str]).
     """
-    gc = grid_cols(n)
+    f = _resolve_axis_fold(n, reuse_factor, name)
+    return {
+        "cg": f["group"],
+        "n_passes": f["passes"],
+        "grid_cols": f["chunks"],
+        "grid_cols_pad": f["chunks_pad"],
+        "reuse_factor_requested": f["reuse_factor_requested"],
+        "reuse_factor": f["reuse_factor"],
+        "warnings": f["warnings"],
+    }
+
+
+def _resolve_axis_fold(dim, reuse_factor, name=None):
+    """Legalize a requested pass count for one axis's tile-group folding.
+
+    Generic version of :func:`resolve_fold_m` / :func:`resolve_fold_n`:
+    ``chunks = ceil(dim/8)`` tiles are covered by ``group = ceil(chunks/RF)``
+    tiles per group, in ``passes = ceil(chunks/group)`` back-to-back groups;
+    the legalized RF is ``passes``. RF=1 legalizes to ``group=chunks``,
+    ``passes=1`` (fully spatial). Legal range ``1..chunks``.
+
+    Returns a dict: group, passes, chunks, chunks_pad, reuse_factor_requested,
+    reuse_factor (legalized), warnings.
+    """
+    chunks = _ceil_div(int(dim), LANE_WIDTH)
     rf_req = int(reuse_factor)
     warnings = []
     rf_use = rf_req
     if rf_use < 1:
         rf_use = 1
-    if rf_use > gc:
+    if rf_use > chunks:
         who = f" for layer {name}" if name is not None else ""
         warnings.append(
             f"WARNING: Invalid ReuseFactor={rf_req}{who}. "
-            f"Using ReuseFactor={gc} instead. Valid ReuseFactor(s): 1..{gc}."
+            f"Using ReuseFactor={chunks} instead. Valid ReuseFactor(s): 1..{chunks}."
         )
-        rf_use = gc
-    cg = _ceil_div(gc, rf_use)
-    n_passes = _ceil_div(gc, cg)
-    grid_cols_pad = n_passes * cg
+        rf_use = chunks
+    group = _ceil_div(chunks, rf_use)
+    passes = _ceil_div(chunks, group)
+    chunks_pad = passes * group
     return {
-        "cg": cg,
-        "n_passes": n_passes,
-        "grid_cols": gc,
-        "grid_cols_pad": grid_cols_pad,
+        "group": group,
+        "passes": passes,
+        "chunks": chunks,
+        "chunks_pad": chunks_pad,
         "reuse_factor_requested": rf_req,
-        "reuse_factor": n_passes,
+        "reuse_factor": passes,
         "warnings": warnings,
+    }
+
+
+def resolve_mkn_geometry(m, k, n, m_reuse_factor=1, k_reuse_factor=1, n_reuse_factor=1,
+                          name=None):
+    """General independent M/K/N tensor_slice geometry resolver.
+
+    Each axis is legalized independently via the same tile-group-fold rule
+    (:func:`_resolve_axis_fold`): axis ``reuse_factor`` RF=1 means "fully
+    spatial, one pass"; RF>1 folds the axis's 8-lane tile count into ``RF``
+    (legalized) back-to-back groups. There is no cross-axis coupling -- the M,
+    K, and N legalizations are independent of each other. This is the general
+    form the single-axis ``fold_axis`` resolvers below degenerate to.
+
+    Returns a dict with, per axis, the spatial tile-group size and pass count
+    (``m_spatial``/``m_passes``, ``k_spatial``/``k_passes``, ``n_spatial``/
+    ``n_passes``), the raw tile counts (``grid_rows``, ``k_chunks``,
+    ``grid_cols``) and their group-padded totals (``grid_rows_pad``,
+    ``k_chunks_pad``, ``grid_cols_pad``), the derived slice count
+    (``slices = k_spatial * m_spatial * n_spatial``, the number of
+    concurrently-active 8x8 tensor-slice tiles), ``multipliers`` (64 per
+    slice), stream widths (``a_bits``/``b_bits``/``c_bits``), and per-axis
+    ``warnings``.
+    """
+    fm = _resolve_axis_fold(m, m_reuse_factor, name)
+    fk = _resolve_axis_fold(k, k_reuse_factor, name)
+    fn = _resolve_axis_fold(n, n_reuse_factor, name)
+
+    m_spatial = fm["group"]
+    m_passes = fm["passes"]
+    k_spatial = fk["group"]
+    k_passes_ = fk["passes"]
+    n_spatial = fn["group"]
+    n_passes = fn["passes"]
+
+    slices = k_spatial * m_spatial * n_spatial
+    mult = 64 * slices
+
+    return {
+        "m_spatial": m_spatial,
+        "m_passes": m_passes,
+        "grid_rows": fm["chunks"],
+        "grid_rows_pad": fm["chunks_pad"],
+        "m_reuse_factor_requested": fm["reuse_factor_requested"],
+        "m_reuse_factor": fm["reuse_factor"],
+
+        "k_spatial": k_spatial,
+        "passes": k_passes_,
+        "k_passes": k_passes_,
+        "k_chunks": fk["chunks"],
+        "k_chunks_pad": fk["chunks_pad"],
+        "k_reuse_factor_requested": fk["reuse_factor_requested"],
+        "k_reuse_factor": fk["reuse_factor"],
+        "reuse_factor": fk["reuse_factor"],
+        "effective_reuse": fk["reuse_factor"],
+
+        "n_spatial": n_spatial,
+        "n_passes": n_passes,
+        "grid_cols": fn["chunks"],
+        "grid_cols_pad": fn["chunks_pad"],
+        "n_reuse_factor_requested": fn["reuse_factor_requested"],
+        "n_reuse_factor": fn["reuse_factor"],
+
+        "slices": slices,
+        "multipliers": mult,
+        "warnings": fm["warnings"] + fk["warnings"] + fn["warnings"],
     }
 
 
@@ -237,31 +312,16 @@ def _resolve_reuse_factor_k(k, reuse_factor, name=None):
     reuse_factor_requested, reuse_factor (legalized), effective_reuse
     (== passes), warnings (list[str]).
     """
-    kc = k_chunks(k)
-    rf_req = int(reuse_factor)
-    warnings = []
-    rf_use = rf_req
-    if rf_use < 1:
-        rf_use = 1
-    if rf_use > kc:
-        who = f" for layer {name}" if name is not None else ""
-        warnings.append(
-            f"WARNING: Invalid ReuseFactor={rf_req}{who}. "
-            f"Using ReuseFactor={kc} instead. Valid ReuseFactor(s): 1..{kc}."
-        )
-        rf_use = kc
-    ks = _ceil_div(kc, rf_use)
-    passes = _ceil_div(kc, ks)
-    k_chunks_pad = passes * ks
+    f = _resolve_axis_fold(k, reuse_factor, name)
     return {
-        "k_spatial": ks,
-        "passes": passes,
-        "k_chunks": kc,
-        "k_chunks_pad": k_chunks_pad,
-        "reuse_factor_requested": rf_req,
-        "reuse_factor": passes,
-        "effective_reuse": passes,
-        "warnings": warnings,
+        "k_spatial": f["group"],
+        "passes": f["passes"],
+        "k_chunks": f["chunks"],
+        "k_chunks_pad": f["chunks_pad"],
+        "reuse_factor_requested": f["reuse_factor_requested"],
+        "reuse_factor": f["reuse_factor"],
+        "effective_reuse": f["passes"],
+        "warnings": f["warnings"],
     }
 
 

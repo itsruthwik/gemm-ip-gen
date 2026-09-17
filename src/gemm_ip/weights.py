@@ -125,6 +125,47 @@ def build_weight_rom_fold_n(B_full, m, core_n, k, k_spatial, n_passes):
     return rom
 
 
+def build_weight_rom_combined_fold(B_full, m, core_n, k, k_spatial, n_passes):
+    """Combined-fold (2+ folded axes) weight ROM: contents for
+    ``_general_synth_combined_fold``'s address
+    ``(chunk_idx*n_passes + ng)*n + beat_count`` -- ``passes*n_passes*core_n``
+    entries, ``passes = ceil(K_CHUNKS/k_spatial)``. ``B_full`` is
+    ``[K, n_passes*core_n]`` (real columns first, zero-padded tail), same
+    convention as :func:`build_weight_rom_fold_n`.
+
+    Per the confirmed contract and the csim-verified simplification (see
+    jojo-track/open/tensor-slice-general-synth-grid), weight contents depend
+    only on ``(k_pass, n_group)`` -- never ``m_group`` -- so this builder
+    covers every ``m_group`` in a combined M+K+N fold by construction (the
+    emitter replays the same ROM for every ``mg``).
+
+    Reuses :func:`build_weight_rom_k_spatial` per N-group exactly like
+    :func:`build_weight_rom_fold_n` (so each group's packing/layout/tail
+    masking is identical, already validated there), but re-orders the result
+    into CHUNK-major / N-GROUP-minor layout (``build_weight_rom_fold_n`` is
+    N-GROUP-major / chunk-minor) to match the combined emitter's address
+    ordering. Degenerate reductions:
+      - ``n_passes == 1``: single N-group -> byte-identical to
+        ``build_weight_rom_fold_n(B_full, m, core_n, k, k_spatial, 1)``.
+      - ``k_spatial == 1`` and ``n_passes == 1``: -> byte-identical to
+        ``build_weight_rom(B_full, m, core_n, k)``.
+      - ``k_spatial == k_chunks`` (one K-pass) and ``n_passes == 1``: ->
+        byte-identical to ``build_weight_rom_full_k(B_full, m, core_n, k)``.
+    """
+    B_full = np.asarray(B_full)
+    k_chunks = (k + 7) // 8
+    passes = -(-k_chunks // k_spatial)
+    rom = [0] * (passes * n_passes * core_n)
+    for ng in range(n_passes):
+        Bg = B_full[:, ng * core_n:(ng + 1) * core_n]
+        sub = build_weight_rom_k_spatial(Bg, m, core_n, k, k_spatial)  # pass-major, len passes*core_n
+        for chunk_idx in range(passes):
+            dst = (chunk_idx * n_passes + ng) * core_n
+            src = chunk_idx * core_n
+            rom[dst:dst + core_n] = sub[src:src + core_n]
+    return rom
+
+
 def build_weight_rom_full_k(B, m, n, k):
     """Today's full-K endpoint of :func:`build_weight_rom_k_spatial` (one pass)."""
     k_chunks = (k + 7) // 8

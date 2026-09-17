@@ -23,6 +23,7 @@ _ceil_div = _geometry._ceil_div
 _geom_k_chunks = _geometry.k_chunks
 _geom_k_passes = _geometry.k_passes
 resolve_reuse_factor = _geometry.resolve_reuse_factor
+resolve_mkn_geometry = _geometry.resolve_mkn_geometry
 latency_first_out = _geometry.latency_first_out
 a_stream_width = _geometry.a_stream_width
 b_stream_width = _geometry.b_stream_width
@@ -93,7 +94,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # itself now emits the fully-requantised, bias-added result -- the drain
     # below is a pure unpack, no rescale/bias/cast.
     c_bits = grid_cols * 8 * out_width
-    mr = grid_rows * 8
+    physical_rows = grid_rows * 8
     ks = int(k_spatial)
     k_chunks = _geom_k_chunks(k)
     passes = _geom_k_passes(k, ks)
@@ -122,6 +123,14 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     first_out = latency_cycles(m, k, n, grid_rows, grid_cols, k_spatial=ks)
     # Frame slots for the pipelined sim core: feed of frame t+1 may overlap
     # compute/drain of frame t (min frame period = total_beats + 1 calls).
+    #
+    # op-contract note (jojo-track/open/tensor-slice-op-shadow-drain): this C
+    # core has no op/pe_reset/shadow state -- it is a grid-level `gemm.run()`
+    # frame-period abstraction, not a port-level model. The op[0..2] pins live
+    # only in the synth branch's tensor_slice_int8 black-box instantiation
+    # (see rtl.py). This frame-period overlap (feed of t+1 while t is still
+    # draining) is the same compute/drain decoupling the op contract expresses
+    # at the pin level; it is realized here without modeling the pins.
     slots = -(-(first_out + 1 + m) // (total_beats + 1)) + 1
 
     # Merged feed+drain call budget. The RUN loop polls out_valid on every
@@ -143,7 +152,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # followed by total_beats in_valid beats; the idle beat drops the core's
     # `feeding` flag so the next frame allocates a fresh slot.
     # Steady-state frame period = total_beats + 1; the last frame's outputs drain
-    # in the trailing first_out + mr + slack tail. With n_frames == 1 this reduces
+    # in the trailing first_out + m + slack tail. With n_frames == 1 this reduces
     # to a single frame (real hls4ml flow: one frame per wrapper call).
     period = total_beats + 1
     # in_valid is asserted only inside the feed region; feed_total covers every
@@ -151,10 +160,11 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     feed_total = n_frames * period
     # Loop length: the LAST frame starts feeding at (n_frames-1)*period and its
     # final output lands first_out + m later (the behavioral core emits m rows per
-    # frame). Use mr (>= m) + slack for the port-lag tail. Sizing on feed_total
+    # frame). The structural core aborts masked physical rows after logical M,
+    # so the tail is sized on m. Sizing on feed_total
     # here would over-run by a full period per frame (a serialized-latency
     # regression for n_frames == 1).
-    total_steps = (n_frames - 1) * period + first_out + mr + 6
+    total_steps = (n_frames - 1) * period + first_out + m + 6
     total_rows = n_frames * m
 
     # Fold-M: ``m`` here is the CORE row count (M_g = 8*mg); ``logical_m`` is
@@ -166,6 +176,30 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # logical_m == m and nothing below changes any generated text.
     fold_m = int(m_passes) > 1
     logical_m = m if logical_m is None else int(logical_m)
+
+    # Fold-M remains conservative. Its core M is tile-aligned today, so this
+    # is normally a zero-trip loop; retain the legacy flush text if that ever
+    # changes rather than assuming a cross-frame abort protocol here.
+    array_padding_drain = f"""
+    #pragma hls_pipeline_init_interval 1
+    DRAIN_ARRAY_WL_PADDED_ROWS: for (int i = 0; i < {physical_rows - m}; i++) {{
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        ac_int<1, false> drain_valid = 0;
+        ac_int<1, false> drain_preload_valid = 0;
+        gemm.run(last_a_rows, drain_preload_valid, drain_valid, c_row, v, l);
+    }}
+""" if fold_m else ""
+    array_padding_drain_two_operand = f"""
+    #pragma hls_pipeline_init_interval 1
+    DRAIN_ARRAY_PADDED_ROWS: for (int i = 0; i < {physical_rows - m}; i++) {{
+        ac_int<{c_bits}, false> c_row;
+        ac_int<1, false> v, l;
+        ac_int<1, false> drain_valid = 0;
+        ac_int<1, false> drain_preload_valid = 0;
+        gemm.run(last_a_rows, last_b_cols, drain_preload_valid, drain_valid, c_row, v, l);
+    }}
+""" if fold_m else ""
 
     # Fold-N: ``n`` here is the CORE column count (N_g == 8*cg); ``logical_n``
     # is the true N the caller's CONFIG_T::gemm_n and res_T carry. ``n_passes``
@@ -209,6 +243,26 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         bias_grp_static_decl = ""
         bias_grp_static_step = ""
     logical_n = n if logical_n is None else int(logical_n)
+
+    # General M/K/N fold: the frame schedule (period/feed_total/total_steps/
+    # total_rows, computed above from the caller-supplied ``n_frames``) must
+    # cover the PRODUCT of the independent M- and N-group pass counts once
+    # either one folds (m_passes*n_passes frames total: mg-major, ng-minor --
+    # see the fold_any RUN loop below). This reduces to the caller-supplied
+    # ``n_frames`` exactly at every existing single-axis call site (which
+    # already passes n_frames == m_passes for fold-M-only and n_frames ==
+    # n_passes for fold-N-only, since n_passes/m_passes respectively == 1
+    # there), and only changes behavior for the new combined case where a
+    # caller has NOT already folded that product into n_frames itself. Pure
+    # multi-frame batching (n_frames > 1 with m_passes == n_passes == 1) is
+    # untouched -- it is an orthogonal feature (repeated activation frames
+    # against the same weights), not geometry folding.
+    if fold_m or fold_n:
+        n_frames = int(m_passes) * int(n_passes)
+        period = total_beats + 1
+        feed_total = n_frames * period
+        total_steps = (n_frames - 1) * period + first_out + m + 6
+        total_rows = n_frames * m
 
     # Choose the RHS expression for the final output assignment based on the
     # configured result type.  Integer types (ac_int / ac_uint) need an explicit
@@ -334,7 +388,22 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # groups of core_n entries per pass, so offset the read by the frame's
         # group (a static counter stepping at each frame start, as the RTL's
         # group counter does). Single-group packages keep the plain index.
-        bbuf_src = "B_ROM[_bidx + _grp * %d]" % n if fold_n else "B_ROM[_bidx]"
+        #
+        # ``_bidx + _grp*n`` (== kc*n + t + grp*n) only matches
+        # build_weight_rom_fold_n's N-group-major/chunk-minor layout
+        # (grp*passes*n + kc*n + t) when passes == 1 -- true for every
+        # single-axis fold-N package (resolve_mkn_geometry defaults k_spatial
+        # to K_CHUNKS, i.e. passes == 1, unless the caller ALSO explicitly
+        # folds K), so this branch is byte-identical there. Once K also folds
+        # in time (passes > 1) -- only reachable via a combined M/K/N fold
+        # (jojo-track/open/tensor-slice-general-synth-grid) -- the ROM is
+        # built by build_weight_rom_combined_fold instead, whose layout is
+        # chunk-major/ng-minor ((kc*n_passes + grp)*n + t); address it to match.
+        bbuf_src = (
+            f"B_ROM[((cc_slot[wr_slot] / {input_beats}) * {n_passes} + _grp) * {n} + _t]"
+            if (fold_n and passes > 1)
+            else ("B_ROM[_bidx + _grp * %d]" % n if fold_n else "B_ROM[_bidx]")
+        )
         brom_decl = _const_weights_brom_cpp(b_bits, grid_cols, weight_rom)
         stream_bcols_decl = ""
         # Weight-stationary: the IP holds B, so the feed packs no B beat at all.
@@ -543,65 +612,90 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         a_replay_else = """
             }"""
 
-    # Fold-N raw output capture: shared by the stream and array RUN loops.
-    # Every frame emits M REAL rows (M is fully spatial under fold_axis="n"),
-    # so `captured` needs no padding guard beyond the plain n_passes*m total;
-    # only the group's N_g columns are stored, at that group's column offset
-    # -- the emission loop after RUN assembles/rescales/biases the full
-    # logical_n-wide rows once every group has landed.
-    capture_fold_n = f"""\
+    # General M/N-group raw output capture: shared by the stream and array RUN
+    # loops whenever n_passes > 1 (the group-scoped weight/bias/ROM machinery
+    # is keyed purely on n_passes, unaffected by whether M also folds). Every
+    # frame g decomposes into mg = g // n_passes, ng = g % n_passes and emits
+    # M REAL rows for M-group mg's N-group ng; only that group's N_g columns
+    # are stored, at the group's row/column offset -- the emission loop after
+    # RUN assembles/rescales/biases the full logical_m x logical_n result once
+    # every group has landed. Reduces to the old fold-N-only body exactly when
+    # m_passes == 1 (mg always 0, rowOut == captured % m).
+    capture_general = f"""\
         if (v) {{
-            if (captured < {n_passes * m}) {{
+            if (captured < {m_passes * n_passes * m}) {{
                 int gOut = captured / {m};
-                int rowOut = captured % {m};
-                #pragma hls_unroll
-                for (int col = 0; col < {n}; col++) {{
-                    int col_tile = col / 8;
-                    int col_local = col % 8;
-                    c_buf[rowOut][gOut * {n} + col] =
-                        c_row.template slc<{out_width}>(col_tile * {8 * out_width} + col_local * {out_width});
+                int rowIn = captured % {m};
+                int mgOut = gOut / {n_passes};
+                int ngOut = gOut % {n_passes};
+                int rowOut = mgOut * {m} + rowIn;
+                if (rowOut < {logical_m}) {{
+                    #pragma hls_unroll
+                    for (int col = 0; col < {n}; col++) {{
+                        int col_tile = col / 8;
+                        int col_local = col % 8;
+                        c_buf[rowOut][ngOut * {n} + col] =
+                            c_row.template slc<{out_width}>(col_tile * {8 * out_width} + col_local * {out_width});
+                    }}
                 }}
             }}
             captured++;
         }}"""
 
+    # General M/K/N fold: every frame g in [0, m_passes*n_passes) decomposes
+    # into an M-group mg = g // n_passes and an N-group ng = g % n_passes
+    # (mg-major, ng-minor -- the weight/bias group counters inside the ccore
+    # step by 1 every ccore-detected frame, so `_grp mod n_passes` already
+    # equals ng regardless of mg; no change needed there). This subsumes the
+    # old fold-M-only (n_passes == 1, ng always 0) and fold-N-only
+    # (m_passes == 1, mg always 0) branches as degenerate points, and adds
+    # the new case where both are simultaneously > 1.
+    fold_any = fold_m or fold_n
     _a_read_guard = "kc == 0"
     _stream_feed_cond = f"feeding_now && t < {m}"
     _stream_g_decl = ""
     _stream_capture_use = stream_capture_b2b
-    if fold_m:
-        # Fold-M: gate the per-frame read against the logical row bound too
-        # (frame g's beat t is global row g*M_g + t; only real rows are read
-        # off a_stream -- there are exactly `logical_m` of them, not
-        # m_passes*M_g). Padding rows feed zero A. Capture uses the
-        # single-frame-style body (bound `logical_m`, a plain monotonic
-        # counter across every frame), which already drops the last frame's
-        # trailing padding pulses in emission order.
-        _stream_g_decl = "\n        int g = step / %d;" % period
-        _stream_feed_cond = f"feeding_now && t < {m} && (g * {m} + t) < {logical_m}"
-        _stream_capture_use = stream_capture
-    elif fold_n:
-        # Fold-N: A rows are IDENTICAL across every frame (same M rows, only
-        # the B columns / output group change), but the stream is single-read
-        # -- frame 0 stores the rows as they are read (one shared slot: every
-        # later frame replays the exact same value, so a_replay does not need
-        # a per-frame copy the way the K-pass replay does). Capture is the
-        # raw group-scoped c_buf write above.
+    if fold_any:
+        # A rows repeat identically across every N-group of the same M-group
+        # (only B's group / output group changes across ng); a fresh stream
+        # read happens only at the first K-pass of the first N-group of each
+        # M-group (kc == 0 && ng == 0). The replay table caches ALL `passes`
+        # K-pass slices for the CURRENT M-group's rows, so later K-passes
+        # within the same frame (kc > 0) and later N-groups of the same
+        # M-group (ng > 0, any kc) both replay from it -- this merges what
+        # used to be two separate mechanisms (the K-pass replay buffer and
+        # fold-N's single cross-frame replay slot) into one general cache.
         a_replay_decl = f"""
-    // Fold-N: A rows repeat identically across every frame (only B's group
-    // and the output group change); frame 0 stores them as they are read off
-    // the stream (single-read ac_channel), frames >= 1 replay the same slot.
-    ac_int<{a_bits}, false> a_replay_n[{m}];
+    // General fold replay cache: holds every K-pass slice ({passes} of them)
+    // of the CURRENT M-group's rows. Refilled only when a new M-group's first
+    // N-group starts reading fresh A data off the stream (kc == 0 && ng == 0);
+    // every other (kc, ng) combination for the same M-group replays from it.
+    ac_int<{a_bits}, false> a_replay_all[{passes}][{m}];
 """
-        a_prepack_replay = f"""
-                a_replay_n[t] = a_rows;"""
-        a_replay_else = f"""
-            }} else {{
-                a_rows = a_replay_n[t];
-            }}"""
-        _a_read_guard = "g == 0"
-        _stream_g_decl = "\n        int g = step / %d;" % period
-        _stream_capture_use = capture_fold_n
+        _a_prepack_all = f"""
+                #pragma hls_unroll
+                PREPACK_REPLAY: for (int replay_kc = 0; replay_kc < {passes}; replay_kc++) {{
+                    ac_int<{a_bits}, false> replay_rows = 0;{_a_pack_block("replay_rows", "replay_kc", "ROW_PACK_REPLAY")}
+                    a_replay_all[replay_kc][t] = replay_rows;
+                }}"""
+        a_prepack_replay = _a_prepack_all
+        a_replay_else = """
+            }
+            a_rows = a_replay_all[kc][t];"""
+        _a_read_guard = "kc == 0 && ng == 0"
+        _stream_g_decl = (
+            "\n        int g = step / %d;"
+            "\n        int mg = g / %d;"
+            "\n        int ng = g %% %d;" % (period, n_passes, n_passes)
+        )
+        _stream_feed_cond = f"feeding_now && t < {m} && (mg * {m} + t) < {logical_m}"
+        # n_passes == 1 (pure fold-M, ng always 0): results emerge in row
+        # order exactly as today's fold-M -- stream them live (no deferred
+        # buffer, no latency regression for the M-only case).
+        # n_passes > 1: defer through the group-scoped c_buf (today's fold-N
+        # behavior), now offset by the M-group so it generalizes to
+        # simultaneous M+N folding.
+        _stream_capture_use = stream_capture if n_passes == 1 else capture_general
 
     stream_feed_loop = f"""
 {a_replay_decl}
@@ -677,13 +771,21 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     }}
 """
 
-    if fold_m:
+    if fold_any:
+        # General array feed: B-side (two-stream) weight beats are indexed by
+        # the N-group `ng` (the ROM/const-weight path addresses by the same
+        # `ng` inside the ccore's `_grp` counter -- see above). Reduces to the
+        # old fold-array_bcols_pack (indexed by `g`) exactly when n_passes==1
+        # (ng always 0, weight_cols[0*n+t] == weight_cols[t] -- fine, that
+        # branch is only emitted when n_passes>1 needs an explicit group
+        # anyway) and to the old fold_n_array_bcols_pack when m_passes==1
+        # (mg always 0, ng == g).
         if weights_in_core:
-            fold_array_bcols_pack = ""
+            fold_general_bcols_pack = ""
         elif ks > 1:
-            fold_array_bcols_pack = f"""
+            fold_general_bcols_pack = f"""
         if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[{b_col_idx}];
+            b_beat_T b_beat = weight_cols[ng * {n} + t];
             #pragma hls_unroll
             for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
                 #pragma hls_unroll
@@ -697,9 +799,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
             }}
         }}"""
         else:
-            fold_array_bcols_pack = f"""
+            fold_general_bcols_pack = f"""
         if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[{b_col_idx}];
+            b_beat_T b_beat = weight_cols[ng * {n} + t];
             #pragma hls_unroll
             for (int kl = 0; kl < 8; kl++) {{
                 int kk = kc * 8 + kl;
@@ -713,124 +815,64 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                 }}
             }}
         }}"""
-        # Fold-M array loop: structurally the same frame schedule as the stream
-        # RUN loop above (period/feed_total/total_steps), sourcing A directly
-        # from a_rows[] instead of a channel read, gated the same way (frame
-        # g's beat t is global row g*M_g + t; only rows < logical_m are real).
+        _array_capture_use = array_capture if n_passes == 1 else capture_general
+        # General array loop: one nested (implicit) mg x ng x kc schedule --
+        # frame g = mg * n_passes + ng, decoded the same way as the stream RUN
+        # loop above. A rows come straight from a_rows[] (random access -- no
+        # replay buffer needed, unlike the channel-fed stream entry: every
+        # (kc, ng) combination for the same M-group just re-slices the row it
+        # already has in hand at a_rows[mg*m + t]). Reduces to the old
+        # fold-M-only array loop when n_passes == 1 (ng always 0, g == mg) and
+        # to the old fold-N-only array loop when m_passes == 1 (mg always 0,
+        # g == ng, a_rows[mg*m+t] == a_rows[t]).
         array_feed_loop = f"""
-    // Fold-M multi-frame feed: {m_passes} frames of {m} core rows each (K and N
-    // fully spatial, k_spatial={ks}), issued back-to-back like the stream RUN
-    // loop. Frame g reads logical rows [g*{m}, (g+1)*{m}) directly from
-    // a_rows; rows at/after the logical M bound are the last frame's padding
-    // (fed zero A, dropped by the captured < {logical_m} guard in the capture body).
+    // General M/K/N-fold multi-frame feed: {m_passes} M-group(s) x {n_passes}
+    // N-group(s) of {m} core rows / {n} core columns each frame (K sweeps
+    // k_spatial={ks} chunks in {passes} passes within each frame), issued
+    // back-to-back. Frame g = mg * {n_passes} + ng reads logical rows
+    // [mg*{m}, (mg+1)*{m}) directly from a_rows; rows at/after the logical M
+    // bound are the last M-group's padding (fed zero A, dropped by the
+    // capture body's logical bound).
     #pragma hls_pipeline_init_interval 1
     RUN_ARRAY: for (int step = 0; step < {total_steps}; step++) {{
         bool in_feed = (step < {feed_total});
         int p = in_feed ? (step % {period}) : {period};
         int g = step / {period};
+        int mg = g / {n_passes};
+        int ng = g % {n_passes};
         bool feeding_now = in_feed && (p >= 1) && (p <= {total_beats});
         int pf = p - 1;
         int kc = pf / {input_beats};
         int t = pf % {input_beats};
         ac_int<{a_bits}, false> a_rows_packed = 0;{array_bcols_decl}
 
-        if (feeding_now && t < {m} && (g * {m} + t) < {logical_m}) {{
-            a_beat_T a_beat = a_rows[g * {m} + t];{_a_pack_block("a_rows_packed", "kc", "ROW_PACK_ARRAY_FOLD")}
+        if (feeding_now && t < {m} && (mg * {m} + t) < {logical_m}) {{
+            a_beat_T a_beat = a_rows[mg * {m} + t];{_a_pack_block("a_rows_packed", "kc", "ROW_PACK_ARRAY_FOLD")}
         }}
-        {fold_array_bcols_pack}
+        {fold_general_bcols_pack}
 
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
         ac_int<1, false> feed_preload_valid = (in_feed && p == 0) ? 1 : 0;
         gemm.run(a_rows_packed, {array_bcols_run_arg}feed_preload_valid, feed_valid, c_row, v, l);
-{array_capture}
-    }}
-"""
-    elif fold_n:
-        if weights_in_core:
-            fold_n_array_bcols_pack = ""
-        elif ks > 1:
-            fold_n_array_bcols_pack = f"""
-        if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[g * {n} + t];
-            #pragma hls_unroll
-            for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
-                #pragma hls_unroll
-                for (int kl = 0; kl < 8; kl++) {{
-                    int kk = (kc * {ks} + kc_local) * 8 + kl;
-                    if (kk < {k}) {{
-                        b_cols_packed.set_slc(kc_local * 64 + kl * 8,
-                                              {name}_to_gemm_int8(b_beat[kk]));
-                    }}
-                }}
-            }}
-        }}"""
-        else:
-            fold_n_array_bcols_pack = f"""
-        if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[g * {n} + t];
-            #pragma hls_unroll
-            for (int kl = 0; kl < 8; kl++) {{
-                int kk = kc * 8 + kl;
-                int col_tile = t / 8;
-                #pragma hls_unroll
-                for (int ct = 0; ct < {grid_cols}; ct++) {{
-                    if (col_tile == ct && kk < {k}) {{
-                        b_cols_packed.set_slc(ct * 64 + kl * 8,
-                                              {name}_to_gemm_int8(b_beat[kk]));
-                    }}
-                }}
-            }}
-        }}"""
-        # Fold-N array loop: same multi-frame schedule as the fold-N stream RUN
-        # loop above (period/feed_total/total_steps). A rows come straight from
-        # a_rows[] (random access -- no replay buffer needed, unlike the
-        # channel-fed stream entry); every frame re-reads the SAME M rows, and
-        # group g's B columns are restricted by beat index (two-stream) or by
-        # the group-scoped ROM (const weights). Capture is the raw group-scoped
-        # c_buf write; the drain/rescale/bias/cast is a separate loop after RUN.
-        array_feed_loop = f"""
-    // Fold-N multi-frame feed: {n_passes} frames of {m} rows each (core
-    // N_g={n} columns per frame, K and M fully spatial, k_spatial={ks}),
-    // issued back-to-back. Every frame re-reads the same M rows off a_rows[].
-    #pragma hls_pipeline_init_interval 1
-    RUN_ARRAY: for (int step = 0; step < {total_steps}; step++) {{
-        bool in_feed = (step < {feed_total});
-        int p = in_feed ? (step % {period}) : {period};
-        int g = step / {period};
-        bool feeding_now = in_feed && (p >= 1) && (p <= {total_beats});
-        int pf = p - 1;
-        int kc = pf / {input_beats};
-        int t = pf % {input_beats};
-        ac_int<{a_bits}, false> a_rows_packed = 0;{array_bcols_decl}
-
-        if (feeding_now && t < {m}) {{
-            a_beat_T a_beat = a_rows[t];{_a_pack_block("a_rows_packed", "kc", "ROW_PACK_ARRAY_FOLD_N")}
-        }}
-        {fold_n_array_bcols_pack}
-
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
-        ac_int<1, false> feed_preload_valid = (in_feed && p == 0) ? 1 : 0;
-        gemm.run(a_rows_packed, {array_bcols_run_arg}feed_preload_valid, feed_valid, c_row, v, l);
-{capture_fold_n}
+{_array_capture_use}
     }}
 """
 
-    # Fold-N C assembly: raw group-scoped lanes land in c_buf during the RUN
-    # loop above (capture_fold_n); once every group's frame has landed, this
-    # separate M-iteration loop pure-unpacks the full logical_n-wide rows
-    # (decision 8: no rescale/bias/accum_t -- the core already requantised,
-    # bias baked in) -- exactly today's per-row drain, just deferred past the
-    # last frame instead of interleaved with the feed.
+    # General M/N-group C assembly: raw group-scoped lanes land in c_buf
+    # during the RUN loop above (capture_general) whenever n_passes > 1; once
+    # every group's frame has landed, this separate row-iteration loop
+    # pure-unpacks the full logical_n-wide rows (decision 8: no rescale/bias/
+    # accum_t -- the core already requantised, bias baked in) across every
+    # M-group's logical rows -- exactly today's per-row drain, just deferred
+    # past the last frame instead of interleaved with the feed.
     _c_buf_decl = (
-        f"    ac_int<{out_width}, true> c_buf[{m}][{n_passes * n}];\n" if fold_n else ""
+        f"    ac_int<{out_width}, true> c_buf[{logical_m}][{n_passes * n}];\n" if fold_n else ""
     )
     _fold_n_emit_body = f"""\
     #pragma hls_pipeline_init_interval 1
-    EMIT_FOLD_N: for (int row = 0; row < {m}; row++) {{
+    EMIT_FOLD_N: for (int row = 0; row < {logical_m}; row++) {{
         %SINK_DECL%
         #pragma hls_unroll
         for (int col = 0; col < {logical_n}; col++) {{
@@ -906,15 +948,7 @@ void {name}_gemm_ip_array_const_weights(
     ac_int<{a_bits}, false> last_a_rows = 0;
 {_c_buf_decl}
 {array_feed_loop}
-
-    #pragma hls_pipeline_init_interval 1
-    DRAIN_ARRAY_WL_PADDED_ROWS: for (int i = 0; i < {mr - m}; i++) {{
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        ac_int<1, false> drain_valid = 0;
-        ac_int<1, false> drain_preload_valid = 0;
-        gemm.run(last_a_rows, drain_preload_valid, drain_valid, c_row, v, l);
-    }}
+{array_padding_drain}
 {_emit_array}}}
 """
     else:
@@ -986,15 +1020,7 @@ void {name}_gemm_ip_array(
 {_c_buf_decl}
 
 {array_feed_loop}
-
-    #pragma hls_pipeline_init_interval 1
-    DRAIN_ARRAY_PADDED_ROWS: for (int i = 0; i < {mr - m}; i++) {{
-        ac_int<{c_bits}, false> c_row;
-        ac_int<1, false> v, l;
-        ac_int<1, false> drain_valid = 0;
-        ac_int<1, false> drain_preload_valid = 0;
-        gemm.run(last_a_rows, last_b_cols, drain_preload_valid, drain_valid, c_row, v, l);
-    }}
+{array_padding_drain_two_operand}
 {_emit_array}}}
 """
 
@@ -2075,9 +2101,49 @@ def _operand_zero_point(precision):
     return 128 if (not signed and width == 8) else 0
 
 
+def _resolve_axis_reuse_factors(name, fold_axis, reuse_factor,
+                                 m_reuse_factor, k_reuse_factor, n_reuse_factor):
+    """Merge the legacy single-axis ``fold_axis``/``reuse_factor`` knob with the
+    independent per-axis ``m_reuse_factor``/``k_reuse_factor``/``n_reuse_factor``
+    knobs into the ``(m_rf, k_rf, n_rf)`` triple :func:`resolve_mkn_geometry`
+    expects.
+
+    Precedence: any explicit per-axis knob (not ``None``) wins outright over
+    the legacy pair. Legacy ``fold_axis``/``reuse_factor`` is only used when
+    NONE of the per-axis knobs are given. Supplying both an explicit per-axis
+    knob and a non-default legacy pair is not an error -- it prints a
+    precedence warning naming which value wins -- so this stays permissive of
+    ATLASConfig items that carry stale legacy fields.
+    """
+    explicit = {ax: v for ax, v in
+                (("m", m_reuse_factor), ("k", k_reuse_factor), ("n", n_reuse_factor))
+                if v is not None}
+    fold_axis = str(fold_axis or "k").lower()
+    legacy_active = fold_axis != "k" or int(reuse_factor) != 1
+    if explicit and legacy_active:
+        print(
+            f"WARNING: {name}: both explicit per-axis fold knob(s) "
+            f"({', '.join(f'{ax.upper()}Fold={v}' for ax, v in explicit.items())}) "
+            f"and the legacy FoldAxis={fold_axis!r}/ReuseFactor={reuse_factor} were "
+            "given; the explicit per-axis knob(s) win and the legacy pair is ignored "
+            "for any axis not named above.",
+            file=sys.stderr,
+        )
+    if explicit:
+        return (explicit.get("m", 1), explicit.get("k", 1), explicit.get("n", 1))
+    # Legacy path: fold_axis picks which single axis reuse_factor legalizes;
+    # this degenerates to resolve_mkn_geometry's single-axis form exactly.
+    if fold_axis == "m":
+        return (reuse_factor, 1, 1)
+    if fold_axis == "n":
+        return (1, 1, reuse_factor)
+    return (1, reuse_factor, 1)
+
+
 def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_precision=None,
                           reuse_factor=1, input_precision=None, weight_precision=None,
                           clock_period_ns=None, n_frames=1, weight_matrix=None, fold_axis="k",
+                          m_reuse_factor=None, k_reuse_factor=None, n_reuse_factor=None,
                           accum_precision=None, bias_precision=None, has_bias=None, bias=None,
                           **_ignored):
     if interface not in ("stream", "array"):
@@ -2087,10 +2153,32 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     a_zero_point = _operand_zero_point(input_precision)
     b_zero_point = _operand_zero_point(weight_precision)
     fold_axis = str(fold_axis).lower()
-    resolved = resolve_reuse_factor(k, reuse_factor, name, fold_axis=fold_axis, m=m, n=n)
+    m_rf, k_rf, n_rf = _resolve_axis_reuse_factors(
+        name, fold_axis, reuse_factor, m_reuse_factor, k_reuse_factor, n_reuse_factor)
+    resolved = resolve_mkn_geometry(m, k, n, m_reuse_factor=m_rf, k_reuse_factor=k_rf,
+                                     n_reuse_factor=n_rf, name=name)
     for w in resolved["warnings"]:
         print(w, file=sys.stderr)
     k_spatial = resolved["k_spatial"]
+    passes = resolved["passes"]
+    m_passes = resolved["m_passes"]
+    n_passes = resolved["n_passes"]
+    fold_m = m_passes > 1
+    fold_n = n_passes > 1
+    fold_k = passes > 1
+    # Combined M/K/N folding (jojo-track/open/tensor-slice-general-synth-grid,
+    # sub-phase 2e): 2+ folded axes now route to the general structural synth
+    # emitter (`_general_synth_combined_fold`, dispatched from
+    # `_generate_general_synth_verilog`/`generate_k_spatial_synth_verilog`
+    # whenever 2+ of {m_passes, k time-passes, n_passes} > 1) instead of the
+    # single-axis emitters below. What remains genuinely unsupported is a
+    # folded spatial factor (m_spatial/n_spatial) that overflows the 5-bit
+    # a_loc/b_loc ports (cap 32) -- the combined emitter itself raises a clear
+    # ValueError for that; it is allowed to propagate as-is (not caught or
+    # rewrapped here) rather than let it surface as some obscurer downstream
+    # failure.
+    folded_axes = [ax for ax, folded in (("M", fold_m), ("K", fold_k), ("N", fold_n)) if folded]
+    combined_fold = len(folded_axes) >= 2
     if k_spatial != 1 and (a_zero_point or b_zero_point):
         raise NotImplementedError(
             f"{name}: a zero-pointed operand (a_zero_point={a_zero_point}, "
@@ -2101,21 +2189,17 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             "k_spatial==1) with a zero-pointed operand, or a signed/narrower "
             "operand with this ReuseFactor."
         )
-    passes = resolved["passes"]
     rf_legalized = resolved["reuse_factor"]
-    fold_m = fold_axis == "m"
-    fold_n = fold_axis == "n"
-    m_passes = resolved.get("m_passes", 1) if fold_m else 1
-    n_passes = resolved.get("n_passes", 1) if fold_n else 1
-    # ``core_m`` is the RTL/csim-core row count: M_g = 8*mg when fold-M issues
-    # more than one frame (m_passes frames of core_m rows assemble the logical
-    # M rows), otherwise the logical M itself, so a single-frame package is
-    # today's shape whichever axis was named.
-    core_m = resolved["mg"] * 8 if m_passes > 1 else m
-    # ``core_n`` is the RTL/csim-core column count: N_g = 8*cg when fold-N
-    # issues more than one frame (n_passes frames of core_n columns assemble
-    # the logical N columns), otherwise the logical N itself.
-    core_n = resolved["cg"] * 8 if n_passes > 1 else n
+    # ``core_m`` is the RTL/csim-core row count: M_g = 8*m_spatial when fold-M
+    # issues more than one frame (m_passes frames of core_m rows assemble the
+    # logical M rows), otherwise the logical M itself, so a single-frame
+    # package is today's shape whichever axis was named. fold_m/fold_n/fold_k
+    # are independent knobs -- 2+ can be true at once (combined_fold above).
+    core_m = resolved["m_spatial"] * 8 if m_passes > 1 else m
+    # ``core_n`` is the RTL/csim-core column count: N_g = 8*n_spatial when
+    # fold-N issues more than one frame (n_passes frames of core_n columns
+    # assemble the logical N columns), otherwise the logical N itself.
+    core_n = resolved["n_spatial"] * 8 if n_passes > 1 else n
     # Weight-stationary (const-weight) variant: weights (B, shape [K, N]) baked into
     # the core ROM AND the csim header; the wrapper takes no external weight port and
     # the header entry takes A only. Single source of truth = weight_matrix. Works at
@@ -2124,8 +2208,23 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     weights_in_core = weight_matrix is not None
     weight_rom = None
     if weights_in_core:
-        from gemm_ip.weights import build_weight_rom_k_spatial, build_weight_rom_fold_n
-        if n_passes > 1:
+        from gemm_ip.weights import (
+            build_weight_rom_k_spatial, build_weight_rom_fold_n, build_weight_rom_combined_fold,
+        )
+        if combined_fold:
+            # Combined fold (2+ axes): weight contents depend only on
+            # (k_pass, n_group), never m_group (confirmed contract + csim
+            # simplification -- see _general_synth_combined_fold's docstring),
+            # so the same n_passes*core_n padded-B layout as fold-N feeds the
+            # combined builder; it re-orders into the chunk-major/ng-minor
+            # layout the combined emitter's ROM address expects.
+            import numpy as _np
+            n_full = n_passes * core_n
+            b_full = _np.zeros((k, n_full), dtype=_np.asarray(weight_matrix).dtype)
+            b_full[:, :n] = weight_matrix
+            weight_rom = build_weight_rom_combined_fold(b_full, core_m, core_n, k, k_spatial, n_passes)
+            expected_beats = passes * n_passes * core_n
+        elif n_passes > 1:
             # Fold-N: the ROM holds every group's columns back to back (group
             # g's block at base g*core_n, padded tail columns zero -- weight_
             # matrix's own N may be smaller than n_passes*core_n). Built per
@@ -2264,7 +2363,53 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     from . import rtl as _rtl
     generate_combined_core_verilog = _rtl.generate_combined_core_verilog
     generate_k_spatial_combined_core_verilog = _rtl.generate_k_spatial_combined_core_verilog
-    if k_spatial == 1:
+    if combined_fold:
+        # Combined M/K/N fold (2+ axes): route to the general structural synth
+        # emitter (`_general_synth_combined_fold`) via the public
+        # `generate_k_spatial_sim_verilog`/`generate_k_spatial_synth_verilog`
+        # wrappers -- these already thread m_passes/logical_m/logical_n (added
+        # additively in sub-phase 2b) and work at k_spatial==1 too (they
+        # delegate to the same k_spatial==1 body as the plain
+        # `generate_sim_verilog`/`generate_synth_verilog`). Unlike
+        # `generate_combined_core_verilog`'s ROM-hoisting split-module trick
+        # (built for the two VERIFIED single-axis branches), each combined-fold
+        # branch here emits its OWN ROM(s) as a whole module -- the same
+        # simpler pattern `generate_k_spatial_combined_core_verilog` already
+        # uses for its (also experimental/structural) k_spatial>1 body -- so
+        # no `rtl.py` changes are needed for this wiring.
+        if a_zero_point or b_zero_point:
+            raise NotImplementedError(
+                f"{name}: a zero-pointed operand (a_zero_point={a_zero_point}, "
+                f"b_zero_point={b_zero_point}) with combined M/K/N folding "
+                f"(folded axes: {', '.join(folded_axes)}) is not supported: the "
+                "combined-fold structural synth emitter does not carry the "
+                "zero-point running-sum correction. Use a signed/narrower "
+                "operand, or fold at most one axis, with a zero-pointed operand."
+            )
+        core_module = f"{name}_core"
+        sim_top = _rtl.generate_k_spatial_sim_verilog(
+            core_m, k, core_n, module_name=core_module, k_spatial=k_spatial,
+            s1=s1, s2=s2, out_width=out_bits, weight_rom=weight_rom, emit_rom=True,
+            n_passes=n_passes, bias_codes=bias_codes, emit_bias_rom=True,
+        )
+        synth_top = _rtl.generate_k_spatial_synth_verilog(
+            core_m, k, core_n, module_name=core_module, k_spatial=k_spatial,
+            n_passes=n_passes, s1=s1, s2=s2, out_width=out_bits,
+            weight_rom=weight_rom, emit_rom=True,
+            bias_codes=bias_codes, emit_bias_rom=True,
+            m_passes=m_passes, logical_m=m, logical_n=n,
+        )
+        grid_v = (
+            f"// Auto-generated by package.py (combined M/K/N fold)\n"
+            f"// Combined-fold core: M={m}, K={k}, N={n} (core_m={core_m}, core_n={core_n}, "
+            f"m_passes={m_passes}, k_spatial={k_spatial}, n_passes={n_passes}, "
+            f"folded_axes={','.join(folded_axes)})\n"
+            "//   ifndef SYNTHESIS -> behavioral simulation model\n"
+            "//   else             -> combined-fold structural synth wrapper "
+            "(_general_synth_combined_fold)\n"
+            "\n`ifndef SYNTHESIS\n\n" + sim_top + "\n\n`else\n\n" + synth_top + "\n\n`endif\n"
+        )
+    elif k_spatial == 1:
         grid_v = generate_combined_core_verilog(core_m, k, core_n, module_name=f"{name}_core",
                                                 out_width=out_bits, s1=s1, s2=s2,
                                                 weight_rom=weight_rom, n_passes=n_passes,
@@ -2326,4 +2471,5 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     (pkg_dir / "run_catapult.tcl").write_text(
         gen_tcl(name, m, k, n, interface, weights_in_core=weight_matrix is not None))
     print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface}, "
-          f"reuse_factor={rf_legalized}, k_spatial={k_spatial}, fold_axis={fold_axis})")
+          f"reuse_factor={rf_legalized}, k_spatial={k_spatial}, fold_axis={fold_axis}, "
+          f"m_passes={m_passes}, n_passes={n_passes})")

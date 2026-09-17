@@ -31,7 +31,25 @@ class TensorSliceTarget(Target):
     knobs = [
         {"name": "FoldAxis", "key": "fold_axis", "type": "enum",
          "choices": ("k", "m", "n"), "default": "k",
-         "description": "which dimension ReuseFactor folds"},
+         "description": "legacy single-axis knob: which dimension ReuseFactor folds. "
+                         "Back-compat alias for MFold/KFold/NFold=1 elsewhere; ignored "
+                         "(with a warning) if any of MFold/KFold/NFold is set explicitly."},
+        {"name": "MFold", "key": "m_reuse_factor", "type": "int", "default": None,
+         "description": "independent M-axis fold pass count (legal 1..ceil(m/8)); "
+                         "1 (or unset) means M is fully spatial. Explicit MFold/KFold/"
+                         "NFold take precedence over legacy FoldAxis+ReuseFactor. Setting "
+                         "2+ axes to a value >1 at once (combined folding) is csim-valid "
+                         "but not yet synth-valid -- see KFold."},
+        {"name": "KFold", "key": "k_reuse_factor", "type": "int", "default": None,
+         "description": "independent K-axis fold pass count (legal 1..ceil(k/8)); "
+                         "1 (or unset) means K is fully spatial (today's default/legacy "
+                         "ReuseFactor axis). See MFold for precedence and the combined-"
+                         "folding synth-grid limitation (a hard error is raised if 2+ of "
+                         "MFold/KFold/NFold resolve to a pass count >1 and a synth package "
+                         "is requested; the general synth grid is a pending roadmap item)."},
+        {"name": "NFold", "key": "n_reuse_factor", "type": "int", "default": None,
+         "description": "independent N-axis fold pass count (legal 1..ceil(n/8)); "
+                         "1 (or unset) means N is fully spatial. See MFold."},
     ]
 
     def geometry(self, shape, reuse_factor=1, fold_axis="k"):

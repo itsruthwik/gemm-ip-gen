@@ -113,6 +113,12 @@ def _normalize_config_items(cfg):
                 "gemm_ip_index": item.get("gemm_ip_index"),
                 "reuse_factor": item.get("reuse_factor", 1),
                 "fold_axis": item.get("fold_axis"),
+                # Independent per-axis fold knobs (tensor-slice-independent-mkn-fold-knobs).
+                # None (unset) here means "use the legacy fold_axis/reuse_factor pair" --
+                # see targets/tensor_slice/package.py's precedence resolution.
+                "m_reuse_factor": item.get("m_reuse_factor"),
+                "k_reuse_factor": item.get("k_reuse_factor"),
+                "n_reuse_factor": item.get("n_reuse_factor"),
                 "output_precision": item.get("output_precision"),
                 "input_precision": item.get("input_precision"),
                 "weight_precision": item.get("weight_precision"),
