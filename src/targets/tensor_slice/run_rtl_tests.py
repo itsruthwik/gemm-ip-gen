@@ -32,7 +32,8 @@ HERE = Path(__file__).resolve().parent
 from .rtl import generate_combined_core_verilog, generate_k_spatial_combined_core_verilog
 from .golden import generate_tb, generate_tb_with_data, _gen_catapult_tb, pack_a_chunk, pack_b_chunk, \
     pack_bias, pack_c_row, two_stage_reference, hex_literal
-from .geometry import k_chunks as _k_chunks, resolve_reuse_factor, resolve_fold_m, resolve_fold_n
+from .geometry import k_chunks as _k_chunks, resolve_reuse_factor, resolve_fold_m, resolve_fold_n, \
+    combined_fold_cycles
 from gemm_ip.weights import build_weight_rom_k_spatial, build_weight_rom_fold_n
 
 GEN_DIR = HERE / "tb" / "generated"
@@ -110,6 +111,43 @@ FOLD_N_CASES = [
     (12, 24, 32, 4),
     (20, 24, 16, 2),
     (9, 17, 10, 2),
+]
+
+
+# Combined M+N fold regression (jojo-track/open/tensor-slice-combined-fold-sim-validation,
+# 5b-i): (m, k, n, rf_m, rf_n). K stays single-pass (k_spatial=k_chunks, no K
+# fold) so this isolates the M+N composition. m=33 (grid_rows=5) with rf_m=3
+# legalizes to mg=2 row-tiles/group, m_passes=3 (ragged last mg block, only 1
+# real row-tile); n=40 (grid_cols=5) with rf_n=3 legalizes to cg=2
+# col-tiles/group, n_passes=3 (also ragged). m_passes*n_passes = 9 frames,
+# neither axis an exact division -- exercises the A-slice-keyed-on-mg
+# composition and grp_ctr cycling well past n_passes (today only ever tested
+# at exactly n_passes frames).
+COMBINED_CASES = [
+    (33, 17, 40, 3, 3),
+]
+
+# Combined M+K and M+K+N fold regression (5b-ii/iii): (m, k, n, rf_m, rf_k, rf_n).
+# rf_k folds K (k_spatial<k_chunks, i.e. multi-pass K-in-time) SIMULTANEOUSLY
+# with M (and, for the M+K+N case, N too) via run_case's generalized "mn"
+# combined mode (rf as a 3-tuple). Per 5a, K-pass handling is a WITHIN-frame
+# loop in the per-group core (generate_k_spatial_combined_core_verilog),
+# orthogonal to which axes fold the frame count, so composing it with M/N
+# needed no rtl.py change -- only relaxing run_case's k_spatial=k_chunks
+# hardcode on the "mn" path.
+#
+# (33, 17, 40, 3, ..., 1): M+K only (rf_n=1 -> n_passes=1, single N group).
+# m=33/rf_m=3 is the same ragged M-fold as COMBINED_CASES (mg=2, m_passes=3,
+# last mg block only 1 real row-tile); k=17/rf_k=2 mirrors DEFAULT_CASES'
+# (9,17,10,2) multi-pass K-spatial case (k_chunks=3, rf=2 pads the last pass).
+# (33, 17, 40, 3, 2, 3): same M and K fold, PLUS rf_n=3 (n=40 -> cg=2,
+# n_passes=3, also ragged, same as COMBINED_CASES) -- all three axes folded
+# and ragged simultaneously.
+COMBINED_MK_CASES = [
+    (33, 17, 40, 3, 2, 1),
+]
+COMBINED_MKN_CASES = [
+    (33, 17, 40, 3, 2, 3),
 ]
 
 
@@ -656,6 +694,41 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
         n_passes = fn["n_passes"]
         num_vectors = fn["n_passes"]
         k_spatial = _k_chunks(k)
+    elif fold_axis == "mn":
+        # Combined M+N (jojo-track 5b-i) / M+K+N (5b-ii/iii): rf is (rf_m, rf_n)
+        # -- unchanged, K stays single-pass (k_spatial=k_chunks) -- or
+        # (rf_m, rf_k, rf_n) to ALSO fold K. M and N are legalized independently
+        # via the same fold-M/fold-N geometry the single-axis paths use; K is
+        # legalized via the same K-partition geometry the plain fold_axis="k"
+        # path uses (resolve_reuse_factor). Core is sized for ONE (mg, ng) tile
+        # (K folding is a WITHIN-frame pass loop in the per-group core, per 5a
+        # -- orthogonal to which axes fold the frame count); TB feeds
+        # m_passes*n_passes frames, A-slice keyed on mg = frame // n_passes.
+        if isinstance(rf, tuple) and len(rf) == 3:
+            rf_m, rf_k, rf_n = rf
+        else:
+            rf_m, rf_n = rf if isinstance(rf, tuple) else (rf, rf)
+            rf_k = None
+        fm = resolve_fold_m(m, rf_m if rf_m is not None else 1)
+        for w in fm["warnings"]:
+            print(w, file=sys.stderr)
+        fn = resolve_fold_n(n, rf_n if rf_n is not None else 1)
+        for w in fn["warnings"]:
+            print(w, file=sys.stderr)
+        core_m = fm["mg"] * 8
+        core_n = fn["cg"] * 8
+        m_passes = fm["m_passes"]
+        n_passes = fn["n_passes"]
+        num_vectors = m_passes * n_passes
+        if rf_k is None:
+            k_spatial = _k_chunks(k)
+            rf_use = (fm["reuse_factor"], fn["reuse_factor"])
+        else:
+            rk = resolve_reuse_factor(k, rf_k)
+            for w in rk["warnings"]:
+                print(w, file=sys.stderr)
+            k_spatial = rk["k_spatial"]
+            rf_use = (fm["reuse_factor"], rk["reuse_factor"], fn["reuse_factor"])
     else:
         rf_use = rf if rf is not None else _k_chunks(k)
         resolved = resolve_reuse_factor(k, rf_use)
@@ -665,7 +738,8 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
         num_vectors = 10
         k_spatial = resolved["k_spatial"]
 
-    stem = f"gemm_{m}x{k}x{n}_rf{rf_use}_s{seed}"
+    rf_tag = "_".join(str(x) for x in rf_use) if isinstance(rf_use, tuple) else str(rf_use)
+    stem = f"gemm_{m}x{k}x{n}_rf{rf_tag}_s{seed}"
     if fold_axis != "k":
         stem += f"_fold{fold_axis}"
     if weights_in_core:
@@ -677,7 +751,7 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
 
     weight_rom = None
     fixed_B = None
-    if weights_in_core and fold_axis == "n":
+    if weights_in_core and fold_axis in ("n", "mn"):
         import numpy as np
         rng = np.random.default_rng(seed)
         max_val = max(1, int((127 / max(k, 1)) ** 0.5))
@@ -691,7 +765,7 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
         fixed_B = rng.integers(-max_val, max_val + 1, size=(k, n), dtype=np.int8)
         weight_rom = build_weight_rom_k_spatial(fixed_B, core_m, n, k, k_spatial)
 
-    n_passes_rtl = n_passes if fold_axis == "n" else 1
+    n_passes_rtl = n_passes if fold_axis in ("n", "mn") else 1
     has_bias = bias_codes is not None
     if k_spatial == 1:
         rtl.write_text(generate_combined_core_verilog(core_m, k, core_n, module_name=mod,
@@ -703,9 +777,10 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
             core_m, k, core_n, module_name=mod, k_spatial=k_spatial, weight_rom=weight_rom,
             n_passes=n_passes_rtl, s1=s1, s2=s2, out_width=out_width, bias_codes=bias_codes))
     tb.write_text(generate_tb(core_m, k, core_n, module_name=mod, seed=seed, k_spatial=k_spatial,
-                              num_vectors=num_vectors, back2back=(fold_axis in ("m", "n")),
+                              num_vectors=num_vectors, back2back=(fold_axis in ("m", "n", "mn")),
                               weights_in_core=weights_in_core, fixed_B=fixed_B,
                               fold_n_groups=(n_passes if fold_axis == "n" else None),
+                              fold_mn=((m_passes, n_passes) if fold_axis == "mn" else None),
                               bias_codes=bias_codes, s1=s1, s2=s2, out_width=out_width,
                               has_bias=has_bias))
 
@@ -721,6 +796,67 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
     return True, log
 
 
+def _mn_combined_geom(m, k, n, rf_m, rf_k, rf_n):
+    """Resolve the per-frame core size / k_spatial / frame counts for a
+    fold_axis="mn" case, mirroring run_case's "mn" branch exactly (5c/5d:
+    the closed-form cycle model needs the SAME core_m/core_n/k_spatial/
+    m_passes/n_passes run_case feeds into the RTL generators)."""
+    fm = resolve_fold_m(m, rf_m if rf_m is not None else 1)
+    fn = resolve_fold_n(n, rf_n if rf_n is not None else 1)
+    core_m = fm["mg"] * 8
+    core_n = fn["cg"] * 8
+    m_passes = fm["m_passes"]
+    n_passes = fn["n_passes"]
+    if rf_k is None:
+        k_spatial = _k_chunks(k)
+    else:
+        k_spatial = resolve_reuse_factor(k, rf_k)["k_spatial"]
+    return core_m, core_n, k_spatial, m_passes, n_passes
+
+
+def _parse_beh_cycles(log):
+    """Parse BEH_START/BEH_II/BEH_DONE diagnostics (rtl.py's behav_grid) out
+    of a vvp log. Returns (starts, dones, ii_values) as lists of ints, in
+    emission order."""
+    starts, dones, iis = [], [], []
+    for line in log.splitlines():
+        line = line.strip()
+        if line.startswith("BEH_START beh_cyc="):
+            starts.append(int(line.split("=", 1)[1]))
+        elif line.startswith("BEH_DONE beh_cyc="):
+            dones.append(int(line.split("=", 1)[1]))
+        elif line.startswith("BEH_II="):
+            iis.append(int(line.split("=", 1)[1]))
+    return starts, dones, iis
+
+
+def check_combined_cycles(m, k, n, rf_m, rf_k, rf_n, log):
+    """Validate 5c's closed-form combined-fold cycle model (geometry.
+    combined_fold_cycles) against the ACTUAL sim-measured cycles (5d) for one
+    fold_axis="mn" run's vvp log. Returns (ok, message)."""
+    core_m, core_n, k_spatial, m_passes, n_passes = _mn_combined_geom(m, k, n, rf_m, rf_k, rf_n)
+    predicted = combined_fold_cycles(core_m, k, core_n, k_spatial, m_passes, n_passes)
+    starts, dones, iis = _parse_beh_cycles(log)
+    frames = m_passes * n_passes
+    if len(starts) != frames or len(dones) != frames:
+        return False, (
+            f"cycle-check {m}x{k}x{n} rf=({rf_m},{rf_k},{rf_n}): expected {frames} frames, "
+            f"saw {len(starts)} BEH_START / {len(dones)} BEH_DONE"
+        )
+    measured_latency = dones[0] - starts[0]
+    measured_total = dones[-1] - starts[0]
+    measured_interval = iis[-1] if iis else None
+    ok = (measured_latency == predicted["latency"] and measured_total == predicted["total_cycles"]
+          and (measured_interval is None or measured_interval == predicted["interval"]))
+    msg = (
+        f"cycle-check {m}x{k}x{n} rf=({rf_m},{rf_k},{rf_n}) frames={frames}: "
+        f"predicted latency={predicted['latency']} interval={predicted['interval']} "
+        f"total={predicted['total_cycles']} | measured latency={measured_latency} "
+        f"interval={measured_interval} total={measured_total}"
+    )
+    return ok, msg
+
+
 def run(cases=None, seeds=None, keep=False):
     """Generate + simulate the wrapper for each (shape, seed); return 0 if all pass.
 
@@ -734,6 +870,9 @@ def run(cases=None, seeds=None, keep=False):
     rom_cases = list(ROM_CASES) if not cases else []
     fold_m_cases = list(FOLD_M_CASES) if not cases else []
     fold_n_cases = list(FOLD_N_CASES) if not cases else []
+    combined_cases = list(COMBINED_CASES) if not cases else []
+    combined_mk_cases = list(COMBINED_MK_CASES) if not cases else []
+    combined_mkn_cases = list(COMBINED_MKN_CASES) if not cases else []
     cases = list(cases) if cases else list(DEFAULT_CASES)
     seeds = list(seeds) if seeds else list(DEFAULT_SEEDS)
 
@@ -782,6 +921,57 @@ def run(cases=None, seeds=None, keep=False):
                 if not ok:
                     print(log)
                     failures.append(tag)
+
+    # Combined M+N fold regression (5b-i checkpoint): streamed-B and
+    # weight-stationary (ROM, exercises grp_ctr cycling past n_passes).
+    for m, k, n, rf_m, rf_n in combined_cases:
+        for seed in seeds:
+            for rom in (False, True):
+                ok, log = run_case(m, k, n, seed, rf=(rf_m, rf_n), weights_in_core=rom,
+                                   fold_axis="mn")
+                tag = f"{m}x{k}x{n} rf=({rf_m},{rf_n}) seed={seed} fold_axis=mn{' rom' if rom else ''}"
+                print(f"{'PASS' if ok else 'FAIL'} {tag}")
+                if not ok:
+                    print(log)
+                    failures.append(tag)
+                cyc_ok, cyc_msg = check_combined_cycles(m, k, n, rf_m, None, rf_n, log)
+                print(f"{'PASS' if cyc_ok else 'FAIL'} {cyc_msg}")
+                if not cyc_ok:
+                    failures.append(cyc_msg)
+
+    # Combined M+K fold regression (5b-ii checkpoint): K folds (k_spatial <
+    # k_chunks) simultaneously with M, N single-pass (rf_n=1).
+    for m, k, n, rf_m, rf_k, rf_n in combined_mk_cases:
+        for seed in seeds:
+            for rom in (False, True):
+                ok, log = run_case(m, k, n, seed, rf=(rf_m, rf_k, rf_n), weights_in_core=rom,
+                                   fold_axis="mn")
+                tag = f"{m}x{k}x{n} rf=({rf_m},{rf_k},{rf_n}) seed={seed} fold_axis=mk{' rom' if rom else ''}"
+                print(f"{'PASS' if ok else 'FAIL'} {tag}")
+                if not ok:
+                    print(log)
+                    failures.append(tag)
+                cyc_ok, cyc_msg = check_combined_cycles(m, k, n, rf_m, rf_k, rf_n, log)
+                print(f"{'PASS' if cyc_ok else 'FAIL'} {cyc_msg}")
+                if not cyc_ok:
+                    failures.append(cyc_msg)
+
+    # Combined M+K+N fold regression (5b-iii checkpoint): all three axes fold
+    # simultaneously.
+    for m, k, n, rf_m, rf_k, rf_n in combined_mkn_cases:
+        for seed in seeds:
+            for rom in (False, True):
+                ok, log = run_case(m, k, n, seed, rf=(rf_m, rf_k, rf_n), weights_in_core=rom,
+                                   fold_axis="mn")
+                tag = f"{m}x{k}x{n} rf=({rf_m},{rf_k},{rf_n}) seed={seed} fold_axis=mkn{' rom' if rom else ''}"
+                print(f"{'PASS' if ok else 'FAIL'} {tag}")
+                if not ok:
+                    print(log)
+                    failures.append(tag)
+                cyc_ok, cyc_msg = check_combined_cycles(m, k, n, rf_m, rf_k, rf_n, log)
+                print(f"{'PASS' if cyc_ok else 'FAIL'} {cyc_msg}")
+                if not cyc_ok:
+                    failures.append(cyc_msg)
 
     # Two-stage requant regression (S1/S2/bias/out_width), run unconditionally
     # (not gated on --cases -- it targets the numerics, not a shape sweep).
@@ -861,7 +1051,9 @@ def run(cases=None, seeds=None, keep=False):
         shutil.rmtree(GEN_DIR, ignore_errors=True)
 
     total = (len(cases) * len(seeds) + len(rom_cases) * len(seeds) + len(fold_m_cases) * len(seeds)
-             + len(fold_n_cases) * len(seeds) * 2 + len(REQUANT_CASES) + 1
+             + len(fold_n_cases) * len(seeds) * 2 + len(combined_cases) * len(seeds) * 2 * 2
+             + len(combined_mk_cases) * len(seeds) * 2 * 2 + len(combined_mkn_cases) * len(seeds) * 2 * 2
+             + len(REQUANT_CASES) + 1
              + len(ZERO_POINT_CASES) + 1 + 1)
     if failures:
         print(f"\n{len(failures)}/{total} FAILED:")

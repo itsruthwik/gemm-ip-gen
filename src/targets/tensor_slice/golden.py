@@ -750,12 +750,77 @@ def _gen_all_stimulus_fold_n(core_m, k, core_n, n_passes, base_seed, k_spatial, 
     return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols, B_full
 
 
+def _gen_all_stimulus_mn(core_m, k, core_n, m_passes, n_passes, base_seed, k_spatial,
+                         fixed_b_full=None, bias_codes=None, s1=0, s2=0, out_width=8,
+                         has_bias=False):
+    """Combined M+N fold stimulus (jojo-track 5b-i): ``m_passes`` distinct A
+    row-groups crossed with ``n_passes`` shared column-groups of ONE full-width
+    B, fed as ``m_passes * n_passes`` back-to-back frames in mg-major/ng-minor
+    order (frame ``t`` -> ``mg = t // n_passes``, ``ng = t % n_passes`` --
+    matches the wrapper's own contract, see rtl.py's combined-fold mg/ng
+    decode). A is constant across the ``n_passes`` frames of one mg block and
+    changes only when mg advances; B's group cycles every frame exactly as
+    fold-N's stimulus does (same shared ``B_full``, sliced by group) -- this
+    is the fold-N generator with an outer per-mg A loop.
+
+    Returns the same 7-tuple ``_gen_all_stimulus_fold_n`` does (plus B_full).
+    """
+    grid_rows = (core_m + 7) // 8
+    grid_cols = (core_n + 7) // 8
+    input_beats = max(core_m, core_n)
+    k_chunks = (k + 7) // 8
+    passes = -(-k_chunks // k_spatial)
+
+    rng = np.random.default_rng(base_seed)
+    max_val = max(1, int((127 / max(k, 1)) ** 0.5))
+    n_full = n_passes * core_n
+    if fixed_b_full is not None:
+        B_full = np.asarray(fixed_b_full, dtype=np.int8)
+    else:
+        B_full = rng.integers(-max_val, max_val + 1, size=(k, n_full), dtype=np.int8)
+
+    all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
+    for _mg in range(m_passes):
+        A_mg = rng.integers(-max_val, max_val + 1, size=(core_m, k), dtype=np.int8)
+        for g in range(n_passes):
+            B_g = B_full[:, g * core_n:(g + 1) * core_n]
+            if has_bias and bias_codes is not None:
+                biases_g = np.asarray(bias_codes[g * core_n:(g + 1) * core_n], dtype=np.int64)
+            else:
+                biases_g = np.zeros((core_n,), dtype=np.int64)
+            C_out = two_stage_reference(A_mg, B_g, biases_g, s1=s1, s2=s2, out_width=out_width)
+
+            a_stim, b_stim = [], []
+            if k_spatial == 1:
+                for chunk in range(k_chunks):
+                    for t in range(input_beats):
+                        a_stim.append(pack_a_chunk(A_mg, t, chunk, grid_rows, core_m, k))
+                        b_stim.append(pack_b_chunk(B_g, t, chunk, grid_cols, core_n, k))
+            else:
+                for pass_idx in range(passes):
+                    for t in range(input_beats):
+                        a_stim.append(pack_a_k_spatial_narrow(A_mg, t, pass_idx, core_m, k, k_spatial))
+                        b_stim.append(pack_b_k_spatial_narrow(B_g, t, pass_idx, core_n, k, k_spatial))
+            all_a_stim.append(a_stim)
+            all_b_stim.append(b_stim)
+            all_bias.append(pack_bias(biases_g, grid_cols, core_n))
+
+            golden = []
+            for rt in range(grid_rows):
+                for row in range(8):
+                    golden.append(pack_c_row(C_out, rt, row, grid_cols, core_m, core_n, out_width=out_width))
+            all_golden.append(golden)
+
+    return all_a_stim, all_b_stim, all_bias, all_golden, grid_rows, grid_cols, B_full
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 
 def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="catapult",
                 num_vectors=10, timing=False, back2back=False, k_spatial=1,
                 weights_in_core=False, fixed_B=None, fold_n_groups=None,
+                fold_mn=None,
                 bias_codes=None, s1=0, s2=0, out_width=8, has_bias=None):
     """Generate a self-checking multi-vector Verilog testbench.
 
@@ -777,7 +842,15 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
     Returns:
         Verilog source as a string.
     """
-    if fold_n_groups and fold_n_groups > 1:
+    if fold_mn is not None:
+        # Combined M+N (jojo-track 5b-i): m_passes*n_passes frames, A keyed by
+        # mg = frame // n_passes, B group keyed by ng = frame % n_passes.
+        m_passes, n_passes = fold_mn
+        all_a, all_b, all_bias, all_golden, gr, gc, _ = _gen_all_stimulus_mn(
+            m, k, n, m_passes, n_passes, seed, k_spatial, fixed_b_full=fixed_B,
+            bias_codes=bias_codes, s1=s1, s2=s2, out_width=out_width,
+            has_bias=bool(has_bias) if has_bias is not None else (bias_codes is not None))
+    elif fold_n_groups and fold_n_groups > 1:
         # Fold-N (FoldAxis="n"): group-aware stimulus -- ONE shared A, ONE
         # shared full-width B sliced by group; overrides num_vectors with
         # fold_n_groups (one vector per group/frame, checked in frame order

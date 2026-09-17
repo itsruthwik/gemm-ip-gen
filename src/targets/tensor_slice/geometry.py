@@ -435,6 +435,53 @@ def latency_first_out(m, k, n, k_spatial):
     return total_beats + latency
 
 
+def combined_fold_cycles(core_m, k, core_n, k_spatial, m_passes=1, n_passes=1):
+    """Closed-form overlapped cycle model for a combined M/K/N fold, sim-branch
+
+    ``frames = m_passes * n_passes`` back-to-back groups feed the SAME
+    per-group core (``core_m`` x ``k`` x ``core_n``, the group tile size after
+    fold-M/fold-N legalization). The behavioral sim scheduler (``behav_grid``
+    in rtl.py) already overlaps frame t+1's feed with frame t's compute/drain
+    (frame-slot pipeline) -- this mirrors it in closed form:
+
+    - ``first_out`` == ``latency_first_out(core_m, k, core_n, k_spatial)``:
+      the first group's first-output offset (fill + wave latency), unaffected
+      by frame count.
+    - ``interval`` == ``k_passes * max(core_m, core_n) + 1``: the steady-state
+      frame period (matches the README's single-axis ``II`` formula) -- one
+      group's feed window plus the pipeline-register cycle. Every frame here
+      shares the same core size, so this holds across all ``frames`` groups;
+      drain(g) (``core_m`` rows) is hidden under compute(g+1) because the
+      generator design keeps ``TOTAL_ROWS <= interval`` (drain never outruns
+      the feed window of the next group).
+    - ``latency`` == ``first_out + core_m``: unloaded latency for ONE group
+      (fill + first group's compute + its own drain) -- the cycle its last
+      output row lands, counted from that group's own feed start.
+    - ``total_cycles`` == ``latency + (frames - 1) * interval``: elapsed
+      cycles from the first group's feed start to the LAST group's last
+      output row, across all ``frames`` overlapped groups.
+
+    At ``m_passes == n_passes == 1`` (``frames == 1``) this reduces exactly
+    to the single-axis model: ``total_cycles == latency == first_out +
+    core_m`` and ``interval`` is reported but unused (only one group).
+    """
+    frames = int(m_passes) * int(n_passes)
+    passes = k_passes(k, k_spatial)
+    total_input_beats = passes * max(core_m, core_n)
+    first_out = latency_first_out(core_m, k, core_n, k_spatial)
+    interval = total_input_beats + 1
+    latency = first_out + core_m
+    total_cycles = latency + (frames - 1) * interval
+    return {
+        "frames": frames,
+        "total_input_beats": total_input_beats,
+        "first_out": first_out,
+        "interval": interval,
+        "latency": latency,
+        "total_cycles": total_cycles,
+    }
+
+
 def dead_cycles_raw(grid_cols_val):
     """Cycles from first output to drain completion (pre-trim)."""
     return (grid_cols_val - 1) * 8 + 10

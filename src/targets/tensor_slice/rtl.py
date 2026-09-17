@@ -1998,13 +1998,15 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
                 )
                 row_mux_cases.append(f"            accum16 = {terms};")
                 if has_bias:
-                    # Bias depends only on n_group (ng), never on mg or k_pass;
-                    # ng is stable for this group's whole S_OUTPUT phase (only
-                    # advances at the group-to-group transition), so no frozen
-                    # per-frame latch is needed here (contrast the single-axis
-                    # fold-N branches' out_grp, which latches against a
-                    # free-running externally-driven counter -- #RUTHWIK).
-                    _bias_e = f"{_bias_lane(bias_rom_name, f'ng * {n} + {c * 8 + lane}')}"
+                    # Bias depends only on n_group (ng), never on mg or k_pass.
+                    # #RUTHWIK: with the Step-3 compute/drain overlap, this must
+                    # read the DRAIN engine's latched cap_ng (the n_group of the
+                    # group currently being drained), NOT the live compute
+                    # engine's ng -- compute may already be several beats into
+                    # the NEXT group by the time this group's rows drain. This
+                    # duplicates the single-axis fold-N branches' out_grp
+                    # freeze-on-drain pattern; unify once that generalizes.
+                    _bias_e = f"{_bias_lane(bias_rom_name, f'cap_ng * {n} + {c * 8 + lane}')}"
                 else:
                     _bias_e = "16'sd0"
                 row_mux_cases.append(
@@ -2036,12 +2038,18 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
         f"                            rom_addr <= ((chunk_idx + 16'd1) * 16'd{n_passes} + ng) * 16'd{n};"
     ) if emit_rom_addr else ""
     rom_addr_output_next_group = (
-        f"                                rom_addr <= (((frame + 16'd1) % 16'd{n_passes})) * 16'd{n};"
+        f"                        rom_addr <= (((frame_c + 16'd1) % 16'd{n_passes})) * 16'd{n};"
     ) if emit_rom_addr else ""
-    rom_addr_output_done = "                                rom_addr <= 16'd0;" if emit_rom_addr else ""
+    rom_addr_output_done = "                        rom_addr <= 16'd0;" if emit_rom_addr else ""
 
+    # #RUTHWIK: op0/op1 (shadow readout control) are now driven by the DRAIN
+    # engine's own state (dstate/cur_row_tile), independent of the compute
+    # engine's state -- this is the crux of the Step-3 overlap: op0/op1 read
+    # out group g's shadow bank while cstate/chunk_idx/beat_count advance
+    # through group g+1's live compute. Duplicates the single-axis emitters'
+    # per-row op0/op1 shape; unify once that generalizes.
     op0_lines = "\n".join(
-        f"    wire op0_{r} = !((state == S_OUTPUT) && (cur_row_tile == 16'd{r}));"
+        f"    wire op0_{r} = !((dstate == D_OUTPUT) && (cur_row_tile == 16'd{r}));"
         for r in range(grid_rows)
     )
     op1_lines = "\n".join(
@@ -2105,23 +2113,39 @@ module {module_name}(
     localparam integer CORE_N = {n};
     localparam integer LOGICAL_M = {logical_m};
     localparam integer LOGICAL_N = {logical_n};
-    localparam [1:0] S_IDLE=2'd0, S_RUN=2'd1, S_WAIT=2'd2, S_OUTPUT=2'd3;
+    // Step 3 (tensor-slice-group-overlap): TWO cooperating engines instead of
+    // one sequential FSM. COMPUTE (cstate) feeds A/B, drives start_mat_mul and
+    // the K passes, and advances the compute-group index (frame_c). DRAIN
+    // (dstate) walks the shadow-bank readout (op[0]/op[1]) for a captured
+    // group and advances an INDEPENDENT drain-group index. op[2] (capture_pulse,
+    // below) hands a finished compute group to the drain engine and, in the
+    // same cycle, lets the compute engine start the NEXT group -- so drain(g)
+    // overlaps compute(g+1). The drain-group index trails the compute-group
+    // index by at most one: compute stalls in C_HANDOFF if the previous
+    // capture hasn't finished draining yet (no queue depth > 1). No inter-
+    // group gap and no preload, per the op contract.
+    localparam [2:0] C_IDLE=3'd0, C_RUN=3'd1, C_WAIT=3'd2, C_HANDOFF=3'd3, C_DONE=3'd4;
+    localparam D_IDLE=1'd0, D_OUTPUT=1'd1;
 
-    reg [1:0] state;
+    reg [2:0] cstate;
+    reg       dstate;
     reg [15:0] beat_count;
     reg [15:0] chunk_idx;
-    reg [15:0] frame;
-    reg [15:0] out_row_count;
+    reg [15:0] frame_c;        // compute-group index
+    reg [15:0] out_row_count;  // drain-side row cursor within the draining group
+    reg        drain_active;   // 1 while dstate is draining a captured group (owned by drain engine)
+    reg [15:0] cap_ng;         // #RUTHWIK: latched ng of the group currently draining
+    reg [15:0] cap_rows;       // latched group_logical_rows of the group currently draining
+    reg        cap_last;       // latched: this is the final logical group overall
     reg signed [15:0] accum16;
     reg [{c_width-1}:0] row_mux;
-    reg state_output_d;
 {rom_addr_decl}
 
-    // mg/ng decode (contract: mg = frame // n_passes, ng = frame % n_passes),
-    // stable for a whole group's duration (frame only advances after that
-    // group's own S_OUTPUT drain completes).
-    wire [15:0] mg = frame / 16'd{n_passes};
-    wire [15:0] ng = frame % 16'd{n_passes};
+    // mg/ng decode (contract: mg = frame // n_passes, ng = frame % n_passes)
+    // for the COMPUTE engine -- stable for a whole group's compute, i.e. until
+    // the C_HANDOFF -> C_RUN transition into the next group.
+    wire [15:0] mg = frame_c / 16'd{n_passes};
+    wire [15:0] ng = frame_c % 16'd{n_passes};
     // Ragged final-group logical extents (only the LAST m_group/n_group is
     // ragged; every other group is a full CORE_M x CORE_N tile).
     wire [15:0] group_logical_rows = (mg == 16'd{m_passes - 1}) ?
@@ -2152,16 +2176,24 @@ module {module_name}(
     end
 
     wire slice_reset = rst;
-    wire in_beat_active = (state == S_RUN) && in_valid_q && (beat_count < INPUT_BEATS);
+    wire in_beat_active = (cstate == C_RUN) && in_valid_q && (beat_count < INPUT_BEATS);
     wire slice_start = in_beat_active && (beat_count == 16'd0);
     wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
     wire all_slices_done = &done_mat_mul;
-    // op[1] drain_stop source: the logical row count of THIS group's current
-    // tile-row burst has just been taken.
-    wire logical_output_complete = (state == S_OUTPUT) && any_avail &&
-                                   (out_row_count + 16'd1 == group_logical_rows);
-    // op[2] shadow_swap: one-cycle pulse on entry into S_OUTPUT for this group.
-    wire op2 = (state == S_OUTPUT) && !state_output_d;
+    // Compute-group handoff: once cstate reaches C_HANDOFF (this group's
+    // compute is fully done -- chunk_idx reached the last K pass), fire the
+    // moment the drain engine has freed the previous capture (or never had
+    // one) -- capture NOW (op2 pulse) and let compute proceed into the next
+    // group's C_RUN this same edge.
+    wire capture_pulse = (cstate == C_HANDOFF) && !drain_active;
+
+    // op[1] drain_stop source: the logical row count of the group currently
+    // DRAINING (cap_rows, not the live compute group's group_logical_rows)
+    // has just been taken.
+    wire logical_output_complete = (dstate == D_OUTPUT) && any_avail &&
+                                   (out_row_count + 16'd1 == cap_rows);
+    // op[2] shadow_swap: exactly the capture handoff pulse.
+    wire op2 = capture_pulse;
     wire [15:0] cur_row_tile = out_row_count >> 3;
 {op0_lines}
 {op1_lines}
@@ -2183,76 +2215,121 @@ module {module_name}(
 {chr(10).join(row_mux_cases)}
     end
 
+    // COMPUTE engine: feed + start_mat_mul + K passes, advancing frame_c.
+    // Owns cstate, beat_count, chunk_idx, frame_c and rom_addr. Reads
+    // drain_active only (never writes drain-engine regs).
     always @(posedge clk) begin
         if (rst) begin
-            state <= S_IDLE;
+            cstate <= C_IDLE;
             beat_count <= 16'd0;
             chunk_idx <= 16'd0;
-            frame <= 16'd0;
-            out_row_count <= 16'd0;
-            c_row <= {c_width}'d0;
-            out_valid <= 1'b0;
-            out_last <= 1'b0;
-            state_output_d <= 1'b0;
+            frame_c <= 16'd0;
+            cap_ng <= 16'd0;
+            cap_rows <= 16'd0;
+            cap_last <= 1'b0;
 {rom_addr_reset}
         end else if (en) begin
-            out_valid <= 1'b0;
-            out_last <= 1'b0;
-            state_output_d <= (state == S_OUTPUT);
-            case (state)
-                S_IDLE: begin
+            case (cstate)
+                C_IDLE: begin
                     beat_count <= 16'd0;
                     chunk_idx <= 16'd0;
-                    frame <= 16'd0;
-                    out_row_count <= 16'd0;
+                    frame_c <= 16'd0;
 {rom_addr_idle}
                     if (preload_valid_q) begin
-                        state <= S_RUN;
+                        cstate <= C_RUN;
                     end
                 end
-                S_RUN: begin
+                C_RUN: begin
                     if (in_beat_active) begin
                         beat_count <= beat_count + 16'd1;
 {rom_addr_run}
                         if (beat_count + 16'd1 == INPUT_BEATS)
-                            state <= S_WAIT;
+                            cstate <= C_WAIT;
                     end
                 end
-                S_WAIT: begin
+                C_WAIT: begin
                     if (all_slices_done) begin
                         if (chunk_idx + 16'd1 == 16'd{passes}) begin
-                            out_row_count <= 16'd0;
-                            state <= S_OUTPUT;
+                            cstate <= C_HANDOFF;
                         end else begin
                             chunk_idx <= chunk_idx + 16'd1;
                             beat_count <= 16'd0;
 {rom_addr_wait}
-                            state <= S_RUN;
+                            cstate <= C_RUN;
                         end
                     end
                 end
-                S_OUTPUT: begin
+                C_HANDOFF: begin
+                    // Stall here (accumulators held, undisturbed) until the
+                    // drain engine has freed the previous capture -- at most
+                    // one captured-but-undrained group in flight.
+                    if (capture_pulse) begin
+                        cap_ng <= ng;
+                        cap_rows <= group_logical_rows;
+                        cap_last <= (frame_c + 16'd1 == 16'd{total_frames});
+                        if (frame_c + 16'd1 == 16'd{total_frames}) begin
+                            cstate <= C_DONE;
+{rom_addr_output_done}
+                        end else begin
+                            frame_c <= frame_c + 16'd1;
+                            chunk_idx <= 16'd0;
+                            beat_count <= 16'd0;
+{rom_addr_output_next_group}
+                            cstate <= C_RUN;
+                        end
+                    end
+                end
+                C_DONE: begin
+                    // All compute issued; wait for the final drain to finish
+                    // before the module is ready to accept a new preload.
+                    if (dstate == D_IDLE && !drain_active)
+                        cstate <= C_IDLE;
+                end
+                default: cstate <= C_IDLE;
+            endcase
+        end
+    end
+
+    // DRAIN engine: shadow readout via op[0]/op[1], advancing an independent
+    // drain-group index (cap_ng/cap_rows/cap_last, latched by the compute
+    // engine at each capture_pulse). Owns dstate, out_row_count,
+    // drain_active and the module's c_row/out_valid/out_last outputs.
+    // #RUTHWIK: this duplicates the single-axis emitters' per-row S_OUTPUT
+    // drain shape (row_mux capture + out_row_count walk); unify once that
+    // generalizes to a shared drain-engine helper.
+    always @(posedge clk) begin
+        if (rst) begin
+            dstate <= D_IDLE;
+            out_row_count <= 16'd0;
+            drain_active <= 1'b0;
+            c_row <= {c_width}'d0;
+            out_valid <= 1'b0;
+            out_last <= 1'b0;
+        end else if (en) begin
+            out_valid <= 1'b0;
+            out_last <= 1'b0;
+            case (dstate)
+                D_IDLE: begin
+                    out_row_count <= 16'd0;
+                    if (capture_pulse) begin
+                        drain_active <= 1'b1;
+                        dstate <= D_OUTPUT;
+                    end
+                end
+                D_OUTPUT: begin
                     if (any_avail) begin
                         c_row <= row_mux;
                         out_valid <= 1'b1;
-                        out_last <= (frame + 16'd1 == 16'd{total_frames}) &&
-                                    (out_row_count + 16'd1 == group_logical_rows);
+                        out_last <= cap_last && (out_row_count + 16'd1 == cap_rows);
                         out_row_count <= out_row_count + 16'd1;
-                        if (out_row_count + 16'd1 == group_logical_rows) begin
-                            if (frame + 16'd1 == 16'd{total_frames}) begin
-                                state <= S_IDLE;
-{rom_addr_output_done}
-                            end else begin
-                                frame <= frame + 16'd1;
-                                chunk_idx <= 16'd0;
-                                beat_count <= 16'd0;
-{rom_addr_output_next_group}
-                                out_row_count <= 16'd0;
-                                state <= S_RUN;
-                            end
+                        if (out_row_count + 16'd1 == cap_rows) begin
+                            out_row_count <= 16'd0;
+                            drain_active <= 1'b0;
+                            dstate <= D_IDLE;
                         end
                     end
                 end
+                default: dstate <= D_IDLE;
             endcase
         end
     end

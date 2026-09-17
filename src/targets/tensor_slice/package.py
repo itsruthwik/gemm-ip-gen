@@ -1966,6 +1966,12 @@ def gen_integration_manifest(items):
         np_ = item["n_passes"]
         gc_pad = item["grid_cols_pad"]
         core_cols = item["core_cols"]
+        # Closed-form overlapped cycle model (jojo-track 5c/5d): predicted
+        # latency/interval/frame-count for the DSE, valid for every fold_axis
+        # (mp == np_ == 1 for fold_axis "k"/single-axis reduces to the
+        # existing single-group model -- see geometry.combined_fold_cycles).
+        cycles = _geometry.combined_fold_cycles(core_rows, item["k"], core_cols, ks,
+                                                 m_passes=mp, n_passes=np_)
         cores.append({
             "name": item["name"],
             "interface": item.get("interface", "stream"),
@@ -1991,6 +1997,13 @@ def gen_integration_manifest(items):
             "n_passes": np_,
             "grid_cols_pad": gc_pad,
             "core_cols": core_cols,
+            "predicted_cycles": {
+                "frames": cycles["frames"],
+                "first_out": cycles["first_out"],
+                "interval": cycles["interval"],
+                "latency": cycles["latency"],
+                "total_cycles": cycles["total_cycles"],
+            },
             "reset": {
                 "name": "rst",
                 "sync_active": "high"
