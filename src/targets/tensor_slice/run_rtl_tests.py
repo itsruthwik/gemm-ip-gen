@@ -34,7 +34,7 @@ from .golden import generate_tb, generate_tb_with_data, _gen_catapult_tb, pack_a
     pack_bias, pack_c_row, two_stage_reference, hex_literal
 from .geometry import k_chunks as _k_chunks, resolve_reuse_factor, resolve_fold_m, resolve_fold_n, \
     combined_fold_cycles
-from gemm_ip.weights import build_weight_rom_k_spatial, build_weight_rom_fold_n
+from gemm_ip.weights import build_weight_rom_k_spatial, build_weight_rom_fold_n, build_weight_rom_combined_fold
 
 GEN_DIR = HERE / "tb" / "generated"
 
@@ -755,9 +755,19 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
         import numpy as np
         rng = np.random.default_rng(seed)
         max_val = max(1, int((127 / max(k, 1)) ** 0.5))
-        # ROM holds every group's columns back to back (base g*core_n).
         fixed_B = rng.integers(-max_val, max_val + 1, size=(k, n_passes * core_n), dtype=np.int8)
-        weight_rom = build_weight_rom_fold_n(fixed_B, core_m, core_n, k, k_spatial, n_passes)
+        # Match the production flow's builder (package.py). When K also folds in
+        # time (passes > 1) alongside N (n_passes > 1) -- the combined M/K/N fold
+        # -- package.py bakes the ROM chunk-major/ng-minor via
+        # build_weight_rom_combined_fold (the layout the C csim, the sim-branch
+        # weight feeder, and the structural rom_addr all address). fold-N alone
+        # (passes == 1) keeps the group-major build_weight_rom_fold_n layout.
+        passes = -(-_k_chunks(k) // k_spatial)
+        if fold_axis == "mn" and n_passes > 1 and passes > 1:
+            weight_rom = build_weight_rom_combined_fold(fixed_B, core_m, core_n, k, k_spatial, n_passes)
+        else:
+            # ROM holds every group's columns back to back (base g*core_n).
+            weight_rom = build_weight_rom_fold_n(fixed_B, core_m, core_n, k, k_spatial, n_passes)
     elif weights_in_core:
         import numpy as np
         rng = np.random.default_rng(seed)

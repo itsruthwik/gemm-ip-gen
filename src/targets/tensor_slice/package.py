@@ -298,12 +298,17 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
             f"more than the {gemm_shift} the product carries; a left shift is not "
             "supported by the tensor_slice requant.")
     # Two-stage requant (jojo-track/open/tensor-slice-bias-in-rtl, phase 1):
-    # this ccore mirrors the Verilog sim branch's folded model exactly: stage
-    # 1 (round-half-up shift by S1, wrap to 16) applied once to the exact
-    # full sum, then stage 2 (wrap-add the bias at the 16-bit intermediate
-    # scale, round-half-up shift by S2, wrap to the physical lane). No
-    # saturation anywhere -- decision 5. `requant_shift` here is the TOTAL
-    # shift (S1 + S2); S2 is the remainder after S1.
+    # this ccore mirrors the Verilog sim branch's folded model exactly. Stage 1
+    # (round-half-up shift by S1, wrap to 16) is applied PER K-spatial partition
+    # in-slice -- the RTL computes each of the ``ks`` partitions in its own
+    # 16-bit slice partial and then sums those 16-bit partials (accum16), so the
+    # csim must partition K the same way and wrap each partial to 16 before
+    # summing (see the accumulate loop below). For ``ks == 1`` this reduces to a
+    # single partition == the exact-full-sum-then-S1 behavior it had before.
+    # Stage 2 (wrap-add the bias at the 16-bit intermediate scale, round-half-up
+    # shift by S2, wrap to the physical lane) then runs once on the summed
+    # 16-bit accumulator. No saturation anywhere -- decision 5. `requant_shift`
+    # here is the TOTAL shift (S1 + S2); S2 is the remainder after S1.
     _s1 = int(s1) if s1 else 0
     _s2 = max(0, requant_shift - _s1)
     _half1 = (1 << (_s1 - 1)) if _s1 > 0 else 0
@@ -311,9 +316,6 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     core_requant_emit = (
         f"                        ac_int<{out_width}, true> sat_val;\n"
         "                        {\n"
-        "                            // Stage 1: round-half-up shift the exact sum by S1, wrap to 16.\n"
-        f"                            ac_int<33, true> _r1 = (ac_int<33, true>) acc + {_half1};\n"
-        f"                            ac_int<16, true> _p1 = (ac_int<16, true>) (_r1 >> {_s1});\n"
         "                            // Stage 2: wrap-add the bias, round-half-up shift by S2, wrap.\n"
         "                            ac_int<16, true> _biased = _p1 + bias_el;\n"
         f"                            ac_int<32, true> _r2 = (ac_int<32, true>) _biased + {_half2};\n"
@@ -1129,24 +1131,37 @@ class {name}_ccore {{
                 for (int ct = 0; ct < {grid_cols}; ct++) {{
                     for (int cl = 0; cl < 8; cl++) {{
                         int actual_col = ct * 8 + cl;
-                        ac_int<32, true> acc = 0;
-                        // Bias no longer pre-adds into the raw accumulation --
-                        // it lands post-stage-1 (core_requant_emit below), read
-                        // from the compile-time bias_c_array (or 0 -- folds the
-                        // add away when has_bias is False), mirroring the
-                        // Verilog sim branch's bias_rom.
-                        if (actual_row < {m} && actual_col < {n}) {{
-                            for (int kk = 0; kk < {k}; kk++) {{
-                                int k_chunk = kk / 8;
-                                int k_lane = kk % 8;
-                                ac_int<8, true> a_el = {a_el_expr};
-                                ac_int<8, true> b_el = {b_el_expr};
-                                acc += a_el * b_el;
-                                // Zero-point correction (see {name}_to_gemm_int8): a_el/b_el
-                                // are the signed codes actually fed into the multiply this
-                                // iteration; adding these terms makes acc exactly the ideal
-                                // unsigned/mixed-sign product accumulation.
-{zp_correction_emit}                            }}
+                        // Per-K-spatial-partition INT16 accumulation, mirroring
+                        // the RTL: each of the {ks} partitions (partition pp owns
+                        // K chunks with chunk % {ks} == pp) accumulates its own
+                        // exact product sum, gets stage-1 requantised and wrapped
+                        // to 16 bits in-slice, and only then are the {ks} 16-bit
+                        // partials summed (16-bit wrap, == the RTL's accum16). Bias
+                        // is added post-stage-2 (core_requant_emit below). For
+                        // {ks} == 1 this is one partition over the full K == the
+                        // former exact-full-sum-then-S1 model.
+                        ac_int<16, true> _p1 = 0;
+                        for (int _pp = 0; _pp < {ks}; _pp++) {{
+                            ac_int<32, true> acc = 0;
+                            if (actual_row < {m} && actual_col < {n}) {{
+                                for (int kk = 0; kk < {k}; kk++) {{
+                                    int k_chunk = kk / 8;
+                                    if (k_chunk % {ks} != _pp) continue;
+                                    int k_lane = kk % 8;
+                                    ac_int<8, true> a_el = {a_el_expr};
+                                    ac_int<8, true> b_el = {b_el_expr};
+                                    acc += a_el * b_el;
+                                    // Zero-point correction (see {name}_to_gemm_int8): a_el/b_el
+                                    // are the signed codes actually fed into the multiply this
+                                    // iteration; adding these terms makes acc exactly the ideal
+                                    // unsigned/mixed-sign product accumulation.
+{zp_correction_emit}                                }}
+                            }}
+                            // Stage 1 (per partition): round-half-up shift the
+                            // partition sum by S1, wrap to 16, accumulate into the
+                            // 16-bit partial sum (wraps -- RTL accum16 is 16-bit).
+                            ac_int<33, true> _r1 = (ac_int<33, true>) acc + {_half1};
+                            _p1 += (ac_int<16, true>) (_r1 >> {_s1});
                         }}
                         ac_int<16, true> bias_el = {bias_el_expr};
 {core_requant_emit}

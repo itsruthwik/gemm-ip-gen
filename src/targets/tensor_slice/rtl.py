@@ -413,7 +413,7 @@ def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
     if _sim_ws:
         sim_b_cols_port = ""
         sim_b_src = "w_rom_out"
-        sim_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes) if emit_rom else ""
+        sim_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes, passes=passes) if emit_rom else ""
     else:
         sim_b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
         sim_b_src = "b_cols"
@@ -613,7 +613,7 @@ endmodule
 """
 
 
-def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1):
+def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1, passes=1):
     """Shared const-weight ROM: declaration + inline init + beat/addr counters + w_rom_out.
 
     Emitted once (above the `ifndef SYNTHESIS` split in the combined core) so a single
@@ -642,6 +642,81 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1):
         f"        w_rom[{i}] = {b_width}'h{(int(v) & mask):0{hexw}x};"
         for i, v in enumerate(weight_rom)
     )
+    # Combined K+N fold (passes > 1 AND n_passes > 1): the ROM holds
+    # passes*n_passes*n entries in the chunk-major/ng-minor layout
+    # build_weight_rom_combined_fold emits -- addr = (kc*n_passes + ng)*n + t.
+    # The plain single-group / fold-N feeder below advances rom_addr contiguously
+    # (pass stride == n), which only matches build_weight_rom_fold_n's layout
+    # when passes == 1; with passes > 1 a group's K-passes are strided by
+    # n_passes*n (not contiguous), so that feeder would read another group's
+    # pass-0 columns for pass > 0 -- the tensor-slice-kn-fold-cosim-mismatch bug.
+    # Track the K-pass index (pass_ctr == kc) explicitly and compute the read
+    # address for the NEXT beat straight from (kc, ng, t) next-state values, the
+    # same registered-address trick VTR needs (mirrors the structural wrapper's
+    # rom_addr in _general_synth_combined_fold, and the C csim's bbuf_src).
+    if int(n_passes) > 1 and int(passes) > 1:
+        return f"""
+    // Weight-stationary combined K+N fold ROM (baked; no external b_cols port).
+    // {len(weight_rom)} entries in chunk-major/ng-minor layout
+    // (addr = (k_pass*{n_passes} + n_group)*{n} + beat); only {n} of every
+    // {input_beats} beats per pass carry a real column, beats t >= {n} read zero.
+    reg [{b_width - 1}:0] w_rom [0:{nbeats - 1}];
+    initial begin
+{rom_init}
+    end
+    reg [15:0] beat_ctr;
+    // rom_addr must be a plain register (single driver = this block, single use =
+    // w_rom index) so VTR's parmys infers a clocked single_port_ram; it is always
+    // updated to the address the NEXT presented beat will read.
+    reg [15:0] rom_addr;
+    // K-pass index (kc) within the current frame and N-group index (ng); ng only
+    // advances at real frame boundaries (grp_was_feeding gates out reset settle /
+    // trailing idle beats), matching the fold-N feeder's group cadence.
+    reg [15:0] pass_ctr;
+    reg [15:0] grp_ctr;
+    reg grp_was_feeding;
+    always @(posedge clk) begin
+        if (rst) begin
+            beat_ctr <= 16'd0;
+            rom_addr <= 16'd0;
+            pass_ctr <= 16'd0;
+            grp_ctr <= 16'd0;
+            grp_was_feeding <= 1'b0;
+        end else if (en) begin
+            if (!in_valid) begin
+                beat_ctr <= 16'd0;
+                pass_ctr <= 16'd0;
+                if (grp_was_feeding) begin
+                    if (grp_ctr + 16'd1 >= 16'd{n_passes}) begin
+                        rom_addr <= 16'd0;
+                        grp_ctr <= 16'd0;
+                    end else begin
+                        // Next group's pass-0 base: (0*{n_passes} + (ng+1))*{n}.
+                        rom_addr <= (grp_ctr + 16'd1) * 16'd{n};
+                        grp_ctr <= grp_ctr + 16'd1;
+                    end
+                end
+                grp_was_feeding <= 1'b0;
+            end else if (beat_ctr < 16'd{input_beats - 1}) begin
+                beat_ctr <= beat_ctr + 16'd1;
+                // Next beat, same K-pass: (kc*{n_passes} + ng)*{n} + (t+1).
+                if (beat_ctr + 16'd1 < 16'd{n})
+                    rom_addr <= (pass_ctr * 16'd{n_passes} + grp_ctr) * 16'd{n} + (beat_ctr + 16'd1);
+                grp_was_feeding <= 1'b1;
+            end else begin
+                // Pass boundary: beat 0 of the next K-pass, same group:
+                // ((kc+1)*{n_passes} + ng)*{n}. (On the frame's final pass this
+                // lands one pass past the group; the idle beat that always
+                // follows overrides it before any in_valid beat consumes it.)
+                beat_ctr <= 16'd0;
+                pass_ctr <= pass_ctr + 16'd1;
+                rom_addr <= ((pass_ctr + 16'd1) * 16'd{n_passes} + grp_ctr) * 16'd{n};
+                grp_was_feeding <= 1'b1;
+            end
+        end
+    end
+    wire [{b_width - 1}:0] w_rom_out = (beat_ctr < 16'd{n}) ? w_rom[rom_addr] : {b_width}'d0;
+"""
     # Fold-N group counter, emitted only when n_passes > 1 (the ROM then holds
     # n_passes*n entries, group g's columns at base g*n). The wrap on a frame's
     # last beat already lands rom_addr on the next group's base (base + n); the
@@ -1501,10 +1576,10 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
             .done_mat_mul(done_mat_mul[{idx}]),
             .a_data((part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
             .b_data((part{p}_active && ({r} == 0){b_route}) ? {b_expr} : 64'b0),
-            .a_data_in(64'b0),
-            .b_data_in(64'b0),
-            .a_data_out(),
-            .b_data_out(),
+            .a_data_in(a_chain_p{p}_r{r}_c{c}),
+            .b_data_in(b_chain_p{p}_r{r}_c{c}),
+            .a_data_out(a_chain_p{p}_r{r}_c{c+1}),
+            .b_data_out(b_chain_p{p}_r{r+1}_c{c}),
             .c_data_out(partial_c_p{p}_r{r}_c{c}),
             .c_data_available(partial_avail_p{p}_r{r}_c{c}),
             .validity_mask_a_rows({vm(row_mask_vals[r])}),
@@ -1560,10 +1635,10 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
             .done_mat_mul(done_mat_mul[{idx}]),
             .a_data((part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
             .b_data((part{p}_active && ({r} == 0){b_route}) ? {b_expr} : 64'b0),
-            .a_data_in(64'b0),
-            .b_data_in(64'b0),
-            .a_data_out(),
-            .b_data_out(),
+            .a_data_in(a_chain_p{p}_r{r}_c{c}),
+            .b_data_in(b_chain_p{p}_r{r}_c{c}),
+            .a_data_out(a_chain_p{p}_r{r}_c{c+1}),
+            .b_data_out(b_chain_p{p}_r{r+1}_c{c}),
             .c_data_out(partial_c_p{p}_r{r}_c{c}),
             .c_data_available(partial_avail_p{p}_r{r}_c{c}),
             .validity_mask_a_rows({vm(row_mask_vals[r])}),
@@ -1582,6 +1657,24 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
             for c in range(grid_cols):
                 partial_wires.append(f"    wire [127:0] partial_c_p{p}_r{r}_c{c};")
                 partial_wires.append(f"    wire         partial_avail_p{p}_r{r}_c{c};")
+    # Per-partition systolic chain: each K-spatial partition p is its own
+    # grid_rows x grid_cols grid (A flows left->right, B flows top->bottom
+    # within the partition; the k_spatial partials are reduced OUTSIDE the
+    # grids by the Sum_p row_mux below -- no chain crosses partitions). Mirrors
+    # the chunked emitter's a_chain/b_chain wiring, replicated per partition.
+    # Boundary column (c==0) and row (r==0) chain inputs are zero; interior
+    # tiles are fed only through the chain (their a_data/b_data are 0).
+    for p in range(k_spatial):
+        for r in range(grid_rows):
+            for c in range(grid_cols + 1):
+                partial_wires.append(f"    wire [63:0] a_chain_p{p}_r{r}_c{c};")
+        for r in range(grid_rows + 1):
+            for c in range(grid_cols):
+                partial_wires.append(f"    wire [63:0] b_chain_p{p}_r{r}_c{c};")
+        for r in range(grid_rows):
+            partial_wires.append(f"    assign a_chain_p{p}_r{r}_c0 = 64'b0;")
+        for c in range(grid_cols):
+            partial_wires.append(f"    assign b_chain_p{p}_r0_c{c} = 64'b0;")
 
     row_avail = []
     row_mux_cases = []
@@ -1955,10 +2048,10 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
             .done_mat_mul(done_mat_mul[{idx}]),
             .a_data(({c} == 0){a_route} ? {a_expr} : 64'b0),
             .b_data(({r} == 0){b_route} ? {b_expr} : 64'b0),
-            .a_data_in(64'b0),
-            .b_data_in(64'b0),
-            .a_data_out(),
-            .b_data_out(),
+            .a_data_in(a_chain_p{p}_r{r}_c{c}),
+            .b_data_in(b_chain_p{p}_r{r}_c{c}),
+            .a_data_out(a_chain_p{p}_r{r}_c{c+1}),
+            .b_data_out(b_chain_p{p}_r{r+1}_c{c}),
             .c_data_out(partial_c_p{p}_r{r}_c{c}),
             .c_data_available(partial_avail_p{p}_r{r}_c{c}),
             .validity_mask_a_rows(row_mask_{r}),
@@ -1977,6 +2070,24 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
             for c in range(grid_cols):
                 partial_wires.append(f"    wire [127:0] partial_c_p{p}_r{r}_c{c};")
                 partial_wires.append(f"    wire         partial_avail_p{p}_r{r}_c{c};")
+    # Per-partition systolic chain: each K-spatial partition p is its own
+    # grid_rows x grid_cols grid (A flows left->right, B flows top->bottom
+    # within the partition; the k_spatial partials are reduced OUTSIDE the
+    # grids by the Sum_p row_mux below -- no chain crosses partitions). Mirrors
+    # the chunked emitter's a_chain/b_chain wiring, replicated per partition.
+    # Boundary column (c==0) and row (r==0) chain inputs are zero; interior
+    # tiles are fed only through the chain (their a_data/b_data are 0).
+    for p in range(k_spatial):
+        for r in range(grid_rows):
+            for c in range(grid_cols + 1):
+                partial_wires.append(f"    wire [63:0] a_chain_p{p}_r{r}_c{c};")
+        for r in range(grid_rows + 1):
+            for c in range(grid_cols):
+                partial_wires.append(f"    wire [63:0] b_chain_p{p}_r{r}_c{c};")
+        for r in range(grid_rows):
+            partial_wires.append(f"    assign a_chain_p{p}_r{r}_c0 = 64'b0;")
+        for c in range(grid_cols):
+            partial_wires.append(f"    assign b_chain_p{p}_r0_c{c} = 64'b0;")
 
     # Per-group ragged-tail masks (#RUTHWIK: same tail_mask_hex algorithm the
     # single-axis branches evaluate at PYTHON compile time -- here it must be

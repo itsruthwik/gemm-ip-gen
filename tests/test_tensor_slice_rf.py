@@ -489,3 +489,29 @@ def test_generate_catapult_pkg_fold_axis_n_rom_read_offsets_by_group(scratch_dir
     assert "B_ROM[_bidx + _grp * 16]" in hdr_n
     assert "_grp = (_grp + 1) % 2;" in hdr_n
     assert "_grp" not in hdr_k
+
+
+@pytest.mark.parametrize("axis,reuse_factor,run_steps", [("k", 2, 59), ("n", 2, 52)])
+def test_logical_row_drain_aborts_masked_structural_tail(scratch_dir, axis, reuse_factor, run_steps):
+    """K/N folding must expose M rows, then pulse pe_reset to retire an 8-row
+    physical burst. This checks generated structural control; the hardblock
+    itself is external and its abort semantics are a hardware contract."""
+    name = f"logical_drain_{axis}"
+    generate_catapult_pkg(
+        5, 24, 16, name, str(scratch_dir), interface="stream",
+        reuse_factor=reuse_factor, fold_axis=axis,
+    )
+    pkg_dir = scratch_dir / name
+    core = (pkg_dir / f"{name}_core.v").read_text()
+    header = (pkg_dir / f"{name}_gemm_ip.h").read_text()
+
+    assert "localparam integer LOGICAL_OUT_ROWS = 5;" in core
+    assert "localparam integer PHYSICAL_OUT_ROWS = 8;" in core
+    assert "logical_output_complete" in core
+    assert "out_row_count + 16'd1 == LOGICAL_OUT_ROWS" in core
+    assert ".pe_reset(" in core and "logical_output_complete" in core
+    assert "DRAIN_ARRAY_PADDED_ROWS" not in header
+    assert "DRAIN_ARRAY_WL_PADDED_ROWS" not in header
+    assert f"RUN: for (int step = 0; step < {run_steps}; step++)" in header
+    assert f"RUN_ARRAY: for (int step = 0; step < {run_steps}; step++)" in header
+    assert f"step < {run_steps + 3}; step++)" not in header

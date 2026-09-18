@@ -8,10 +8,33 @@ regression). The heavy modules (``package`` pulls in ``gemm_ip.quant``;
 module stays cheap and free of core dependencies.
 """
 
+import sys
+
 from ..base import Target
 from . import geometry as _geom
 from . import rtl as _rtl
 from . import golden as _golden
+
+
+def _axis_reuse_factors(fold_axis, reuse_factor, m_rf, k_rf, n_rf):
+    """Resolve the (m_rf, k_rf, n_rf) pass-count triple from the legacy
+    ``fold_axis``/``reuse_factor`` pair and the explicit per-axis
+    ``MFold``/``KFold``/``NFold`` knobs, with the same precedence
+    ``package._resolve_axis_reuse_factors`` applies to the RTL: any explicit
+    per-axis knob wins outright over the legacy pair. Kept in sync with that
+    function so the manifest geometry matches the generated core; the
+    user-facing precedence-collision warning is emitted there, not here, to
+    avoid printing it twice per build."""
+    explicit = {ax: v for ax, v in (("m", m_rf), ("k", k_rf), ("n", n_rf))
+                if v is not None}
+    fold_axis = str(fold_axis or "k").lower()
+    if explicit:
+        return explicit.get("m", 1), explicit.get("k", 1), explicit.get("n", 1)
+    if fold_axis == "m":
+        return reuse_factor, 1, 1
+    if fold_axis == "n":
+        return 1, 1, reuse_factor
+    return 1, reuse_factor, 1
 
 
 def _package():
@@ -136,37 +159,39 @@ class TensorSliceTarget(Target):
         for item in items:
             self.validate_knobs(item, item.get("name"))
             fold_axis = str(item.get("fold_axis") or "k").lower()
-            resolved = _geom.resolve_reuse_factor(
-                item["k"], item.get("reuse_factor", 1), item.get("name"),
-                fold_axis=fold_axis, m=item["m"], n=item["n"])
+            # Resolve via the same independent M/K/N geometry the RTL uses
+            # (``package.generate_catapult_pkg`` -> ``resolve_mkn_geometry``),
+            # honouring the explicit MFold/KFold/NFold knobs. The legacy
+            # single-axis ``fold_axis``/``reuse_factor`` path is the degenerate
+            # case of this (one axis folded), so single-axis runs are
+            # unchanged; combined folds now report the geometry actually built
+            # instead of a single-axis approximation.
+            m_rf, k_rf, n_rf = _axis_reuse_factors(
+                fold_axis, item.get("reuse_factor", 1),
+                item.get("m_reuse_factor"), item.get("k_reuse_factor"),
+                item.get("n_reuse_factor"))
+            resolved = _geom.resolve_mkn_geometry(
+                item["m"], item["k"], item["n"],
+                m_reuse_factor=m_rf, k_reuse_factor=k_rf, n_reuse_factor=n_rf,
+                name=item.get("name"))
             for w in resolved["warnings"]:
                 print(w, file=sys.stderr)
-            gr = _geom.grid_rows(item["m"])
-            gc = _geom.grid_cols(item["n"])
-            mg = resolved.get("mg", gr)
-            m_passes = resolved.get("m_passes", 1)
-            cg = resolved.get("cg", gc)
-            n_passes = resolved.get("n_passes", 1)
+            n_passes = resolved["n_passes"]
             item["k_spatial"] = resolved["k_spatial"]
-            item["k_passes"] = resolved["passes"]
+            item["k_passes"] = resolved["k_passes"]
             item["k_chunks_pad"] = resolved["k_chunks_pad"]
-            item["reuse_factor_requested"] = resolved["reuse_factor_requested"]
+            item["reuse_factor_requested"] = resolved["k_reuse_factor_requested"]
             item["reuse_factor"] = resolved["reuse_factor"]
             item["effective_reuse"] = resolved["effective_reuse"]
             item["fold_axis"] = fold_axis
-            item["m_groups"] = mg
-            item["m_passes"] = m_passes
-            item["grid_rows_pad"] = resolved.get("grid_rows_pad", gr)
-            item["n_groups"] = cg
+            item["m_groups"] = resolved["m_spatial"]
+            item["m_passes"] = resolved["m_passes"]
+            item["grid_rows_pad"] = resolved["grid_rows_pad"]
+            item["n_groups"] = resolved["n_spatial"]
             item["n_passes"] = n_passes
-            item["grid_cols_pad"] = resolved.get("grid_cols_pad", gc)
-            item["core_cols"] = item["n"] if n_passes == 1 else 8 * cg
-            if fold_axis == "m":
-                item["multipliers"] = 64 * mg * gc * resolved["k_chunks"]
-            elif fold_axis == "n":
-                item["multipliers"] = 64 * gr * cg * resolved["k_chunks"]
-            else:
-                item["multipliers"] = _geom.multipliers(item["m"], item["n"], resolved["k_spatial"])
+            item["grid_cols_pad"] = resolved["grid_cols_pad"]
+            item["core_cols"] = item["n"] if n_passes == 1 else 8 * resolved["n_spatial"]
+            item["multipliers"] = resolved["multipliers"]
         return items
 
     def combined_header(self, items):
