@@ -139,7 +139,8 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_
 
 
 def _build_2op_case(work, name, shape, seed, kind=None, backpressure=True, fsm_debug=False,
-                    mode=0, **plan_kw):
+                    mode=0, ap_continue_hold=False, late_b=False, late_b_node=1,
+                    late_b_delay=15, **plan_kw):
     """Single-tile two-operand case (``dynamic_load_2op``), any depth including the
     fully-spatial DEPTH==1 case (SF=NF=1) -- 2-op only ever folds within one MVU
     tile (see jojo-track/defer/mvau-two-operand-dynamic-load/plan.md's "Cleanup:
@@ -215,7 +216,9 @@ def _build_2op_case(work, name, shape, seed, kind=None, backpressure=True, fsm_d
     sv_tb = _tb.generate_sv_tb("2op", module_name, ab, pb, len(a_words), len(exp_words),
                                N_NODES, str(a_dat), str(exp_dat), bb=bb,
                                b_beats=len(b_words), b_dat=str(b_dat),
-                               backpressure=backpressure, fsm_debug=fsm_debug)
+                               backpressure=backpressure, fsm_debug=fsm_debug,
+                               ap_continue_hold=ap_continue_hold, late_b=late_b,
+                               late_b_node=late_b_node, late_b_delay=late_b_delay)
     (work / "tb.sv").write_text(sv_tb)
     return module_name, [work / f"{module_name}.v"]
 
@@ -283,6 +286,29 @@ CASES = {
     "o_2op_foldkn_col_major_memstream": lambda work, seed, **kw: _build_2op_case(
         work, "o", (4, 9, 8), seed, reuse_factor=2, fold_axis="kn", mode=1,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    # ── ap_continue_hold: withhold the ack across a completion for a randomized
+    # (seeded) span, exercising done_pending accumulating multiple completions.
+    "p1_2op_ap_continue_hold_depth1": lambda work, seed, **kw: _build_2op_case(
+        work, "p1", (2, 4, 4), seed, pe=4, simd=4, ap_continue_hold=True,
+        backpressure=kw.get("backpressure", True)),
+    "p2_2op_ap_continue_hold_foldn": lambda work, seed, **kw: _build_2op_case(
+        work, "p2", (4, 4, 8), seed, reuse_factor=2, fold_axis="n", ap_continue_hold=True,
+        backpressure=kw.get("backpressure", True)),
+    "p3_2op_ap_continue_hold_col_major": lambda work, seed, **kw: _build_2op_case(
+        work, "p3", (4, 4, 8), seed, reuse_factor=2, fold_axis="n", mode=1, ap_continue_hold=True,
+        backpressure=kw.get("backpressure", True)),
+    # ── late_b: withhold node n+1's B beats until after node n+1's A beats
+    # are already available at the A FIFO (and node n has finished), then
+    # release -- must stall (no output) instead of pairing A[n+1] with B[n].
+    "q1_2op_late_b_depth1": lambda work, seed, **kw: _build_2op_case(
+        work, "q1", (2, 4, 4), seed, pe=4, simd=4, late_b=True, late_b_node=1,
+        backpressure=kw.get("backpressure", True)),
+    "q2_2op_late_b_foldn": lambda work, seed, **kw: _build_2op_case(
+        work, "q2", (4, 4, 8), seed, reuse_factor=2, fold_axis="n", late_b=True, late_b_node=1,
+        backpressure=kw.get("backpressure", True)),
+    "q3_2op_late_b_col_major": lambda work, seed, **kw: _build_2op_case(
+        work, "q3", (4, 4, 8), seed, reuse_factor=2, fold_axis="n", mode=1, late_b=True, late_b_node=1,
+        backpressure=kw.get("backpressure", True)),
 }
 
 RTL_STATIC_DIR = HERE / "rtl_static"

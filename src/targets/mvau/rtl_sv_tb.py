@@ -18,9 +18,10 @@ output under temp_space/mvau-ws and the mvu_vvu_axi shim sources):
               PLUS b_dout/b_empty_n/b_read. B is the loader's own narrow beat
               (PE-wide Mode A / SIMD-wide Mode B), A is SF beats/vector of
               byte-aligned SIMD*AW bits, P is NF beats/vector of byte-aligned
-              PE*out_width bits (SF==NF==1 -> one beat each). Control is its
-              own per-node ``run_r`` register (generate_two_operand_shim): one
-              invocation in flight at a time, no overlap.
+              PE*out_width bits (SF==NF==1 -> one beat each). Control is the
+              same shared ``_decoupled_ctrl`` handshake ws/kt use
+              (generate_two_operand_shim): consecutive nodes overlap, no idle
+              gap. B loading (b_read) is un-gated by ap_ctrl throughout.
 
 Stimulus/expected values reuse the exact deterministic generators golden.py's
 C-twin testbenches use (``_ws_tb``/``_2op_tb`` in golden.py): same seeded
@@ -117,8 +118,9 @@ module tb;
   // ap_continue: ack a pending completion the instant ap_done is seen -- legal
   // under ap_ctrl_chain (the caller may assert ap_continue any cycle ap_done is
   // high) and lets a run of several already-pending done_pending completions
-  // drain one per cycle without a separate driver process.
-  wire ap_continue = ap_done;
+  // drain one per cycle without a separate driver process. (Overridden below
+  // when ap_continue_hold mode withholds the ack for a randomized span.)
+{ap_continue_wire}
 
   reg  [AW-1:0] a_dout;
   reg           a_empty_n = 0;
@@ -174,6 +176,8 @@ module tb;
 {b_feed_process}
 
 {fsm_debug_process}
+
+{ap_continue_process}
 
   // ---- feed A ----
   // NOTE: a_read/a_empty_n are sampled combinationally against the CURRENT
@@ -246,6 +250,17 @@ module tb;
     end
   end
 
+  // ---- global watchdog: guard the new overlap control against a hang (e.g.
+  // an un-acked done_pending) -- report FAIL instead of letting xsim block. ----
+  initial begin
+    repeat (200000) @(posedge ap_clk);
+    if (done_count < NNODES) begin
+      $display("TEST_RESULT: FAIL watchdog timeout done_count=%0d/%0d",
+                done_count, NNODES);
+      $finish;
+    end
+  end
+
   initial begin
     wait (done_count == NNODES);
     per_node_cyc = (last_done_cyc - first_start_cyc) * 1.0 / NNODES;
@@ -273,7 +288,9 @@ endmodule
 
 def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
                    a_dat, exp_dat, bb=None, b_beats=None, b_dat=None,
-                   backpressure=True, fsm_debug=False, sustained_output_stall=False):
+                   backpressure=True, fsm_debug=False, sustained_output_stall=False,
+                   ap_continue_hold=False, ap_continue_hold_max=24,
+                   late_b=False, late_b_node=1, late_b_delay=15):
     """Build the SV TB text. ``kind`` is 'ws' (no B port) or '2op' (has B port).
 
     ``backpressure`` (default True, unchanged behaviour): random a_empty_n /
@@ -351,19 +368,21 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
 
     fsm_debug_process = ""
     if fsm_debug and kind != "ws":
-        # NOTE: the two-operand ("ms") shim no longer has an IDLE/FILL/WRITE/DRAIN/RUN
-        # state register (dynamic_load_2op replaces that FSM) -- only a run_r/done_r
-        # pair. FSM_WRITE (there is no WRITE phase to load B into anymore; B streams
-        # into the loader independently of ap_ctrl) is dropped; FSM_RUN stamps
-        # run_r's rising edge instead of a state-register transition.
+        # NOTE: the two-operand shim no longer has an IDLE/FILL/WRITE/DRAIN/RUN state
+        # register (dynamic_load_2op replaces that FSM), nor its own run_r/done_r pair
+        # -- ap_ctrl now runs on the shared _decoupled_ctrl handshake (same as ws/kt).
+        # FSM_WRITE (there is no WRITE phase to load B into anymore; B streams into the
+        # loader independently of ap_ctrl) is dropped; FSM_RUN stamps dut.in_open's
+        # rising edge (the node-admission window, gates A/weight consumption) instead
+        # of a state-register transition.
         fsm_debug_process = """\
   // ---- fsm_debug: extra latency-breakdown stamps ----
   reg dbg_prev_run = 1'b0;
   always @(posedge ap_clk) begin
     if (ap_rst) dbg_prev_run <= 1'b0;
     else begin
-      if (dut.run_r && !dbg_prev_run) $display("FSM_RUN cyc=%0d", cyc);
-      dbg_prev_run <= dut.run_r;
+      if (dut.in_open && !dbg_prev_run) $display("FSM_RUN cyc=%0d", cyc);
+      dbg_prev_run <= dut.in_open;
     end
   end
   always @(posedge ap_clk)
@@ -402,7 +421,7 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
       // to do) glitches a held-valid beat low before it's read, violating
       // the valid/ready stability the DUT's B-side FSM relies on and
       // causing spurious re-presentation of beats -- a second misalignment
-      if (b_idx < B_BEATS) b_empty_n <= rnd_bit() | rnd_bit();
+      if (b_idx < B_BEATS && !b_late_gate_active) b_empty_n <= rnd_bit() | rnd_bit();
       else b_empty_n <= 0;
     end
   end"""
@@ -411,9 +430,34 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
   // backpressure disabled: present a beat every cycle data remains
   always @(posedge ap_clk) begin
     if (ap_rst) b_empty_n <= 0;
-    else b_empty_n <= (b_idx < B_BEATS);
+    else b_empty_n <= (b_idx < B_BEATS && !b_late_gate_active);
   end"""
+        # late_b: withhold node late_b_node's B beats until late_b_delay cycles
+        # AFTER that node's A beats are already available at the A FIFO (i.e.
+        # after a_idx has reached that node's A-beat offset). Disabled by
+        # default (LATE_B_EN=0), in which case b_late_gate_active is tied low.
+        late_b_en = 1 if late_b else 0
+        late_b_gate_decl = f"""\
+  // ---- late_b: gate node {late_b_node}'s B beats behind its A availability ----
+  localparam LATE_B_EN       = {late_b_en};
+  localparam LATE_B_A_THRESH = (A_BEATS / NNODES) * {late_b_node};
+  localparam LATE_B_B_THRESH = (B_BEATS / NNODES) * {late_b_node};
+  localparam LATE_B_DELAY    = {late_b_delay};
+  reg late_b_released = (LATE_B_EN == 0);
+  integer late_b_wait_cnt = 0;
+  wire b_late_gate_active = (LATE_B_EN != 0) && (b_idx >= LATE_B_B_THRESH) && !late_b_released;
+  always @(posedge ap_clk) begin
+    if (ap_rst) begin
+      late_b_released <= (LATE_B_EN == 0);
+      late_b_wait_cnt <= 0;
+    end else if ((LATE_B_EN != 0) && !late_b_released && (a_idx >= LATE_B_A_THRESH)) begin
+      if (late_b_wait_cnt >= LATE_B_DELAY) late_b_released <= 1'b1;
+      else late_b_wait_cnt <= late_b_wait_cnt + 1;
+    end
+  end
+"""
         b_feed_process = f"""
+{late_b_gate_decl}
 {b_empty_process}
   always @(posedge ap_clk) begin
     if (!ap_rst && b_read && b_empty_n) begin
@@ -430,6 +474,57 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
                     ".b_dout(b_dout), .b_empty_n(b_empty_n), .b_read(b_read), "
                     ".p_din(p_din), .p_full_n(p_full_n), .p_write(p_write));")
 
+    if ap_continue_hold:
+        # ap_continue withheld across a completion for a randomized (seeded)
+        # span, then acked -- exercises done_pending accumulating more than
+        # one pending completion (the new overlap control's main risk: a
+        # dropped or duplicated output beat, or a node whose done never gets
+        # acked). Reuses the shared lfsr/rnd_bit() (declared below, in the
+        # randomized-backpressure section); Verilog module-item scoping makes
+        # the forward reference to them legal.
+        ap_continue_wire = ("  reg ap_done_prev = 1'b0;\n"
+                            "  reg ac_holding = 1'b0;\n"
+                            "  integer ac_hold_cnt = 0;\n"
+                            "  reg ap_continue_r = 1'b0;\n"
+                            "  wire ap_continue = ap_continue_r;")
+        ap_continue_process = f"""\
+  // ---- ap_continue_hold: withhold the ack across a completion ----
+  localparam AC_HOLD_MAX = {ap_continue_hold_max};
+  function automatic integer ac_rnd_small(input integer maxv);
+    integer v, i;
+    begin
+      v = 0;
+      for (i = 0; i < 8; i = i + 1) v = {{v[6:0], rnd_bit()}};
+      ac_rnd_small = v % (maxv + 1);
+    end
+  endfunction
+  always @(posedge ap_clk) begin
+    if (ap_rst) begin
+      ap_done_prev <= 1'b0; ac_holding <= 1'b0; ac_hold_cnt <= 0; ap_continue_r <= 1'b0;
+    end else begin
+      ap_done_prev <= ap_done;
+      if (ap_done && !ap_done_prev) begin
+        // a new completion just became visible -- sample a random hold span
+        ac_hold_cnt   <= ac_rnd_small(AC_HOLD_MAX);
+        ac_holding    <= 1'b1;
+        ap_continue_r <= 1'b0;
+      end else if (ac_holding) begin
+        if (ac_hold_cnt == 0) begin
+          ac_holding    <= 1'b0;
+          ap_continue_r <= 1'b1;   // pulse the ack once the hold expires
+        end else begin
+          ac_hold_cnt   <= ac_hold_cnt - 1;
+          ap_continue_r <= 1'b0;
+        end
+      end else begin
+        ap_continue_r <= ap_done;  // past the hold: immediate-ack as usual
+      end
+    end
+  end"""
+    else:
+        ap_continue_wire = "  wire ap_continue = ap_done;"
+        ap_continue_process = ""
+
     return _HEADER.format(
         ab=ab, pb=pb, a_beats=a_beats, p_beats=p_beats, n_nodes=n_nodes,
         bw_localparam=bw_localparam, b_ports_decl=b_ports_decl,
@@ -437,4 +532,5 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
         b_feed_process=b_feed_process, a_dat=a_dat, exp_dat=exp_dat,
         dut_inst=dut_inst, a_empty_process=a_empty_process,
         p_full_process=p_full_process, fsm_debug_process=fsm_debug_process,
+        ap_continue_wire=ap_continue_wire, ap_continue_process=ap_continue_process,
     )
