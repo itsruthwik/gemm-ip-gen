@@ -126,6 +126,11 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     else:
         a_bits = a_stream_width(m, ks)
         b_bits = b_stream_width(n, ks)
+    # A-row replay lives in the core (rtl.py's _a_replay_block), never in a C
+    # array here: the a_rows port carries every K-pass slice of a row on the
+    # beat that reads it (slice p at bit p*a_bits) and zeros on every beat that
+    # re-uses it -- later K passes, and all of a later N-group's frame.
+    a_port_bits = passes * a_bits
     # Bias is a COMPILE-TIME constant now (decision 4): no bias_cols port at
     # all. ``bias_codes`` (or None -- the add folds away) is the SAME codes
     # list baked as the Verilog bias ROM (see rtl.py's _bias_rom_block); here
@@ -573,7 +578,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # keeps today's single-chunk, row-tile-addressed pack (offset by row_tile);
     # ks > 1 packs ``ks`` K chunks into one narrow word (offset by kc_local),
     # generalizing the old full-K-only pack across every pass.
-    def _a_pack_block(dest, pass_expr, label):
+    def _a_pack_block(dest, pass_expr, label, base=""):
         if ks > 1 or _combined_fold:
             return f"""
                 #pragma hls_unroll
@@ -582,7 +587,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                     {label}_KL: for (int kl = 0; kl < 8; kl++) {{
                         int kk = (({pass_expr}) * {ks} + kc_local) * 8 + kl;
                         if (kk < {k}) {{
-                            {dest}.set_slc(kc_local * 64 + kl * 8,
+                            {dest}.set_slc({base}kc_local * 64 + kl * 8,
                                            {name}_to_gemm_int8(a_beat[kk]));
                         }}
                     }}
@@ -595,36 +600,25 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                     #pragma hls_unroll
                     {label}_RT: for (int rt = 0; rt < {grid_rows}; rt++) {{
                         if (row_tile == rt && kk < {k}) {{
-                            {dest}.set_slc(rt * 64 + kl * 8,
+                            {dest}.set_slc({base}rt * 64 + kl * 8,
                                            {name}_to_gemm_int8(a_beat[kk]));
                         }}
                     }}
                 }}"""
 
-    if passes >= 2:
-        a_replay_decl = f"""
-    // Replay storage is packed to the blackbox protocol. HLS4ML still emits
-    // each logical K-wide A row once; later K passes replay packed slices.
-    // Reused per frame (written at each frame's kc==0 beats, read within the
-    // same frame's later passes — the feed is sequential in step order).
-    // Slot 0 (pass 0, fed directly from the stream) is never stored, so the
-    // buffer holds only the {passes - 1} replayed passes, each M rows wide.
-    ac_int<{a_bits}, false> a_replay[{passes - 1}][{m}];
-"""
-        a_prepack_replay = f"""
+    # Every K-pass slice of the row just read goes out on this beat; the core
+    # keeps the later ones.
+    def _a_pack_later_passes(dest, label):
+        if passes < 2:
+            return ""
+        return f"""
                 #pragma hls_unroll
-                PREPACK_REPLAY: for (int replay_kc = 1; replay_kc < {passes}; replay_kc++) {{
-                    ac_int<{a_bits}, false> replay_rows = 0;{_a_pack_block("replay_rows", "replay_kc", "ROW_PACK_REPLAY")}
-                    a_replay[replay_kc - 1][t] = replay_rows;
+                {label}: for (int pack_kc = 1; pack_kc < {passes}; pack_kc++) {{{_a_pack_block(dest, "pack_kc", label + "_ROW", base=f"pack_kc * {a_bits} + ")}
                 }}"""
-        a_replay_else = f"""
-            }} else {{
-                a_rows = a_replay[kc - 1][t];
-            }}"""
-    else:
-        a_replay_decl = ""
-        a_prepack_replay = ""
-        a_replay_else = """
+
+    a_replay_decl = ""
+    a_prepack_replay = _a_pack_later_passes("a_rows", "PACK_REPLAY")
+    a_replay_else = """
             }"""
 
     # General M/N-group raw output capture: shared by the stream and array RUN
@@ -674,29 +668,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # A rows repeat identically across every N-group of the same M-group
         # (only B's group / output group changes across ng); a fresh stream
         # read happens only at the first K-pass of the first N-group of each
-        # M-group (kc == 0 && ng == 0). The replay table caches ALL `passes`
-        # K-pass slices for the CURRENT M-group's rows, so later K-passes
-        # within the same frame (kc > 0) and later N-groups of the same
-        # M-group (ng > 0, any kc) both replay from it -- this merges what
-        # used to be two separate mechanisms (the K-pass replay buffer and
-        # fold-N's single cross-frame replay slot) into one general cache.
-        a_replay_decl = f"""
-    // General fold replay cache: holds every K-pass slice ({passes} of them)
-    // of the CURRENT M-group's rows. Refilled only when a new M-group's first
-    // N-group starts reading fresh A data off the stream (kc == 0 && ng == 0);
-    // every other (kc, ng) combination for the same M-group replays from it.
-    ac_int<{a_bits}, false> a_replay_all[{passes}][{m}];
-"""
-        _a_prepack_all = f"""
-                #pragma hls_unroll
-                PREPACK_REPLAY: for (int replay_kc = 0; replay_kc < {passes}; replay_kc++) {{
-                    ac_int<{a_bits}, false> replay_rows = 0;{_a_pack_block("replay_rows", "replay_kc", "ROW_PACK_REPLAY")}
-                    a_replay_all[replay_kc][t] = replay_rows;
-                }}"""
-        a_prepack_replay = _a_prepack_all
-        a_replay_else = """
-            }
-            a_rows = a_replay_all[kc][t];"""
+        # M-group (kc == 0 && ng == 0). The core caches the CURRENT M-group's
+        # rows, so later K-passes within the same frame (kc > 0) and later
+        # N-groups of the same M-group (ng > 0, any kc) both replay from it.
         _a_read_guard = "kc == 0 && ng == 0"
         _stream_g_decl = (
             "\n        int g = step / %d;"
@@ -711,6 +685,29 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # behavior), now offset by the M-group so it generalizes to
         # simultaneous M+N folding.
         _stream_capture_use = stream_capture if n_passes == 1 else capture_general
+
+    # csim twin of the core's A replay: one a_bits slice per (pass, beat) slot.
+    # A fresh row fills every pass's slot on its pass-0 beat; under fold-N the
+    # N-group-0 frame's slots are kept and re-used by the group's later frames.
+    if fold_n:
+        a_grp_static_decl = (f"\n        static int _a_grp = {int(n_passes) - 1};"
+                             f"\n        static ac_int<{a_bits}, false> a_keep[{total_beats}];")
+        a_grp_static_step = f"\n                _a_grp = (_a_grp + 1) % {int(n_passes)};"
+        _a_buf_capture = f"""\
+                if (_a_grp == 0 && cc_slot[wr_slot] < {input_beats}) {{
+                    for (int _p = 0; _p < {passes}; _p++) {{
+                        a_keep[_p * {input_beats} + cc_slot[wr_slot]] = a_rows.slc<{a_bits}>(_p * {a_bits});
+                    }}
+                }}
+                a_buf[wr_slot][cc_slot[wr_slot]] = a_keep[cc_slot[wr_slot]];"""
+    else:
+        a_grp_static_decl = a_grp_static_step = ""
+        _a_buf_capture = f"""\
+                if (cc_slot[wr_slot] < {input_beats}) {{
+                    for (int _p = 0; _p < {passes}; _p++) {{
+                        a_buf[wr_slot][_p * {input_beats} + cc_slot[wr_slot]] = a_rows.slc<{a_bits}>(_p * {a_bits});
+                    }}
+                }}"""
 
     stream_feed_loop = f"""
 {a_replay_decl}
@@ -729,7 +726,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         int pf = p - 1;
         int kc = pf / {input_beats};
         int t = pf % {input_beats};
-        ac_int<{a_bits}, false> a_rows = 0;
+        ac_int<{a_port_bits}, false> a_rows = 0;
         {stream_bcols_decl}
 
         if ({_stream_feed_cond}) {{
@@ -771,10 +768,10 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         int eff_step = (step == 0 || step > {total_beats}) ? 0 : step - 1;
         int kc = eff_step / {input_beats};
         int t = eff_step % {input_beats};
-        ac_int<{a_bits}, false> a_rows_packed = 0;{array_bcols_decl}
+        ac_int<{a_port_bits}, false> a_rows_packed = 0;{array_bcols_decl}
 
-        if (step > 0 && step <= {total_beats} && t < {m}) {{
-            a_beat_T a_beat = a_rows[t];{_a_pack_block("a_rows_packed", "kc", "ROW_PACK_ARRAY")}
+        if (step > 0 && step <= {total_beats} && t < {m} && kc == 0) {{
+            a_beat_T a_beat = a_rows[t];{_a_pack_block("a_rows_packed", "0", "ROW_PACK_ARRAY")}{_a_pack_later_passes("a_rows_packed", "PACK_ARRAY")}
         }}{array_bcols_pack}
 
         ac_int<{c_bits}, false> c_row;
@@ -840,6 +837,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # fold-M-only array loop when n_passes == 1 (ng always 0, g == mg) and
         # to the old fold-N-only array loop when m_passes == 1 (mg always 0,
         # g == ng, a_rows[mg*m+t] == a_rows[t]).
+        _array_a_cond = f"feeding_now && t < {m} && (mg * {m} + t) < {logical_m} && kc == 0 && ng == 0"
+        _array_a_pack = (_a_pack_block("a_rows_packed", "0", "ROW_PACK_ARRAY_FOLD")
+                         + _a_pack_later_passes("a_rows_packed", "PACK_ARRAY_FOLD"))
         array_feed_loop = f"""
     // General M/K/N-fold multi-frame feed: {m_passes} M-group(s) x {n_passes}
     // N-group(s) of {m} core rows / {n} core columns each frame (K sweeps
@@ -859,10 +859,10 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         int pf = p - 1;
         int kc = pf / {input_beats};
         int t = pf % {input_beats};
-        ac_int<{a_bits}, false> a_rows_packed = 0;{array_bcols_decl}
+        ac_int<{a_port_bits}, false> a_rows_packed = 0;{array_bcols_decl}
 
-        if (feeding_now && t < {m} && (mg * {m} + t) < {logical_m}) {{
-            a_beat_T a_beat = a_rows[mg * {m} + t];{_a_pack_block("a_rows_packed", "kc", "ROW_PACK_ARRAY_FOLD")}
+        if ({_array_a_cond}) {{
+            a_beat_T a_beat = a_rows[mg * {m} + t];{_array_a_pack}
         }}
         {fold_general_bcols_pack}
 
@@ -960,7 +960,7 @@ void {name}_gemm_ip_array_const_weights(
 
     static {name}_ccore gemm;
     int captured = 0;
-    ac_int<{a_bits}, false> last_a_rows = 0;
+    ac_int<{a_port_bits}, false> last_a_rows = 0;
 {_c_buf_decl}
 {array_feed_loop}
 {array_padding_drain}
@@ -1028,7 +1028,7 @@ void {name}_gemm_ip_array(
 
     static {name}_ccore gemm;
     int captured = 0;
-    ac_int<{a_bits}, false> last_a_rows = 0;
+    ac_int<{a_port_bits}, false> last_a_rows = 0;
     ac_int<{b_bits}, false> last_b_cols = 0;
     constexpr bool HAS_BIAS = false;
     typename CONFIG_T::bias_t *biases = nullptr;
@@ -1064,7 +1064,7 @@ class {name}_ccore {{
 
     #pragma hls_design interface ccore blackbox
     void run(
-        ac_int<{a_bits}, false>  a_rows,
+        ac_int<{a_port_bits}, false>  a_rows,
 {bcols_run_param}        ac_int<1, false>         preload_valid,
         ac_int<1, false>         in_valid,
         ac_int<{c_bits}, false>& c_row,
@@ -1104,7 +1104,7 @@ class {name}_ccore {{
         static int cc_slot[{slots}] = {{0}};
         static bool slot_run[{slots}] = {{false}};
         static int wr_slot = {slots - 1};
-        static bool feeding = false;{grp_static_decl}{bias_grp_static_decl}
+        static bool feeding = false;{grp_static_decl}{bias_grp_static_decl}{a_grp_static_decl}
 
         c_row = 0;
         out_valid = 0;
@@ -1115,10 +1115,10 @@ class {name}_ccore {{
                 wr_slot = (wr_slot + 1) % {slots};
                 feeding = true;
                 slot_run[wr_slot] = true;
-                cc_slot[wr_slot] = 0;{grp_static_step}{bias_grp_static_step}
+                cc_slot[wr_slot] = 0;{grp_static_step}{bias_grp_static_step}{a_grp_static_step}
             }}
             if (cc_slot[wr_slot] < {total_beats}) {{
-                a_buf[wr_slot][cc_slot[wr_slot]] = a_rows;
+{_a_buf_capture}
                 // Only beat t < n of each pass carries a real column (see b_el_expr /
                 // B_ROM above); beats t >= n are never captured (and never read back).
                 int _t = cc_slot[wr_slot] % {input_beats};

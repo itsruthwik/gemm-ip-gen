@@ -393,7 +393,7 @@ def _gen_all_stimulus_catapult_k_spatial(m, k, n, num_vectors, base_seed, k_spat
 
 
 
-def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, k_spatial=1, weights_in_core=False, out_width=8, combined_fold=False):
+def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, k_spatial=1, weights_in_core=False, out_width=8, combined_fold=False, n_passes=1):
     """Generate a multi-vector Catapult testbench.
 
     back2back=False (default): Reset between every vector; check each vector
@@ -421,6 +421,21 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
         b_bytes = 8 * k_spatial
     # Bias is compile-time now (decision 4): no bias_cols port/width at all.
     c_bytes = grid_cols * out_width // 8
+    # A-row replay lives in the core: a row's K-pass slices all ride its pass-0
+    # beat (slice p at bit p*slice_width) and every beat that re-uses the row --
+    # later K passes, and whole frames of a later N-group -- carries zeros.
+    # Stimulus builders emit one slice per (pass, beat); fold it to that form.
+    a_slice_bits = a_bytes * 8
+    folded_a_stim = []
+    for frame, a_stim in enumerate(all_a_stim):
+        wide = [0] * total_input_beats
+        if frame % int(n_passes) == 0:
+            for t in range(input_beats):
+                for p in range(passes):
+                    wide[t] |= int(a_stim[p * input_beats + t]) << (p * a_slice_bits)
+        folded_a_stim.append(wide)
+    all_a_stim = folded_a_stim
+    a_bytes *= passes
     aw = a_bytes * 8
     bw = b_bytes * 8
     cw = c_bytes * 8
@@ -849,15 +864,18 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
     Returns:
         Verilog source as a string.
     """
+    tb_n_passes = 1
     if fold_mn is not None:
         # Combined M+N (jojo-track 5b-i): m_passes*n_passes frames, A keyed by
         # mg = frame // n_passes, B group keyed by ng = frame % n_passes.
         m_passes, n_passes = fold_mn
+        tb_n_passes = n_passes
         all_a, all_b, all_bias, all_golden, gr, gc, _ = _gen_all_stimulus_mn(
             m, k, n, m_passes, n_passes, seed, k_spatial, fixed_b_full=fixed_B,
             bias_codes=bias_codes, s1=s1, s2=s2, out_width=out_width,
             has_bias=bool(has_bias) if has_bias is not None else (bias_codes is not None))
     elif fold_n_groups and fold_n_groups > 1:
+        tb_n_passes = fold_n_groups
         # Fold-N (FoldAxis="n"): group-aware stimulus -- ONE shared A, ONE
         # shared full-width B sliced by group; overrides num_vectors with
         # fold_n_groups (one vector per group/frame, checked in frame order
@@ -876,7 +894,7 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
             m, k, n, num_vectors, seed, fixed_B=fixed_B,
             bias_codes=bias_codes, s1=s1, s2=s2, out_width=out_width,
             has_bias=(bias_codes is not None) if has_bias is None else bool(has_bias))
-    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back, k_spatial=k_spatial, weights_in_core=weights_in_core, out_width=out_width, combined_fold=(fold_mn is not None))
+    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back, k_spatial=k_spatial, weights_in_core=weights_in_core, out_width=out_width, combined_fold=(fold_mn is not None), n_passes=tb_n_passes)
 
 
 def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_out, timing=False, out_width=8):

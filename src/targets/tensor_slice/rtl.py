@@ -353,13 +353,118 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1, passes=1)
     return text
 
 
+def _a_replay_block(a_width, passes, n_passes, m, input_beats):
+    """A-row replay held in the core: port width, replay logic, a_rows_q source.
+
+    The wrapper reads each A row off its stream once and presents every K-pass
+    slice of it on the pass-0 beat (slice p at ``a_rows[p*a_width +: a_width]``);
+    every beat that re-uses the row -- a later K pass, or any pass of a later
+    N-group frame of the same M-group -- carries zeros on the port and is fed
+    from here instead. Keeping the cache in RTL lets it map to a RAM block; as a
+    C array in the HLS wrapper it becomes a register file plus an m:1 mux.
+
+    Stored slices: passes 1.. when ``n_passes == 1`` (pass 0 always comes from
+    the port), every pass when N folds (frames ng > 0 replay pass 0 too).
+    Rows t >= m of a pass are feed padding and read back zero. A single-row
+    cache (m == 1) is a plain register; anything deeper is a memory addressed
+    PORT-side like w_rom/rom_addr -- the feed FSM's beat_count/chunk_idx lag
+    the port by a cycle and must not be used.
+    """
+    passes, n_passes, m = int(passes), int(n_passes), int(m)
+    a_port_width = passes * a_width
+    fold_n = n_passes > 1
+    if passes < 2 and not fold_n:
+        return a_port_width, "", "a_rows"
+    lo = 0 if fold_n else 1
+    replay_width = (passes - lo) * a_width
+    sel = "replay_q[%d:0]" % (a_width - 1)
+    for p_ in range(lo + 1, passes):
+        sel = "(replay_pass == 16'd%d) ? replay_q[%d:%d] : %s" % (
+            p_, (p_ - lo + 1) * a_width - 1, (p_ - lo) * a_width, sel)
+    fresh = "(replay_pass == 16'd0) && (replay_grp == 16'd0)" if fold_n else "(replay_pass == 16'd0)"
+    if fold_n:
+        grp_decl = """
+    // N-group of the frame on the port, stepped at real frame boundaries only
+    // (same cadence as the weight ROM's grp_ctr).
+    reg [15:0] replay_grp;
+    reg replay_was_feeding;"""
+        grp_reset = """
+            replay_grp <= 16'd0;
+            replay_was_feeding <= 1'b0;"""
+        grp_idle = f"""
+                if (replay_was_feeding)
+                    replay_grp <= (replay_grp + 16'd1 >= 16'd{n_passes}) ? 16'd0 : replay_grp + 16'd1;
+                replay_was_feeding <= 1'b0;"""
+        grp_feeding = """
+                replay_was_feeding <= 1'b1;"""
+    else:
+        grp_decl = grp_reset = grp_idle = grp_feeding = ""
+    if m == 1:
+        store_decl = f"    reg [{replay_width-1}:0] replay_q;"
+        addr_decl = addr_reset = addr_hold = addr_step = ""
+        store_write = f"replay_q <= a_rows[{a_port_width-1}:{lo * a_width}];"
+    else:
+        store_decl = (f"    reg [{replay_width-1}:0] replay_mem [0:{m-1}];\n"
+                      f"    wire [{replay_width-1}:0] replay_q = replay_mem[replay_addr];")
+        addr_decl = """
+    // replay_addr is a plain single-driver register used only as the memory
+    // index so VTR's parmys infers a RAM block; it holds at the last row over
+    // the padding beats.
+    reg [15:0] replay_addr;"""
+        addr_reset = """
+            replay_addr <= 16'd0;"""
+        addr_hold = """
+                replay_addr <= 16'd0;"""
+        addr_step = f"""
+                if (replay_beat + 16'd1 < 16'd{m}) replay_addr <= replay_addr + 16'd1;"""
+        store_write = f"replay_mem[replay_addr] <= a_rows[{a_port_width-1}:{lo * a_width}];"
+    # No padding beats when the pass is exactly m rows long (M >= N layers):
+    # the row-valid compare and the zero mux drop out of the a_rows_q path.
+    padded = int(input_beats) > m
+    row_valid = f" && (replay_beat < 16'd{m})" if padded else ""
+    replay_row = f"(replay_beat < 16'd{m}) ? ({sel}) : {a_width}'d0" if padded else sel
+    block = f"""
+    // A-row replay: the row on the port this cycle is replay_beat of K pass
+    // replay_pass, both cleared by the frame's in_valid=0 preload beat. Fresh
+    // rows are stored as they pass; the read lands in a_rows_q on the same edge
+    // port data would, so latency is unchanged. Contents need no reset.
+    reg [15:0] replay_beat;
+    reg [15:0] replay_pass;{addr_decl}{grp_decl}
+    always @(posedge clk) begin
+        if (rst) begin
+            replay_beat <= 16'd0;
+            replay_pass <= 16'd0;{addr_reset}{grp_reset}
+        end else if (en) begin
+            if (!in_valid) begin
+                replay_beat <= 16'd0;
+                replay_pass <= 16'd0;{addr_hold}{grp_idle}
+            end else if (replay_beat < 16'd{input_beats - 1}) begin
+                replay_beat <= replay_beat + 16'd1;{addr_step}{grp_feeding}
+            end else begin
+                replay_beat <= 16'd0;
+                replay_pass <= replay_pass + 16'd1;{addr_hold}{grp_feeding}
+            end
+        end
+    end
+{store_decl}
+    wire replay_fresh = {fresh};
+    always @(posedge clk) begin
+        if (en && in_valid && replay_fresh{row_valid})
+            {store_write}
+    end
+    wire [{a_width-1}:0] replay_row = {replay_row};
+"""
+    return a_port_width, block, f"replay_fresh ? a_rows[{a_width-1}:0] : replay_row"
+
+
 def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
                                     feed_mode="chained", debug=False,
                                     weight_rom=None, emit_rom=True, n_passes=1,
                                     s1=0, s2=0, out_width=16, bias_codes=None, emit_bias_rom=True,
                                      bias_rom_name="bias_rom", a_zero_point=0, b_zero_point=0,
                                      a_zero_point_correct=None, b_zero_point_correct=None,
-                                     m_passes=1, logical_m=None, logical_n=None):
+                                     m_passes=1, logical_m=None, logical_n=None,
+                                     a_replay_n_passes=None):
     """Unified internal SYNTH emitter (jojo-track/open/tensor-slice-general-synth-grid,
     sub-phase 2a-ii).
 
@@ -427,6 +532,11 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     # One pass per K chunk (k_spatial == 1 on this branch); pad short shapes
     # so consecutive pass starts stay >= 8 cycles apart.
     input_beats = _geometry.feed_beats(m, n, (k + 7) // 8)
+    # The combined core calls this emitter with n_passes left at 1 (its ROMs
+    # are hoisted), so the A replay's N-group count arrives separately.
+    a_port_width, a_replay_block, a_rows_src = _a_replay_block(
+        a_width, (k + 7) // 8,
+        n_passes if a_replay_n_passes is None else a_replay_n_passes, m, input_beats)
     # The slice emits 8 physical rows per tile.  The wrapper retires after M
     # logical rows and uses op[1] to truncate the masked remainder.
     logical_output_rows = m
@@ -649,7 +759,7 @@ module {module_name}(
     input  wire                   clk,
     input  wire                   rst,
     input  wire                   en,
-    input  wire [{a_width-1}:0]   a_rows,
+    input  wire [{a_port_width-1}:0]   a_rows,
 {b_cols_port}    input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
@@ -703,6 +813,7 @@ module {module_name}(
     // Register the whole input bundle (en-gated, so the core stays self-timed),
     // keeping the beat decode and data gating muxes off the path into the
     // tensor_slice input pins.
+{a_replay_block}
     reg [{a_width-1}:0] a_rows_q;
     reg [{b_width-1}:0] b_cols_q;
     reg preload_valid_q;
@@ -718,7 +829,7 @@ module {module_name}(
             // Symmetric-only quantization scope: operands reach the slices
             // unflipped (signed codes straight through; padding K lanes are
             // raw 0 on the wire).
-            a_rows_q        <= a_rows;
+            a_rows_q        <= {a_rows_src};
             b_cols_q        <= {b_cols_q_src};
             preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;
@@ -883,7 +994,7 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
                            s1=0, s2=0, out_width=16, bias_codes=None, emit_bias_rom=True,
                            bias_rom_name="bias_rom", a_zero_point=0, b_zero_point=0,
                            a_zero_point_correct=None, b_zero_point_correct=None,
-                           m_passes=1, logical_m=None, logical_n=None):
+                           m_passes=1, logical_m=None, logical_n=None, a_replay_n_passes=None):
     """Public entry point: k_spatial=1 (K-in-time) branch of the unified
     ``_generate_general_synth_verilog``. See that function's docstring for
     the unification contract. Thin wrapper -- signature unchanged (m_passes/
@@ -898,6 +1009,7 @@ def generate_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", feed_mode="
         bias_rom_name=bias_rom_name, a_zero_point=a_zero_point, b_zero_point=b_zero_point,
         a_zero_point_correct=a_zero_point_correct, b_zero_point_correct=b_zero_point_correct,
         m_passes=m_passes, logical_m=logical_m, logical_n=logical_n,
+        a_replay_n_passes=a_replay_n_passes,
     )
 
 
@@ -963,7 +1075,8 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
                                            bias_codes=bias_codes, emit_bias_rom=False,
                                            a_zero_point=a_zero_point, b_zero_point=b_zero_point,
                                            a_zero_point_correct=a_zero_point_correct,
-                                           b_zero_point_correct=b_zero_point_correct)
+                                           b_zero_point_correct=b_zero_point_correct,
+                                           a_replay_n_passes=n_passes)
         b_width = ((n + 7) // 8) * 64
         input_beats = _geometry.feed_beats(m, n, (k + 7) // 8)
         header, syn_body = _split_module(synth_top, module_name)   # header incl. 'module..);'
@@ -988,7 +1101,8 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
     synth_top = generate_synth_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width,
                                        a_zero_point=a_zero_point, b_zero_point=b_zero_point,
                                        a_zero_point_correct=a_zero_point_correct,
-                                       b_zero_point_correct=b_zero_point_correct)
+                                       b_zero_point_correct=b_zero_point_correct,
+                                       a_replay_n_passes=n_passes)
 
     lines = []
     lines.append("// Auto-generated by rtl.py")
@@ -1071,6 +1185,8 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
     b_chunk_width = 64
     c_width = grid_cols * 8 * out_width
     input_beats = _geometry.feed_beats(m, n, passes)
+    a_port_width, a_replay_block, a_rows_src = _a_replay_block(
+        a_width, passes, n_passes, m, input_beats)
     # K-spatial uses the same logical-row retirement contract as the chunked
     # wrapper; physical 8-row bursts are aborted after logical M.
     logical_output_rows = m
@@ -1308,7 +1424,7 @@ module {module_name}(
     input  wire                   clk,
     input  wire                   rst,
     input  wire                   en,
-    input  wire [{a_width-1}:0]   a_rows,
+    input  wire [{a_port_width-1}:0]   a_rows,
 {ksp_b_cols_port}    input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
@@ -1359,6 +1475,7 @@ module {module_name}(
     // the whole bundle en-gated so the beat decode + partition gating muxes
     // start from local registers instead of chaining from the Catapult
     // wrapper into the tensor_slice input pins.
+{a_replay_block}
     reg [{a_width-1}:0] a_rows_q;
     reg [{b_width-1}:0] b_cols_q;
     reg preload_valid_q;
@@ -1371,7 +1488,7 @@ module {module_name}(
             preload_valid_q <= 1'b0;
             in_valid_q      <= 1'b0;
         end else if (en) begin
-            a_rows_q        <= a_rows;
+            a_rows_q        <= {a_rows_src};
             b_cols_q        <= {ksp_b_cols_src};
             preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;
@@ -1556,6 +1673,8 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
     b_width = 64 * k_spatial
     c_width = grid_cols * 8 * out_width
     input_beats = _geometry.feed_beats(m, n, passes)
+
+    a_port_width, a_replay_block, a_rows_src = _a_replay_block(a_width, passes, n_passes, m, input_beats)
 
     if ws:
         b_cols_port = ""
@@ -1764,7 +1883,7 @@ module {module_name}(
     input  wire                   clk,
     input  wire                   rst,
     input  wire                   en,
-    input  wire [{a_width-1}:0]   a_rows,
+    input  wire [{a_port_width-1}:0]   a_rows,
 {b_cols_port}    input  wire                   preload_valid,
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
@@ -1826,7 +1945,7 @@ module {module_name}(
 
 {chr(10).join(row_mask_lines)}
 {chr(10).join(col_mask_lines)}
-
+{a_replay_block}
     reg [{a_width-1}:0] a_rows_q;
     reg [{b_width-1}:0] b_cols_q;
     reg preload_valid_q;
@@ -1839,7 +1958,7 @@ module {module_name}(
             preload_valid_q <= 1'b0;
             in_valid_q      <= 1'b0;
         end else if (en) begin
-            a_rows_q        <= a_rows;
+            a_rows_q        <= {a_rows_src};
             b_cols_q        <= {b_cols_src};
             preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;

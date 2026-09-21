@@ -5,6 +5,7 @@ RF is purely "number of passes over K" -- never a cycle count or an
 initiation interval. See geometry.resolve_reuse_factor / package
 pass 2 for the full model.
 """
+import re
 import json
 import shutil
 import sys
@@ -149,15 +150,17 @@ def test_generate_catapult_pkg_reuse_factor_weight_stationary(scratch_dir, reuse
     assert (pkg_dir / f"{name}_core.v").is_file()
     # passes == expect_replay_size at k=24 (k_chunks=3) for rf in {1,2,3}:
     #   rf=1 -> passes=1, rf=2 -> passes=2, rf=3 -> passes=3.
-    # Slot 0 (fed directly from the stream) is never stored, so the buffer
-    # holds only the passes-1 replayed passes, each of the m A rows wide.
-    # At passes == 1 (full-K, rf=1) there is nothing to replay: no a_replay
-    # buffer is declared at all.
+    # The A-row replay lives in the core, never in a C array: the a_rows port
+    # carries all `passes` slices of a row, and the core stores the passes-1
+    # later ones, m rows deep. At passes == 1 there is nothing to replay.
+    core = (pkg_dir / f"{name}_core.v").read_text()
+    assert "a_replay" not in header
+    a_slice = int(re.search(r"reg \[(\d+):0\] a_rows_q;", core).group(1)) + 1
+    assert f"ac_int<{expect_replay_size * a_slice}, false>  a_rows," in header
     if expect_replay_size == 1:
-        assert "a_replay" not in header
+        assert "replay_mem" not in core
     else:
-        assert f"a_replay[{expect_replay_size - 1}][{m}]" in header
-
+        assert f"reg [{(expect_replay_size - 1) * a_slice - 1}:0] replay_mem [0:{m - 1}];" in core
 
 def test_generate_catapult_pkg_manifest_fields_via_flow(scratch_dir):
     """The batch manifest path (flow.normalize_config + gen_integration_manifest)
