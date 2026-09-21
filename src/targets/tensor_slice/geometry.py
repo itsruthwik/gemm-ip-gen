@@ -480,10 +480,10 @@ def combined_fold_cycles(core_m, k, core_n, k_spatial, m_passes=1, n_passes=1):
     - ``first_out`` == ``latency_first_out(core_m, k, core_n, k_spatial)``:
       the first group's first-output offset (fill + wave latency), unaffected
       by frame count.
-    - ``interval`` == ``k_passes * feed_beats(core_m, core_n, passes) + 1``:
-      the steady-state
-      frame period (matches the README's single-axis ``II`` formula) -- one
-      group's feed window plus the pipeline-register cycle. Every frame here
+    - ``interval`` == ``k_passes * feed_beats(core_m, core_n, passes)`` (+ 1
+      when K is a single pass): the steady-state frame period -- one group's
+      feed window, frames being gapless on the combined-fold core once K takes
+      two or more passes (no preload beat). Every frame here
       shares the same core size, so this holds across all ``frames`` groups;
       drain(g) (``core_m`` rows) is hidden under compute(g+1) because the
       generator design keeps ``TOTAL_ROWS <= interval`` (drain never outruns
@@ -503,7 +503,9 @@ def combined_fold_cycles(core_m, k, core_n, k_spatial, m_passes=1, n_passes=1):
     passes = k_passes(k, k_spatial)
     total_input_beats = passes * feed_beats(core_m, core_n, passes)
     first_out = latency_first_out(core_m, k, core_n, k_spatial)
-    interval = total_input_beats + 1
+    # Combined-fold frames are gapless once K takes two or more passes (the
+    # core has no preload stage); a one-pass frame keeps one idle beat.
+    interval = total_input_beats + (0 if passes >= 2 else 1)
     latency = first_out + core_m
     total_cycles = latency + (frames - 1) * interval
     return {

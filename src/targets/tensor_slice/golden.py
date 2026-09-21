@@ -421,6 +421,15 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
         b_bytes = 8 * k_spatial
     # Bias is compile-time now (decision 4): no bias_cols port/width at all.
     c_bytes = grid_cols * out_width // 8
+    # The combined-fold core has no preload stage and, with K in two or more
+    # passes, takes gapless frames; one-pass frames and the single-axis cores
+    # keep one in_valid=0 beat per frame.
+    tb_preload = "" if (combined_fold and passes >= 2) else """\
+            // Preload (bias is compile-time now, baked into the core)
+            preload_valid <= 1;
+            @(posedge clk);
+            preload_valid <= 0;
+"""
     # A-row replay lives in the core: a row's K-pass slices all ride its pass-0
     # beat (slice p at bit p*slice_width) and every beat that re-uses the row --
     # later K passes, and whole frames of a later N-group -- carries zeros.
@@ -484,11 +493,7 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
                 @(posedge clk);
             end
 
-            // Preload (bias is compile-time now, baked into the core)
-            preload_valid <= 1;
-            @(posedge clk);
-            preload_valid <= 0;
-
+{tb_preload}
             // Feed data
             in_valid <= 1;
             a_rows <= a_stim[vec_idx][0];
@@ -505,9 +510,10 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
 
             // True back-to-back cadence: the structural wrapper pipelines
             // frames (feed of frame t+1 overlaps compute/drain of frame t), so
-            // the next vector's preload follows immediately — the only gap is
-            // the preload step itself, giving a sustained frame II of
-            // TOTAL_INPUT_BEATS+1 cycles.
+            // the next vector follows immediately — after its one preload step
+            // on the single-axis cores (frame II TOTAL_INPUT_BEATS+1), with no
+            // gap at all on the combined-fold core (frame II TOTAL_INPUT_BEATS:
+            // in_valid is re-asserted before the next clock edge).
         end
 
         // Wait for all out_last events
@@ -576,11 +582,7 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
                 @(posedge clk);
             end
 
-            // Preload (bias is compile-time now, baked into the core)
-            preload_valid <= 1;
-            @(posedge clk);
-            preload_valid <= 0;
-
+{tb_preload}
             // Feed data
             in_valid <= 1;
             a_rows <= a_stim[vec_idx][0];

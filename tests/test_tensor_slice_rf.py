@@ -151,8 +151,9 @@ def test_generate_catapult_pkg_reuse_factor_weight_stationary(scratch_dir, reuse
     # passes == expect_replay_size at k=24 (k_chunks=3) for rf in {1,2,3}:
     #   rf=1 -> passes=1, rf=2 -> passes=2, rf=3 -> passes=3.
     # The A-row replay lives in the core, never in a C array: the a_rows port
-    # carries all `passes` slices of a row, and the core stores the passes-1
-    # later ones, m rows deep. At passes == 1 there is nothing to replay.
+    # carries all `passes` slices of a row, and the core stores the live K
+    # lanes of the passes-1 later ones (k*8 bits minus pass 0's slice), m rows
+    # deep. At passes == 1 there is nothing to replay.
     core = (pkg_dir / f"{name}_core.v").read_text()
     assert "a_replay" not in header
     a_slice = int(re.search(r"reg \[(\d+):0\] a_rows_q;", core).group(1)) + 1
@@ -160,7 +161,7 @@ def test_generate_catapult_pkg_reuse_factor_weight_stationary(scratch_dir, reuse
     if expect_replay_size == 1:
         assert "replay_mem" not in core
     else:
-        assert f"reg [{(expect_replay_size - 1) * a_slice - 1}:0] replay_mem [0:{m - 1}];" in core
+        assert f"reg [{k * 8 - a_slice - 1}:0] replay_mem [0:{m - 1}];" in core
 
 def test_generate_catapult_pkg_manifest_fields_via_flow(scratch_dir):
     """The batch manifest path (flow.normalize_config + gen_integration_manifest)
