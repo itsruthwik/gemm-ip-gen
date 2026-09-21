@@ -50,7 +50,7 @@ def _normalize_mvau_items(cfg):
             "bias_precision": it.get("bias_precision"),
             "clock_period_ns": it.get("clock_period_ns"),
             "part": it.get("part"),
-            "weights_in_core": bool(it.get("weights_in_core", False)),
+            "weights_in_core": bool(it.get("weights_in_core", True)),
             "weight_file": it.get("weight_file"),
             # ROM layout hls4ml wrote the .dat in; the CLI refuses anything the target
             # does not consume (Target.weight_layouts).

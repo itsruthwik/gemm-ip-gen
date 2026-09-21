@@ -5,7 +5,7 @@ Generalizes the cosim-validated ``temp_space/mvau-spike``. Per package ``<name>`
     <name>_core.v      shim (FINN mvu_vvu_axi wrapped) -- module name == c_function_name
     <name>_core.cpp    the C twin (blackbox behavioral model, csim)
     <name>_top.cpp     the DUT: feed -> blackbox -> drain, in a HLS dataflow region
-    <name>.json        blackbox descriptor (FIFO ports, ap_ctrl_none, CE, 5 ap_ctrl keys)
+    <name>.json        blackbox descriptor (FIFO ports, CE, the 5 ap_ctrl_chain_protocol_* keys)
     <name>_tb.cpp      self-checking testbench
     <name>_gemm_ip.h   hls4ml-facing adapter (minimal for now)
     run_vitis.tcl      csim + csynth + cosim

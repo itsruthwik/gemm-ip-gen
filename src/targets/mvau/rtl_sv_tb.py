@@ -10,13 +10,17 @@ output under temp_space/mvau-ws and the mvu_vvu_axi shim sources):
 
   ws       -- weight-stationary: ap_ctrl_chain + a_dout/a_empty_n/a_read +
               p_din/p_full_n/p_write. One raw K-wide beat in, one raw N-wide
-              beat out, per vector. No weight port (baked memstream).
+              beat out, per vector. No weight port (baked memstream). Control
+              is the decoupled handshake (_decoupled_ctrl): input/output beat
+              counters with an inflight cap, so consecutive nodes overlap.
   2op      -- two-operand, single-tile (``dynamic_load_2op``, any depth incl.
-              the fully-spatial DEPTH==1 case): same ap_ctrl_chain + a_*/p_*
-              as ws, PLUS b_dout/b_empty_n/b_read. B is the loader's own
-              narrow beat (PE-wide Mode A / SIMD-wide Mode B), A is SF
-              beats/vector of byte-aligned SIMD*AW bits, P is NF beats/vector
-              of byte-aligned PE*out_width bits (SF==NF==1 -> one beat each).
+              the fully-spatial DEPTH==1 case): same ap_ctrl_chain pins as ws,
+              PLUS b_dout/b_empty_n/b_read. B is the loader's own narrow beat
+              (PE-wide Mode A / SIMD-wide Mode B), A is SF beats/vector of
+              byte-aligned SIMD*AW bits, P is NF beats/vector of byte-aligned
+              PE*out_width bits (SF==NF==1 -> one beat each). Control is its
+              own per-node ``run_r`` register (generate_two_operand_shim): one
+              invocation in flight at a time, no overlap.
 
 Stimulus/expected values reuse the exact deterministic generators golden.py's
 C-twin testbenches use (``_ws_tb``/``_2op_tb`` in golden.py): same seeded
