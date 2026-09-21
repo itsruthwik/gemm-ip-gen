@@ -246,6 +246,27 @@ def test_bias_scaled_and_added(tmp_path):
     assert "gb_core_bias" not in top
 
 
+def test_truncating_result_floors_through_the_bias_codes(tmp_path):
+    # The requant stage only rounds half-up; floor(x / 2^s) == round_half_up(x - 2^(s-1), s),
+    # so a TRN result gets the half folded into the baked codes. Product frac 8, result
+    # frac 6: shift 2, half 2.
+    bias = [0.5, -0.25, 0.0, 0.25, 1.0, -1.0, 0.75, -0.5]
+    pkg = _gen(tmp_path, (2, 8, 8), "gt", reuse_factor=1, bias=bias,
+               output_precision="fixed<12,6,TRN,WRAP,0>")
+    core = (pkg / "gt_core.cpp").read_text()
+    assert "static const long gt_core_bias[8] = {126, -66, -2, 62, 254, -258, 190, -130}" in core
+    # A bias-free TRN layer still needs the half, so the codes are created for it.
+    pkg = _gen(tmp_path, (2, 8, 8), "gtn", reuse_factor=1, has_bias=False,
+               output_precision="fixed<12,6,TRN,WRAP,0>")
+    assert "static const long gtn_core_bias[8] = {-2, -2, -2, -2, -2, -2, -2, -2}" in (
+        pkg / "gtn_core.cpp").read_text()
+    # A rounding result keeps the plain codes.
+    pkg = _gen(tmp_path, (2, 8, 8), "gr", reuse_factor=1, bias=bias,
+               output_precision="fixed<12,6,RND,WRAP,0>")
+    assert "static const long gr_core_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in (
+        pkg / "gr_core.cpp").read_text()
+
+
 def test_no_bias_omits_array(tmp_path):
     # has_bias=False (the manifest's own field) is the gate for "no bias" -- not
     # whether a bias value happens to be given.

@@ -21,6 +21,7 @@ from . import geometry as _geom
 from . import rtl as _rtl
 from . import golden as _golden
 from . import weightpack as _wpack
+from gemm_ip.quant import _truncates
 
 _RTL_STATIC = Path(__file__).resolve().parent / "rtl_static"
 # memstream is the weight-stationary weight ROM (baked from <name>_weights.dat);
@@ -497,7 +498,7 @@ def _2op_dataflow_top(name, plan):
     passthrough of A, the affine requant drain (no bias; act×act product scale
     ``fa+fb``), and a ``feed_b`` gearbox that reindexes hls4ml's wide B beat down to
     ``dynamic_load_2op``'s narrow input beat -- AT MOST a 1-wide-beat register, no
-    reorder buffer (see jojo-track/defer/mvau-two-operand-dynamic-load/plan.md,
+    reorder buffer (see jojo-track/archive/mvau-two-operand-dynamic-load/plan.md,
     "Input width gearbox").
 
     Mode A (``mode=0``, row-major B): one N-wide K-row arrives per beat (K beats
@@ -622,7 +623,7 @@ def _2op_gemm_ip_header(name, plan):
     (repack A -> shim activations, repack B -> the loader's narrow beat via the HLS
     feed_b gearbox, internal MVU blackbox, requant drain). Single-tile only -- 2-op
     only ever folds within one MVU tile (no N/K-tiling; see
-    jojo-track/defer/mvau-two-operand-dynamic-load/plan.md's "Cleanup: collapse 2-op
+    jojo-track/archive/mvau-two-operand-dynamic-load/plan.md's "Cleanup: collapse 2-op
     to a single dynamic_load_2op tile"), any depth including the fully-spatial
     DEPTH==1 case (SF=NF=1), both B-layout modes (``SecondOperandRowMajor``)."""
     t = plan["tile"]
@@ -703,7 +704,7 @@ void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res
 
     # repack B: reindex hls4ml's wide beat down to the loader's narrow beat (the HLS
     # feed_b gearbox -- see rtl.py's dynamic_load_2op instantiation and
-    # jojo-track/defer/mvau-two-operand-dynamic-load/plan.md, "Input width gearbox").
+    # jojo-track/archive/mvau-two-operand-dynamic-load/plan.md, "Input width gearbox").
     # Materializes AT MOST one arriving wide beat (a 1xN or 1xK register), never a
     # reorder buffer. Padding (K -> KPAD rows for Mode A, N -> PE*NF columns for Mode
     # B) is a zero-filled pass with no stream read, matching the old zero-pad semantics
@@ -852,7 +853,7 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     loaded at runtime into the forked ``dynamic_load_2op`` module (double-buffered
     ping-pong), replayed across the M rows of A. No baked weights; no bias. 2-op
     only ever folds within ONE MVU tile -- no N/K-tiling (see
-    jojo-track/defer/mvau-two-operand-dynamic-load/plan.md's "Cleanup: collapse
+    jojo-track/archive/mvau-two-operand-dynamic-load/plan.md's "Cleanup: collapse
     2-op to a single dynamic_load_2op tile"); any depth (including the
     fully-spatial DEPTH==1 case), both B-layout modes."""
     if cfg.get("interface") == "array":
@@ -1025,6 +1026,15 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
     _has_bias_default = _bias is not None and any(_bias)
     bias_codes = _wpack.bias_acc_codes(_bias, plan["product_frac"], plan["n"],
                                        bool(cfg.get("has_bias", _has_bias_default)))
+    # Truncating (TRN) result: the requant stage only rounds half-up, and
+    # floor(x / 2^s) == round_half_up(x - 2^(s-1), s), so the half is folded into the
+    # baked bias codes (created for a bias-free layer). One list feeds the RTL ROM,
+    # the C twin and the testbench, so all three floor together.
+    _shift = plan["product_frac"] - plan["output_frac"]
+    if _truncates(cfg.get("output_precision")) and _shift > 0:
+        _half = 1 << (_shift - 1)
+        bias_codes = [int(c) - _half for c in (bias_codes if bias_codes is not None
+                                               else [0] * plan["n"])]
 
     # FORCE_BEHAVIORAL=0 -> real DSP48/DSP58 primitives (impl-ready; cosim runs them via
     # XSIM unisim models). Set force_behavioral=True in cfg for unisim-free behavioral cosim.
