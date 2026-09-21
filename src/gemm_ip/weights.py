@@ -144,21 +144,28 @@ def build_weight_rom_combined_fold(B_full, m, core_n, k, k_spatial, n_passes):
     masking is identical, already validated there), but re-orders the result
     into CHUNK-major / N-GROUP-minor layout (``build_weight_rom_fold_n`` is
     N-GROUP-major / chunk-minor) to match the combined emitter's address
-    ordering. Degenerate reductions:
-      - ``n_passes == 1``: single N-group -> byte-identical to
-        ``build_weight_rom_fold_n(B_full, m, core_n, k, k_spatial, 1)``.
-      - ``k_spatial == 1`` and ``n_passes == 1``: -> byte-identical to
-        ``build_weight_rom(B_full, m, core_n, k)``.
-      - ``k_spatial == k_chunks`` (one K-pass) and ``n_passes == 1``: ->
-        byte-identical to ``build_weight_rom_full_k(B_full, m, core_n, k)``.
+    ordering.
+
+    Every word uses the NARROW layout (``64*k_spatial`` bits, no grid tile
+    offset), at ``k_spatial == 1`` too: the combined-fold core and its C twin
+    read a narrow word at every ``k_spatial``, whereas
+    :func:`build_weight_rom_k_spatial` falls back to the chunked wide word
+    there, which puts column ``t`` in tile ``t // 8`` and so reads as zero for
+    every column past the first tile. With ``k_spatial > 1`` and
+    ``n_passes == 1`` the result is byte-identical to
+    ``build_weight_rom_fold_n(B_full, m, core_n, k, k_spatial, 1)``.
     """
+    from targets.tensor_slice.golden import pack_b_k_spatial_narrow
+
     B_full = np.asarray(B_full)
     k_chunks = (k + 7) // 8
     passes = -(-k_chunks // k_spatial)
     rom = [0] * (passes * n_passes * core_n)
     for ng in range(n_passes):
         Bg = B_full[:, ng * core_n:(ng + 1) * core_n]
-        sub = build_weight_rom_k_spatial(Bg, m, core_n, k, k_spatial)  # pass-major, len passes*core_n
+        # pass-major, len passes*core_n
+        sub = [int(pack_b_k_spatial_narrow(Bg, t, pass_idx, core_n, k, k_spatial))
+               for pass_idx in range(passes) for t in range(core_n)]
         for chunk_idx in range(passes):
             dst = (chunk_idx * n_passes + ng) * core_n
             src = chunk_idx * core_n
