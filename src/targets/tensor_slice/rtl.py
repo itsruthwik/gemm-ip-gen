@@ -2004,8 +2004,11 @@ module {module_name}(
                 if (out_row_count + 16'd1 == drain_rows) begin
                     out_row_count <= 16'd0;
                     frames_emitted <= frames_emitted + 16'd1;
+                    // Wrap to the first group: the next inference drains from
+                    // group 0 again (holding the last group would give every
+                    // later inference the last N-group's bias).
                     drain_frame <= (drain_frame + 16'd1 == 16'd{total_frames}) ?
-                        drain_frame : drain_frame + 16'd1;
+                        16'd0 : drain_frame + 16'd1;
                 end
             end
         end
