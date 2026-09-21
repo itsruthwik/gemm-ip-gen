@@ -63,8 +63,10 @@ def _drain_pipeline_fn(m, t):
 
 def _glue_pipeline_loop(m):
     """Loop-level PIPELINE for the row loop when a node is M > 1 rows: one row
-    per cycle inside the frame; the per-frame handshake is amortised over M."""
-    return "" if int(m) == 1 else "        #pragma HLS PIPELINE II=1\n"
+    per cycle inside the frame; the per-frame handshake is amortised over M.
+    Flushable (flp): a stalling auto-rewind pipeline deeper than one stage holds
+    the frame's last row until the next frame's first beat arrives."""
+    return "" if int(m) == 1 else "        #pragma HLS PIPELINE II=1 style=flp\n"
 
 
 def _with_timescale(text):
@@ -698,6 +700,7 @@ void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res
     typedef typename res_T::value_type result_t;
     res_T crow;
     for (unsigned bt = 0; bt < {m * NF}; bt++) {{
+        #pragma HLS PIPELINE II=1 style=flp
 {drain_body}
     }}
 }}"""
