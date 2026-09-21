@@ -190,14 +190,32 @@ column (`c_bits = GRID_COLS * 8 * out_width`).
   wrap to 16 bits. `S1` is an IP parameter set out of band; the generator
   records it as a comment above each instantiation (VTR's hard-block model has
   no parameters, so it is not a Verilog override). `S1 = 0` is a pass-through
-  and is the normal case: the generator derives `S1` from the layer's
-  `accum_t` as the smallest shift that makes the gemm-scale accumulator fit
-  16 bits, and warns when it is nonzero (that layer double-rounds).
+  (no rounding) and is the normal case: the generator derives `S1` from the
+  layer's `accum_t` as the smallest shift that makes the gemm-scale accumulator
+  fit 16 bits.
 - **Stage 2, in the wrapper.** The 16-bit partials of the K partitions are
   summed in 16-bit wrapping arithmetic (one term in the chunked path), the
   bias is added at that intermediate scale (`frac_a + frac_b - S1`), then a
   round-half-up shift by `S2` and a wrap to `out_width`. `S1 + S2 =
   frac_a + frac_b - frac_out`. No saturation anywhere.
+
+The requant is meant to be **one exact step in the result type's own mode**
+(`RND` = round half up, `TRN` = floor), and the generator picks `S1`/`S2` to
+get there:
+
+- `S1 = 0`: stage 2 does the whole shift. For a `TRN` result the floor is
+  `floor(x / 2^S2) = round_half_up(x - 2^(S2-1), S2)`, so the generator folds
+  `-2^(S2-1)` into the baked bias codes (creating them for a bias-free layer);
+  the emitters keep a single stage-2 form.
+- `S1 > 0` on an `RND` result: the whole shift moves into the slice (`S1 =
+  frac_a + frac_b - frac_out`, `S2 = 0`) so it rounds once. The bias then lands
+  at the output scale, so this needs a bias-free layer or a bias no finer than
+  the result.
+- Otherwise (`S1 > 0` with a `TRN` result, or with a bias finer than the
+  result) the two-stage path stays and can differ from the reference by one
+  output LSB; the generator warns. The same holds for `S1 > 0` with
+  `k_spatial > 1`, where every K partition is rounded before the partials are
+  summed; folding K fully in time avoids it.
 
 The bias is a **compile-time constant**: one 16-bit signed lane per column,
 baked into the core as a flat `wire` from the same codes list the C behavioral

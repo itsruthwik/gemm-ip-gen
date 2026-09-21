@@ -61,6 +61,15 @@ def _output_bits(output_precision):
     return int(m.group(1)) if m else 8
 
 
+def _truncates(precision):
+    """True iff a precision like 'fixed<10,5,TRN,WRAP,0>' names the truncating
+    (floor) quantization mode explicitly. Anything else -- RND, or no mode field --
+    keeps the round-half-up requant the GEMM cores have always applied."""
+    if not precision:
+        return False
+    return bool(re.search(r"fixed<[^>]*,\s*(?:AC_)?TRN\b", str(precision)))
+
+
 def _accum_shift_bits(accum_precision, gemm_frac):
     """Bit width needed to hold ``accum_precision`` re-expressed with ``gemm_frac``
     fraction bits (sign included), i.e. the width of the GEMM-scale accumulator

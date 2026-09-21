@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from gemm_ip.common import _is_ac_integer_type
-from gemm_ip.quant import _frac_bits, _operand_bits, _output_bits, _accum_shift_bits
+from gemm_ip.quant import _frac_bits, _operand_bits, _output_bits, _accum_shift_bits, _truncates
 
 from . import geometry as _geometry
 
@@ -2287,11 +2287,29 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             f"{name}: accum_precision needs S1={s1} bits of in-slice pre-rounding, "
             f"more than the total gemm->result shift ({_total_shift}); the output "
             "needs more than 16 bits of range at the gemm scale.")
-    if s1 > 0:
-        print(f"WARNING: {name}: accum_t forces S1={s1} (in-slice pre-round); "
-              "the phase-1 sim model folds the whole contraction before rounding, "
-              "so this double-rounds against the per-partition synth behavior -- "
-              "see jojo-track/open/tensor-slice-bias-in-rtl.", file=sys.stderr)
+    # The slice rounds half-up for any non-zero shift_amount and passes the raw
+    # low 16 bits through at 0, so a single exact requant is reachable two ways:
+    #   - S1 == 0: the wrapper (stage 2) does the whole shift in the result type's
+    #     own mode, round-half-up for RND, floor for TRN;
+    #   - S1 > 0 on an RND result: the whole shift moves into the slice (S1 = T,
+    #     S2 = 0) so it rounds once. The bias is then added at the output scale, so
+    #     this needs a bias-free layer or a bias no finer than the result.
+    # Anything else keeps the two-stage path, which can differ by one output LSB.
+    _trn = _truncates(output_precision)
+    _bias_fine = bool(has_bias) and _frac_bits(bias_precision) > _out_frac
+    if s1 > 0 and not _trn and not _bias_fine:
+        s1 = _total_shift
+    elif s1 > 0:
+        _why = ("a truncating (TRN) result" if _trn
+                else "a bias finer than the result scale")
+        print(f"WARNING: {name}: accum_t forces S1={s1} (in-slice round-half-up) on "
+              f"{_why}; the requant cannot be a single exact step and may differ "
+              "from the reference by one output LSB.", file=sys.stderr)
+    if s1 > 0 and int(k_spatial) > 1:
+        print(f"WARNING: {name}: S1={s1} with k_spatial={k_spatial}: every K partition "
+              "is rounded on its own before the 16-bit partials are summed, which may "
+              "differ from the reference by one output LSB. Fold K fully in time "
+              "(k_spatial 1) for an exact result.", file=sys.stderr)
     s2 = _total_shift - s1
     # gen_inst_cpp/gen_tb's own self-check reference is a single-round
     # formula (gemm_acc rounded once by the TOTAL shift). Identical to the
@@ -2326,6 +2344,13 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
                 f"{name}: bias code(s) {_bad} do not fit the 16-bit stage-2 "
                 f"intermediate scale (2^{_intermediate_frac} fractional bits) -- "
                 "reduce the bias magnitude or accum_precision's fractional bits.")
+    if _trn and s2 > 0:
+        # Truncating result: floor(x / 2^S2) == round_half_up(x - 2^(S2-1), S2), and
+        # stage 2 already adds a baked 16-bit wrapping constant before its round, so
+        # the half goes into the bias codes (one list feeds the ROM and the C twins).
+        _half2 = 1 << (s2 - 1)
+        _codes = bias_codes if bias_codes is not None else [0] * (n_passes * core_n if fold_n else core_n)
+        bias_codes = [((int(c) - _half2 + 32768) % 65536) - 32768 for c in _codes]
 
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
