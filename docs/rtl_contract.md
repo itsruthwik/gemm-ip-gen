@@ -10,17 +10,16 @@ B = transposed weight columns   (K x N)
 C = A @ B + bias                (M x N)
 ```
 
-Simulation and synthesis use a single combined RTL file (`{name}_core.v`)
-with an `ifndef SYNTHESIS` guard:
-
-- `ifndef SYNTHESIS` — behavioral GEMM model (double-buffer, row/col streaming,
-  shadow FIFO for pipelined back-to-back). Used for iverilog regression and
-  Catapult SCVerify co-simulation.
-- `else` — structural grid of black-box `tensor_slice_int8` tiles. Used for
-  Catapult HLS synthesis and downstream implementation.
+Simulation and synthesis share a single structural RTL file (`{name}_core.v`):
+a grid of black-box `tensor_slice_int8_atlas` tiles, one source of truth for
+iverilog regression, Catapult SCVerify co-simulation, Catapult HLS synthesis,
+and downstream implementation. There is no separate behavioral GEMM branch —
+the earlier `ifndef SYNTHESIS` behavioral/synth split is gone.
 
 The package adapters preserve the public row/column API. For synthesis, they
 pack public rows/columns into 8-lane K chunks before driving the RTL wrapper.
+Quantization is symmetric only: nonzero zero-points raise at generation time,
+there is no zero-point datapath in the RTL.
 
 ## RTL Blackbox Interface
 
@@ -170,11 +169,12 @@ and this file's fold-M section above for the row-fold analogue.
    `S_IDLE -> S_PRELOAD -> S_RUN` arm live, not to load coefficients.
 2. For each K chunk:
    - pulse `start_mat_mul` on the first A/B beat of that chunk
-   - assert `pe_reset` on chunk 0 to clear accumulators (cold start only --
-     `pe_reset` no longer has any role at end-of-output; see *Output
-     Collector* below)
-   - drive `validity_mask_a_cols_b_rows` and `final_mat_mul_size` for that chunk
+   - drive `validity_mask_a_cols_b_rows` for that chunk
    - feed `max(M,N)` row/column beats
+
+   `pe_reset` and `final_mat_mul_size` are tied off (`1'b0` / `8'd0`) in the
+   wrapper instantiation: the slice never acts on them, and `rst` is the only
+   recovery path (see *Tensor-Slice Assumption* below).
 3. Intermediate outputs from non-final K chunks are ignored.
 4. After the final K chunk, the output collector releases one tile-row at a
    time and concatenates its column tiles into full output rows.
@@ -231,36 +231,33 @@ Output readout is gated by a three-bit tensor-slice `op` input, with
 - `op[1]` (`drain_stop`, 1-cycle pulse) — terminates the remaining
   masked/padded tail of the current drain burst early. It has no effect on
   the accumulators or on shadow contents.
-- `op[2]` (`shadow_swap`, 1-cycle pulse) — snapshots the final PE
-  accumulators into the shadow bank and clears the accumulators in the same
-  cycle, freeing the array to start the next group's `start_mat_mul` before
-  the shadow bank has finished draining.
+- `op[2]` (commit tag, level asserted at the committed pass's `start_mat_mul`
+  edge) — tags the wave slot allocated on that edge as committed; only a
+  committed wave's per-cell captures land in the shadow bank. Non-final K
+  passes of a multi-pass frame start with `op[2] = 0` so their partial sums
+  keep accumulating without being captured.
 
-Splitting drain control (`op[1]`/`op[2]`) out of `pe_reset` decouples drain
-from the accumulator lifecycle: one group can drain from its shadow bank
-while the next group is already computing into the (now-cleared) live
-accumulators. Legacy free-run (no shadow bank in use, no drain-stop) is
-`op = 3'b000`.
+`op[1]`/`op[2]` replace the accumulator lifecycle that `pe_reset` used to
+own: one wave can drain from its shadow bank while the next wave is already
+computing into the (self-clearing, per-cell) live accumulators.
 
 All tiles in the grid finish together, so the column tiles of one tile-row
 concatenate as pure wiring. The wrapper holds every tile-row (`op[0] = 1`) and
 releases them one at a time in row-major order for their 8-row bursts,
-pulsing `op[1]` to cut a burst short and `op[2]` once the group's final K
-chunk lands.
+pulsing `op[1]` to cut a burst short; `op[2]` rides the final K pass's
+`start_mat_mul` rather than pulsing at drain time.
 
 This replaced an earlier per-tile delay-line alignment pyramid, whose shift
 registers cost sum-of-delays x 129 FFs (~6.2k on a 2x2 grid, ~29k on 4x2). That
 pyramid — and its unused buffered-synth generator — has since been removed.
 
-The `op`/`pe_reset` pins live only on the synth branch's `tensor_slice_int8`
-black-box instantiation (see *Tensor-Slice Assumption* below); the
-behavioral sim model and the C behavioral core are grid-level
-compute-at-emit models that realize the same compute/drain overlap through
-their own frame/slot schedulers and carry no `op` state. Local regression is
-therefore compile-check only for the `op` contract itself; functional
-validation of the pins is deferred to the separate hardblock project's
-cosim. See `wrapper_run_loop.md` for the multi-frame feed/capture schedule
-this overlap builds on.
+The `op`/`pe_reset` pins live only on the `tensor_slice_int8_atlas` black-box
+instantiation (see *Tensor-Slice Assumption* below); the RTL is structural
+only now, so there is no separate behavioral grid model driving these pins.
+Local regression is therefore compile-check only for the `op` contract
+itself; functional validation of the pins is deferred to the separate
+hardblock project's cosim. See `wrapper_run_loop.md` for the multi-frame
+feed/capture schedule this overlap builds on.
 
 ## Tensor-Slice Assumption
 
@@ -268,37 +265,46 @@ The synth wrapper does not define the tensor-slice module. It instantiates
 each slice as a black box:
 
 ```verilog
-(* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_rX_cY (...);
+(* blackbox *) tensor_slice_int8_atlas slice_rX_cY (...);
 ```
 
-'tensor_slice_int8' module directly maps to a hardblock in the VTR architecture, with the following properties:
+`tensor_slice_int8_atlas` (22 ports) directly maps to a hardblock in the VTR
+architecture, with the following properties:
 
 - accept one A row tile and one B column tile per cycle
 - internally skew/diagonalize row/column inputs for its systolic array
-- preserve PE accumulators across repeated `start_mat_mul` operations when
-  `pe_reset` is not asserted
-- on `op[2]` (`shadow_swap`), snapshot the final accumulated result into an
-  internal shadow bank and clear the accumulators, so the next group's
-  `start_mat_mul` can begin immediately
+- per-cell accumulators self-clear at capture; a wave's cells are captured
+  into the shadow bank only when that wave's `op[2]` commit tag was asserted
+  at its `start_mat_mul` edge, freeing the array for the next wave without
+  waiting for the shadow bank to drain
 - gate readout by `op[0]` (`out_ctrl`) from the shadow bank, independent of
   the live accumulators' state (see *Output Collector* above)
 - on `op[1]` (`drain_stop`), cut the remaining masked/padded drain burst
   short, with no effect on accumulators or shadow contents
-- `pe_reset` clears the PE accumulators only (cold start / error recovery);
-  it does not touch drain or the shadow bank and is not asserted at
-  end-of-output
+- `pe_reset` and `final_mat_mul_size` are tied off in the wrapper
+  instantiation (`1'b0` / `8'd0`); the slice never acts on either, so `rst`
+  is the only recovery path
+- one stage-1 round-half-up shift input, `shift_amount[3:0]`, latched at
+  `start_mat_mul`
+- symmetric-only quantization: no zero-point pins or datapath
+- the module definition carries `(* blackbox *)` so yosys/parmys discards the
+  body and maps instances to the VTR hard-block model (simulators ignore the
+  attribute)
 
 This is a **model-level contract, not an in-repo implementation**: the
-`tensor_slice_int8` hardblock is a separate project, and neither the
-behavioral sim model (`behav_grid`) nor the C behavioral core in
-`package.py` instantiates it or drives these pins -- both are grid-level
-compute-at-emit models whose own frame/slot schedulers realize the same
-compute/drain overlap without an `op` port. Validating the pins themselves
-against real hardblock RTL is out of scope for this repo's regression;
-that happens in the hardblock project's cosim.
+`tensor_slice_int8_atlas` hardblock ships with the target
+(`src/targets/tensor_slice/tensor_slice_int8_atlas.v`) but its internals are a
+separate project's concern. The RTL wrapper is structural only -- there is no
+behavioral grid model instantiating or driving these pins in this repo.
+Validating the pins themselves against real hardblock RTL is out of scope for
+this repo's regression; that happens in the hardblock project's cosim.
 
 The generated wrapper does not change the tensor-slice port list and does not
-inline or concatenate tensor-slice RTL.
+inline or concatenate tensor-slice RTL. The model ships once per package
+root (per target), not once per layer: `finalize()` writes it, and
+`sources_tcl()` adds it once via `gemm_ip_sources.tcl`; a standalone
+`run_catapult.tcl` adds `../tensor_slice_int8_atlas.v` and uses
+`-RESET_KIND sync` so the exported RTL goes straight into VTR.
 
 ## Wrapper Responsibilities
 

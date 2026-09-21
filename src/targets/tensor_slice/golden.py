@@ -14,6 +14,11 @@ import argparse
 import numpy as np
 from pathlib import Path
 
+try:
+    from . import geometry as _geometry
+except ImportError:  # standalone script use (python golden.py ...)
+    import geometry as _geometry
+
 
 # ── Low-level helpers (shared) ─────────────────────────────────────────────────
 
@@ -312,8 +317,8 @@ def _gen_all_stimulus(m, k, n, num_vectors, base_seed, fixed_B=None,
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
-    input_beats = max(m, n)  # row/col: one row + one col per cycle
     k_chunks = (k + 7) // 8
+    input_beats = _geometry.feed_beats(m, n, k_chunks)  # row/col feed
 
     all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
 
@@ -357,9 +362,9 @@ def _gen_all_stimulus_catapult_k_spatial(m, k, n, num_vectors, base_seed, k_spat
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
-    input_beats = max(m, n)
     k_chunks = (k + 7) // 8
     passes = -(-k_chunks // k_spatial)
+    input_beats = _geometry.feed_beats(m, n, passes)
 
     all_a_stim, all_b_stim, all_bias, all_golden = [], [], [], []
 
@@ -388,7 +393,7 @@ def _gen_all_stimulus_catapult_k_spatial(m, k, n, num_vectors, base_seed, k_spat
 
 
 
-def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, k_spatial=1, weights_in_core=False, out_width=8):
+def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, all_bias, all_golden, timing=False, back2back=False, k_spatial=1, weights_in_core=False, out_width=8, combined_fold=False):
     """Generate a multi-vector Catapult testbench.
 
     back2back=False (default): Reset between every vector; check each vector
@@ -400,15 +405,18 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
-    input_beats = max(m, n)  # row/col: one A row + one B col per cycle
     k_chunks = (k + 7) // 8
     passes = -(-k_chunks // k_spatial)
+    input_beats = _geometry.feed_beats(m, n, passes)  # row/col feed
     total_input_beats = passes * input_beats
     a_bytes = grid_rows * 8
     b_bytes = grid_cols * 8
-    if k_spatial > 1:
+    if k_spatial > 1 or combined_fold:
         # Narrow word: 64*k_spatial bits = 8*k_spatial bytes (one tile, k_spatial
-        # K chunks per pass); the wrapper RTL routes the tile by beat index.
+        # K chunks per pass); the wrapper RTL routes the tile by beat index. The
+        # combined-fold emitter uses this layout at EVERY k_spatial, so a
+        # k_spatial==1 combined core still needs the 8-byte (not grid_rows*8)
+        # word -- otherwise the extra row-tile bits are truncated off the port.
         a_bytes = 8 * k_spatial
         b_bytes = 8 * k_spatial
     # Bias is compile-time now (decision 4): no bias_cols port/width at all.
@@ -480,7 +488,7 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
             a_rows <= 0;
             b_cols <= 0;
 
-            // True back-to-back cadence: the frame-slot sim model pipelines
+            // True back-to-back cadence: the structural wrapper pipelines
             // frames (feed of frame t+1 overlaps compute/drain of frame t), so
             // the next vector's preload follows immediately — the only gap is
             // the preload step itself, giving a sustained frame II of
@@ -695,9 +703,9 @@ def _gen_all_stimulus_fold_n(core_m, k, core_n, n_passes, base_seed, k_spatial, 
     """
     grid_rows = (core_m + 7) // 8
     grid_cols = (core_n + 7) // 8  # per-group/per-frame core grid cols
-    input_beats = max(core_m, core_n)
     k_chunks = (k + 7) // 8
     passes = -(-k_chunks // k_spatial)  # always 1 under fold-N (single K pass)
+    input_beats = _geometry.feed_beats(core_m, core_n, passes)
 
     rng = np.random.default_rng(base_seed)
     max_val = max(1, int((127 / max(k, 1)) ** 0.5))
@@ -767,9 +775,9 @@ def _gen_all_stimulus_mn(core_m, k, core_n, m_passes, n_passes, base_seed, k_spa
     """
     grid_rows = (core_m + 7) // 8
     grid_cols = (core_n + 7) // 8
-    input_beats = max(core_m, core_n)
     k_chunks = (k + 7) // 8
     passes = -(-k_chunks // k_spatial)
+    input_beats = _geometry.feed_beats(core_m, core_n, passes)
 
     rng = np.random.default_rng(base_seed)
     max_val = max(1, int((127 / max(k, 1)) ** 0.5))
@@ -791,16 +799,15 @@ def _gen_all_stimulus_mn(core_m, k, core_n, m_passes, n_passes, base_seed, k_spa
             C_out = two_stage_reference(A_mg, B_g, biases_g, s1=s1, s2=s2, out_width=out_width)
 
             a_stim, b_stim = [], []
-            if k_spatial == 1:
-                for chunk in range(k_chunks):
-                    for t in range(input_beats):
-                        a_stim.append(pack_a_chunk(A_mg, t, chunk, grid_rows, core_m, k))
-                        b_stim.append(pack_b_chunk(B_g, t, chunk, grid_cols, core_n, k))
-            else:
-                for pass_idx in range(passes):
-                    for t in range(input_beats):
-                        a_stim.append(pack_a_k_spatial_narrow(A_mg, t, pass_idx, core_m, k, k_spatial))
-                        b_stim.append(pack_b_k_spatial_narrow(B_g, t, pass_idx, core_n, k, k_spatial))
+            # The combined-fold emitter always uses the narrow word (one A row /
+            # one B column per beat, tile selected by beat index) for EVERY
+            # k_spatial -- including k_spatial==1, where the legacy chunked
+            # pack_a_chunk/pack_b_chunk would instead tile-shift row/col tiles
+            # into the same word and overflow the 64-bit a_rows port.
+            for pass_idx in range(passes):
+                for t in range(input_beats):
+                    a_stim.append(pack_a_k_spatial_narrow(A_mg, t, pass_idx, core_m, k, k_spatial))
+                    b_stim.append(pack_b_k_spatial_narrow(B_g, t, pass_idx, core_n, k, k_spatial))
             all_a_stim.append(a_stim)
             all_b_stim.append(b_stim)
             all_bias.append(pack_bias(biases_g, grid_cols, core_n))
@@ -869,7 +876,7 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
             m, k, n, num_vectors, seed, fixed_B=fixed_B,
             bias_codes=bias_codes, s1=s1, s2=s2, out_width=out_width,
             has_bias=(bias_codes is not None) if has_bias is None else bool(has_bias))
-    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back, k_spatial=k_spatial, weights_in_core=weights_in_core, out_width=out_width)
+    return _gen_catapult_tb(m, k, n, module_name, seed, all_a, all_b, all_bias, all_golden, timing=timing, back2back=back2back, k_spatial=k_spatial, weights_in_core=weights_in_core, out_width=out_width, combined_fold=(fold_mn is not None))
 
 
 def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_out, timing=False, out_width=8):
@@ -880,8 +887,8 @@ def generate_tb_with_data(m, k, n, module_name, seed, protocol, A, B, biases, C_
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
-    input_beats = max(m, n)  # row/col: one row + one col per cycle
     k_chunks = (k + 7) // 8
+    input_beats = _geometry.feed_beats(m, n, k_chunks)  # row/col feed
     a_stim, b_stim = [], []
     for chunk in range(k_chunks):
         for t in range(input_beats):

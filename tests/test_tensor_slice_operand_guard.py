@@ -2,11 +2,10 @@
 
 The generated wrapper reads every operand's low 8 bits as ac_int<8,true>
 ({name}_to_gemm_int8). An operand wider than 8 bits gets truncated -- signed
-or unsigned. An unsigned 8-bit operand is handled via a zero-point offset
-(bit-7 flip at the feed, corrected after accumulation -- see
-``_operand_zero_point``), so it no longer needs to be rejected; only widths
-> 8 (either signedness) are still out of range for the always-signed int8
-core. These tests confirm the guard's (relaxed) boundary.
+or unsigned. Symmetric-only quantization scope: an unsigned exactly-8-bit
+operand would need a zero-point offset to keep bit 7 from being misread as
+the sign bit, so it is rejected; unsigned operands narrower than 8 bits
+pass through unchanged. These tests confirm the guard's boundary.
 """
 import sys
 from pathlib import Path
@@ -39,7 +38,7 @@ def test_operand_bits(precision, expected):
 @pytest.mark.parametrize("precision,should_raise", [
     ("fixed<8,2>", False),      # signed width 8: still accepted
     ("ufixed<7,0>", False),     # unsigned width 7: still accepted
-    ("ufixed<8,2>", False),     # unsigned width 8: now accepted (zero-point offset)
+    ("ufixed<8,2>", True),      # unsigned width 8: rejected (would need a zero-point offset)
     ("fixed<16,6>", True),      # signed width 16: still rejected
     ("fixed<9,3>", True),       # signed width 9: still rejected
     ("ufixed<9,3>", True),      # unsigned width 9: still rejected
@@ -62,11 +61,12 @@ def test_generate_catapult_pkg_rejects_signed_9bit_input(tmp_path):
         )
 
 
-def test_generate_catapult_pkg_accepts_unsigned_8bit_input(tmp_path):
-    # Unsigned 8-bit no longer rejected: it's handled via the zero-point
-    # offset (a_zero_point=128), not truncated.
-    generate_catapult_pkg(
-        m=1, k=8, n=8, name="t2", output_dir=str(tmp_path),
-        interface="stream", output_precision="fixed<10,4>",
-        input_precision="ufixed<8,2>", weight_precision="fixed<8,2>",
-    )
+def test_generate_catapult_pkg_rejects_unsigned_8bit_input(tmp_path):
+    # Unsigned 8-bit is rejected under the symmetric-only quantization
+    # scope: it would need a zero-point offset, which is not supported.
+    with pytest.raises(ValueError, match="symmetric-only"):
+        generate_catapult_pkg(
+            m=1, k=8, n=8, name="t2", output_dir=str(tmp_path),
+            interface="stream", output_precision="fixed<10,4>",
+            input_precision="ufixed<8,2>", weight_precision="fixed<8,2>",
+        )

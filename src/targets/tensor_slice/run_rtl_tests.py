@@ -9,10 +9,9 @@ self-checking testbench (``golden``), writes them under
 testbench's ``ALL_PASS`` marker.
 
 This is the RTL-level regression: it exercises the wrapper protocol + the
-behavioral GEMM datapath end-to-end. No external ``tensor_slice_int8`` IP is
-needed — iverilog compiles without ``-DSYNTHESIS``, so the combined core's
-``ifndef SYNTHESIS`` behavioral branch (which does the matmul directly) is the
-one simulated.
+structural GEMM datapath end-to-end. Single-branch RTL: iverilog compiles
+with ``-DSYNTHESIS`` and links the ``tensor_slice_int8_atlas`` black-box model, so
+the structural wrapper (the one true core) is what is simulated.
 
 Run it via the repo venv (numpy is needed by the generators):
 
@@ -33,7 +32,7 @@ from .rtl import generate_combined_core_verilog, generate_k_spatial_combined_cor
 from .golden import generate_tb, generate_tb_with_data, _gen_catapult_tb, pack_a_chunk, pack_b_chunk, \
     pack_bias, pack_c_row, two_stage_reference, hex_literal
 from .geometry import k_chunks as _k_chunks, resolve_reuse_factor, resolve_fold_m, resolve_fold_n, \
-    combined_fold_cycles
+    feed_beats as _feed_beats
 from gemm_ip.weights import build_weight_rom_k_spatial, build_weight_rom_fold_n, build_weight_rom_combined_fold
 
 GEN_DIR = HERE / "tb" / "generated"
@@ -155,6 +154,28 @@ def _run(cmd):
     return subprocess.run(cmd, text=True, capture_output=True)
 
 
+# Single-branch RTL: every generated core is the structural wrapper, so each
+# iverilog compile links the tensor_slice_int8_atlas black-box model with
+# -DSYNTHESIS. Resolved next to this file (clone tree) or under the sandbox
+# final/ dir (vendor tree).
+_MODEL_CANDIDATES = (
+    HERE / "tensor_slice_int8_atlas.v",
+    HERE.parents[3] / "final" / "tensor_slice_int8_atlas.v",
+)
+MODEL = next((p for p in _MODEL_CANDIDATES if p.is_file()), None)
+
+
+def _compile(out_path, tb_path, rtl_path):
+    """Compile one TB + structural core + black-box model (single-branch)."""
+    if MODEL is None:
+        raise FileNotFoundError(
+            "tensor_slice_int8_atlas.v not found next to run_rtl_tests.py nor under "
+            "ts-rtl-work/final/; cannot link the structural black-box model."
+        )
+    return _run(["iverilog", "-g2012", "-DSYNTHESIS", "-o", str(out_path),
+                 str(tb_path), str(rtl_path), str(MODEL)])
+
+
 # ── Two-stage requant (S1/S2/bias/out_width) regression ───────────────────────
 #
 # Exercises jojo-track/open/tensor-slice-bias-in-rtl phase 1 directly at the
@@ -200,96 +221,7 @@ def run_requant_case(label, m, k, n, k_spatial, s1, s2, out_width, bias_codes, s
         m, k, n, module_name=mod, seed=seed, k_spatial=k_spatial, num_vectors=5,
         bias_codes=bias_codes, s1=s1, s2=s2, out_width=out_width, has_bias=True))
 
-    comp = _run(["iverilog", "-g2012", "-o", str(out_path), str(tb_path), str(rtl_path)])
-    if comp.returncode != 0:
-        return False, "iverilog compile failed\n" + comp.stdout + comp.stderr
-    sim = _run(["vvp", str(out_path)])
-    log = sim.stdout + sim.stderr
-    if sim.returncode != 0:
-        return False, "vvp failed\n" + log
-    if "ALL_PASS" not in log or "FAILURES=" in log:
-        return False, log
-    return True, log
-
-
-# ── Zero-point (unsigned 8-bit operand) regression ─────────────────────────
-#
-# The tensor_slice_int8 black box is always driven as a signed int8 core; an
-# unsigned 8-bit operand is offset by a zero point (128) and corrected after
-# accumulation (see rtl.py's a_zero_point/b_zero_point). These cases feed the
-# DUT with raw unsigned 0..255 codes on the wire (pack_a_chunk/pack_b_chunk
-# mask with & 0xFF, so an unsigned Python int drives the exact same bit
-# pattern a signed int8 would) and check the sim/behavioral branch against
-# an EXACT reference computed directly from the true operand values -- plain
-# integer arithmetic (numpy matmul in int64 + the two-stage round/wrap), not
-# a re-derivation of the RTL's zero-point algebra. If the zero-point
-# correction is exact, feeding the true (possibly unsigned) values into
-# two_stage_reference is bit-for-bit what the corrected RTL must produce.
-ZERO_POINT_CASES = [
-    # (label, m, k, n, a_zero_point, b_zero_point)
-    ("a_unsigned", 8, 8, 8, 128, 0),
-    ("b_unsigned", 8, 8, 8, 0, 128),
-    ("both_unsigned", 8, 16, 8, 128, 128),
-]
-
-
-def _zp_operand(rng, shape, zero_point):
-    """Random operand values: unsigned 0..255 codes when zero_point is set
-    (128), else a modest-magnitude signed int8 range (keeps most default
-    vectors away from the out_width wrap boundary, matching
-    ``golden._random_matrices``'s own default range)."""
-    k = shape[-1] if len(shape) > 1 else shape[0]
-    if zero_point:
-        return rng.integers(0, 256, size=shape)
-    max_val = max(1, int((127 / max(k, 1)) ** 0.5))
-    return rng.integers(-max_val, max_val + 1, size=shape)
-
-
-def run_zero_point_case(label, m, k, n, a_zero_point, b_zero_point, seed=1, out_width=8):
-    """Two-operand-GEMM (streamed B) zero-point case: DUT vs an exact
-    integer reference computed from the true operand values."""
-    from .rtl import generate_combined_core_verilog
-    from .golden import _gen_catapult_tb, pack_a_chunk, pack_b_chunk, pack_bias, pack_c_row, \
-        two_stage_reference
-    import numpy as np
-
-    rng = np.random.default_rng(seed)
-    A = _zp_operand(rng, (m, k), a_zero_point)
-    B = _zp_operand(rng, (k, n), b_zero_point)
-
-    grid_rows = (m + 7) // 8
-    grid_cols = (n + 7) // 8
-    k_chunks = (k + 7) // 8
-    input_beats = max(m, n)
-    a_stim, b_stim = [], []
-    for chunk in range(k_chunks):
-        for t in range(input_beats):
-            a_stim.append(pack_a_chunk(A, t, chunk, grid_rows, m, k))
-            b_stim.append(pack_b_chunk(B, t, chunk, grid_cols, n, k))
-    # Exact reference: the true operand values (unsigned codes included), a
-    # plain int64 matmul + the same two-stage round/wrap the DUT applies --
-    # this IS the ideal result the zero-point correction must reproduce.
-    golden = two_stage_reference(A.astype(np.int64), B.astype(np.int64), None,
-                                 s1=0, s2=0, out_width=out_width)
-    cat_golden = []
-    for rt in range(grid_rows):
-        for row in range(8):
-            cat_golden.append(pack_c_row(golden, rt, row, grid_cols, m, n, out_width=out_width))
-
-    stem = f"zp_{label}"
-    mod = f"{stem}_wrapper"
-    rtl_path = GEN_DIR / f"{stem}.v"
-    tb_path = GEN_DIR / f"tb_{stem}.v"
-    out_path = GEN_DIR / f"{stem}.out"
-    rtl_path.write_text(generate_combined_core_verilog(
-        m, k, n, module_name=mod, out_width=out_width, s1=0, s2=0,
-        a_zero_point=a_zero_point, b_zero_point=b_zero_point))
-    tb_path.write_text(_gen_catapult_tb(
-        m, k, n, mod, seed, [a_stim], [b_stim],
-        [pack_bias(np.zeros(n, dtype=np.int64), grid_cols, n)], [cat_golden],
-        out_width=out_width))
-
-    comp = _run(["iverilog", "-g2012", "-o", str(out_path), str(tb_path), str(rtl_path)])
+    comp = _compile(out_path, tb_path, rtl_path)
     if comp.returncode != 0:
         return False, "iverilog compile failed\n" + comp.stdout + comp.stderr
     sim = _run(["vvp", str(out_path)])
@@ -302,25 +234,25 @@ def run_zero_point_case(label, m, k, n, a_zero_point, b_zero_point, seed=1, out_
 
 
 # Real Catapult ``*_gemm_ip_stream_buffered_b`` protocol regression
-# (jojo-track: gemm_mha_aV_h0 av_pkg_tb). The generic run_zero_point_case
-# above drives a_rows/b_cols together every beat via _gen_catapult_tb's
-# sequential/back2back templates -- which turns out to be EXACTLY the same
-# per-cycle cadence the real wrapper's RUN loop uses (weight_cols is a plain
-# array pre-buffered by READ_B_COLS before this function is even called, but
-# inside the RUN loop b_cols is re-driven from that array on the SAME beat
-# index t as the row currently being read off a_stream, every cycle -- see
+# (jojo-track: gemm_mha_aV_h0 av_pkg_tb). _gen_catapult_tb's
+# sequential/back2back templates drive a_rows/b_cols together every beat --
+# which turns out to be EXACTLY the same per-cycle cadence the real
+# wrapper's RUN loop uses (weight_cols is a plain array pre-buffered by
+# READ_B_COLS before this function is even called, but inside the RUN loop
+# b_cols is re-driven from that array on the SAME beat index t as the row
+# currently being read off a_stream, every cycle -- see
 # gemm_mha_aV_h0_gemm_ip.h's gemm_ip_stream_buffered_b). This case pins that
-# exact m=4/k=4/n=8/a_zero_point=128 shape with several back-to-back frames
-# (period = TOTAL_INPUT_BEATS+1 = 9, matching "Each frame is ONE in_valid=0
-# beat + 8 in_valid beats" in the wrapper's own comment) as a permanent
-# regression so any future change to generate_sim_verilog's frame-slot
-# capture/emit timing that breaks this cadence is caught here.
-def run_zero_point_buffered_b_case(label="mha_tiny_buffered_b", seed=1, num_frames=4,
-                                    a_zero_point=128, b_zero_point=0,
-                                    m=4, k=4, n=8, out_width=8):
+# exact m=4/k=4/n=8 shape with several back-to-back frames (period =
+# TOTAL_INPUT_BEATS+1 = 9, matching "Each frame is ONE in_valid=0 beat + 8
+# in_valid beats" in the wrapper's own comment) as a permanent regression
+# so any future change to the wrapper's frame capture/emit timing that
+# breaks this cadence is caught here. Symmetric-only quantization scope:
+# operands are signed (no zero point).
+def run_buffered_b_case(label="mha_tiny_buffered_b", seed=1, num_frames=4,
+                        m=4, k=4, n=8, out_width=8):
     """Buffered-B-then-streamed-A protocol regression: several back-to-back
-    frames of the exact gemm_mha_aV_h0 shape, checked row-by-row against an
-    exact integer reference (see run_zero_point_case's docstring)."""
+    frames of the exact gemm_mha_aV_h0 shape with symmetric operands,
+    checked row-by-row against an exact integer reference."""
     from .rtl import generate_combined_core_verilog
     from .golden import _gen_catapult_tb, pack_a_chunk, pack_b_chunk, pack_bias, pack_c_row, \
         two_stage_reference
@@ -329,13 +261,14 @@ def run_zero_point_buffered_b_case(label="mha_tiny_buffered_b", seed=1, num_fram
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
     k_chunks = (k + 7) // 8
-    input_beats = max(m, n)
+    input_beats = _feed_beats(m, n, k_chunks)
 
     rng = np.random.default_rng(seed)
+    max_val = max(1, int((127 / max(k, 1)) ** 0.5))
     all_a_stim, all_b_stim, all_golden = [], [], []
     for _f in range(num_frames):
-        A = _zp_operand(rng, (m, k), a_zero_point)
-        B = _zp_operand(rng, (k, n), b_zero_point)
+        A = rng.integers(-max_val, max_val + 1, size=(m, k))
+        B = rng.integers(-max_val, max_val + 1, size=(k, n))
         a_stim, b_stim = [], []
         for chunk in range(k_chunks):
             for t in range(input_beats):
@@ -351,20 +284,19 @@ def run_zero_point_buffered_b_case(label="mha_tiny_buffered_b", seed=1, num_fram
                 cat_golden.append(pack_c_row(golden, rt, row, grid_cols, m, n, out_width=out_width))
         all_golden.append(cat_golden)
 
-    stem = f"zp_buffered_b_{label}"
+    stem = f"bb_{label}"
     mod = f"{stem}_wrapper"
     rtl_path = GEN_DIR / f"{stem}.v"
     tb_path = GEN_DIR / f"tb_{stem}.v"
     out_path = GEN_DIR / f"{stem}.out"
     rtl_path.write_text(generate_combined_core_verilog(
-        m, k, n, module_name=mod, out_width=out_width, s1=0, s2=0,
-        a_zero_point=a_zero_point, b_zero_point=b_zero_point))
+        m, k, n, module_name=mod, out_width=out_width, s1=0, s2=0))
     tb_path.write_text(_gen_catapult_tb(
         m, k, n, mod, seed, all_a_stim, all_b_stim,
         [pack_bias(np.zeros(n, dtype=np.int64), grid_cols, n)] * num_frames, all_golden,
         out_width=out_width, back2back=True))
 
-    comp = _run(["iverilog", "-g2012", "-o", str(out_path), str(tb_path), str(rtl_path)])
+    comp = _compile(out_path, tb_path, rtl_path)
     if comp.returncode != 0:
         return False, "iverilog compile failed\n" + comp.stdout + comp.stderr
     sim = _run(["vvp", str(out_path)])
@@ -389,8 +321,8 @@ def _full_width_catapult_tb(m, k, n, module_name, seed, all_a_stim, all_b_stim, 
     """
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
-    input_beats = max(m, n)
     k_chunks = (k + 7) // 8
+    input_beats = _feed_beats(m, n, k_chunks)
     total_input_beats = k_chunks * input_beats
     aw = grid_rows * 64
     bw = grid_cols * 64
@@ -490,157 +422,6 @@ module tb_full_width_{module_name};
     end
 endmodule
 """
-
-
-def run_zero_point_padded_k_case(label, m, k, n, a_zero_point, b_zero_point, seed=1, out_width=8,
-                                 s1=0, s2=6, num_vectors=8):
-    """K-padding zero-point regression (jojo-track/open/tensor-slice-zero-point-k-pad):
-    a shape with K < 8 (so the single K chunk pads real K up to 8 lanes) AND
-    M < 8 (so the row grid also pads), streamed-B, unsigned-A -- the exact
-    shape class that exposed the padding-lane bit-7 flip bug in the
-    structural emitter (``generate_synth_verilog``'s a_rows_q/b_cols_q feed).
-    Checks every output lane (unlike ``run_zero_point_case``, which shares
-    ``_gen_catapult_tb``'s undersized ``c_row``/``golden`` width and only
-    ever compares column 0 -- see ``_full_width_catapult_tb``), and drives A
-    with the realistic full unsigned range including codes >= 128 (ufixed
-    probabilities >= 1.0) and rows whose real codes sum to ~128, matching a
-    softmax-like operand.
-    """
-    import numpy as np
-
-    rng = np.random.default_rng(seed)
-    grid_rows = (m + 7) // 8
-    grid_cols = (n + 7) // 8
-    k_chunks = (k + 7) // 8
-    input_beats = max(m, n)
-
-    all_a_stim, all_b_stim, all_golden = [], [], []
-    for v in range(num_vectors):
-        if a_zero_point:
-            # Softmax-like unsigned rows: real codes sum to ~128 (probabilities
-            # summing to ~1.0 in ufixed<8,1>), with a couple of codes >= 128
-            # (probabilities >= 1.0, legal under WRAP quantization).
-            raw = rng.random((m, k))
-            raw = raw / raw.sum(axis=1, keepdims=True)
-            A = np.clip(np.round(raw * 128), 0, 255).astype(np.int64)
-        else:
-            A = rng.integers(-100, 100, size=(m, k))
-        B = rng.integers(0, 256, size=(k, n)) if b_zero_point else rng.integers(-100, 100, size=(k, n))
-
-        a_stim, b_stim = [], []
-        for chunk in range(k_chunks):
-            for t in range(input_beats):
-                a_stim.append(pack_a_chunk(A, t, chunk, grid_rows, m, k))
-                b_stim.append(pack_b_chunk(B, t, chunk, grid_cols, n, k))
-        golden = two_stage_reference(A.astype(np.int64), B.astype(np.int64), None,
-                                     s1=s1, s2=s2, out_width=out_width)
-        cat_golden = [pack_c_row(golden, 0, row, grid_cols, m, n, out_width=out_width) for row in range(m)]
-        all_a_stim.append(a_stim)
-        all_b_stim.append(b_stim)
-        all_golden.append(cat_golden)
-
-    stem = f"zpk_{label}"
-    mod = f"{stem}_wrapper"
-    rtl_path = GEN_DIR / f"{stem}.v"
-    tb_path = GEN_DIR / f"tb_{stem}.v"
-    out_path = GEN_DIR / f"{stem}.out"
-    rtl_path.write_text(generate_combined_core_verilog(
-        m, k, n, module_name=mod, out_width=out_width, s1=s1, s2=s2,
-        a_zero_point=a_zero_point, b_zero_point=b_zero_point))
-    tb_path.write_text(_full_width_catapult_tb(
-        m, k, n, mod, seed, all_a_stim, all_b_stim, all_golden, out_width))
-
-    comp = _run(["iverilog", "-g2012", "-o", str(out_path), str(tb_path), str(rtl_path)])
-    if comp.returncode != 0:
-        return False, "iverilog compile failed\n" + comp.stdout + comp.stderr
-    sim = _run(["vvp", str(out_path)])
-    log = sim.stdout + sim.stderr
-    if sim.returncode != 0:
-        return False, "vvp failed\n" + log
-    if "ALL_PASS" not in log or "FAILURES=" in log:
-        return False, log
-    return True, log
-
-
-# (m, k, n, a_zero_point, b_zero_point): K < 8 and M < 8 together, so the
-# single K chunk pads real K up to a full 8-lane beat AND the row grid pads
-# too -- the exact shape class (gemm_mha_aV_h0, m=4/k=4/n=8) that surfaced
-# the padding-lane bit-7 flip bug.
-ZERO_POINT_PADDED_K_CASES = [
-    ("m4k4n8_a_unsigned", 4, 4, 8, 128, 0),
-    ("m5k3n8_a_unsigned", 5, 3, 8, 128, 0),
-    ("m4k4n8_both_unsigned", 4, 4, 8, 128, 128),
-]
-
-
-def run_zero_point_weight_stationary_case(label, m, k, n, seed=1, out_width=8):
-    """Weight-stationary zero-point case: unsigned A, B baked into the ROM.
-
-    The A_ZERO_POINT * colsum(B) correction is folded into bias_codes at
-    package.py's level (mirrored here) rather than added as RTL logic for
-    weights_in_core builds (see rtl.py's ``*_zero_point_correct`` override
-    and package.py's weight-stationary bias fold) -- so the RTL is generated
-    with ``a_zero_point_correct=0`` (the feed-side bit-7 flip still happens;
-    only the running-sum correction is suppressed to avoid double-counting
-    the term the bias fold already carries).
-    """
-    from .rtl import generate_combined_core_verilog
-    from .golden import _gen_catapult_tb, pack_a_chunk, pack_b_chunk, pack_bias, pack_c_row, \
-        two_stage_reference
-    from gemm_ip.weights import build_weight_rom_k_spatial
-    import numpy as np
-
-    rng = np.random.default_rng(seed)
-    A = _zp_operand(rng, (m, k), 128)  # unsigned A
-    max_val = max(1, int((127 / max(k, 1)) ** 0.5))
-    B = rng.integers(-max_val, max_val + 1, size=(k, n))  # signed weight, baked
-
-    weight_rom = build_weight_rom_k_spatial(B, m, n, k, 1)
-    a_zero_point = 128
-    bias_codes = [
-        a_zero_point * int(sum(int(B[row][col]) for row in range(k))) for col in range(n)
-    ]
-
-    grid_rows = (m + 7) // 8
-    grid_cols = (n + 7) // 8
-    k_chunks = (k + 7) // 8
-    input_beats = max(m, n)
-    a_stim, b_stim = [], []
-    for chunk in range(k_chunks):
-        for t in range(input_beats):
-            a_stim.append(pack_a_chunk(A, t, chunk, grid_rows, m, k))
-            b_stim.append(pack_b_chunk(B, t, chunk, grid_cols, n, k))
-    golden = two_stage_reference(A.astype(np.int64), B.astype(np.int64), None,
-                                 s1=0, s2=0, out_width=out_width)
-    cat_golden = []
-    for rt in range(grid_rows):
-        for row in range(8):
-            cat_golden.append(pack_c_row(golden, rt, row, grid_cols, m, n, out_width=out_width))
-
-    stem = f"zp_{label}"
-    mod = f"{stem}_wrapper"
-    rtl_path = GEN_DIR / f"{stem}.v"
-    tb_path = GEN_DIR / f"tb_{stem}.v"
-    out_path = GEN_DIR / f"{stem}.out"
-    rtl_path.write_text(generate_combined_core_verilog(
-        m, k, n, module_name=mod, out_width=out_width, s1=0, s2=0,
-        a_zero_point=a_zero_point, b_zero_point=0, weight_rom=weight_rom,
-        a_zero_point_correct=0, bias_codes=bias_codes))
-    tb_path.write_text(_gen_catapult_tb(
-        m, k, n, mod, seed, [a_stim], [b_stim],
-        [pack_bias(np.zeros(n, dtype=np.int64), grid_cols, n)], [cat_golden],
-        weights_in_core=True, out_width=out_width))
-
-    comp = _run(["iverilog", "-g2012", "-o", str(out_path), str(tb_path), str(rtl_path)])
-    if comp.returncode != 0:
-        return False, "iverilog compile failed\n" + comp.stdout + comp.stderr
-    sim = _run(["vvp", str(out_path)])
-    log = sim.stdout + sim.stderr
-    if sim.returncode != 0:
-        return False, "vvp failed\n" + log
-    if "ALL_PASS" not in log or "FAILURES=" in log:
-        return False, log
-    return True, log
 
 
 def measure_s1_delta(label, m, k, n, s1, s2, out_width, bias_codes, seed=1, num_vectors=5):
@@ -777,15 +558,16 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
 
     n_passes_rtl = n_passes if fold_axis in ("n", "mn") else 1
     has_bias = bias_codes is not None
-    if k_spatial == 1:
-        rtl.write_text(generate_combined_core_verilog(core_m, k, core_n, module_name=mod,
-                                                       weight_rom=weight_rom, n_passes=n_passes_rtl,
-                                                       s1=s1, s2=s2, out_width=out_width,
-                                                       bias_codes=bias_codes))
-    else:
-        rtl.write_text(generate_k_spatial_combined_core_verilog(
-            core_m, k, core_n, module_name=mod, k_spatial=k_spatial, weight_rom=weight_rom,
-            n_passes=n_passes_rtl, s1=s1, s2=s2, out_width=out_width, bias_codes=bias_codes))
+    # Combined M/K/N fold folds M in the wrapper (M_PASSES frames), unlike the
+    # harness-side M-fold replay on the other axes -- thread m_passes/logical
+    # extents through the structural core generator so the emitted core
+    # actually declares M_PASSES (package.py:2313 does the same).
+    rtl.write_text(generate_k_spatial_combined_core_verilog(
+        core_m, k, core_n, module_name=mod, k_spatial=k_spatial, weight_rom=weight_rom,
+        n_passes=n_passes_rtl, s1=s1, s2=s2, out_width=out_width, bias_codes=bias_codes,
+        m_passes=(m_passes if fold_axis == "mn" else 1),
+        logical_m=(m if fold_axis == "mn" else None),
+        logical_n=(n if fold_axis == "mn" else None)))
     tb.write_text(generate_tb(core_m, k, core_n, module_name=mod, seed=seed, k_spatial=k_spatial,
                               num_vectors=num_vectors, back2back=(fold_axis in ("m", "n", "mn")),
                               weights_in_core=weights_in_core, fixed_B=fixed_B,
@@ -794,7 +576,7 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
                               bias_codes=bias_codes, s1=s1, s2=s2, out_width=out_width,
                               has_bias=has_bias))
 
-    comp = _run(["iverilog", "-g2012", "-o", str(out), str(tb), str(rtl)])
+    comp = _compile(out, tb, rtl)
     if comp.returncode != 0:
         return False, "iverilog compile failed\n" + comp.stdout + comp.stderr
     sim = _run(["vvp", str(out)])
@@ -804,67 +586,6 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
     if "ALL_PASS" not in log or "FAILURES=" in log:
         return False, log
     return True, log
-
-
-def _mn_combined_geom(m, k, n, rf_m, rf_k, rf_n):
-    """Resolve the per-frame core size / k_spatial / frame counts for a
-    fold_axis="mn" case, mirroring run_case's "mn" branch exactly (5c/5d:
-    the closed-form cycle model needs the SAME core_m/core_n/k_spatial/
-    m_passes/n_passes run_case feeds into the RTL generators)."""
-    fm = resolve_fold_m(m, rf_m if rf_m is not None else 1)
-    fn = resolve_fold_n(n, rf_n if rf_n is not None else 1)
-    core_m = fm["mg"] * 8
-    core_n = fn["cg"] * 8
-    m_passes = fm["m_passes"]
-    n_passes = fn["n_passes"]
-    if rf_k is None:
-        k_spatial = _k_chunks(k)
-    else:
-        k_spatial = resolve_reuse_factor(k, rf_k)["k_spatial"]
-    return core_m, core_n, k_spatial, m_passes, n_passes
-
-
-def _parse_beh_cycles(log):
-    """Parse BEH_START/BEH_II/BEH_DONE diagnostics (rtl.py's behav_grid) out
-    of a vvp log. Returns (starts, dones, ii_values) as lists of ints, in
-    emission order."""
-    starts, dones, iis = [], [], []
-    for line in log.splitlines():
-        line = line.strip()
-        if line.startswith("BEH_START beh_cyc="):
-            starts.append(int(line.split("=", 1)[1]))
-        elif line.startswith("BEH_DONE beh_cyc="):
-            dones.append(int(line.split("=", 1)[1]))
-        elif line.startswith("BEH_II="):
-            iis.append(int(line.split("=", 1)[1]))
-    return starts, dones, iis
-
-
-def check_combined_cycles(m, k, n, rf_m, rf_k, rf_n, log):
-    """Validate 5c's closed-form combined-fold cycle model (geometry.
-    combined_fold_cycles) against the ACTUAL sim-measured cycles (5d) for one
-    fold_axis="mn" run's vvp log. Returns (ok, message)."""
-    core_m, core_n, k_spatial, m_passes, n_passes = _mn_combined_geom(m, k, n, rf_m, rf_k, rf_n)
-    predicted = combined_fold_cycles(core_m, k, core_n, k_spatial, m_passes, n_passes)
-    starts, dones, iis = _parse_beh_cycles(log)
-    frames = m_passes * n_passes
-    if len(starts) != frames or len(dones) != frames:
-        return False, (
-            f"cycle-check {m}x{k}x{n} rf=({rf_m},{rf_k},{rf_n}): expected {frames} frames, "
-            f"saw {len(starts)} BEH_START / {len(dones)} BEH_DONE"
-        )
-    measured_latency = dones[0] - starts[0]
-    measured_total = dones[-1] - starts[0]
-    measured_interval = iis[-1] if iis else None
-    ok = (measured_latency == predicted["latency"] and measured_total == predicted["total_cycles"]
-          and (measured_interval is None or measured_interval == predicted["interval"]))
-    msg = (
-        f"cycle-check {m}x{k}x{n} rf=({rf_m},{rf_k},{rf_n}) frames={frames}: "
-        f"predicted latency={predicted['latency']} interval={predicted['interval']} "
-        f"total={predicted['total_cycles']} | measured latency={measured_latency} "
-        f"interval={measured_interval} total={measured_total}"
-    )
-    return ok, msg
 
 
 def run(cases=None, seeds=None, keep=False):
@@ -944,10 +665,6 @@ def run(cases=None, seeds=None, keep=False):
                 if not ok:
                     print(log)
                     failures.append(tag)
-                cyc_ok, cyc_msg = check_combined_cycles(m, k, n, rf_m, None, rf_n, log)
-                print(f"{'PASS' if cyc_ok else 'FAIL'} {cyc_msg}")
-                if not cyc_ok:
-                    failures.append(cyc_msg)
 
     # Combined M+K fold regression (5b-ii checkpoint): K folds (k_spatial <
     # k_chunks) simultaneously with M, N single-pass (rf_n=1).
@@ -961,10 +678,6 @@ def run(cases=None, seeds=None, keep=False):
                 if not ok:
                     print(log)
                     failures.append(tag)
-                cyc_ok, cyc_msg = check_combined_cycles(m, k, n, rf_m, rf_k, rf_n, log)
-                print(f"{'PASS' if cyc_ok else 'FAIL'} {cyc_msg}")
-                if not cyc_ok:
-                    failures.append(cyc_msg)
 
     # Combined M+K+N fold regression (5b-iii checkpoint): all three axes fold
     # simultaneously.
@@ -978,10 +691,6 @@ def run(cases=None, seeds=None, keep=False):
                 if not ok:
                     print(log)
                     failures.append(tag)
-                cyc_ok, cyc_msg = check_combined_cycles(m, k, n, rf_m, rf_k, rf_n, log)
-                print(f"{'PASS' if cyc_ok else 'FAIL'} {cyc_msg}")
-                if not cyc_ok:
-                    failures.append(cyc_msg)
 
     # Two-stage requant regression (S1/S2/bias/out_width), run unconditionally
     # (not gated on --cases -- it targets the numerics, not a shape sweep).
@@ -1022,36 +731,12 @@ def run(cases=None, seeds=None, keep=False):
         failures.append(tag)
         requant_failures.append(tag)
 
-    # Zero-point (unsigned 8-bit operand) regression.
-    for label, zm, zk, zn, zazp, zbzp in ZERO_POINT_CASES:
-        ok, log = run_zero_point_case(label, zm, zk, zn, zazp, zbzp)
-        tag = f"zeropoint:{label} {zm}x{zk}x{zn} a_zp={zazp} b_zp={zbzp}"
-        print(f"{'PASS' if ok else 'FAIL'} {tag}")
-        if not ok:
-            print(log)
-            failures.append(tag)
-
-    # K-padding zero-point regression (full-lane check; see
-    # run_zero_point_padded_k_case / _full_width_catapult_tb).
-    for label, zm, zk, zn, zazp, zbzp in ZERO_POINT_PADDED_K_CASES:
-        ok, log = run_zero_point_padded_k_case(label, zm, zk, zn, zazp, zbzp)
-        tag = f"zeropoint_padded_k:{label} {zm}x{zk}x{zn} a_zp={zazp} b_zp={zbzp}"
-        print(f"{'PASS' if ok else 'FAIL'} {tag}")
-        if not ok:
-            print(log)
-            failures.append(tag)
-
-    ok, log = run_zero_point_weight_stationary_case("ws_a_unsigned", 8, 8, 8)
-    tag = "zeropoint:ws_a_unsigned 8x8x8 a_zp=128 (weight-stationary)"
-    print(f"{'PASS' if ok else 'FAIL'} {tag}")
-    if not ok:
-        print(log)
-        failures.append(tag)
-
     # Real Catapult gemm_ip_stream_buffered_b protocol regression (gemm_mha_aV_h0
-    # av_pkg_tb shape: m=4/k=4/n=8, A unsigned zero_point=128, back-to-back frames).
-    ok, log = run_zero_point_buffered_b_case()
-    tag = "zeropoint:buffered_b_protocol 4x4x8 a_zp=128 (back-to-back frames)"
+    # av_pkg_tb shape: m=4/k=4/n=8, symmetric operands, back-to-back frames).
+    # Symmetric-only quantization scope: the back-to-back frame cadence is
+    # covered with signed operands; zero-point variants were removed.
+    ok, log = run_buffered_b_case()
+    tag = "buffered_b_protocol 4x4x8 symmetric (back-to-back frames)"
     print(f"{'PASS' if ok else 'FAIL'} {tag}")
     if not ok:
         print(log)
@@ -1060,17 +745,17 @@ def run(cases=None, seeds=None, keep=False):
     if not keep:
         shutil.rmtree(GEN_DIR, ignore_errors=True)
 
-    total = (len(cases) * len(seeds) + len(rom_cases) * len(seeds) + len(fold_m_cases) * len(seeds)
-             + len(fold_n_cases) * len(seeds) * 2 + len(combined_cases) * len(seeds) * 2 * 2
-             + len(combined_mk_cases) * len(seeds) * 2 * 2 + len(combined_mkn_cases) * len(seeds) * 2 * 2
+    total = (len(cases) * len(seeds) + len(rom_cases) * len(seeds) + len(fold_m_cases) * len(seeds) * 2
+             + len(fold_n_cases) * len(seeds) * 2 + len(combined_cases) * len(seeds) * 2
+             + len(combined_mk_cases) * len(seeds) * 2 + len(combined_mkn_cases) * len(seeds) * 2
              + len(REQUANT_CASES) + 1
-             + len(ZERO_POINT_CASES) + 1 + 1)
+             + 1)
     if failures:
         print(f"\n{len(failures)}/{total} FAILED:")
         for t in failures:
             print(f"  {t}")
         return 1
-    print(f"\nALL PASSED: {len(cases)} shapes x {len(seeds)} seeds = {total} runs")
+    print(f"\nALL PASSED: {total} runs")
     return 0
 
 

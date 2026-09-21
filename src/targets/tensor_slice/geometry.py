@@ -14,7 +14,7 @@ LANE_WIDTH = 8  # tensor_slice processes 8 int8 lanes per tile per cycle
 
 # Standalone slice IP RTL for this target (external; not required for the
 # behavioral RTL path, only for structural synthesis).
-TENSOR_SLICE_SRC = Path(__file__).resolve().parent / "tensor_slice_int8.v"
+TENSOR_SLICE_SRC = Path(__file__).resolve().parent / "tensor_slice_int8_atlas.v"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -379,6 +379,38 @@ def vm(val):
     return f"8'h{val:02X}"
 
 
+# The slice drains one K row through its boundary staging shift register in 8
+# cycles, so consecutive ``start_mat_mul`` pulses must be at least 8 cycles
+# apart.  A back-to-back frame boundary (feed period = total_beats + 1) must
+# not present the next frame's starts early either, so *every* K pass is
+# zero-padded up to this minimum -- including single-pass shapes with
+# ``max(m, n) < 8`` (their frame period then floors at 9).
+MIN_FEED_GAP_BEATS = 8
+
+
+def feed_beats(m, n, passes):
+    """Beats presented per K pass on the row/col stream.
+
+    One pass carries ``max(m, n)`` real beats (one A row + one B column per
+    beat); short shapes are zero-padded up to ``MIN_FEED_GAP_BEATS`` so no two
+    ``start_mat_mul`` pulses are ever less than 8 cycles apart.  ``passes`` is
+    kept for call-site compatibility; it does not affect the padding.
+
+    The column count is additionally padded to its tile granularity
+    (``8*ceil(n/8)``): the structural wrapper presents one complete output row
+    by AND-ing all column tiles, so a row on the fastest column can only be
+    taken after the slowest column's wave is done.  An overlapped next frame
+    must therefore start at least ``8*grid_cols`` cycles after the current one
+    (capture of cell (i,0) on column 0 at F+i vs. row take at
+    loc_max+16+i), otherwise the next frame's captures clobber rows the
+    wrapper has not drained yet.  Frame spacing is ``passes*feed_beats+1``,
+    so padding the per-pass feed to the column tile multiple guarantees it.
+    """
+    beats = max(int(m), int(n))
+    beats = max(beats, ((int(n) + 7) // 8) * 8)
+    return max(beats, MIN_FEED_GAP_BEATS)
+
+
 # ── Latency / cycle counts ─────────────────────────────────────────────────────
 
 
@@ -413,7 +445,8 @@ def latency_cycles(k_val, grid_rows_val, grid_cols_val, m=None, n=None,
 def latency_first_out(m, k, n, k_spatial):
     """First-output beat offset for the K-spatial behavioral sim model.
 
-    ``total_beats = passes * max(m, n)``; the remaining wave latency is
+    ``total_beats = passes * feed_beats(m, n, passes)``; the remaining wave
+    latency is
     ``max(0, K' + n - total_beats)`` where ``K'`` is *k* itself whenever there
     is no K-chunk padding (``k_spatial == 1``, today's chunked endpoint, or
     ``k_chunks_pad == k_chunks``, today's full-K endpoint and any other
@@ -426,7 +459,7 @@ def latency_first_out(m, k, n, k_spatial):
     kc = k_chunks(k)
     passes = k_passes(k, ks)
     kc_pad = passes * ks
-    total_beats = passes * max(m, n)
+    total_beats = passes * feed_beats(m, n, passes)
     if ks == 1 or kc_pad == kc:
         k_term = k
     else:
@@ -447,7 +480,8 @@ def combined_fold_cycles(core_m, k, core_n, k_spatial, m_passes=1, n_passes=1):
     - ``first_out`` == ``latency_first_out(core_m, k, core_n, k_spatial)``:
       the first group's first-output offset (fill + wave latency), unaffected
       by frame count.
-    - ``interval`` == ``k_passes * max(core_m, core_n) + 1``: the steady-state
+    - ``interval`` == ``k_passes * feed_beats(core_m, core_n, passes) + 1``:
+      the steady-state
       frame period (matches the README's single-axis ``II`` formula) -- one
       group's feed window plus the pipeline-register cycle. Every frame here
       shares the same core size, so this holds across all ``frames`` groups;
@@ -467,7 +501,7 @@ def combined_fold_cycles(core_m, k, core_n, k_spatial, m_passes=1, n_passes=1):
     """
     frames = int(m_passes) * int(n_passes)
     passes = k_passes(k, k_spatial)
-    total_input_beats = passes * max(core_m, core_n)
+    total_input_beats = passes * feed_beats(core_m, core_n, passes)
     first_out = latency_first_out(core_m, k, core_n, k_spatial)
     interval = total_input_beats + 1
     latency = first_out + core_m

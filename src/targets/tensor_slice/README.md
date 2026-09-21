@@ -1,21 +1,20 @@
 # Tensor Slice
 
-`tensor_slice_int8` is the hardblock-specific RTL core used by the GEMM wrapper flow.
+`tensor_slice_int8_atlas` is the hardblock-specific RTL core used by the GEMM wrapper flow.
 
 ## Contents
 
-- `tensor_slice_int8.v`: standalone 8×8 int8 systolic slice RTL
-- `rtl.py`: generates Catapult RTL wrappers (behavioral sim, synth, combined core)
+- `tensor_slice_int8_atlas.v`: standalone 8×8 int8 systolic slice RTL
+- `rtl.py`: generates Catapult RTL wrappers (structural-only combined core, one
+  source of truth for simulation and synthesis)
 - `golden.py`: generates self-checking Verilog testbenches for both protocols
 - `geometry.py`: shared helpers (tail mask, cycle counter)
-- `tb/`: standalone slice testbenches and regressions
 
 ## Interface Summary
 
 The slice is intended for int8 tensor matmul mode:
 
-- `slice_dtype = 2'b00`
-- `slice_mode = 1'b0`
+- `shift_amount = 4'd0`
 - `op` is the 3-bit output/drain control described under
   [Output control (`op` pins)](#output-control-op-pins); `op = 3'b000` is the
   legacy free-run encoding (hold nothing, no drain-stop, no shadow swap)
@@ -42,18 +41,16 @@ Masking support:
 
 ## Output control (`op` pins)
 
-The slice's 3-bit `op` port is the readout/drain interface. Each bit is an
-independent control, and the wrapper drives all three; `pe_reset` is reserved
-for accumulator lifecycle only and never doubles as a drain control.
+The slice's 3-bit `op` port is the readout/drain interface. `pe_reset` and
+`final_mat_mul_size` are tied off (`1'b0` / `8'd0`) in every wrapper
+instantiation template -- the slice never acts on either, and `rst` is the
+only recovery path.
 
 | bit | name | kind | meaning |
 |-----|------|------|---------|
 | `op[0]` | `out_ctrl` | level | `1` holds the completed result inside the tile (emits nothing); `0` shifts one result row per cycle onto `c_data_out`, qualified by `c_data_available`. Readout sources the **shadow bank**, not the live accumulators. |
-| `op[1]` | `drain_stop` | 1-cycle pulse | Terminates the remaining masked/padded tail of the current drain burst. Does **not** touch accumulators or the shadow contents beyond ending the burst. |
-| `op[2]` | `shadow_swap` | 1-cycle pulse | Snapshots the final PE accumulators into the shadow output bank **and** clears the accumulators, freeing the array to begin the next group immediately. |
-
-`pe_reset` is a plain accumulator clear (cold start / error recovery). It has
-no effect on an in-progress drain and is not pulsed at end-of-output.
+| `op[1]` | `drain_stop` | 1-cycle pulse | Terminates the remaining masked/padded tail of the current drain burst. Does **not** touch accumulators or the shadow contents beyond ending the burst. Kept (owner decision: no drain-all-8-rows, throughput matters). |
+| `op[2]` | commit tag | level, asserted at a wave's `start_mat_mul` edge | Tags that wave's slot as committed: only a committed wave's per-cell captures land in the shadow bank (and self-clear their accumulator) as the wave's diagonal completes. Non-final K passes of a multi-pass frame start with `op[2] = 0` so their partials keep accumulating uncaptured. |
 
 How the wrapper uses them:
 
@@ -63,14 +60,14 @@ How the wrapper uses them:
   for their 8-row bursts, with zero parking storage.
 - **Tail truncation.** When a tile-row has emitted all its *logical* rows, the
   wrapper pulses `op[1]` to drop the padded remainder of that burst instead of
-  clocking out masked rows. This replaces the old scheme of asserting `pe_reset`
-  at end-of-output (which conflated drain-abort with accumulator clear).
-- **Group hand-off / overlap.** When a group's compute completes (after its last
-  K pass), the wrapper pulses `op[2]` to capture that group's results into the
-  shadow bank and free the accumulators. The next M/N group then feeds and
-  accumulates on the live array while the previous group drains from the shadow
-  bank — one group computing and one draining concurrently (single shadow bank =
-  double buffering). This is what lets M/N-group folding pipeline rather than
+  clocking out masked rows.
+- **Group hand-off / overlap.** `op[2]` rides the final K pass's
+  `start_mat_mul` rather than pulsing at drain time; a committed wave's cells
+  capture into the shadow bank and self-clear as its diagonal completes, so
+  the next M/N group can start feeding and accumulating on the live array
+  while the previous group still drains from the shadow bank -- one group
+  computing and one draining concurrently (single shadow bank = double
+  buffering). This is what lets M/N-group folding pipeline rather than
   serialize drain behind compute.
 
 See `docs/rtl_contract.md`'s Output Collector and Tensor-Slice Assumption
@@ -179,8 +176,6 @@ section).
 
 ## Verification
 
-Standalone slice regressions live in `tb/`.
-
 Wrapper-level verification:
 
 ```bash
@@ -190,9 +185,3 @@ pytest tests/test_rtl_sim.py -v
 # Combined core verification (Catapult package test)
 pytest tests/test_catapult.py -v
 ```
-
-Useful slice coverage:
-
-- `tb_tensor_slice_regression.v`: baseline, back-to-back launch, chained-input timing
-- `tb_tensor_slice_mask_regression.v`: non-8x8 and mask behavior
-- size-specific smoke benches such as `tb_5x5.v`, `tb_12x10.v`, `tb_16x16.v`

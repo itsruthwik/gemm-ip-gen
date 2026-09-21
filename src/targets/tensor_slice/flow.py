@@ -9,6 +9,7 @@ module stays cheap and free of core dependencies.
 """
 
 import sys
+from pathlib import Path
 
 from ..base import Target
 from . import geometry as _geom
@@ -121,7 +122,8 @@ class TensorSliceTarget(Target):
         return _rtl.generate_synth_verilog(*shape, **kwargs)
 
     def emit_behavioral(self, shape, **kwargs):
-        return _rtl.generate_sim_verilog(*shape, **kwargs)
+        # Single-branch RTL: behavioral IS structural (no sim-only model).
+        return _rtl.generate_synth_verilog(*shape, **kwargs)
 
     def golden(self, shape, seed=42, **kwargs):
         return _golden.generate_tb(*shape, seed=seed, **kwargs)
@@ -145,6 +147,9 @@ class TensorSliceTarget(Target):
                     f"{name}_inst.cpp", f"{name}_tb.cpp", "run_catapult.tcl"]
         missing = [f for f in required
                    if not (pkg / f).is_file() or (pkg / f).stat().st_size == 0]
+        # the hard-block model ships once per package root, not per layer
+        if not (pkg.parent / _geom.TENSOR_SLICE_SRC.name).is_file():
+            missing.append(f"../{_geom.TENSOR_SLICE_SRC.name}")
         if missing:
             raise RuntimeError(f"{name}: package incomplete, missing/empty: {missing}")
         return True
@@ -202,6 +207,19 @@ class TensorSliceTarget(Target):
 
     def blackbox_tcl(self, items):
         return _package().gen_blackbox_tcl(items)
+
+    def sources_tcl(self, items):
+        # One hard-block model per package root, added once for the whole
+        # design however many GEMM layers instantiate it. Excluded from the
+        # RTL netlist: simulation resolves it, VTR maps it to the arch model.
+        return (
+            "# tensor_slice target: hard-block simulation model (one per design)\n"
+            "solution file add [file join [file dirname [info script]] "
+            f"{_geom.TENSOR_SLICE_SRC.name}] -type Verilog -exclude true\n")
+
+    def finalize(self, items, output_dir):
+        dst = Path(output_dir) / _geom.TENSOR_SLICE_SRC.name
+        dst.write_text(_geom.TENSOR_SLICE_SRC.read_text())
 
 
 TARGET = TensorSliceTarget()

@@ -57,11 +57,9 @@ def _blackbox_delay_ns(clock_period_ns):
 def latency_cycles(m, k, n, grid_rows, grid_cols, k_spatial=1):
     """First-output cycle offset for the C++ simulation model.
 
-    Delegates to ``geometry.latency_first_out`` so the sim-Verilog FIRST_OUT
-    constant and this C++-header-facing count always agree on the same
-    number for a given ``k_spatial`` (number of K partitions fed per pass;
-    ``k_spatial == 1`` is the chunked endpoint, ``k_spatial == k_chunks`` is
-    the full-K endpoint).
+    Delegates to ``geometry.latency_first_out`` for a given ``k_spatial``
+    (number of K partitions fed per pass; ``k_spatial == 1`` is the chunked
+    endpoint, ``k_spatial == k_chunks`` is the full-K endpoint).
     """
     return latency_first_out(m, k, n, k_spatial)
 
@@ -80,8 +78,19 @@ def dead_cycles(m, k, n, grid_cols, k_spatial=1):
 def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_spatial=1,
                       input_precision=None, weight_precision=None, clock_period_ns=None,
                       n_frames=1, weight_rom=None, m_passes=1, logical_m=None,
-                      n_passes=1, logical_n=None, out_width=16, bias_codes=None, s1=0,
-                      a_zero_point=0, b_zero_point=0):
+                       n_passes=1, logical_n=None, out_width=16, bias_codes=None, s1=0,
+                       a_zero_point=0, b_zero_point=0):
+    # Symmetric-only quantization scope: nonzero zero points are rejected
+    # (see generate_catapult_pkg, which derives these as 0 after the
+    # precision guard).
+    for _label, _value in (("a_zero_point", a_zero_point),
+                           ("b_zero_point", b_zero_point)):
+        if _value is not None and int(_value) != 0:
+            raise ValueError(
+                f"{name}: symmetric-only quantization scope -- nonzero "
+                f"zero point not supported ({_label}={_value!r}). Use "
+                "symmetric (signed, or <8-bit unsigned) operands."
+            )
     # Weight-stationary (const-weight) mode: weights live in the RTL wrapper ROM,
     # so the ccore run() drops the b_cols port (matching the ROM wrapper), and the
     # csim-only behavioral branch bakes the same per-beat words into an internal
@@ -98,14 +107,25 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     ks = int(k_spatial)
     k_chunks = _geom_k_chunks(k)
     passes = _geom_k_passes(k, ks)
+    # 2+ folded axes route to the general combined-fold structural emitter
+    # (`_general_synth_combined_fold`), which uses the narrow 64*k_spatial word
+    # at EVERY k_spatial -- so a k_spatial==1 combined core still needs the
+    # narrow (not grid_rows*64) word. Single-axis folds (fold-M only, fold-N
+    # only, K only) keep the wide grid-padded word of their emitters.
+    _folded_axes = int(int(m_passes) > 1) + int(int(n_passes) > 1) + int(passes > 1)
+    _combined_fold = _folded_axes >= 2
     # ``k_spatial == 1`` keeps today's grid-padded word width (chunked
     # endpoint). ``k_spatial > 1`` is the narrow K-spatial word: 64*k_spatial
     # bits per beat, independent of the row/col tile count, replayed across
     # ``passes`` sweeps of K. This is a single general layout: the chunked
     # (k_spatial == 1, passes == k_chunks) and full-K (k_spatial == k_chunks,
     # passes == 1) cases are just its two endpoints.
-    a_bits = a_stream_width(m, ks)
-    b_bits = b_stream_width(n, ks)
+    if ks > 1 or _combined_fold:
+        a_bits = 64 * ks
+        b_bits = 64 * ks
+    else:
+        a_bits = a_stream_width(m, ks)
+        b_bits = b_stream_width(n, ks)
     # Bias is a COMPILE-TIME constant now (decision 4): no bias_cols port at
     # all. ``bias_codes`` (or None -- the add folds away) is the SAME codes
     # list baked as the Verilog bias ROM (see rtl.py's _bias_rom_block); here
@@ -118,7 +138,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         "        " + _bias_c_decl(bias_c_array_name, list(bias_codes)).replace("\n", "\n        ").rstrip() + "\n"
         if has_bias else ""
     )
-    input_beats = max(m, n)
+    input_beats = _geometry.feed_beats(m, n, passes)
     total_beats = passes * input_beats
     first_out = latency_cycles(m, k, n, grid_rows, grid_cols, k_spatial=ks)
     # Frame slots for the pipelined sim core: feed of frame t+1 may overlap
@@ -127,7 +147,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # op-contract note (jojo-track/open/tensor-slice-op-shadow-drain): this C
     # core has no op/pe_reset/shadow state -- it is a grid-level `gemm.run()`
     # frame-period abstraction, not a port-level model. The op[0..2] pins live
-    # only in the synth branch's tensor_slice_int8 black-box instantiation
+    # only in the synth branch's tensor_slice_int8_atlas black-box instantiation
     # (see rtl.py). This frame-period overlap (feed of t+1 while t is still
     # draining) is the same compute/drain decoupling the op contract expresses
     # at the pin level; it is realized here without modeling the pins.
@@ -261,7 +281,16 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         n_frames = int(m_passes) * int(n_passes)
         period = total_beats + 1
         feed_total = n_frames * period
-        total_steps = (n_frames - 1) * period + first_out + m + 6
+        # Structural-core tail: the last frame's rows are produced through the
+        # tensor_slice_int8_atlas blackbox, whose registered inputs + handshake add
+        # latency beyond the behavioral `first_out`. With the bare `+ 6` the
+        # capture RUN loop could end before the final frame's drain (seen on
+        # mkn_2x2: k_spatial==1 combined, 4 frames -> only 59/64 rows emitted
+        # inside the window, second N-group columns captured as 0). One extra
+        # `period` of slack guarantees the loop outlives the last drain for
+        # every combined shape; harmless idle cycles otherwise.
+        _struct_tail = period if _combined_fold else 0
+        total_steps = (n_frames - 1) * period + first_out + m + 6 + _struct_tail
         total_rows = n_frames * m
 
     # Choose the RHS expression for the final output assignment based on the
@@ -334,7 +363,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     a_el_expr = (
         f"a_buf[s][(k_chunk / {ks}) * {input_beats} + actual_row]"
         f".slc<8>((k_chunk % {ks}) * 64 + k_lane * 8)"
-        if ks > 1
+        if ks > 1 or _combined_fold
         else f"a_buf[s][k_chunk * {input_beats} + actual_row].slc<8>(row_tile * 64 + k_lane * 8)"
     )
     # b_buf is sized passes*n (only real columns t < n are ever captured — see the
@@ -343,28 +372,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     b_el_expr = (
         f"b_buf[s][(k_chunk / {ks}) * {n} + actual_col]"
         f".slc<8>((k_chunk % {ks}) * 64 + k_lane * 8)"
-        if ks > 1
+        if ks > 1 or _combined_fold
         else f"b_buf[s][k_chunk * {n} + actual_col].slc<8>(ct * 64 + k_lane * 8)"
-    )
-
-    # Weight-stationary + A_ZERO_POINT: package.py already folded
-    # A_ZERO_POINT * colsum(B) into bias_codes (the column sums are
-    # compile-time constants once B is baked into the ROM), so suppress the
-    # a_zp accumulate term here to avoid double-counting it. The feed-side
-    # bit-7 flip (a_el's actual value) is unaffected -- that still happens
-    # via {name}_to_gemm_int8 regardless of weights_in_core.
-    _azp = 0 if weights_in_core else int(a_zero_point)
-    _bzp = int(b_zero_point)
-    _zp_terms = []
-    if _azp:
-        _zp_terms.append(f"{_azp} * b_el")
-    if _bzp:
-        _zp_terms.append(f"{_bzp} * a_el")
-    if _azp and _bzp:
-        _zp_terms.append(f"{_azp * _bzp}")
-    zp_correction_emit = (
-        "".join(f"                                acc += {t};\n" for t in _zp_terms)
-        if _zp_terms else ""
     )
 
     # ---- Weight-stationary vs. two-stream: b_cols plumbing inserts -------------
@@ -375,9 +384,13 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # build_weight_rom_k_spatial for whatever k_spatial/passes this package
     # resolved to), so both the narrow and grid-padded feed loops need the
     # conditional inserts.
-    # Under fold-N the external weight beats of frame g are group g's columns
-    # (the array feed under fold-N has its own override further down).
-    b_col_idx = f"g * {n} + t" if fold_n else "t"
+    # Under fold-N the external weight beats of frame g are group ng's columns.
+    # Index by the N-group ``ng`` (declared by ``_stream_g_decl`` whenever
+    # fold_any) rather than the frame index ``g``: for combined M+N fold
+    # ng != g once mg > 0, and indexing by g reads a later M-group's columns
+    # (the stream path mirrored the already-fixed array path here). For
+    # fold-N alone ng == g, so this is byte-identical to the old text.
+    b_col_idx = f"ng * {n} + t" if fold_n else "t"
     if weights_in_core:
         bcols_run_param = ""
         bcols_bb_xor = ""
@@ -425,7 +438,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # stream), so B never needs a replay buffer: every pass simply
         # re-slices the same full-K row/column it already has in hand. ``kc``
         # is the pass index (== the K chunk index when k_spatial == 1).
-        if ks > 1:
+        if ks > 1 or _combined_fold:
             stream_bcols_pack = f"""if (feeding_now && t < {n}) {{
             b_beat_T b_beat = weight_cols[{b_col_idx}];
             #pragma hls_unroll
@@ -459,7 +472,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # Array feed loop, two-stream: pack the external weight_cols beat into b_cols_packed.
         array_bcols_decl = f"\n        ac_int<{b_bits}, false> b_cols_packed = 0;"
         array_bcols_run_arg = "b_cols_packed, "
-        if ks > 1:
+        if ks > 1 or _combined_fold:
             array_bcols_pack = f"""
         if (step > 0 && step <= {total_beats} && t < {n}) {{
             b_beat_T b_beat = weight_cols[{b_col_idx}];
@@ -561,7 +574,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # ks > 1 packs ``ks`` K chunks into one narrow word (offset by kc_local),
     # generalizing the old full-K-only pack across every pass.
     def _a_pack_block(dest, pass_expr, label):
-        if ks > 1:
+        if ks > 1 or _combined_fold:
             return f"""
                 #pragma hls_unroll
                 {label}_KC: for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
@@ -784,7 +797,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # (mg always 0, ng == g).
         if weights_in_core:
             fold_general_bcols_pack = ""
-        elif ks > 1:
+        elif ks > 1 or _combined_fold:
             fold_general_bcols_pack = f"""
         if (feeding_now && t < {n}) {{
             b_beat_T b_beat = weight_cols[ng * {n} + t];
@@ -1079,7 +1092,7 @@ class {name}_ccore {{
         out_valid = in_valid;
         out_last = in_valid;
 #else{brom_decl}
-{bias_c_decl_block}        // Frame-slot behavioral scheduler (mirrors the RTL sim model): up to
+{bias_c_decl_block}        // Frame-slot scheduler (mirrors the structural wrapper's overlapped-frame schedule): up to
         // {slots} frames in flight. A frame starts at the first in_valid call
         // after a non-in_valid call (the FEED protocol always inserts the
         // preload step between frames); each frame keeps a private operand
@@ -1151,11 +1164,7 @@ class {name}_ccore {{
                                     ac_int<8, true> a_el = {a_el_expr};
                                     ac_int<8, true> b_el = {b_el_expr};
                                     acc += a_el * b_el;
-                                    // Zero-point correction (see {name}_to_gemm_int8): a_el/b_el
-                                    // are the signed codes actually fed into the multiply this
-                                    // iteration; adding these terms makes acc exactly the ideal
-                                    // unsigned/mixed-sign product accumulation.
-{zp_correction_emit}                                }}
+                                }}
                             }}
                             // Stage 1 (per partition): round-half-up shift the
                             // partition sum by S1, wrap to 16, accumulate into the
@@ -1185,20 +1194,15 @@ class {name}_ccore {{
 template <class src_T>
 ac_int<8, true> {name}_to_gemm_int8(const src_T &value) {{
     // The int8 code is the fixed-point MANTISSA (value · 2^frac), i.e. the raw
-    // stored bits — NOT value.to_int(), which would truncate the fractional part
+    // stored bits -- NOT value.to_int(), which would truncate the fractional part
     // of an ac_fixed operand and destroy it. slc<8>(0) reinterprets the low 8
     // mantissa bits as a signed int8 code; the drain rescales by 2^-(fa+fb).
+    // Symmetric-only quantization scope: operands reach the core unflipped
+    // (signed codes straight through). Unsigned 8-bit operands are rejected
+    // at package time (see _check_operand_fits_int8_core); narrower unsigned
+    // codes pass through unchanged (bit 7 is never set).
     static_assert(src_T::width <= 8, "tensor_slice int8 core: operand wider than 8 bits");
-    // The tensor_slice_int8 black box is always driven as a signed int8 core.
-    // An unsigned 8-bit operand is offset by its zero point (128): flip bit 7
-    // of the 8-bit code (u -> u-128 in two's complement), which is exactly the
-    // signed code the core expects; the accumulate site below corrects the
-    // cross terms this offset introduces. Unsigned operands narrower than 8
-    // bits need no offset (bit 7 is never set) and pass through unchanged.
     ac_int<8, false> raw = value.template slc<8>(0);
-    if (!src_T::sign && src_T::width == 8) {{
-        raw ^= 0x80;
-    }}
     return static_cast<ac_int<8, true> >(raw);
 }}
 
@@ -1253,7 +1257,7 @@ template <typename T, unsigned N> struct array {
 
 def gen_tb(name, m, k, n, interface="stream", n_frames=1,
            requant_shift=0, weight_matrix=None,
-           out_width=16, bias_codes=None):
+           out_width=16, bias_codes=None, s1=0, s2=0, k_spatial=1):
     weights_in_core = weight_matrix is not None
     if weights_in_core:
         # Golden uses the SAME baked weights as the core ROM.
@@ -1413,9 +1417,7 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
     # bias to the packager, so its own `biases[]` fixture is zeroed and
     # unused -- kept only for entry-point signature compatibility). The
     # drain is a pure unpack: this reference reinterprets the requantised
-    # code as the result type directly, matching the core bit-for-bit
-    # whenever the packager's own S1 is 0 (the common case).
-    _half = (1 << (requant_shift - 1)) if requant_shift else 0
+    # code as the result type directly, matching the core bit-for-bit.
     res_typedef = f"typedef nnet::array<ac_int<{out_width}, true>, {n}> res_t;"
     # Bias codes (decision 4): the SAME integer codes baked into the core's
     # bias ROM at generation time (gemm_ip.biasrom.bias_acc_codes, at the
@@ -1426,24 +1428,43 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
     # two_stage_reference's stage-2 add does when s1 == 0. No bias -> zeros.
     _bias_vals = list(bias_codes) if bias_codes is not None else [0] * n
     _bias_lit = ", ".join(str(int(b)) for b in _bias_vals)
+    _ks = int(k_spatial)
+    _s1 = int(s1)
+    _s2 = int(s2)
+    _half1 = (1 << (_s1 - 1)) if _s1 else 0
+    _half2 = (1 << (_s2 - 1)) if _s2 else 0
+    _st1 = (f"(ac_int<16, true>)((part[p] + {_half1}) >> {_s1})" if _s1
+            else "(ac_int<16, true>)(part[p])")
+    _st2 = (f"(ac_int<{out_width}, true>)((biased.to_int() + {_half2}) >> {_s2})"
+            if _s2 else f"(ac_int<{out_width}, true>)(biased.to_int())")
+    # Per-K-partition two-stage reference, matching the structural RTL bit-for-bit:
+    # chunk c = kk/8 belongs to partition c % k_spatial (chunk = pass*k_spatial + p),
+    # each partition is stage-1 round-half-up shifted and wrapped to 16, the 16-bit
+    # partials are summed (wrap 16), the bias code is added (wrap 16), then stage 2
+    # round-half-up shifts and wraps to out_width. Reduces to the exact full-K sum +
+    # stage1 when k_spatial == 1. (The old single-round-by-total-shift form was only
+    # correct at S1 == 0; it mis-scored every S1>0 package and made the smoke TB's
+    # own check_row fail csim/cosim even though the IP was correct.)
     check_row = f"""\
-// Per-row golden check: accumulate the whole dot product exactly, add the
-// SAME bias codes baked into the core's bias ROM (zero if this package has
-// no bias), then round-half-up shift by the total gemm->result shift and
-// wrap to out_width -- no saturation. This mirrors two_stage_reference()
-// (golden.py) under the S1==0 assumption noted above.
+// Per-row golden check: per-K-partition stage 1 (round-half-up shift by S1, wrap
+// to 16), sum the 16-bit partials, add the SAME bias code baked into the core's
+// bias ROM, stage 2 (round-half-up shift by S2, wrap to out_width). No saturation.
 static const int _golden_bias_codes[{n}] = {{{_bias_lit}}};
 static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
                       ac_int<8, true> weights[{n}][{k}], int biases[{n}],
                       int f, int i, int &failed) {{
     for (int j = 0; j < {n}; j++) {{
-        int gemm_acc = 0;
+        int part[{_ks}] = {{0}};
         for (int kk = 0; kk < {k}; kk++) {{
-            gemm_acc += a_row[kk].to_int() * weights[j][kk].to_int();
+            part[(kk / 8) % {_ks}] += a_row[kk].to_int() * weights[j][kk].to_int();
         }}
-        int biased = gemm_acc + _golden_bias_codes[j];
-        ac_int<32, true> rounded = (ac_int<32, true>)(biased + {_half}) >> {requant_shift};
-        ac_int<{out_width}, true> expect_code = (ac_int<{out_width}, true>) rounded;
+        int psum = 0;
+        for (int p = 0; p < {_ks}; p++) {{
+            ac_int<16, true> st = {_st1};
+            psum += st.to_int();
+        }}
+        ac_int<16, true> biased = (ac_int<16, true>)(psum + _golden_bias_codes[j]);
+        ac_int<{out_width}, true> expect_code = {_st2};
         if (out[j].to_int() != expect_code.to_int()) {{
             printf("Mismatch frame %d row %d col %d: got %d expected %d\\n",
                    f, i, j, out[j].to_int(), expect_code.to_int());
@@ -1681,12 +1702,20 @@ solution new $solution_name
 solution options defaults
 solution options set /Output/OutputVerilog true
 solution options set /Output/GenerateCycleNetlist false
+
+# Turn on SCVerify (C++ TB vs RTL cosim) before go analyze. The generated tcl
+# previously called /SCVerify/launch_make without requiring the package, which
+# dies with "Flow '/SCVerify/launch_make' not found".
+flow package require /SCVerify
+
 options set Input/CompilerFlags {{-DBLACKBOX_FLOW}}
 
 solution file add ./{name}_inst.cpp -type C++
 solution file add ./{name}_tb.cpp -type C++
-# Behavioral blackbox core RTL (ifndef SYNTHESIS branch) for SCVerify RTL cosim.
+# Structural core RTL (single-branch) for SCVerify RTL cosim.
 solution file add ./{name}_core.v -type Verilog -exclude true
+# hard-block model: one copy per package root, shared by every layer
+solution file add ../tensor_slice_int8_atlas.v -type Verilog -exclude true
 
 directive set -DESIGN_GOAL area
 directive set -SPECULATE true
@@ -1713,7 +1742,7 @@ solution library add Xilinx_RAMS
 solution library add Xilinx_ROMS
 go libraries
 
-directive set -CLOCKS {{clk {{-CLOCK_PERIOD 5.0 -CLOCK_EDGE rising -CLOCK_UNCERTAINTY 0.0 -CLOCK_HIGH_TIME 2.5 -RESET_SYNC_NAME rst -RESET_ASYNC_NAME arst_n -RESET_KIND both -RESET_SYNC_ACTIVE high -RESET_ASYNC_ACTIVE low}}}}
+directive set -CLOCKS {{clk {{-CLOCK_PERIOD 5.0 -CLOCK_EDGE rising -CLOCK_UNCERTAINTY 0.0 -CLOCK_HIGH_TIME 2.5 -RESET_SYNC_NAME rst -RESET_ASYNC_NAME arst_n -RESET_KIND sync -RESET_SYNC_ACTIVE high -RESET_ASYNC_ACTIVE low}}}}
 
 {map_lines}
 
@@ -1723,10 +1752,10 @@ go allocate
 go schedule
 go extract
 
-# RTL co-simulation (QuestaSim/msim) on the generated Verilog. Compiled WITHOUT
-# -DSYNTHESIS, so the core's ifndef SYNTHESIS behavioral (frame-slot) branch is
-# exercised — the same path large-bench cosim uses. Parse BEH_START/BEH_II/
-# BEH_DONE from the transcript for back-to-back frame timing.
+# RTL co-simulation (QuestaSim/msim) on the generated Verilog. Single-branch
+# RTL: the structural wrapper (+ tensor_slice_int8_atlas.v black-box slices) is
+# exercised — the same core large-bench cosim uses. Parse T:first_output /
+# T:last_output from the transcript for back-to-back frame timing.
 flow run /SCVerify/launch_make ./scverify/Verify_rtl_v_msim.mk {{}} SIMTOOL=msim sim
 
 project save
@@ -2057,9 +2086,8 @@ def _assert_core_port_widths(name, header_text, grid_v, weights_in_core=False):
         rtl.setdefault(port, set()).add(int(w) + 1)
     for port in _CORE_PORTS:
         # Weight-stationary drops b_cols from the ccore run() AND the top wrapper
-        # (weights come from the ROM). The inner behavioral grid submodule still
-        # has a b_cols port fed by the ROM, so a whole-file scan would false-flag
-        # it — b_cols simply isn't a blackbox port in this mode, so skip it.
+        # (weights come from the ROM) — b_cols simply isn't a blackbox port in
+        # this mode, so skip it.
         if weights_in_core and port == "b_cols":
             continue
         hw, rw = hdr.get(port, set()), rtl.get(port, set())
@@ -2072,61 +2100,29 @@ def _assert_core_port_widths(name, header_text, grid_v, weights_in_core=False):
             )
 
 
-def _assert_core_first_out(name, m, k, n, k_spatial, grid_v):
-    """Cross-check the behavioral grid's FIRST_OUT localparam against
-    latency_cycles. The C++ sim core, the wrapper's DRAIN capture window, and
-    the behavioral Verilog model must agree on the first-output cycle at every
-    k_spatial/passes combination; silent drift would desynchronize cosim
-    capture."""
-    expected = latency_cycles(m, k, n, grid_rows=(m + 7) // 8,
-                              grid_cols=(n + 7) // 8, k_spatial=k_spatial)
-    found = re.findall(r"localparam integer FIRST_OUT\s*=\s*(\d+);", grid_v)
-    if len(found) != 1 or int(found[0]) != expected:
-        raise RuntimeError(
-            f"{name}: behavioral grid FIRST_OUT {found} does not match "
-            f"latency_cycles()={expected} (m={m} k={k} n={n}, "
-            f"k_spatial={k_spatial}). The sim model and the wrapper "
-            "were generated with inconsistent drain timing."
-        )
-
-
 def _check_operand_fits_int8_core(name, operand_label, precision):
     """Raise ValueError if `precision` cannot be losslessly read as the
     tensor_slice int8 core's ac_int<8,true> operand.
 
-    Both signed and unsigned operands fit with width <= 8. The tensor_slice
-    int8 core is always driven as a signed int8 core; an unsigned 8-bit
-    operand is handled via a zero-point offset (see ``_operand_zero_point``):
-    the {name}_to_gemm_int8 conversion flips bit 7 (u -> u-128) at the feed,
-    and the accumulation is corrected afterward, so bit 7 no longer needs to
-    be reserved as a true sign bit for unsigned operands.
+    Symmetric-only quantization scope: signed operands fit with width <= 8,
+    and unsigned operands fit only when narrower than 8 bits (bit 7 is never
+    set, so the code reads back unchanged). An unsigned exactly-8-bit
+    operand would need a zero-point offset to keep bit 7 from being misread
+    as the sign bit -- zero points are out of scope, so it is rejected.
     """
     bits = _operand_bits(precision)
     if bits is None:
         return
     width, signed = bits
-    fits = width <= 8
+    fits = width <= 8 and (signed or width < 8)
     if not fits:
         raise ValueError(
             f"{name}: {operand_label} precision '{precision}' does not fit the "
-            "tensor_slice int8 core: signed and unsigned operands both need "
-            "width <= 8"
+            "tensor_slice int8 core under the symmetric-only quantization "
+            "scope: signed operands need width <= 8, unsigned operands need "
+            "width < 8 (an unsigned 8-bit operand would need a zero-point "
+            "offset, which is not supported)"
         )
-
-
-def _operand_zero_point(precision):
-    """Zero point for an operand read by the tensor_slice int8 core.
-
-    128 when the operand is unsigned AND exactly 8 bits wide (bit 7 would
-    otherwise be misread as the sign bit by the always-signed core); 0
-    otherwise (signed operands, or unsigned operands narrower than 8 bits,
-    need no offset).
-    """
-    bits = _operand_bits(precision)
-    if bits is None:
-        return 0
-    width, signed = bits
-    return 128 if (not signed and width == 8) else 0
 
 
 def _resolve_axis_reuse_factors(name, fold_axis, reuse_factor,
@@ -2178,8 +2174,11 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         raise ValueError(f"Unsupported GEMM interface '{interface}' for {name}; expected stream or array")
     _check_operand_fits_int8_core(name, "input_precision", input_precision)
     _check_operand_fits_int8_core(name, "weight_precision", weight_precision)
-    a_zero_point = _operand_zero_point(input_precision)
-    b_zero_point = _operand_zero_point(weight_precision)
+    # Symmetric-only quantization scope: zero points are rejected outright
+    # (unsigned exactly-8-bit precisions already raise in the width guard
+    # above, so no zero-point offset can arise here).
+    a_zero_point = 0
+    b_zero_point = 0
     fold_axis = str(fold_axis).lower()
     m_rf, k_rf, n_rf = _resolve_axis_reuse_factors(
         name, fold_axis, reuse_factor, m_reuse_factor, k_reuse_factor, n_reuse_factor)
@@ -2207,16 +2206,6 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     # failure.
     folded_axes = [ax for ax, folded in (("M", fold_m), ("K", fold_k), ("N", fold_n)) if folded]
     combined_fold = len(folded_axes) >= 2
-    if k_spatial != 1 and (a_zero_point or b_zero_point):
-        raise NotImplementedError(
-            f"{name}: a zero-pointed operand (a_zero_point={a_zero_point}, "
-            f"b_zero_point={b_zero_point}) with k_spatial={k_spatial} (a "
-            "ReuseFactor that partitions K) is not supported: the structural "
-            "K-spatial RTL emitter does not yet carry the zero-point running-sum "
-            "correction across partitions. Use ReuseFactor=1 (chunked, "
-            "k_spatial==1) with a zero-pointed operand, or a signed/narrower "
-            "operand with this ReuseFactor."
-        )
     rf_legalized = resolved["reuse_factor"]
     # ``core_m`` is the RTL/csim-core row count: M_g = 8*m_spatial when fold-M
     # issues more than one frame (m_passes frames of core_m rows assemble the
@@ -2303,18 +2292,6 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
               "the phase-1 sim model folds the whole contraction before rounding, "
               "so this double-rounds against the per-partition synth behavior -- "
               "see jojo-track/open/tensor-slice-bias-in-rtl.", file=sys.stderr)
-    if s1 > 0 and (a_zero_point or b_zero_point):
-        raise ValueError(
-            f"{name}: a zero-pointed operand (a_zero_point={a_zero_point}, "
-            f"b_zero_point={b_zero_point}) requires in-slice pre-round shift "
-            f"S1==0 (got S1={s1}). The zero-point correction must be added "
-            "before the slice's own internal rounding, at the same scale the "
-            "raw contraction is computed at; since the correction cannot reach "
-            "inside the tensor_slice_int8 black box, S1 must be 0 whenever a "
-            "zero point is nonzero. Reduce accum_precision so no in-slice "
-            "pre-rounding is needed, or use signed/narrower-than-8-bit "
-            "operands instead."
-        )
     s2 = _total_shift - s1
     # gen_inst_cpp/gen_tb's own self-check reference is a single-round
     # formula (gemm_acc rounded once by the TOTAL shift). Identical to the
@@ -2350,34 +2327,6 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
                 f"intermediate scale (2^{_intermediate_frac} fractional bits) -- "
                 "reduce the bias magnitude or accum_precision's fractional bits.")
 
-    # Weight-stationary (const-weight) + zero-pointed A: the column sums of
-    # B are compile-time constants (B is baked into the ROM at package time),
-    # so fold A_ZERO_POINT * colsum(B[:, col]) directly into bias_codes here
-    # rather than adding any RTL correction logic for this term.
-    if weights_in_core and a_zero_point:
-        if bias_codes is None:
-            bias_codes = [0] * (n_passes * core_n if fold_n else core_n)
-        _cols = weight_matrix.shape[1] if hasattr(weight_matrix, "shape") else len(weight_matrix[0])
-        for _col in range(_cols):
-            _colsum = sum(int(weight_matrix[_row][_col]) for _row in range(k))
-            bias_codes[_col] += a_zero_point * _colsum
-        _bad = [c for c in bias_codes if not (-32768 <= c <= 32767)]
-        if _bad:
-            raise RuntimeError(
-                f"{name}: bias code(s) {_bad} (after folding the A-zero-point "
-                "weight-stationary column-sum correction) do not fit the 16-bit "
-                "stage-2 intermediate scale -- reduce the zero-pointed operand's "
-                "magnitude or the weight matrix magnitude.")
-    if weights_in_core and b_zero_point:
-        raise NotImplementedError(
-            f"{name}: weight-stationary packaging with a zero-pointed "
-            "weight/B operand (b_zero_point != 0) is not supported: the "
-            "weight ROM bytes themselves would need the same bit-7 zero-point "
-            "flip applied at ROM-build time (gemm_ip.weights), which this "
-            "target does not do. Use a signed (or <8-bit unsigned) "
-            "weight_precision for weight-stationary packages."
-        )
-
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2387,39 +2336,23 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     grid_rows = (core_m + 7) // 8
     grid_cols = (core_n + 7) // 8
 
-    # The combined core (ifndef SYNTHESIS) lives in the rtl sibling module.
+    # The combined core lives in the rtl sibling module (structural-only,
+    # single-branch RTL).
     from . import rtl as _rtl
     generate_combined_core_verilog = _rtl.generate_combined_core_verilog
     generate_k_spatial_combined_core_verilog = _rtl.generate_k_spatial_combined_core_verilog
     if combined_fold:
         # Combined M/K/N fold (2+ axes): route to the general structural synth
         # emitter (`_general_synth_combined_fold`) via the public
-        # `generate_k_spatial_sim_verilog`/`generate_k_spatial_synth_verilog`
-        # wrappers -- these already thread m_passes/logical_m/logical_n (added
-        # additively in sub-phase 2b) and work at k_spatial==1 too (they
-        # delegate to the same k_spatial==1 body as the plain
-        # `generate_sim_verilog`/`generate_synth_verilog`). Unlike
-        # `generate_combined_core_verilog`'s ROM-hoisting split-module trick
-        # (built for the two VERIFIED single-axis branches), each combined-fold
-        # branch here emits its OWN ROM(s) as a whole module -- the same
-        # simpler pattern `generate_k_spatial_combined_core_verilog` already
-        # uses for its (also experimental/structural) k_spatial>1 body -- so
-        # no `rtl.py` changes are needed for this wiring.
-        if a_zero_point or b_zero_point:
-            raise NotImplementedError(
-                f"{name}: a zero-pointed operand (a_zero_point={a_zero_point}, "
-                f"b_zero_point={b_zero_point}) with combined M/K/N folding "
-                f"(folded axes: {', '.join(folded_axes)}) is not supported: the "
-                "combined-fold structural synth emitter does not carry the "
-                "zero-point running-sum correction. Use a signed/narrower "
-                "operand, or fold at most one axis, with a zero-pointed operand."
-            )
+        # `generate_k_spatial_synth_verilog` wrapper -- it already threads
+        # m_passes/logical_m/logical_n (added additively in sub-phase 2b) and
+        # works at k_spatial==1 too. Unlike
+        # `generate_combined_core_verilog`'s ROM-hoisting split-module trick,
+        # each combined-fold branch here emits its OWN ROM(s) as a whole
+        # module -- the same simpler pattern
+        # `generate_k_spatial_combined_core_verilog` already uses for its
+        # (also experimental/structural) k_spatial>1 body.
         core_module = f"{name}_core"
-        sim_top = _rtl.generate_k_spatial_sim_verilog(
-            core_m, k, core_n, module_name=core_module, k_spatial=k_spatial,
-            s1=s1, s2=s2, out_width=out_bits, weight_rom=weight_rom, emit_rom=True,
-            n_passes=n_passes, bias_codes=bias_codes, emit_bias_rom=True,
-        )
         synth_top = _rtl.generate_k_spatial_synth_verilog(
             core_m, k, core_n, module_name=core_module, k_spatial=k_spatial,
             n_passes=n_passes, s1=s1, s2=s2, out_width=out_bits,
@@ -2432,18 +2365,15 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             f"// Combined-fold core: M={m}, K={k}, N={n} (core_m={core_m}, core_n={core_n}, "
             f"m_passes={m_passes}, k_spatial={k_spatial}, n_passes={n_passes}, "
             f"folded_axes={','.join(folded_axes)})\n"
-            "//   ifndef SYNTHESIS -> behavioral simulation model\n"
-            "//   else             -> combined-fold structural synth wrapper "
-            "(_general_synth_combined_fold)\n"
-            "\n`ifndef SYNTHESIS\n\n" + sim_top + "\n\n`else\n\n" + synth_top + "\n\n`endif\n"
+            "//   structural synth wrapper (_general_synth_combined_fold), "
+            "single-branch RTL\n"
+            "\n" + synth_top + "\n"
         )
     elif k_spatial == 1:
         grid_v = generate_combined_core_verilog(core_m, k, core_n, module_name=f"{name}_core",
                                                 out_width=out_bits, s1=s1, s2=s2,
                                                 weight_rom=weight_rom, n_passes=n_passes,
-                                                bias_codes=bias_codes,
-                                                a_zero_point=a_zero_point, b_zero_point=b_zero_point,
-                                                a_zero_point_correct=(0 if weights_in_core else None))
+                                                bias_codes=bias_codes)
     else:
         print(
             f"WARNING: {name}: ReuseFactor={rf_legalized} partitions K into "
@@ -2456,7 +2386,6 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             core_m, k, core_n, module_name=f"{name}_core", k_spatial=k_spatial,
             out_width=out_bits, s1=s1, s2=s2, weight_rom=weight_rom,
             n_passes=n_passes, bias_codes=bias_codes,
-            a_zero_point=a_zero_point, b_zero_point=b_zero_point,
         )
     header_text = gen_public_header(
         name, core_m, k, core_n, grid_rows, grid_cols,
@@ -2478,7 +2407,6 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         b_zero_point=b_zero_point,
     )
     _assert_core_port_widths(name, header_text, grid_v, weights_in_core=weights_in_core)
-    _assert_core_first_out(name, core_m, k, core_n, k_spatial, grid_v)
     (pkg_dir / f"{name}_core.v").write_text(grid_v)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
     (pkg_dir / f"{name}_gemm_ip.h").write_text(header_text)
@@ -2495,6 +2423,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         requant_shift=requant_shift,
         weight_matrix=weight_matrix, out_width=out_bits,
         bias_codes=(bias_codes[:n] if bias_codes is not None else None),
+        s1=s1, s2=s2, k_spatial=k_spatial,
     ))
     (pkg_dir / "run_catapult.tcl").write_text(
         gen_tcl(name, m, k, n, interface, weights_in_core=weight_matrix is not None))

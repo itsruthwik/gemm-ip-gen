@@ -12,12 +12,18 @@ For GEMM shape `M x K x N`:
 ```text
 grid_rows = ceil(M / 8)
 grid_cols = ceil(N / 8)
-MR        = grid_rows * 8
+PHYSICAL_ROWS = grid_rows * 8
+LOGICAL_ROWS  = M
 ```
 
-`MR` is the number of physical output rows emitted by the hardblock, including
-padded rows. The hls4ml wrapper writes only the first `M` rows to `res_stream` and
-drains the remaining padded rows.
+`PHYSICAL_ROWS` is the tensor-slice burst size, including masked padded rows.
+The generated structural wrapper exposes only `LOGICAL_ROWS`: after its final
+logical row, it pulses `op[1]` (`drain_stop`). The tensor-slice hardware
+contract defines that pulse as aborting the remaining masked burst with no
+effect on accumulators or shadow contents, so the next operation may start
+without a visible padded drain. `pe_reset` is tied off (`1'b0`) in the
+wrapper instantiation -- the slice never acts on it, and `rst` is the only
+recovery path.
 
 ## Input Feed Contract
 
@@ -143,18 +149,20 @@ the previous frame's):
 - `RUN` / `RUN_ARRAY`: `total_steps` iterations, II=1 pipelined, where
 
   ```text
-  total_steps = (n_frames - 1) * period + first_out + MR + 6
+  total_steps = (n_frames - 1) * period + first_out + M + 6
   ```
 
   The `+6` is the port-lag tail: the last row sits at call index
   `first_out + (M-1) + 2`, worst-case RTL port lag is 3 calls, plus 2 spare.
-  Note the tail is sized on `MR` (padded rows), not `M`.
-- `DRAIN_PADDED_ROWS`: `MR - M` iterations, II=1 pipelined
+  The tail is sized on logical `M`, not the tile-padded physical row count.
+- `DRAIN_PADDED_ROWS` is removed for K- and N-fold packages. Fold-M retains
+  its conservative legacy flush hook (currently zero-trip because its core M
+  is tile-aligned).
 
 Generation fails hard (`RuntimeError`) if the single-frame budget
 `run_calls = first_out + M + 6` cannot even cover `total_beats + 2`.
 
-For `8x8x8` (`total_beats = 8`, `first_out = 16`, `MR = M = 8`, `n_frames = 1`):
+For `8x8x8` (`total_beats = 8`, `first_out = 16`, `M = 8`, `n_frames = 1`):
 
 ```text
 BIAS_PACK          8 iterations (unrolled)
@@ -193,7 +201,7 @@ RTL latency makes Catapult schedule excessive pipeline depth around the blackbox
 
 ## Latency Regression Signals
 
-- `RUN` has more than `(n_frames - 1) * period + first_out + MR + 6` iterations.
+- `RUN` has more than `(n_frames - 1) * period + first_out + M + 6` iterations.
 - Catapult reports large local array load loops before `RUN`.
 - `preload_valid` is a compile-time constant in the Catapult-generated RTL.
   It must stay a live signal (`frame_preload`, pulsed at `p == 0`): if it folds
@@ -237,7 +245,7 @@ to a *leading preload* without changing the period.
 ```text
 period      = total_beats + 1          # 1 preload/idle beat + total_beats in_valid beats
 feed_total  = n_frames * period
-total_steps = (n_frames - 1) * period + first_out + MR + 6
+total_steps = (n_frames - 1) * period + first_out + M + 6
 ```
 
 Each frame is ONE `in_valid=0` beat (`p == 0`, carrying `preload_valid=1`)
@@ -253,10 +261,11 @@ over-run by a whole period per frame and reintroduce serialized latency at
 
 ### Output capture
 
-The behavioral core emits exactly **M** `out_valid` pulses per frame
-(`TOTAL_ROWS = M` in the `ifndef SYNTHESIS` branch — note this differs from the
-structural branch's `MR`), retiring in frame order. The wrapper writes the first
-`n_frames * M` pulses to `res_stream`.
+Both branches emit exactly **M** `out_valid` pulses per frame. The structural
+branch uses `op[1]` (`drain_stop`) after the final logical row to suppress the
+remaining masked rows in its physical tile burst; `pe_reset` is tied off, not
+used for this. The behavioral branch has no physical tail. The wrapper writes
+the first `n_frames * M` pulses to `res_stream`.
 
 ### Measured (Catapult synth + scverify RTL cosim, msim, 5 frames)
 

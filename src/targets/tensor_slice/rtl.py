@@ -25,7 +25,7 @@ tail_mask_hex, vm, _total_cycles = _geometry.tail_mask_hex, _geometry.vm, _geome
 # contraction is requantised in exactly two stages, both round-half-up + wrap
 # (never saturate):
 #   stage 1 (in-slice, S1): round-half-up shift by S1, wrap to 16 bits. S1 is a
-#     Verilog module PARAMETER on the tensor_slice_int8 black box, not a port;
+#     Verilog module PARAMETER on the tensor_slice_int8_atlas black box, not a port;
 #     the sim behavioural model applies it once to the exact full sum (see the
 #     "Sim vs synth branches" note in the plan -- phase 2 moves this per-K-
 #     partition).
@@ -153,471 +153,37 @@ def _stage2_function(s2, out_width, func_name="stage2"):
     )
 
 
-_ZERO_POINT_COMMENT = (
-    "    // signedness mode: the tensor_slice_int8 black box is driven as signed\n"
-    "    // int8. Unsigned 8-bit operands are offset by the zero point (bit-7 flip\n"
-    "    // at the feed, = u-128) and corrected after accumulation (zero_point *\n"
-    "    // sum of the other operand). If the slice exposes a native unsigned mode\n"
-    "    // (slice_dtype pins), set the zero point to 0 and drive that mode instead."
-)
+def _require_symmetric_quant(a_zero_point=0, b_zero_point=0,
+                             a_zero_point_correct=None, b_zero_point_correct=None,
+                             who="tensor_slice"):
+    """Fail fast on any nonzero zero point.
 
-
-def _zero_point_params_block(a_zero_point, b_zero_point):
-    """Module parameter declarations + doc comment for A_ZERO_POINT/B_ZERO_POINT."""
-    return (
-        f"{_ZERO_POINT_COMMENT}\n"
-        f"    parameter integer A_ZERO_POINT = {int(a_zero_point)};\n"
-        f"    parameter integer B_ZERO_POINT = {int(b_zero_point)};\n"
-    )
-
-
-def _lane_flip_mask(width, zero_point):
-    """Verilog literal that XORs bit 7 of every packed 8-bit lane across a
-    ``width``-bit word when ``zero_point`` is nonzero (all-zero -- folds
-    away -- otherwise)."""
-    if not zero_point or width <= 0:
-        return f"{max(width, 1)}'d0"
-    mask_int = int("80" * (width // 8), 16) if width % 8 == 0 else (1 << (width - 1))
-    return f"{width}'h{mask_int:x}"
-
-
-def _lane_flip(zero_point):
-    """Verilog XOR suffix that flips bit 7 of every packed 8-bit lane when
-    ``zero_point`` is nonzero (u -> u-128, the same conversion the C++
-    ``{name}_to_gemm_int8`` helper performs)."""
-    return " ^ 8'h80" if zero_point else ""
-
-
-def _lane_flip_mask_masked(width, zero_point, mask_signal):
-    """Like ``_lane_flip_mask``, but gates every lane's bit-7 flip on that
-    lane's bit in ``mask_signal`` (expected 8 bits wide, one bit per K lane
-    within the current chunk -- e.g. ``current_k_mask``).
-
-    K < 8-per-chunk cases (the common tail chunk, and any chunk in a K < 8
-    GEMM) present zero-code padding on the lanes beyond the real K width.
-    The plain (unconditional) ``_lane_flip_mask`` XORs bit 7 of EVERY lane,
-    including those padding lanes: a padding zero code (0) becomes -128 once
-    flipped, instead of staying 0. Whether that silently pollutes the
-    product depends on the tensor_slice_int8 black box's own K-masking
-    (``validity_mask_a_cols_b_rows``/``current_k_mask``) doing its job
-    end-to-end; feeding a mathematically wrong operand code into a black box
-    and relying on it never being read is fragile. Masking the flip itself
-    by the SAME per-lane validity mask the slice is given keeps padding
-    lanes at raw, unflipped 0 -- multiplying by 0 (not -128) regardless of
-    whether/how the slice's own masking gates the MAC.
+    Scope decision: every quantizer is symmetric-style fixed-point, so the
+    zero-point machinery (feed-side bit-7 flip + post-accumulation
+    correction) has been removed from all emitters. A nonzero value here is
+    a caller error and is never silently ignored. Unsigned operands narrower
+    than 8 bits need no offset (bit 7 is never set) and remain supported.
     """
-    if not zero_point or width <= 0:
-        return f"{max(width, 1)}'d0"
-    n_lanes = width // 8
-    lanes = [f"({mask_signal}[{i % 8}] ? 8'h80 : 8'h00)" for i in range(n_lanes - 1, -1, -1)]
-    return "{" + ", ".join(lanes) + "}"
-
-
-def generate_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
-                         s1=0, s2=0, out_width=16, weight_rom=None, emit_rom=True,
-                         n_passes=1, bias_codes=None, emit_bias_rom=True,
-                         bias_rom_name="bias_rom", a_zero_point=0, b_zero_point=0,
-                         a_zero_point_correct=None, b_zero_point_correct=None):
-    """``a_zero_point``/``b_zero_point`` always drive the feed-side bit-7 flip
-    (and the A_ZERO_POINT/B_ZERO_POINT module parameters). ``a_zero_point_correct``/
-    ``b_zero_point_correct`` (default: same as the respective zero point) drive
-    the post-accumulation correction term ONLY; a caller that already folded a
-    zero point's correction elsewhere (e.g. package.py folds a weight-stationary
-    A_ZERO_POINT * colsum(B) into the compile-time bias instead) passes 0 here
-    to avoid double-counting it while the feed-side flip still happens.
-    """
-    has_bias = bias_codes is not None
-    a_flip = _lane_flip(a_zero_point)
-    b_flip = _lane_flip(b_zero_point)
-    _azp = int(a_zero_point if a_zero_point_correct is None else a_zero_point_correct)
-    _bzp = int(b_zero_point if b_zero_point_correct is None else b_zero_point_correct)
-    _zp_terms = []
-    if _azp:
-        _zp_terms.append(f"{_azp} * bmat[s * {k} + kk][actual_col]")
-    if _bzp:
-        _zp_terms.append(f"{_bzp} * amat[s * {m} + actual_row][kk]")
-    if _azp and _bzp:
-        _zp_terms.append(str(_azp * _bzp))
-    zp_correction = "".join(f" + ({t})" for t in _zp_terms)
-    bias_rom_block = _bias_rom_block(bias_codes, bias_rom_name) if (has_bias and emit_bias_rom) else ""
-    # Two-stage requant (jojo-track/open/tensor-slice-bias-in-rtl, phase 1):
-    # stage 1 rounds/wraps the FULL contraction (in-slice and cross-chunk
-    # folded into `acc`, the whole point of the behavioural model) to 16 bits
-    # once; stage 2 (shared verbatim with every other emitter) wrap-adds the
-    # bias and rounds/wraps to out_width. Both stages are plain functions, no
-    # saturation anywhere.
-    #
-    # Bias is a COMPILE-TIME constant (decision 4): no bias_cols port. When
-    # has_bias, the caller (generate_combined_core_verilog et al.) has
-    # already declared a `bias_rom` array (one 16-bit signed entry/column, at
-    # the intermediate scale) hoisted above `ifndef SYNTHESIS`, above this
-    # module's own text; this generator only REFERENCES it by name -- never
-    # declares it, so sim and synth read the exact same ROM. When not
-    # has_bias, the add folds away to a literal 0 (no ROM at all).
-    stage_fns = _stage1_function(s1) + "\n" + _stage2_function(s2, out_width)
-    # Fold-N + bias: the bias ROM holds n_passes*n entries (group g's real
-    # columns at base g*n, like the weight ROM); a frame/slot's bias group is
-    # NOT the live bias_grp_ctr at emit time (it may already have advanced to
-    # the NEXT frame's group by then -- see _fold_n_bias_group_decl) but a
-    # frozen per-slot copy latched at that slot's allocation, mirroring
-    # exactly how the old (removed) bias_buf captured per-slot bias values.
-    _fold_n_bias = bool(has_bias and n_passes and int(n_passes) > 1)
-    if _fold_n_bias:
-        _bias_expr = f"{_bias_lane(bias_rom_name, f'slot_grp[s] * {n} + actual_col')}"
-    elif has_bias:
-        _bias_expr = f"{_bias_lane(bias_rom_name, 'actual_col')}"
-    else:
-        _bias_expr = "16'sd0"
-    _sat_call = f"stage2(stage1(acc), {_bias_expr})"
-    grid_rows = (m + 7) // 8
-    grid_cols = (n + 7) // 8
-    a_width = grid_rows * 64
-    b_width = grid_cols * 64
-    a_chunk_width = a_width
-    b_chunk_width = b_width
-    c_width = grid_cols * 8 * out_width
-    input_beats = max(m, n)
-    k_chunks = (k + 7) // 8
-    passes = -(-k_chunks // k_spatial)
-    full_k_spatial = k_spatial > 1 and passes == 1
-    general_k_spatial = k_spatial > 1 and passes > 1
-    if k_spatial > 1:
-        # Narrow per-beat word: k_spatial partitions, 64 bits per K-chunk each
-        # pass, no grid padding.
-        a_width = 64 * k_spatial
-        b_width = 64 * k_spatial
-    total_input_beats = passes * input_beats
-    total_output_rows = m
-    # Wave-latency term: use k directly whenever there is no K-chunk padding
-    # (chunked, full-K, or any other passes==1 case); the padded partial-pass
-    # endpoint uses 8*k_chunks_pad instead (see geometry.latency_first_out,
-    # which this mirrors).
-    k_chunks_pad = passes * k_spatial
-    k_term = k if (k_spatial == 1 or k_chunks_pad == k_chunks) else 8 * k_chunks_pad
-    latency = max(0, k_term + n - total_input_beats)
-    # First-output offset == geometry.latency_first_out(): feed beats + the
-    # systolic K+N wave remainder. K-spatial folding feeds K_SPATIAL chunks per
-    # pass, so its first_out drops accordingly; the C++ core and the wrapper's
-    # DRAIN capture window use the same formula.
-    first_out = total_input_beats + latency
-    behav_name = f"{module_name}_behav_grid"
-    if full_k_spatial:
-        mode_comment = "Full K-spatial behavioral MxKxN GEMM. Not intended for synthesis."
-    elif general_k_spatial:
-        mode_comment = (
-            f"K-spatial (K_SPATIAL={k_spatial}, PASSES={passes}) behavioral MxKxN GEMM. "
-            "Not intended for synthesis."
+    bad = []
+    for label, value in (("a_zero_point", a_zero_point),
+                         ("b_zero_point", b_zero_point),
+                         ("a_zero_point_correct", a_zero_point_correct),
+                         ("b_zero_point_correct", b_zero_point_correct)):
+        if value is not None and int(value) != 0:
+            bad.append(f"{label}={value!r}")
+    if bad:
+        raise ValueError(
+            f"{who}: symmetric-only quantization scope -- nonzero zero "
+            f"point not supported ({', '.join(bad)}). Use symmetric "
+            "(signed, or <8-bit unsigned) operands."
         )
-    else:
-        mode_comment = "Chunked behavioral MxKxN GEMM. Not intended for synthesis."
-    # Frames in flight: the feed of frame t+1 overlaps the compute/drain of
-    # frame t, so back-to-back frames sustain a frame II of total_beats+1
-    # (the preload step plus the data beats). Slot count covers the deepest
-    # overlap plus one spare so an allocating frame never lands on a slot
-    # that is still draining.
-    #
-    # op-contract note (jojo-track/open/tensor-slice-op-shadow-drain): this
-    # behavioral model has no tensor_slice_int8 instance and no op/pe_reset
-    # pins -- it is a pure functional reference (compute-at-emit over
-    # per-frame operand partitions), so op[0]/op[1]/op[2] have no separate
-    # Verilog signals here. The model already implements the CONTRACT the op
-    # pins exist to express: each frame's amat/bmat partition + the acc
-    # computed at emit time plays the role of the frame's shadow bank (its
-    # final result is derived once, at TOTAL_ROWS-bounded emit, from operands
-    # that are never touched again); a frame's slot is freed (slot_run
-    # cleared) only after its own TOTAL_ROWS drain completes -- the
-    # shadow_swap (op[2]) + accumulator-free semantics -- and drain never
-    # extends past TOTAL_ROWS (there IS no padded tail here: unlike the
-    # physical 8-row tensor-slice burst, this model only ever emits the M
-    # logical rows), so drain_stop (op[1]) has nothing to truncate. Frame
-    # t+1's feed overlapping frame t's compute/drain is out_ctrl (op[0])
-    # released per frame rather than gated by a single grid-wide signal.
-    frame_period = total_input_beats + 1
-    slots = -(-(first_out + 1 + total_output_rows) // frame_period) + 1
-    # Per-slot unpack: capture a_rows/b_cols into the allocating slot's amat/
-    # bmat partition at beat index `cc` (== that frame's clk_cnt while
-    # collecting). `ws` is the slot index resolved this cycle.
-    single_unpack = f"""\
-                    cc_chunk = cc / INPUT_BEATS;
-                    cc_beat  = cc % INPUT_BEATS;
-                    if (cc_beat < {m}) begin
-                        for (lane = 0; lane < 8; lane = lane + 1) begin
-                            kk = cc_chunk * 8 + lane;
-                            if (kk < {k})
-                                amat[ws * {m} + cc_beat][kk] = a_rows[(cc_beat / 8) * 64 + lane * 8 +: 8]{a_flip};
-                        end
-                    end
-                    if (cc_beat < {n}) begin
-                        for (lane = 0; lane < 8; lane = lane + 1) begin
-                            kk = cc_chunk * 8 + lane;
-                            if (kk < {k})
-                                bmat[ws * {k} + kk][cc_beat] = b_cols[(cc_beat / 8) * 64 + lane * 8 +: 8]{b_flip};
-                        end
-                    end"""
-    if full_k_spatial:
-        single_unpack = f"""\
-                    cc_beat = cc;
-                    if (cc_beat < {m}) begin
-                        for (kk = 0; kk < {k}; kk = kk + 1) begin
-                            cc_chunk = kk / 8;
-                            lane = kk % 8;
-                            amat[ws * {m} + cc_beat][kk] = a_rows[cc_chunk * 64 + lane * 8 +: 8]{a_flip};
-                        end
-                    end
-                    if (cc_beat < {n}) begin
-                        for (kk = 0; kk < {k}; kk = kk + 1) begin
-                            cc_chunk = kk / 8;
-                            lane = kk % 8;
-                            bmat[ws * {k} + kk][cc_beat] = b_cols[cc_chunk * 64 + lane * 8 +: 8]{b_flip};
-                        end
-                    end"""
-    elif general_k_spatial:
-        # General pass-sequenced unpack: pass q, beat t carries chunk
-        # q*k_spatial+p on partition p (bits [p*64, p*64+64)); cc counts
-        # beats across ALL passes (cc_pass = cc / INPUT_BEATS).
-        single_unpack = f"""\
-                    cc_pass = cc / INPUT_BEATS;
-                    cc_beat = cc % INPUT_BEATS;
-                    if (cc_beat < {m}) begin
-                        for (p_idx = 0; p_idx < {k_spatial}; p_idx = p_idx + 1) begin
-                            cc_chunk = cc_pass * {k_spatial} + p_idx;
-                            for (lane = 0; lane < 8; lane = lane + 1) begin
-                                kk = cc_chunk * 8 + lane;
-                                if (kk < {k})
-                                    amat[ws * {m} + cc_beat][kk] = a_rows[p_idx * 64 + lane * 8 +: 8]{a_flip};
-                            end
-                        end
-                    end
-                    if (cc_beat < {n}) begin
-                        for (p_idx = 0; p_idx < {k_spatial}; p_idx = p_idx + 1) begin
-                            cc_chunk = cc_pass * {k_spatial} + p_idx;
-                            for (lane = 0; lane < 8; lane = lane + 1) begin
-                                kk = cc_chunk * 8 + lane;
-                                if (kk < {k})
-                                    bmat[ws * {k} + kk][cc_beat] = b_cols[p_idx * 64 + lane * 8 +: 8]{b_flip};
-                            end
-                        end
-                    end"""
-
-    # Weight-stationary (const-weight): the top sim wrapper drops its external b_cols
-    # port and feeds the inner behav_grid from the shared ROM (w_rom_out). The behav_grid
-    # keeps its internal b_cols input, now driven by the ROM. Bias stays external.
-    # Full-K is supported: b_width is already the narrow 64*k_chunks word above, and
-    # the ROM holds one beat per presented input cycle (total_input_beats ==
-    # input_beats under full-K), so the widened word carries every K chunk without
-    # adding beats. The ROM must be built with the matching narrow full-K packer —
-    # gemm_ip.weights.build_weight_rom_full_k.
-    extra_int_decls = "    integer p_idx, cc_pass;\n" if general_k_spatial else ""
-
-    _sim_ws = weight_rom is not None
-    if _sim_ws:
-        sim_b_cols_port = ""
-        sim_b_src = "w_rom_out"
-        sim_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes, passes=passes) if emit_rom else ""
-    else:
-        sim_b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
-        sim_b_src = "b_cols"
-        sim_rom_block = ""
-
-    return f"""\
-// Auto-generated simulation model by rtl.py
-// {mode_comment}
-// Dimensions: M={m}, K={k}, N={n}
-`timescale 1ns/1ps
-
-module {module_name}(
-    input  wire                   clk,
-    input  wire                   rst,
-    input  wire                   en,
-    input  wire [{a_width-1}:0]   a_rows,
-{sim_b_cols_port}    input  wire                   preload_valid,
-    input  wire                   in_valid,
-    output reg  [{c_width-1}:0]   c_row,
-    output reg                    out_valid,
-    output reg                    out_last
-);
-{_zero_point_params_block(a_zero_point, b_zero_point)}
-{sim_rom_block}
-    wire [{c_width-1}:0] behav_c_row;
-    wire                 behav_out_valid;
-    wire                 behav_out_last;
-
-    {behav_name} grid (
-        .clk(clk), .rst(rst), .en(en),
-        .a_rows(a_rows), .b_cols({sim_b_src}),
-        .preload_valid(preload_valid), .in_valid(in_valid),
-        .c_row(behav_c_row), .out_valid(behav_out_valid), .out_last(behav_out_last)
-    );
-
-    always @(posedge clk) begin
-        if (rst) begin
-            c_row <= {c_width}'d0;
-            out_valid <= 1'b0;
-            out_last <= 1'b0;
-        end else if (en) begin
-            c_row <= behav_c_row;
-            out_valid <= behav_out_valid;
-            out_last <= behav_out_last;
-        end
-    end
-
-endmodule
-
-module {behav_name}(
-    input  wire                   clk,
-    input  wire                   rst,
-    input  wire                   en,
-    input  wire [{a_width-1}:0]   a_rows,
-    input  wire [{b_width-1}:0]   b_cols,
-    input  wire                   preload_valid,
-    input  wire                   in_valid,
-    output reg  [{c_width-1}:0]   c_row,
-    output reg                    out_valid,
-    output reg                    out_last
-);
-{bias_rom_block}
-    localparam integer INPUT_BEATS       = {input_beats};
-    localparam integer K_CHUNKS          = {k_chunks};
-    localparam integer TOTAL_INPUT_BEATS = {total_input_beats};
-    localparam integer FIRST_OUT         = {first_out};
-    localparam integer TOTAL_ROWS        = {total_output_rows};
-    localparam integer FRAME_SLOTS       = {slots};
-
-    // ── Frame-slot storage: up to FRAME_SLOTS frames in flight ─────────────
-    // Pure behavioral scheduler (no tensor-slice structure): each frame gets
-    // a private operand partition and cycle counter; results are computed at
-    // emit time in full precision. Feed of frame t+1 overlaps compute/drain
-    // of frame t, so back-to-back frames sustain frame II = TOTAL_INPUT_BEATS+1
-    // (~one result row per cycle) while each frame keeps its own FIRST_OUT.
-    reg signed [7:0]  amat [0:{slots * m - 1}][0:{k - 1}];
-    reg signed [7:0]  bmat [0:{slots * k - 1}][0:{n - 1}];
-    reg [31:0] cc_slot [0:{slots - 1}];
-    reg        slot_run [0:{slots - 1}];
-    reg [31:0] wr_slot;
-    reg        feeding;
-{"    reg [15:0] slot_grp [0:" + str(slots - 1) + "];" if _fold_n_bias else ""}
-{"    reg [15:0] bias_grp_ctr;" if _fold_n_bias else ""}
-
-    // ── Diagnostics (parsed by the testbench; not load-bearing) ────────────
-    reg [31:0] beh_cyc;
-    reg [31:0] prev_beh_start;
-    reg [31:0] beh_ii_val;
-
-    integer i, j, kk, lane, tile, s;
-    integer ws, cc, scc, cc_chunk, cc_beat, out_idx, actual_row, actual_col;
-{extra_int_decls}    reg signed [31:0] acc;
-    reg signed [{out_width-1}:0] sat;
-
-{stage_fns}
-    // ═══════════════════════════════════════════════════════════════════════
-    // Frame-slot clk_cnt schedule. A frame starts at the first in_valid call
-    // after a non-in_valid call (the wrapper protocol always inserts at least
-    // the preload step between frames): allocate the next slot, capture its
-    // TOTAL_INPUT_BEATS beats, then emit one row per cycle for that slot's
-    // cc in [FIRST_OUT+1, FIRST_OUT+1+TOTAL_ROWS) and retire it. Emission
-    // windows of consecutive frames cannot overlap (TOTAL_ROWS <= the minimum
-    // frame period TOTAL_INPUT_BEATS+1). Everything advances on en only, so
-    // wrapper stalls keep the model aligned with the run()-call schedule.
-    // ═══════════════════════════════════════════════════════════════════════
-    always @(posedge clk) begin
-        if (rst) begin
-            for (s = 0; s < FRAME_SLOTS; s = s + 1) begin
-                cc_slot[s]  <= 32'd0;
-                slot_run[s] <= 1'b0;
-            end
-            wr_slot        <= FRAME_SLOTS - 1;
-            feeding        <= 1'b0;
-{"            bias_grp_ctr   <= 16'd0;" if _fold_n_bias else ""}
-            c_row          <= {c_width}'d0;
-            out_valid      <= 1'b0;
-            out_last       <= 1'b0;
-            beh_cyc        <= 32'd0;
-            prev_beh_start <= 32'd0;
-            beh_ii_val     <= 32'd0;
-        end else if (en) begin
-            beh_cyc   <= beh_cyc + 1;
-            c_row     <= {c_width}'d0;
-            out_valid <= 1'b0;
-            out_last  <= 1'b0;
-
-            // ── capture into the feeding frame's slot ────────────────────
-            ws = wr_slot;
-            cc = 0;
-            if (in_valid) begin
-                if (!feeding) begin
-                    ws = (wr_slot + 1) % FRAME_SLOTS;
-                    if (slot_run[ws]) $display("BEH_SLOT_OVERFLOW beh_cyc=%0d", beh_cyc);
-                    wr_slot      <= ws;
-                    feeding      <= 1'b1;
-                    slot_run[ws] <= 1'b1;
-                    cc_slot[ws]  <= 32'd1;   // cc = 0 is consumed this cycle
-{"                    slot_grp[ws] <= bias_grp_ctr;" if _fold_n_bias else ""}
-{f"                    if (bias_grp_ctr + 16'd1 >= 16'd{n_passes}) bias_grp_ctr <= 16'd0; else bias_grp_ctr <= bias_grp_ctr + 16'd1;" if _fold_n_bias else ""}
-                    if (prev_beh_start == 0) beh_ii_val <= 32'd0;
-                    else                     beh_ii_val <= beh_cyc - prev_beh_start;
-                    prev_beh_start <= beh_cyc;
-                    $display("BEH_START beh_cyc=%0d", beh_cyc);
-                    cc = 0;
-                end else begin
-                    cc = cc_slot[ws];
-                end
-                if (cc < TOTAL_INPUT_BEATS) begin
-{single_unpack}
-                end
-            end else begin
-                feeding <= 1'b0;
-            end
-
-            // ── per-slot emit (compute-at-emit) + advance / retire ───────
-            // slot_run[] reads pre-edge values, so the slot allocated THIS
-            // cycle (cc already set to 1 above) is naturally skipped.
-            for (s = 0; s < FRAME_SLOTS; s = s + 1) begin
-                if (slot_run[s]) begin
-                    scc = cc_slot[s];
-                    if (scc >= FIRST_OUT + 1 && scc < FIRST_OUT + 1 + TOTAL_ROWS) begin
-                        out_idx    = scc - (FIRST_OUT + 1);
-                        actual_row = out_idx;
-                        for (tile = 0; tile < {grid_cols}; tile = tile + 1) begin
-                            for (lane = 0; lane < 8; lane = lane + 1) begin
-                                actual_col = tile * 8 + lane;
-                                if (actual_row < {m} && actual_col < {n}) begin
-                                    // Pure integer GEMM: no bias here (decision
-                                    // 4 -- bias lands between stage 1 and stage
-                                    // 2, not folded into the raw accumulation).
-                                    acc = 32'sd0;
-                                    for (kk = 0; kk < {k}; kk = kk + 1)
-                                        acc = acc + (amat[s * {m} + actual_row][kk] * bmat[s * {k} + kk][actual_col]){zp_correction};
-                                    sat = {_sat_call};
-                                end else begin
-                                    sat = {out_width}'sd0;
-                                end
-                                c_row[tile * {8 * out_width} + lane * {out_width} +: {out_width}] <= sat;
-                            end
-                        end
-                        out_valid <= 1'b1;
-                        out_last  <= (out_idx + 1 == TOTAL_ROWS) ? 1'b1 : 1'b0;
-                    end
-                    cc_slot[s] <= scc + 1;
-                    if (scc + 1 >= FIRST_OUT + 1 + TOTAL_ROWS) begin
-                        slot_run[s] <= 1'b0;
-                        cc_slot[s]  <= 32'd0;
-                        $display("BEH_II=%0d", beh_ii_val);
-                        $display("BEH_DONE beh_cyc=%0d", beh_cyc);
-                    end
-                end
-            end
-        end
-    end
-
-endmodule
-"""
 
 
 def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1, passes=1):
     """Shared const-weight ROM: declaration + inline init + beat/addr counters + w_rom_out.
 
-    Emitted once (above the `ifndef SYNTHESIS` split in the combined core) so a single
-    ROM feeds both the behavioral-sim and structural-synth branches. The ROM holds only
+    Emitted once (hoisted above the single structural module in the combined
+    core) so a single ROM feeds the wrapper. The ROM holds only
     ``passes*n`` entries (beat ``t < n`` of each pass carries a real column; beats
     ``t >= n`` -- the tail when ``input_beats == max(m, n) > n`` -- are wasted zero
     reads, never stored). ``beat_ctr`` counts one presented input beat per pass
@@ -791,9 +357,9 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
                                     feed_mode="chained", debug=False,
                                     weight_rom=None, emit_rom=True, n_passes=1,
                                     s1=0, s2=0, out_width=16, bias_codes=None, emit_bias_rom=True,
-                                    bias_rom_name="bias_rom", a_zero_point=0, b_zero_point=0,
-                                    a_zero_point_correct=None, b_zero_point_correct=None,
-                                    m_passes=1, logical_m=None, logical_n=None):
+                                     bias_rom_name="bias_rom", a_zero_point=0, b_zero_point=0,
+                                     a_zero_point_correct=None, b_zero_point_correct=None,
+                                     m_passes=1, logical_m=None, logical_n=None):
     """Unified internal SYNTH emitter (jojo-track/open/tensor-slice-general-synth-grid,
     sub-phase 2a-ii).
 
@@ -815,6 +381,9 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     wrapper counters) exactly as before -- no new combined M+K+N folding is
     implemented here (deferred to 2b-2e).
     """
+    _require_symmetric_quant(a_zero_point, b_zero_point,
+                             a_zero_point_correct, b_zero_point_correct,
+                             who=f"{module_name} (_generate_general_synth_verilog)")
     # ── Combined-fold dispatch (2b, ADDITIVE) ────────────────────────────────
     # 2+ of {m_passes, k time-passes, n_passes} folding routes to the new,
     # separate _general_synth_combined_fold path; single-axis geometries fall
@@ -837,30 +406,35 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
             bias_codes=bias_codes, emit_bias_rom=emit_bias_rom, bias_rom_name=bias_rom_name,
         )
     # ── k_spatial == 1: K-in-time, single flowing Ms x Ns grid (chunked) ────
-    # See ``generate_sim_verilog`` for the ``*_correct`` override contract:
-    # ``a_zero_point``/``b_zero_point`` always drive the a_rows_q/b_cols_q
-    # feed-side bit-7 flip and the A_ZERO_POINT/B_ZERO_POINT module parameters;
-    # ``a_zero_point_correct``/``b_zero_point_correct`` (default: same value)
-    # drive the running-sum post-accumulation correction only.
+    # Symmetric-only quantization scope: the zero-point parameters are
+    # fail-fast checked on entry; operands reach the core unflipped and no
+    # running-sum correction exists.
     has_bias = bias_codes is not None
     bias_rom_block = _bias_rom_block(bias_codes, bias_rom_name) if (has_bias and emit_bias_rom) else ""
     _fold_n_bias = bool(has_bias and n_passes and int(n_passes) > 1)
-    _bias_grp_decl, _bias_grp_body = (
-        _fold_n_bias_group_decl(n_passes) if _fold_n_bias else ("", "")
-    )
-    _azp = int(a_zero_point if a_zero_point_correct is None else a_zero_point_correct)
-    _bzp = int(b_zero_point if b_zero_point_correct is None else b_zero_point_correct)
+    # Multi-frame overlap: the emitted frame is always the OLDEST un-emitted
+    # frame, so its fold-N bias group is tracked by a pop-advanced counter
+    # (out_grp) instead of the old "latch the live fed-group at frame start"
+    # scheme, which a pipelined feed would clobber (see _fold_n_bias_group_decl
+    # docstring: the live counter tracks the group being FED).
+    _bias_grp_decl, _bias_grp_body = "", ""
     grid_rows = (m + 7) // 8
     grid_cols = (n + 7) // 8
 
     a_width = grid_rows * 64
     b_width = grid_cols * 64
     c_width = grid_cols * 8 * out_width
-    input_beats = max(m, n)
+    # One pass per K chunk (k_spatial == 1 on this branch); pad short shapes
+    # so consecutive pass starts stay >= 8 cycles apart.
+    input_beats = _geometry.feed_beats(m, n, (k + 7) // 8)
     # The slice emits 8 physical rows per tile.  The wrapper retires after M
-    # logical rows and uses pe_reset to abort the masked remainder.
+    # logical rows and uses op[1] to truncate the masked remainder.
     logical_output_rows = m
     physical_output_rows = grid_rows * 8
+    # op[1] terminates a masked/padded tail; 8-aligned M has none, and a
+    # gratuitous op1 can suppress the next overlapped frame (see the
+    # logical_output_complete declaration).
+    _op1_tail_cond = "" if (logical_output_rows % 8) else " && 1'b0"
     k_chunks = (k + 7) // 8
     last_k_size = k - (k_chunks - 1) * 8
     last_k_mask = tail_mask_hex(k, k_chunks - 1)
@@ -911,10 +485,12 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     for r in range(grid_rows):
         for c in range(grid_cols):
             inst_lines.append(f"""\
-        // S1 = {s1}: in-slice stage-1 round-half-up shift (IP parameter, set out of band;
-        // not passed as a Verilog override -- the VTR hard-block model has no parameters)
-        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_r{r}_c{c} (
-            .clk(clk), .reset(slice_reset), .pe_reset(slice_pe_reset),
+        // S1 = {s1}: in-slice stage-1 round-half-up shift, driven into the slice's
+        // shift_amount pin (= S1 value; that pin
+        // carries no other function -- the VTR hard-block model has no parameters)
+        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8_atlas slice_r{r}_c{c} (
+            .clk(clk), .reset(slice_reset), .pe_reset(1'b0),
+            .en(en),
             .start_mat_mul(slice_start),
             .done_mat_mul(done_mat_mul[{r*grid_cols+c}]),
             .a_data(a_data_{r}_{c}),
@@ -928,15 +504,15 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
             .validity_mask_a_rows({vm(row_mask_vals[r])}),
             .validity_mask_a_cols_b_rows(current_k_mask),
             .validity_mask_b_cols({vm(col_mask_vals[c])}),
-            .slice_dtype(2'd0), .slice_mode(1'b0), .op({{op2, op1_{r}, op0_{r}}}),
-            .preload(preload_d), .no_rounding(1'b0),
-            .final_mat_mul_size(current_k_size),
+            .op({{op2, op1_{r}, op0_{r}}}),
+            .shift_amount(4'd{s1}),
+            .final_mat_mul_size(8'd0),
             .a_loc(5'd{r}),
             .b_loc(5'd{c})
         );""")
 
     # ── Zero-storage output collector (op[0]/op[1]/op[2] contract) ───────────
-    # tensor_slice_int8 contract (jojo-track/open/tensor-slice-op-shadow-drain):
+    # tensor_slice_int8_atlas contract (jojo-track/open/tensor-slice-op-shadow-drain):
     #   op[0] out_ctrl (level): 1 HOLDS the tile's result inside the array (no
     #     burst, including after intermediate K-chunks); 0 shifts one result
     #     row/cycle onto c_data_out, qualified by c_data_available. Readout
@@ -950,7 +526,7 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     #     completes (entry into emit_phase), snapshotting every tile's final
     #     accumulators into its shadow bank and clearing the accumulators so
     #     the array is free for the next operation. pe_reset no longer does
-    #     this job (see slice_pe_reset below).
+    #     this job (it is tied low on every slice).
     # Legacy free-run behaviour is op tied to 3'b000. All tiles finish
     # together, so column tiles of one tile-row concatenate as pure wiring;
     # the wrapper holds every tile-row and releases them one at a time, in
@@ -960,8 +536,14 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     op0_decl = []
     op1_decl = []
     for r in range(grid_rows):
-        release = (f"emit_phase && (cur_row_tile == 16'd{r})"
-                   if grid_rows > 1 else "emit_phase")
+        # Per-row-tile release: a row tile may only be drained once ITS OWN
+        # slices have completed the head frame. Waiting for every row tile
+        # would delay row 0's take past the next overlapped frame's captures
+        # on the early slices (loc grows by 8 per tile row/col).
+        op0_decl.append(
+            f"    wire row_emit_{r} = row_done[{r}] && (frames_fed > frames_emitted);")
+        release = (f"row_emit_{r} && (cur_row_tile == 16'd{r})"
+                   if grid_rows > 1 else f"row_emit_{r}")
         op0_decl.append(f"    wire op0_{r} = !({release});")
         stop = (f"logical_output_complete && (cur_row_tile == 16'd{r})"
                 if grid_rows > 1 else "logical_output_complete")
@@ -984,52 +566,20 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
         _bias_expr_synth = (lambda c, lane: _bias_lane(bias_rom_name, str(c * 8 + lane)))
     else:
         _bias_expr_synth = (lambda c, lane: "16'sd0")
-    # ── Zero-point correction (streamed operands) ───────────────────────────
-    # A_ZERO_POINT nonzero: correction for output column j is
-    # A_ZERO_POINT * sum_k b[k][j] -- a per-column running sum of the signed
-    # B codes actually fed this frame (post bit-7-flip), accumulated as the
-    # slice consumes each K chunk, reset once per frame.
-    # B_ZERO_POINT nonzero: correction for output row i is
-    # B_ZERO_POINT * sum_k a[i][k], looked up by the row currently on the
-    # output wire (out_row_count) since (unlike the per-column correction)
-    # the physical row varies at emit time, not at generation time.
-    # Both nonzero: also add A_ZERO_POINT * B_ZERO_POINT * K once per element
-    # (folded into row_zp_corr below, so every (row, col) sees it exactly once).
+    # Symmetric-only quantization scope: no zero-point running-sum
+    # correction exists. All correction fragments below render empty; the
+    # stage-2 call sites keep their shape (bias term only).
     _zp_col_decl = ""
     _zp_col_reset = ""
     _zp_col_acc = ""
-    if _azp:
-        _zp_col_decl = f"    reg signed [15:0] colsum_b [0:{grid_cols * 8 - 1}];\n"
-        _zp_col_reset = "".join(
-            f"                        colsum_b[{j}] <= 16'sd0;\n" for j in range(grid_cols * 8))
-        _zp_col_acc = "".join(
-            f"                        if (beat_count < 16'd8 && current_k_mask[{lane}]) colsum_b[{c * 8 + lane}] <= "
-            f"colsum_b[{c * 8 + lane}] + $signed(b_data_0_{c}[{lane}*8 +: 8]);\n"
-            for c in range(grid_cols) for lane in range(8))
     _zp_row_decl = ""
     _zp_row_reset = ""
     _zp_row_acc = ""
-    if _bzp:
-        _zp_row_decl = f"    reg signed [15:0] rowsum_a [0:{grid_rows * 8 - 1}];\n"
-        _zp_row_reset = "".join(
-            f"                        rowsum_a[{i}] <= 16'sd0;\n" for i in range(grid_rows * 8))
-        _zp_row_acc = "".join(
-            f"                        if (beat_count < 16'd8 && current_k_mask[{lane}]) rowsum_a[{r * 8 + lane}] <= "
-            f"rowsum_a[{r * 8 + lane}] + $signed(a_data_{r}_0[{lane}*8 +: 8]);\n"
-            for r in range(grid_rows) for lane in range(8))
-    _row_corr_terms = []
-    if _bzp:
-        _row_corr_terms.append(f"{_bzp} * rowsum_a[out_row_count]")
-    if _azp and _bzp:
-        _row_corr_terms.append(str(_azp * _bzp * k))
-    row_zp_corr_decl = (
-        f"    wire signed [31:0] row_zp_corr = {' + '.join(_row_corr_terms)};\n"
-        if _row_corr_terms else ""
-    )
-    row_zp_corr_term = " + row_zp_corr" if _row_corr_terms else ""
+    row_zp_corr_decl = ""
+    row_zp_corr_term = ""
 
     def _col_zp_corr_term(c, lane):
-        return f" + ({_azp} * colsum_b[{c * 8 + lane}])" if _azp else ""
+        return ""
 
     row_avail_decl = []
     row_data_decl = []
@@ -1059,9 +609,11 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     if debug:
         debug_block = """
     always @(posedge clk) begin
-        if (!slice_reset && (transaction_active || row_take || |done_mat_mul)) begin
-            $display("DBG t=%0t st=%0d beat=%0d done=%b take=%0b out_rows=%0d",
-                     $time, state, beat_count, done_mat_mul, row_take, out_row_count);
+        if (!slice_reset && (emit_active || row_take || |done_mat_mul)) begin
+            $display("DBG t=%0t st=%0d beat=%0d done=%b take=%0b out_rows=%0d fed=%0d emit=%0d head=%0b rav=%b cav=%b op0=%b op1=%b trunc=%b",
+                     $time, state, beat_count, done_mat_mul, row_take, out_row_count,
+                     frames_fed, frames_emitted, head_done,
+                     row_avail_0, c_avail_0_0, op0_0, op1_0, slice_r0_c0.trunc);
         end
     end
 """
@@ -1104,7 +656,6 @@ module {module_name}(
     output reg                    out_valid,
     output reg                    out_last
 );
-{_zero_point_params_block(a_zero_point, b_zero_point)}
 {w_rom_block}
 {bias_rom_block}
 {stage2_fn}
@@ -1120,14 +671,33 @@ module {module_name}(
     reg [15:0] beat_count;
     reg [15:0] chunk_idx;
     reg [15:0] out_row_count;
-    reg preload_d;
-    reg transaction_active;
     reg [{c_width-1}:0] row_mux;
     reg row_take;
-    reg emit_phase_d;
 {_bias_grp_decl}
 {"    reg [15:0] out_grp;" if _fold_n_bias else ""}
 {_zp_col_decl}{_zp_row_decl}{row_zp_corr_decl}
+    // Continuous multi-frame bookkeeping (rev-3 overlapped frames).
+    // frames_fed counts preload pulses seen; frames_emitted counts frames
+    // whose LOGICAL_OUT_ROWS rows have been taken. done_count[s] counts the
+    // committed-wave done pulses per slice; the head (oldest un-emitted)
+    // frame's wave is complete when every slice has counted past
+    // frames_emitted, so emission never waits on the feed FSM.
+    reg [15:0] frames_fed;
+    reg [15:0] frames_emitted;
+    reg [15:0] done_count [0:{grid_rows*grid_cols-1}];
+    reg        row_done [0:{grid_rows-1}];
+    reg        any_row_done;
+    integer    hd, hc;
+    always @* begin
+        any_row_done = 1'b0;
+        for (hd = 0; hd < {grid_rows}; hd = hd + 1) begin
+            row_done[hd] = 1'b1;
+            for (hc = 0; hc < {grid_cols}; hc = hc + 1)
+                if (done_count[hd*{grid_cols} + hc] <= frames_emitted)
+                    row_done[hd] = 1'b0;
+            if (row_done[hd]) any_row_done = 1'b1;
+        end
+    end
 
     // ── Input pipeline stage ────────────────────────────────────────────────
     // Register the whole input bundle (en-gated, so the core stays self-timed),
@@ -1145,45 +715,46 @@ module {module_name}(
             preload_valid_q <= 1'b0;
             in_valid_q      <= 1'b0;
         end else if (en) begin
-            // Flip is gated by current_k_mask (this cycle's chunk validity,
-            // computed from the SAME pre-edge chunk_idx that decides which
-            // chunk the a_rows/b_cols beat on the wire right now belongs
-            // to): padding K lanes (mask bit clear -- always zero-code on
-            // the wire) are left unflipped, so they stay raw 0 instead of
-            // becoming -128. See _lane_flip_mask_masked.
-            a_rows_q        <= a_rows ^ {_lane_flip_mask_masked(a_width, int(a_zero_point), 'current_k_mask')};
-            b_cols_q        <= {b_cols_q_src} ^ {_lane_flip_mask_masked(b_width, int(b_zero_point), 'current_k_mask')};
+            // Symmetric-only quantization scope: operands reach the slices
+            // unflipped (signed codes straight through; padding K lanes are
+            // raw 0 on the wire).
+            a_rows_q        <= a_rows;
+            b_cols_q        <= {b_cols_q_src};
             preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;
         end
     end
 
     wire slice_reset = rst;
-    wire in_beat_active = (state == S_RUN) && in_valid_q && (beat_count < INPUT_BEATS);
+    wire in_beat_active = ((state == S_PRELOAD) || (state == S_RUN)) && in_valid_q && (beat_count < INPUT_BEATS);
     wire slice_start = in_beat_active && (beat_count == 16'd0);
     wire final_chunk = (chunk_idx == K_CHUNKS - 1);
-    wire [7:0] current_k_size = final_chunk ? 8'd{last_k_size} : 8'd8;
     wire [7:0] current_k_mask = final_chunk ? {vm(last_k_mask)} : 8'hFF;
 
     wire [{grid_rows*grid_cols-1}:0] done_mat_mul;
-    wire all_slices_done = &done_mat_mul;
-
-    // Output collector control: hold every tile-row (out_ctrl=1) until all
-    // tiles have finished the final chunk, then release one tile-row at a
-    // time for its 8-row burst, in row-major order.
-    wire emit_phase = transaction_active && final_chunk && all_slices_done;
+    // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
+    // done_count[s] tracks them; row_done[r] says every slice of tile-row r
+    // has counted a done past frames_emitted, so each tile-row is released
+    // as soon as ITS wave is complete (not when all rows are). Emission is
+    // independent of the feed FSM, so frame t+1 feeds while frame t drains.
+    wire emit_active = any_row_done && (frames_fed > frames_emitted);
     wire [15:0] cur_row_tile = out_row_count >> 3;
     // op[1] drain_stop source: the logical M'th row of the CURRENT tile-row's
     // burst has just been taken -- the rest of that physical 8-row burst is
     // padding tail, terminated by op1 (see op1_decl below), not by pe_reset.
-    wire logical_output_complete = emit_phase && row_take &&
-                                   (out_row_count + 16'd1 == LOGICAL_OUT_ROWS);
-    // pe_reset reverts to accumulator-clear-only (cold start / error
-    // recovery): asserted on chunk 0 of a new operation, never during drain.
-    wire slice_pe_reset = slice_start && (chunk_idx == 16'd0);
-    // op[2] shadow_swap: one-cycle pulse on the rising edge of emit_phase
-    // (grid-wide compute-complete, after the last K chunk finishes).
-    wire op2 = emit_phase && !emit_phase_d;
+    // Gate on a real tail: for 8-aligned M there is nothing to truncate, and
+    // an unnecessary op1 at a frame end can tie with the NEXT frame's row-0
+    // capture (cap[7] re-arm) and would then suppress that frame's whole
+    // drain under overlap.
+    wire logical_output_complete = emit_active && row_take &&
+                                   (out_row_count + 16'd1 == LOGICAL_OUT_ROWS){_op1_tail_cond};
+    // pe_reset is tied low on every slice: the slice masks it on any start
+    // edge and cells self-clear at capture, so `rst` is the only recovery
+    // path. final_mat_mul_size is unread by the slice and tied to 0.
+    // op[2] commit tag (rev A2): asserted at the committed (final) pass's
+    // start edge; the slice latches it into its wave slot and captures only
+    // for committed waves. Intermediate K passes see op2 == 0.
+    wire op2 = slice_start && final_chunk;
 
 {chr(10).join(op0_decl)}
 {chr(10).join(op1_decl)}
@@ -1213,74 +784,93 @@ module {module_name}(
             beat_count <= 16'd0;
             chunk_idx <= 16'd0;
             out_row_count <= 16'd0;
-            preload_d <= 1'b0;
-            transaction_active <= 1'b0;
-            emit_phase_d <= 1'b0;
+            frames_fed <= 16'd0;
+            frames_emitted <= 16'd0;
+            for (hd = 0; hd < {grid_rows*grid_cols}; hd = hd + 1)
+                done_count[hd] <= 16'd0;
             c_row <= {c_width}'d0;
             out_valid <= 1'b0;
             out_last <= 1'b0;
 {"            out_grp <= 16'd0;" if _fold_n_bias else ""}
         end else if (en) begin
-            preload_d <= 1'b0;
             out_valid <= 1'b0;
             out_last <= 1'b0;
-            emit_phase_d <= emit_phase;
-{_bias_grp_body}
+            for (hd = 0; hd < {grid_rows*grid_cols}; hd = hd + 1)
+                if (done_mat_mul[hd])
+                    done_count[hd] <= done_count[hd] + 16'd1;
 
             case (state)
                 S_IDLE: begin
                     beat_count <= 16'd0;
                     chunk_idx <= 16'd0;
-                    out_row_count <= 16'd0;
-                    transaction_active <= 1'b0;
                     if (preload_valid_q) begin
-                        preload_d <= 1'b1;
-                        transaction_active <= 1'b1;
-{"                        out_grp <= bias_grp_ctr;" if _fold_n_bias else ""}
+                        frames_fed <= frames_fed + 16'd1;
 {_zp_col_reset}{_zp_row_reset}                        state <= S_PRELOAD;
                     end
                 end
 
                 S_PRELOAD: begin
-                    state <= S_RUN;
+                    // Feed the first data beat HERE: the input register already
+                    // holds beat 0 during this cycle, and consuming only in
+                    // S_RUN would advance the register once more (dropping beat
+                    // 0). Launching in S_PRELOAD aligns the slice window for
+                    // both supported drive cadences (preload with in_valid held
+                    // off, or preload immediately followed by data).
+                    if (in_beat_active) begin
+                        beat_count <= beat_count + 16'd1;
+                        if (beat_count + 16'd1 == INPUT_BEATS) begin
+                            if (final_chunk) begin
+                                state <= S_IDLE;
+                            end else begin
+                                chunk_idx <= chunk_idx + 16'd1;
+                                beat_count <= 16'd0;
+                                state <= S_RUN;
+                            end
+                        end else begin
+                            state <= S_RUN;
+                        end
+{_zp_col_acc}{_zp_row_acc}                    end else begin
+                        state <= S_RUN;
+                    end
                 end
 
                 S_RUN: begin
                     if (in_beat_active) begin
-                        beat_count <= beat_count + 16'd1;
-                        if (beat_count + 16'd1 == INPUT_BEATS)
-                            state <= S_WAIT;
+                        if (beat_count + 16'd1 == INPUT_BEATS) begin
+                            if (final_chunk) begin
+                                state <= S_IDLE;
+                            end else begin
+                                // Chunks are fed back-to-back by the driver
+                                // (total_beats = k_chunks * input_beats with no
+                                // gaps), so advance to the next chunk IN PLACE:
+                                // the next cycle's beat_count==0 re-pulses
+                                // slice_start for the new chunk.
+                                chunk_idx <= chunk_idx + 16'd1;
+                                beat_count <= 16'd0;
+                            end
+                        end else begin
+                            beat_count <= beat_count + 16'd1;
+                        end
 {_zp_col_acc}{_zp_row_acc}                    end
-
-                    if (emit_phase && row_take) begin
-                        c_row <= row_mux;
-                        out_valid <= 1'b1;
-                        out_last <= (out_row_count + 16'd1 == LOGICAL_OUT_ROWS);
-                        out_row_count <= out_row_count + 16'd1;
-                        if (out_row_count + 16'd1 == LOGICAL_OUT_ROWS) begin
-                            transaction_active <= 1'b0;
-                            state <= S_IDLE;
-                        end
-                    end
-                end
-
-                S_WAIT: begin
-                    if (emit_phase && row_take) begin
-                        c_row <= row_mux;
-                        out_valid <= 1'b1;
-                        out_last <= (out_row_count + 16'd1 == LOGICAL_OUT_ROWS);
-                        out_row_count <= out_row_count + 16'd1;
-                        if (out_row_count + 16'd1 == LOGICAL_OUT_ROWS) begin
-                            transaction_active <= 1'b0;
-                            state <= S_IDLE;
-                        end
-                    end else if (!final_chunk && all_slices_done) begin
-                        chunk_idx <= chunk_idx + 16'd1;
-                        beat_count <= 16'd0;
-                        state <= S_RUN;
-                    end
                 end
             endcase
+
+            // Emission runs independently of the feed FSM: the head frame's
+            // rows are taken one per edge as the slices present them. Feed
+            // and drain of different frames therefore overlap, while the
+            // module keeps rows in frame order.
+            if (emit_active && row_take) begin
+                c_row <= row_mux;
+                out_valid <= 1'b1;
+                out_last <= (out_row_count + 16'd1 == LOGICAL_OUT_ROWS);
+                out_row_count <= out_row_count + 16'd1;
+                if (out_row_count + 16'd1 == LOGICAL_OUT_ROWS) begin
+                    out_row_count <= 16'd0;
+                    frames_emitted <= frames_emitted + 16'd1;
+{(f"                    if (out_grp + 16'd1 >= 16'd{n_passes}) out_grp <= 16'd0;") if _fold_n_bias else ""}
+{"                    else out_grp <= out_grp + 16'd1;" if _fold_n_bias else ""}
+                end
+            end
         end
     end
 
@@ -1340,53 +930,34 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
                                    s1=0, s2=0, out_width=None, weight_rom=None, n_passes=1,
                                    bias_codes=None, a_zero_point=0, b_zero_point=0,
                                    a_zero_point_correct=None, b_zero_point_correct=None):
-    """Generate a single {module_name}.v with ifndef SYNTHESIS guard.
+    """Generate a single structural {module_name}.v (single-branch RTL).
 
-    ``ifndef SYNTHESIS`` — behavioral simulation model (wrapper + behav_grid).
-    Used by Catapult SCVerify for RTL vs C++ co-simulation.
+    Structural synth wrapper with tensor_slice_int8_atlas black-box slices. Used
+    both for local simulation (iverilog) and by Catapult HLS / SCVerify /
+    downstream synthesis (Design Compiler) -- one source of truth, no
+    behavioral/synth branch split.
 
-    ``else`` — structural synth wrapper with tensor_slice_int8 black-box slices.
-    Used by Catapult HLS → downstream synthesis (Design Compiler).
-
-    Both share the same port list so the ac_blackbox() binding is identical, and
-    -- critically -- the SAME (s1, s2, out_width) so the two branches' stage-2
-    text (and lane width) never disagree. ``bias_codes`` (or None -- the add
-    folds away, decision 4) is baked as ONE compile-time bias ROM hoisted above
-    the `ifndef, exactly like the weight ROM, so sim and synth read the
-    identical declaration.
+    ``bias_codes`` (or None -- the add folds away, decision 4) is baked as
+    ONE compile-time bias ROM hoisted above the single module, exactly like
+    the weight ROM.
 
     ``out_bits`` is accepted as a legacy alias for ``out_width`` (some callers
     still pass it); ``out_width`` wins when both are given. Defaults to 8
     (today's legacy int8-lane default) when neither is given.
+
+    Symmetric-only quantization scope: nonzero ``a_zero_point``/
+    ``b_zero_point`` (or ``*_correct``) raise here via
+    ``_require_symmetric_quant``.
     """
+    _require_symmetric_quant(a_zero_point, b_zero_point,
+                             a_zero_point_correct, b_zero_point_correct,
+                             who=f"{module_name} (generate_combined_core_verilog)")
     if out_width is None:
         out_width = out_bits if out_bits is not None else 8
     has_bias = bias_codes is not None
-    # Weight-stationary and/or a real bias: hoist shared ROM(s) above the `ifndef
-    # so both branches read the identical declaration (one source of truth). The
-    # combined core becomes ONE module with the `ifndef INSIDE it; the sim's
-    # behav_grid helper stays a trailing module. No-weight-rom/no-bias keeps the
-    # old simple full-text ifndef/else path untouched (byte-identical output).
-    #
-    # Bias hoisting has one wrinkle weight-rom hoisting doesn't: the sim
-    # branch's actual per-column bias use lives inside `behav_grid`, a
-    # SEPARATE Verilog module (not the top wrapper), so a `bias_rom` declared
-    # in the wrapper's scope (above `ifndef) is not visible there -- unlike
-    # `w_rom_out`, which the wrapper passes into `grid` as a plain port. So:
-    # the sim branch self-declares its OWN bias_rom inside behav_grid
-    # (emit_bias_rom=True); the synth branch (single module, no submodule)
-    # reads the ONE hoisted declaration below. Both are built from the same
-    # `bias_codes` list, so the two declarations are byte-identical text even
-    # though physically duplicated -- the single Python source of truth the
-    # plan asks for, same as the K-spatial combined core already does for its
-    # (also per-branch) weight ROM.
+    # Weight-stationary and/or a real bias: hoist shared ROM(s) above the
+    # single module (one source of truth), which reads them directly.
     if weight_rom is not None or has_bias:
-        sim_top = generate_sim_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width,
-                                       weight_rom=weight_rom, emit_rom=False,
-                                       bias_codes=bias_codes, emit_bias_rom=True,
-                                       a_zero_point=a_zero_point, b_zero_point=b_zero_point,
-                                       a_zero_point_correct=a_zero_point_correct,
-                                       b_zero_point_correct=b_zero_point_correct)
         synth_top = generate_synth_verilog(m, k, n, module_name, weight_rom=weight_rom, emit_rom=False,
                                            s1=s1, s2=s2, out_width=out_width,
                                            bias_codes=bias_codes, emit_bias_rom=False,
@@ -1394,10 +965,8 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
                                            a_zero_point_correct=a_zero_point_correct,
                                            b_zero_point_correct=b_zero_point_correct)
         b_width = ((n + 7) // 8) * 64
-        input_beats = max(m, n)
+        input_beats = _geometry.feed_beats(m, n, (k + 7) // 8)
         header, syn_body = _split_module(synth_top, module_name)   # header incl. 'module..);'
-        sim_wrapper, sim_behav = _split_after_first_endmodule(sim_top)
-        _, sim_body = _split_module(sim_wrapper, module_name)
         rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes) \
             if weight_rom is not None else ""
         bias_rom = _bias_rom_block(bias_codes) if has_bias else ""
@@ -1405,22 +974,17 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
         if weight_rom is not None:
             tag.append("shared const-weight ROM")
         if has_bias:
-            tag.append("bias ROM (synth branch; sim's behav_grid self-declares the identical ROM)")
+            tag.append("bias ROM")
         out = (
             f"// Auto-generated by rtl.py\n"
             f"// Combined core: M={m}, K={k}, N={n}\n"
-            f"//   {' + '.join(tag)} above `ifndef feeds both branches\n"
+            f"//   {' + '.join(tag)} hoisted above the single structural module\n"
             f"{header}\n{rom_block}{bias_rom}\n"
-            f"`ifndef SYNTHESIS\n{sim_body}`else\n{syn_body}`endif\n"
-            f"endmodule\n\n"
-            f"`ifndef SYNTHESIS\n{sim_behav}`endif\n"
+            f"{syn_body}"
+            f"endmodule\n"
         )
         return out
 
-    sim_top = generate_sim_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width,
-                                   a_zero_point=a_zero_point, b_zero_point=b_zero_point,
-                                   a_zero_point_correct=a_zero_point_correct,
-                                   b_zero_point_correct=b_zero_point_correct)
     synth_top = generate_synth_verilog(m, k, n, module_name, s1=s1, s2=s2, out_width=out_width,
                                        a_zero_point=a_zero_point, b_zero_point=b_zero_point,
                                        a_zero_point_correct=a_zero_point_correct,
@@ -1429,20 +993,10 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
     lines = []
     lines.append("// Auto-generated by rtl.py")
     lines.append(f"// Combined core: M={m}, K={k}, N={n}")
-    lines.append("//   ifndef SYNTHESIS → behavioral simulation model (SCVerify)")
-    lines.append("//   else            → structural synth wrapper  (HLS synthesis)")
-    lines.append("")
-    lines.append("`ifndef SYNTHESIS")
-    lines.append("")
-    for l in sim_top.splitlines():
-        lines.append(l)
-    lines.append("")
-    lines.append("`else")
+    lines.append("//   structural synth wrapper (single-branch RTL: simulation + HLS synthesis)")
     lines.append("")
     for l in synth_top.splitlines():
         lines.append(l)
-    lines.append("")
-    lines.append("`endif")
     return "\n".join(lines) + "\n"
 
 
@@ -1488,9 +1042,9 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
     has_bias = bias_codes is not None
     bias_rom_block = _bias_rom_block(bias_codes, bias_rom_name) if (has_bias and emit_bias_rom) else ""
     _fold_n_bias = bool(has_bias and n_passes and int(n_passes) > 1)
-    _bias_grp_decl, _bias_grp_body = (
-        _fold_n_bias_group_decl(n_passes) if _fold_n_bias else ("", "")
-    )
+    # Multi-frame overlap: emit-side group tracked by the pop-advanced out_grp
+    # (see the chunked emitter's note) instead of the fed-group live counter.
+    _bias_grp_decl, _bias_grp_body = "", ""
     stage2_fn = _stage2_function(s2, out_width)
 
     # Passes over K: ``k_spatial`` partitions cover K_CHUNKS chunks in
@@ -1516,11 +1070,13 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
     a_chunk_width = 64
     b_chunk_width = 64
     c_width = grid_cols * 8 * out_width
-    input_beats = max(m, n)
+    input_beats = _geometry.feed_beats(m, n, passes)
     # K-spatial uses the same logical-row retirement contract as the chunked
     # wrapper; physical 8-row bursts are aborted after logical M.
     logical_output_rows = m
     physical_output_rows = grid_rows * 8
+    # op[1] only for a real masked tail (see the chunked emitter).
+    _ksp_tail_cond = "" if (logical_output_rows % 8) else " && 1'b0"
 
     if ksp_ws:
         ksp_b_cols_port = ""
@@ -1539,7 +1095,7 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
     if full_k_spatial:
         # ── passes == 1 (k_spatial == k_chunks): today's full-K endpoint. ──
         # Kept byte-identical to the pre-fold-K generator: partition p always
-        # carries chunk p (there is only one pass), so every k_size/k_mask is
+        # carries chunk p (there is only one pass), so every k_mask is
         # a Python-computed literal, not a runtime expression.
         partitions = _k_spatial_partitions(k, k_spatial)
         part_comments = "\n".join(
@@ -1548,14 +1104,8 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
         for p, (lo, hi) in enumerate(partitions):
             decls.append(f"    // Spatial grid {p}: contiguous K chunks {lo}..{hi}")
             decls.append(f"    wire part{p}_active = 1'b1;")
-            decls.append(f"    wire part{p}_first_chunk = 1'b1;")
             decls.append(f"    wire part{p}_last_chunk = 1'b1;")
-            part_k_size = k - lo * 8 if hi == k_chunks - 1 else 8
             part_k_mask = tail_mask_hex(k, hi) if hi == k_chunks - 1 else 0xFF
-            decls.append(
-                f"    wire [7:0] part{p}_k_size = part{p}_last_chunk ? "
-                f"((16'd{hi} == K_CHUNKS - 1) ? 8'd{part_k_size} : 8'd8) : 8'd8;"
-            )
             decls.append(
                 f"    wire [7:0] part{p}_k_mask = part{p}_last_chunk ? "
                 f"((16'd{hi} == K_CHUNKS - 1) ? {vm(part_k_mask)} : 8'hFF) : 8'hFF;"
@@ -1568,10 +1118,12 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
                     a_route = f" && (beat_count >> 3 == {r})"
                     b_route = f" && (beat_count >> 3 == {c})"
                     insts.append(f"""\
-        // S1 = {s1}: in-slice stage-1 round-half-up shift (IP parameter, set out of band;
-        // not passed as a Verilog override -- the VTR hard-block model has no parameters)
-        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_p{p}_r{r}_c{c} (
-            .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
+        // S1 = {s1}: in-slice stage-1 round-half-up shift, driven into the slice's
+        // shift_amount pin (= S1 value; that pin
+        // carries no other function -- the VTR hard-block model has no parameters)
+        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8_atlas slice_p{p}_r{r}_c{c} (
+            .clk(clk), .reset(slice_reset), .pe_reset(1'b0),
+            .en(en),
             .start_mat_mul(slice_start && part{p}_active),
             .done_mat_mul(done_mat_mul[{idx}]),
             .a_data((part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
@@ -1585,9 +1137,9 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
             .validity_mask_a_rows({vm(row_mask_vals[r])}),
             .validity_mask_a_cols_b_rows(part{p}_k_mask),
             .validity_mask_b_cols({vm(col_mask_vals[c])}),
-            .slice_dtype(2'd0), .slice_mode(1'b0), .op({{op2, op1_{r}, op0_{r}}}),
-            .preload(1'b0), .no_rounding(1'b0),
-            .final_mat_mul_size(part{p}_k_size),
+            .op({{op2, op1_{r}, op0_{r}}}),
+            .shift_amount(4'd{s1}),
+            .final_mat_mul_size(8'd0),
             .a_loc(5'd{r}),
             .b_loc(5'd{c})
         );""")
@@ -1599,7 +1151,6 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
         # S_WAIT case below). Chunks beyond K_CHUNKS (padding to fill the
         # last pass) are fully masked so every partition runs every pass.
         tail_chunk = k_chunks - 1
-        tail_k_size = k - tail_chunk * 8
         tail_k_mask = tail_mask_hex(k, tail_chunk)
         part_comments = "\n".join(
             f"// K_SPATIAL_PARTITION {p}: chunk = pass*{k_spatial} + {p}" for p in range(k_spatial)
@@ -1607,14 +1158,9 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
         for p in range(k_spatial):
             decls.append(f"    // Spatial grid {p}: chunk = pass*{k_spatial} + {p}")
             decls.append(f"    wire part{p}_active = 1'b1;")
-            decls.append(f"    wire part{p}_first_chunk = (chunk_idx == 16'd0);")
             decls.append(f"    wire [15:0] part{p}_chunk = chunk_idx * 16'd{k_spatial} + 16'd{p};")
             decls.append(f"    wire part{p}_chunk_pad = (part{p}_chunk >= K_CHUNKS);")
             decls.append(f"    wire part{p}_chunk_tail = (part{p}_chunk == K_CHUNKS - 16'd1);")
-            decls.append(
-                f"    wire [7:0] part{p}_k_size = part{p}_chunk_pad ? 8'd8 : "
-                f"(part{p}_chunk_tail ? 8'd{tail_k_size} : 8'd8);"
-            )
             decls.append(
                 f"    wire [7:0] part{p}_k_mask = part{p}_chunk_pad ? 8'h00 : "
                 f"(part{p}_chunk_tail ? {vm(tail_k_mask)} : 8'hFF);"
@@ -1627,10 +1173,12 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
                     a_route = f" && (beat_count >> 3 == {r})"
                     b_route = f" && (beat_count >> 3 == {c})"
                     insts.append(f"""\
-        // S1 = {s1}: in-slice stage-1 round-half-up shift (IP parameter, set out of band;
-        // not passed as a Verilog override -- the VTR hard-block model has no parameters)
-        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_p{p}_r{r}_c{c} (
-            .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
+        // S1 = {s1}: in-slice stage-1 round-half-up shift, driven into the slice's
+        // shift_amount pin (= S1 value; that pin
+        // carries no other function -- the VTR hard-block model has no parameters)
+        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8_atlas slice_p{p}_r{r}_c{c} (
+            .clk(clk), .reset(slice_reset), .pe_reset(1'b0),
+            .en(en),
             .start_mat_mul(slice_start && part{p}_active),
             .done_mat_mul(done_mat_mul[{idx}]),
             .a_data((part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
@@ -1644,9 +1192,9 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
             .validity_mask_a_rows({vm(row_mask_vals[r])}),
             .validity_mask_a_cols_b_rows(part{p}_k_mask),
             .validity_mask_b_cols({vm(col_mask_vals[c])}),
-            .slice_dtype(2'd0), .slice_mode(1'b0), .op({{op2, op1_{r}, op0_{r}}}),
-            .preload(1'b0), .no_rounding(1'b0),
-            .final_mat_mul_size(part{p}_k_size),
+            .op({{op2, op1_{r}, op0_{r}}}),
+            .shift_amount(4'd{s1}),
+            .final_mat_mul_size(8'd0),
             .a_loc(5'd{r}),
             .b_loc(5'd{c})
         );""")
@@ -1711,7 +1259,8 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
         row_mux_cases.append("        end")
     any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
     op0_lines = "\n".join(
-        f"    wire op0_{r} = !((state == S_OUTPUT) && (cur_row_tile == 16'd{r}));"
+        f"    wire row_emit_{r} = row_done[{r}] && (frames_fed > frames_emitted);\n"
+        f"    wire op0_{r} = !(row_emit_{r} && (cur_row_tile == 16'd{r}));"
         for r in range(grid_rows)
     )
     op1_lines = "\n".join(
@@ -1721,23 +1270,31 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
     )
 
     if full_k_spatial:
-        wait_body = """\
-                    if (all_slices_done) begin
-                        state <= S_OUTPUT;
-                    end"""
+        # Single pass: end of window -> feed FSM returns to S_IDLE while the
+        # independent emission block drains the committed wave.
+        run_end_body = """\
+                            state <= S_IDLE;"""
+        wait_body = ""
+        op2_expr = "slice_start"
     else:
         # chunk_idx doubles as the pass counter here: it advances once per
         # pass (not once per chunk), and the loop exits after `passes` passes.
-        wait_body = f"""\
-                    if (all_slices_done) begin
+        # Non-final passes advance IN PLACE at the end of their beat window:
+        # the host run loop (docs/wrapper_run_loop.md) feeds every pass's
+        # beats contiguously -- any non-in_valid call ends the frame -- so
+        # waiting for all_slices_done between passes would strand the later
+        # passes' beats (the iverilog golden TB feeds contiguously too).
+        # The feed FSM never waits for the grid; the emission block drains the
+        # committed (final-pass) wave.
+        run_end_body = f"""\
                         if (chunk_idx + 16'd1 == 16'd{passes}) begin
-                            state <= S_OUTPUT;
+                            state <= S_IDLE;
                         end else begin
                             chunk_idx <= chunk_idx + 16'd1;
                             beat_count <= 16'd0;
-                            state <= S_RUN;
-                        end
-                    end"""
+                        end"""
+        wait_body = ""
+        op2_expr = f"slice_start && (chunk_idx + 16'd1 == 16'd{passes})"
 
     return f"""\
 // Auto-generated by rtl.py
@@ -1773,9 +1330,30 @@ module {module_name}(
     reg [15:0] out_row_count;
     reg signed [15:0] accum16;
     reg [{c_width-1}:0] row_mux;
-    reg state_output_d;
 {_bias_grp_decl}
 {"    reg [15:0] out_grp;" if _fold_n_bias else ""}
+    // Continuous multi-frame bookkeeping (rev-3 overlapped frames); same
+    // contract as the chunked emitter: frames_fed counts preload pulses,
+    // frames_emitted counts drained frames, and the head (oldest un-emitted)
+    // frame's wave is complete when every slice has counted a done past
+    // frames_emitted.
+    reg [15:0] frames_fed;
+    reg [15:0] frames_emitted;
+    reg [15:0] done_count [0:{k_spatial * grid_rows * grid_cols - 1}];
+    reg        row_done [0:{grid_rows-1}];
+    reg        any_row_done;
+    integer    hp, hd, hc;
+    always @* begin
+        any_row_done = 1'b0;
+        for (hd = 0; hd < {grid_rows}; hd = hd + 1) begin
+            row_done[hd] = 1'b1;
+            for (hp = 0; hp < {k_spatial}; hp = hp + 1)
+                for (hc = 0; hc < {grid_cols}; hc = hc + 1)
+                    if (done_count[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] <= frames_emitted)
+                        row_done[hd] = 1'b0;
+            if (row_done[hd]) any_row_done = 1'b1;
+        end
+    end
 
     // Input pipeline stage (same rationale as the chunked emitter): register
     // the whole bundle en-gated so the beat decode + partition gating muxes
@@ -1804,15 +1382,29 @@ module {module_name}(
     wire in_beat_active = (state == S_RUN) && in_valid_q && (beat_count < INPUT_BEATS);
     wire slice_start = in_beat_active && (beat_count == 16'd0);
     wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
-    wire all_slices_done = &done_mat_mul;
+    // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
+    // done_count[s] tracks them; row_done[r] releases each tile-row as soon
+    // as its own slices complete the head frame (not when all rows finish),
+    // so emission is independent of the feed FSM and frames overlap.
+    wire emit_active = any_row_done && (frames_fed > frames_emitted);
+
+{chr(10).join(partial_wires)}
+
+{chr(10).join(row_avail)}
+
+    wire any_avail = {any_avail_expr};
+
     // op[1] drain_stop source: the logical M'th row of the current tile-row's
     // burst has just been taken -- the remaining physical rows are padding
-    // tail, terminated by op1 (op1_lines below), not by pe_reset.
-    wire logical_output_complete = (state == S_OUTPUT) && any_avail &&
-                                   (out_row_count + 16'd1 == LOGICAL_OUT_ROWS);
-    // op[2] shadow_swap: one-cycle pulse on entry into S_OUTPUT (grid-wide
-    // compute-complete, after the last K pass finishes).
-    wire op2 = (state == S_OUTPUT) && !state_output_d;
+    // tail, terminated by op1 (op1_lines below), not by pe_reset. Gate on a
+    // real tail; see the chunked emitter (a gratuitous op1 can tie with the
+    // next overlapped frame's cap[7] re-arm and suppress its whole drain).
+    wire logical_output_complete = emit_active && any_avail &&
+                                   (out_row_count + 16'd1 == LOGICAL_OUT_ROWS){_ksp_tail_cond};
+    // op[2] commit tag (rev A2): asserted at the committed (final) pass's
+    // start edge; the slices latch it into their wave slot and capture only
+    // for committed waves. Intermediate K passes see op2 == 0.
+    wire op2 = {op2_expr};
 
     // op[0] readout gate (op[0] == out_ctrl on the tensor slice): hold every
     // tile-row's completed result inside the tiles until S_OUTPUT, then
@@ -1826,13 +1418,7 @@ module {module_name}(
 
 {chr(10).join(decls)}
 
-{chr(10).join(partial_wires)}
-
 {chr(10).join(insts)}
-
-{chr(10).join(row_avail)}
-
-    wire any_avail = {any_avail_expr};
 
 {stage2_fn}
     always @(*) begin
@@ -1850,20 +1436,24 @@ module {module_name}(
             c_row <= {c_width}'d0;
             out_valid <= 1'b0;
             out_last <= 1'b0;
-            state_output_d <= 1'b0;
+            frames_fed <= 16'd0;
+            frames_emitted <= 16'd0;
+            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1)
+                done_count[hd] <= 16'd0;
 {"            out_grp <= 16'd0;" if _fold_n_bias else ""}
         end else if (en) begin
             out_valid <= 1'b0;
             out_last <= 1'b0;
-            state_output_d <= (state == S_OUTPUT);
+            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1)
+                if (done_mat_mul[hd])
+                    done_count[hd] <= done_count[hd] + 16'd1;
 {_bias_grp_body}
             case (state)
                 S_IDLE: begin
                     beat_count <= 16'd0;
                     chunk_idx <= 16'd0;
-                    out_row_count <= 16'd0;
                     if (preload_valid_q) begin
-{"                        out_grp <= bias_grp_ctr;" if _fold_n_bias else ""}
+                        frames_fed <= frames_fed + 16'd1;
                         state <= S_RUN;
                     end
                 end
@@ -1871,23 +1461,26 @@ module {module_name}(
                     if (in_beat_active) begin
                         beat_count <= beat_count + 16'd1;
                         if (beat_count + 16'd1 == INPUT_BEATS)
-                            state <= S_WAIT;
+{run_end_body}
                     end
                 end
-                S_WAIT: begin
 {wait_body}
-                end
-                S_OUTPUT: begin
-                    if (any_avail) begin
-                        c_row <= row_mux;
-                        out_valid <= 1'b1;
-                        out_last <= (out_row_count + 16'd1 == LOGICAL_OUT_ROWS);
-                        out_row_count <= out_row_count + 16'd1;
-                        if (out_row_count + 16'd1 == LOGICAL_OUT_ROWS)
-                            state <= S_IDLE;
-                    end
-                end
             endcase
+
+            // Emission runs independently of the feed FSM: the head frame
+            // drains while later frames feed.
+            if (emit_active && any_avail) begin
+                c_row <= row_mux;
+                out_valid <= 1'b1;
+                out_last <= (out_row_count + 16'd1 == LOGICAL_OUT_ROWS);
+                out_row_count <= out_row_count + 16'd1;
+                if (out_row_count + 16'd1 == LOGICAL_OUT_ROWS) begin
+                    out_row_count <= 16'd0;
+                    frames_emitted <= frames_emitted + 16'd1;
+{(f"                    if (out_grp + 16'd1 >= 16'd{n_passes}) out_grp <= 16'd0;") if _fold_n_bias else ""}
+{"                    else out_grp <= out_grp + 16'd1;" if _fold_n_bias else ""}
+                end
+            end
         end
     end
 
@@ -1927,8 +1520,7 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
     ping-pong banks, no overlap (Step 3).
 
     No preload: weights are either streamed (``b_cols`` beats) or baked into
-    ``weight_rom`` (weight-stationary); the ``preload`` tensor_slice_int8 pin
-    is tied low either way.
+    ``weight_rom`` (weight-stationary).
     """
     logical_m = m if logical_m is None else int(logical_m)
     logical_n = n if logical_n is None else int(logical_n)
@@ -1941,7 +1533,7 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
             f"{module_name}: combined-fold grid is {grid_rows}x{grid_cols} slices "
             f"(m_spatial={grid_rows}, n_spatial={grid_cols}); a_loc/b_loc are 5-bit "
             "ports capping m_spatial/n_spatial at 32. Reduce the fold so the core grid "
-            "fits, or ask the tensor_slice_int8 owner to widen a_loc/b_loc."
+            "fits, or ask the tensor_slice_int8_atlas owner to widen a_loc/b_loc."
         )
 
     has_bias = bias_codes is not None
@@ -1953,7 +1545,6 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
         raise ValueError(f"k_spatial={k_spatial} must be in [1, K_CHUNKS={k_chunks}]")
     passes = -(-k_chunks // k_spatial)
     tail_chunk = k_chunks - 1
-    tail_k_size = k - tail_chunk * 8
     tail_k_mask = tail_mask_hex(k, tail_chunk)
 
     total_frames = int(m_passes) * int(n_passes)
@@ -1964,51 +1555,29 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
     a_width = 64 * k_spatial
     b_width = 64 * k_spatial
     c_width = grid_cols * 8 * out_width
-    input_beats = max(m, n)
+    input_beats = _geometry.feed_beats(m, n, passes)
 
     if ws:
         b_cols_port = ""
         b_cols_src = "w_rom_out"
-        # #RUTHWIK: this combined-fold ROM block is a NEW, simpler address
-        # generator (base = (k_pass*n_passes + n_group)*n + beat), unlike
-        # _weight_rom_block's frame-boundary-detecting grp_ctr (built for
-        # EXTERNAL multi-frame replay). Unify the two once 2c generalizes
-        # weight ROM addressing for real. The read address (``rom_addr``) is
-        # now a REGISTERED mirror of that same expression -- updated in
-        # lockstep with the FSM's own beat_count/chunk_idx/frame transitions
-        # below (same trick _weight_rom_block uses: the register always holds
-        # the address to use THIS cycle, computed from next-state values at
-        # the prior edge) -- so VTR's parmys infers w_rom as a clocked
-        # single_port_ram (needs a register-fed address, not a combinational
-        # chunk_idx/ng/beat_count expression). See the FSM always block for
-        # the actual rom_addr updates.
+        # Reuse the shared const-weight ROM block: its passes>1 & n_passes>1
+        # branch already implements the combined chunk-major/ng-minor layout
+        # (addr = (k_pass*n_passes + ng)*n + beat) with the registered address
+        # VTR's parmys needs -- driven by in_valid/beat_ctr/pass_ctr/grp_ctr,
+        # exactly like the proven single-axis weight-stationary path. This
+        # replaces the old hand-rolled rom_addr that had to be kept in lockstep
+        # with the FSM (and was off by a cycle under the overlapped feed).
         rom_beats = int(passes) * int(n_passes) * n
         if weight_rom is not None and len(weight_rom) != rom_beats:
             raise ValueError(
                 f"{module_name}: combined-fold weight_rom has {len(weight_rom)} beats, "
                 f"expected passes*n_passes*n = {rom_beats}"
             )
-        if emit_rom:
-            hexw = (b_width + 3) // 4
-            mask = (1 << b_width) - 1
-            rom_init = "\n".join(
-                f"        w_rom[{i}] = {b_width}'h{(int(v) & mask):0{hexw}x};"
-                for i, v in enumerate(weight_rom)
-            )
-            rom_block = f"""
-    // Combined-fold weight-stationary ROM: {rom_beats} beats = K_PASSES({passes}) x
-    // N_PASSES({n_passes}) x n({n}); weight depends only on (k_pass, n_group), never
-    // m_group -- base = (chunk_idx*n_passes + ng)*n, replayed identically for every mg.
-    // rom_addr is a plain register (declared with the FSM state below, updated
-    // in the FSM always block) so parmys infers a clocked single_port_ram.
-    reg [{b_width - 1}:0] w_rom [0:{rom_beats - 1}];
-    initial begin
-{rom_init}
-    end
-    wire [{b_width - 1}:0] w_rom_out = (beat_count < 16'd{n}) ? w_rom[rom_addr] : {b_width}'d0;
-"""
-        else:
-            rom_block = ""
+        rom_block = (
+            _weight_rom_block(b_width, weight_rom, n, input_beats,
+                              n_passes=n_passes, passes=passes)
+            if emit_rom else ""
+        )
     else:
         b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
         b_cols_src = "b_cols"
@@ -2021,14 +1590,9 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
     insts = []
     for p in range(k_spatial):
         decls.append(f"    // Spatial grid {p}: chunk = chunk_idx*{k_spatial} + {p}")
-        decls.append(f"    wire part{p}_first_chunk = (chunk_idx == 16'd0);")
         decls.append(f"    wire [15:0] part{p}_chunk = chunk_idx * 16'd{k_spatial} + 16'd{p};")
         decls.append(f"    wire part{p}_chunk_pad = (part{p}_chunk >= K_CHUNKS);")
         decls.append(f"    wire part{p}_chunk_tail = (part{p}_chunk == K_CHUNKS - 16'd1);")
-        decls.append(
-            f"    wire [7:0] part{p}_k_size = part{p}_chunk_pad ? 8'd8 : "
-            f"(part{p}_chunk_tail ? 8'd{tail_k_size} : 8'd8);"
-        )
         decls.append(
             f"    wire [7:0] part{p}_k_mask = part{p}_chunk_pad ? 8'h00 : "
             f"(part{p}_chunk_tail ? {vm(tail_k_mask)} : 8'hFF);"
@@ -2041,9 +1605,11 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
                 a_route = f" && (beat_count >> 3 == {r})"
                 b_route = f" && (beat_count >> 3 == {c})"
                 insts.append(f"""\
-        // S1 = {s1}: in-slice stage-1 round-half-up shift (IP parameter, set out of band)
-        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8 slice_p{p}_r{r}_c{c} (
-            .clk(clk), .reset(slice_reset), .pe_reset(slice_start && part{p}_first_chunk),
+        // S1 = {s1}: in-slice stage-1 round-half-up shift, driven into the slice's
+        // shift_amount pin (= S1 value)
+        (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8_atlas slice_p{p}_r{r}_c{c} (
+            .clk(clk), .reset(slice_reset), .pe_reset(1'b0),
+            .en(en),
             .start_mat_mul(slice_start),
             .done_mat_mul(done_mat_mul[{idx}]),
             .a_data(({c} == 0){a_route} ? {a_expr} : 64'b0),
@@ -2057,9 +1623,9 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
             .validity_mask_a_rows(row_mask_{r}),
             .validity_mask_a_cols_b_rows(part{p}_k_mask),
             .validity_mask_b_cols(col_mask_{c}),
-            .slice_dtype(2'd0), .slice_mode(1'b0), .op({{op2, op1_{r}, op0_{r}}}),
-            .preload(1'b0), .no_rounding(1'b0),
-            .final_mat_mul_size(part{p}_k_size),
+            .op({{op2, op1_{r}, op0_{r}}}),
+            .shift_amount(4'd{s1}),
+            .final_mat_mul_size(8'd0),
             .a_loc(5'd{r}),
             .b_loc(5'd{c})
         );""")
@@ -2101,7 +1667,9 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
             f"partial_avail_p{p}_r{r}_c{c}" for p in range(k_spatial) for c in range(grid_cols)
         )
         row_avail.append(f"    wire row_avail_{r} = {avail_terms};")
-        row_mux_cases.append(f"        if (row_avail_{r}) begin")
+        _row_cond = (f"(cur_row_tile == 16'd{r}) && row_avail_{r}"
+                     if grid_rows > 1 else f"row_avail_{r}")
+        row_mux_cases.append(f"        if ({_row_cond}) begin")
         for c in range(grid_cols):
             for lane in range(8):
                 terms = " + ".join(
@@ -2110,20 +1678,18 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
                 row_mux_cases.append(f"            accum16 = {terms};")
                 if has_bias:
                     # Bias depends only on n_group (ng), never on mg or k_pass.
-                    # #RUTHWIK: with the Step-3 compute/drain overlap, this must
-                    # read the DRAIN engine's latched cap_ng (the n_group of the
-                    # group currently being drained), NOT the live compute
-                    # engine's ng -- compute may already be several beats into
-                    # the NEXT group by the time this group's rows drain. This
-                    # duplicates the single-axis fold-N branches' out_grp
-                    # freeze-on-drain pattern; unify once that generalizes.
-                    _bias_e = f"{_bias_lane(bias_rom_name, f'cap_ng * {n} + {c * 8 + lane}')}"
+                    # Read the DRAIN engine's own n_group (drain_ng, from the
+                    # independent drain_frame counter) -- the feed engine may
+                    # already be several groups ahead by the time this group's
+                    # rows drain.
+                    _bias_e = f"{_bias_lane(bias_rom_name, f'drain_ng * {n} + {c * 8 + lane}')}"
                 else:
                     _bias_e = "16'sd0"
                 row_mux_cases.append(
                     f"            row_mux[{c}*{8*out_width} + {lane}*{out_width} +: {out_width}] = "
                     f"stage2(accum16, {_bias_e});"
                 )
+        row_mux_cases.append("            row_take = 1'b1;")
         row_mux_cases.append("        end")
     any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
 
@@ -2137,30 +1703,23 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
     # same "held value already equals this cycle's address" trick
     # ``_weight_rom_block`` uses -- so it lands on the same value the old
     # combinational expression had, cycle for cycle.
-    emit_rom_addr = ws and emit_rom
-    rom_addr_decl = "    reg [15:0] rom_addr;" if emit_rom_addr else ""
-    rom_addr_reset = "            rom_addr <= 16'd0;" if emit_rom_addr else ""
-    rom_addr_idle = "                    rom_addr <= 16'd0;" if emit_rom_addr else ""
-    rom_addr_run = (
-        f"                        if (beat_count + 16'd1 < 16'd{n}) "
-        f"rom_addr <= (chunk_idx * 16'd{n_passes} + ng) * 16'd{n} + (beat_count + 16'd1);"
-    ) if emit_rom_addr else ""
-    rom_addr_wait = (
-        f"                            rom_addr <= ((chunk_idx + 16'd1) * 16'd{n_passes} + ng) * 16'd{n};"
-    ) if emit_rom_addr else ""
-    rom_addr_output_next_group = (
-        f"                        rom_addr <= (((frame_c + 16'd1) % 16'd{n_passes})) * 16'd{n};"
-    ) if emit_rom_addr else ""
-    rom_addr_output_done = "                        rom_addr <= 16'd0;" if emit_rom_addr else ""
+    emit_rom_addr = False  # ROM addressing now lives inside _weight_rom_block
+    rom_addr_decl = ""
+    rom_addr_reset = ""
+    rom_addr_idle = ""
+    rom_addr_run = ""
+    rom_addr_wait = ""
+    rom_addr_final = ""
 
-    # #RUTHWIK: op0/op1 (shadow readout control) are now driven by the DRAIN
-    # engine's own state (dstate/cur_row_tile), independent of the compute
-    # engine's state -- this is the crux of the Step-3 overlap: op0/op1 read
-    # out group g's shadow bank while cstate/chunk_idx/beat_count advance
-    # through group g+1's live compute. Duplicates the single-axis emitters'
-    # per-row op0/op1 shape; unify once that generalizes.
+    # op0/op1 (shadow readout control) are driven by the independent emission
+    # engine (row_done/frames_emitted/cur_row_tile), never by the feed FSM --
+    # the crux of the overlapped-frame model: op0/op1 read out group g's shadow
+    # bank while feed advances through group g+1's live compute. Duplicates the
+    # single-axis emitters' per-row op0/op1 shape; unify once that generalizes.
     op0_lines = "\n".join(
-        f"    wire op0_{r} = !((dstate == D_OUTPUT) && (cur_row_tile == 16'd{r}));"
+        (f"    wire op0_{r} = !(row_done[{r}] && (frames_fed > frames_emitted) && (cur_row_tile == 16'd{r}));"
+         if grid_rows > 1 else
+         f"    wire op0_{r} = !(row_done[{r}] && (frames_fed > frames_emitted));")
         for r in range(grid_rows)
     )
     op1_lines = "\n".join(
@@ -2196,7 +1755,8 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
 // Per-group core: M={m}, K={k}, N={n}  |  Grid: {grid_rows}x{grid_cols} slices, K_SPATIAL={k_spatial}
 // Groups: M_PASSES={m_passes} x N_PASSES={n_passes} (mg-major, ng-minor), LOGICAL_M={logical_m}, LOGICAL_N={logical_n}
 // WARNING: K-spatial partial outputs are INT16; correctness requires every partition partial sum to fit INT16.
-// Groups run STRICTLY SEQUENTIALLY (drain g before computing g+1) -- overlap is Step 3.
+// Overlapped multi-frame feed: each group's preload + beats are consumed
+// without waiting on compute, and the head frame's rows drain independently.
 {part_comments}
 `timescale 1ns/1ps
 
@@ -2224,45 +1784,45 @@ module {module_name}(
     localparam integer CORE_N = {n};
     localparam integer LOGICAL_M = {logical_m};
     localparam integer LOGICAL_N = {logical_n};
-    // Step 3 (tensor-slice-group-overlap): TWO cooperating engines instead of
-    // one sequential FSM. COMPUTE (cstate) feeds A/B, drives start_mat_mul and
-    // the K passes, and advances the compute-group index (frame_c). DRAIN
-    // (dstate) walks the shadow-bank readout (op[0]/op[1]) for a captured
-    // group and advances an INDEPENDENT drain-group index. op[2] (capture_pulse,
-    // below) hands a finished compute group to the drain engine and, in the
-    // same cycle, lets the compute engine start the NEXT group -- so drain(g)
-    // overlaps compute(g+1). The drain-group index trails the compute-group
-    // index by at most one: compute stalls in C_HANDOFF if the previous
-    // capture hasn't finished draining yet (no queue depth > 1). No inter-
-    // group gap and no preload, per the op contract.
-    localparam [2:0] C_IDLE=3'd0, C_RUN=3'd1, C_WAIT=3'd2, C_HANDOFF=3'd3, C_DONE=3'd4;
-    localparam D_IDLE=1'd0, D_OUTPUT=1'd1;
+    // Overlapped multi-frame model (mirrors the chunked emitter): a FEED FSM
+    // consumes each group's preload + contiguous beats WITHOUT waiting on
+    // compute, and an INDEPENDENT emission path walks the head frame's shadow
+    // rows as its slices report committed-wave done pulses. feed_frame drives
+    // the per-group validity masks and the weight-ROM address; drain_frame
+    // drives the emitted frame's ragged row count and bias group. A feed-side
+    // counter is never read at emit time.
+    localparam [1:0] S_IDLE=2'd0, S_PRELOAD=2'd1, S_RUN=2'd2;
 
-    reg [2:0] cstate;
-    reg       dstate;
+    reg [1:0] state;
     reg [15:0] beat_count;
     reg [15:0] chunk_idx;
-    reg [15:0] frame_c;        // compute-group index
-    reg [15:0] out_row_count;  // drain-side row cursor within the draining group
-    reg        drain_active;   // 1 while dstate is draining a captured group (owned by drain engine)
-    reg [15:0] cap_ng;         // #RUTHWIK: latched ng of the group currently draining
-    reg [15:0] cap_rows;       // latched group_logical_rows of the group currently draining
-    reg        cap_last;       // latched: this is the final logical group overall
+    reg [15:0] feed_frame;     // frame currently being fed (masks + ROM)
+    reg [15:0] drain_frame;    // frame currently being drained (rows + bias)
+    reg [15:0] out_row_count;  // row cursor within the draining frame
+    reg [15:0] frames_fed;     // preload pulses seen
+    reg [15:0] frames_emitted; // frames whose rows have fully drained
+    reg        row_take;
     reg signed [15:0] accum16;
     reg [{c_width-1}:0] row_mux;
 {rom_addr_decl}
 
-    // mg/ng decode (contract: mg = frame // n_passes, ng = frame % n_passes)
-    // for the COMPUTE engine -- stable for a whole group's compute, i.e. until
-    // the C_HANDOFF -> C_RUN transition into the next group.
-    wire [15:0] mg = frame_c / 16'd{n_passes};
-    wire [15:0] ng = frame_c % 16'd{n_passes};
-    // Ragged final-group logical extents (only the LAST m_group/n_group is
-    // ragged; every other group is a full CORE_M x CORE_N tile).
-    wire [15:0] group_logical_rows = (mg == 16'd{m_passes - 1}) ?
-        (16'd{logical_m} - mg * 16'd{m}) : 16'd{m};
-    wire [15:0] group_logical_cols = (ng == 16'd{n_passes - 1}) ?
-        (16'd{logical_n} - ng * 16'd{n}) : 16'd{n};
+    // Per-frame mg/ng decode (contract: mg = frame // n_passes, ng = frame %
+    // n_passes). Split into feed/drain so feed may already be in a later group
+    // while drain is still reading an earlier one.
+    wire [15:0] feed_mg = feed_frame / 16'd{n_passes};
+    wire [15:0] feed_ng = feed_frame % 16'd{n_passes};
+    wire [15:0] drain_mg = drain_frame / 16'd{n_passes};
+    wire [15:0] drain_ng = drain_frame % 16'd{n_passes};
+    // Combined-fold computes full CORE_M x CORE_N tiles every group; ragged
+    // logical M/N is reassembled downstream (the C++ capture stores only
+    // rowOut < LOGICAL_M and the final assembly keeps only LOGICAL_N columns).
+    // Keeping the full extents here means every physical row/column of each
+    // frame's burst is valid, so the shadow drain progresses and the framing
+    // is one out_last per CORE_M rows -- matching package.py's `captured % m`
+    // and the regression TB's full-tile golden.
+    wire [15:0] group_logical_rows = 16'd{m};
+    wire [15:0] group_logical_cols = 16'd{n};
+    wire [15:0] drain_rows = 16'd{m};
 
 {chr(10).join(row_mask_lines)}
 {chr(10).join(col_mask_lines)}
@@ -2287,161 +1847,167 @@ module {module_name}(
     end
 
     wire slice_reset = rst;
-    wire in_beat_active = (cstate == C_RUN) && in_valid_q && (beat_count < INPUT_BEATS);
+    wire in_beat_active = ((state == S_PRELOAD) || (state == S_RUN)) && in_valid_q && (beat_count < INPUT_BEATS);
     wire slice_start = in_beat_active && (beat_count == 16'd0);
+    wire final_chunk = (chunk_idx == 16'd{passes - 1});
     wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
-    wire all_slices_done = &done_mat_mul;
-    // Compute-group handoff: once cstate reaches C_HANDOFF (this group's
-    // compute is fully done -- chunk_idx reached the last K pass), fire the
-    // moment the drain engine has freed the previous capture (or never had
-    // one) -- capture NOW (op2 pulse) and let compute proceed into the next
-    // group's C_RUN this same edge.
-    wire capture_pulse = (cstate == C_HANDOFF) && !drain_active;
+    // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
+    // done_count[s] counts them; row_done[r] says every slice of tile-row r
+    // (across every K-spatial partition) has counted a done past
+    // frames_emitted, so each tile-row is released as soon as ITS wave is
+    // complete -- emission never waits on the feed FSM. Same shape as the
+    // chunked emitter.
+    reg [15:0] done_count [0:{k_spatial * grid_rows * grid_cols - 1}];
+    reg        row_done [0:{grid_rows - 1}];
+    reg        any_row_done;
+    integer    hp, hd, hc;
+    always @* begin
+        any_row_done = 1'b0;
+        for (hd = 0; hd < {grid_rows}; hd = hd + 1) begin
+            row_done[hd] = 1'b1;
+            for (hp = 0; hp < {k_spatial}; hp = hp + 1)
+                for (hc = 0; hc < {grid_cols}; hc = hc + 1)
+                    if (done_count[(hp*{grid_rows} + hd)*{grid_cols} + hc] <= frames_emitted)
+                        row_done[hd] = 1'b0;
+            if (row_done[hd]) any_row_done = 1'b1;
+        end
+    end
 
-    // op[1] drain_stop source: the logical row count of the group currently
-    // DRAINING (cap_rows, not the live compute group's group_logical_rows)
-    // has just been taken.
-    wire logical_output_complete = (dstate == D_OUTPUT) && any_avail &&
-                                   (out_row_count + 16'd1 == cap_rows);
-    // op[2] shadow_swap: exactly the capture handoff pulse.
-    wire op2 = capture_pulse;
+{chr(10).join(partial_wires)}
+
+{chr(10).join(row_avail)}
+
+    wire any_avail = {any_avail_expr};
+    wire emit_active = any_row_done && (frames_fed > frames_emitted);
+
+    // op[1] drain_stop source: the emitting frame's last logical row has just
+    // been taken AND that frame has a ragged tail to truncate (an 8-aligned
+    // row count needs no op1; firing one would tie with the next frame's row-0
+    // capture under overlap -- see the chunked emitter's tail condition).
+    wire logical_output_complete = emit_active && row_take &&
+                                   (out_row_count + 16'd1 == drain_rows) &&
+                                   (|drain_rows[2:0]);
+    // op[2] commit tag (rev A2): asserted at the committed (final) K pass's
+    // start edge; the slices latch it into their wave slot and capture only
+    // for that wave. Intermediate K passes see op2 == 0.
+    wire op2 = slice_start && final_chunk;
     wire [15:0] cur_row_tile = out_row_count >> 3;
 {op0_lines}
 {op1_lines}
 
 {chr(10).join(decls)}
 
-{chr(10).join(partial_wires)}
-
 {chr(10).join(insts)}
-
-{chr(10).join(row_avail)}
-
-    wire any_avail = {any_avail_expr};
 
 {stage2_fn}
     always @(*) begin
         row_mux = {c_width}'d0;
         accum16 = 16'sd0;
+        row_take = 1'b0;
 {chr(10).join(row_mux_cases)}
     end
 
-    // COMPUTE engine: feed + start_mat_mul + K passes, advancing frame_c.
-    // Owns cstate, beat_count, chunk_idx, frame_c and rom_addr. Reads
-    // drain_active only (never writes drain-engine regs).
+    // FEED engine: consumes each group's preload + contiguous beats, advancing
+    // feed_frame after the final K pass -- with NO wait on compute, so the next
+    // group's beats are accepted while the current group is still computing
+    // (the module's wave slots pipeline them). Owns state/beat_count/chunk_idx/
+    // feed_frame/frames_fed/done_count/rom_addr and the independent emission of
+    // the head frame's rows (row_done/frames_emitted/drain_frame/out_row_count).
     always @(posedge clk) begin
         if (rst) begin
-            cstate <= C_IDLE;
+            state <= S_IDLE;
             beat_count <= 16'd0;
             chunk_idx <= 16'd0;
-            frame_c <= 16'd0;
-            cap_ng <= 16'd0;
-            cap_rows <= 16'd0;
-            cap_last <= 1'b0;
-{rom_addr_reset}
-        end else if (en) begin
-            case (cstate)
-                C_IDLE: begin
-                    beat_count <= 16'd0;
-                    chunk_idx <= 16'd0;
-                    frame_c <= 16'd0;
-{rom_addr_idle}
-                    if (preload_valid_q) begin
-                        cstate <= C_RUN;
-                    end
-                end
-                C_RUN: begin
-                    if (in_beat_active) begin
-                        beat_count <= beat_count + 16'd1;
-{rom_addr_run}
-                        if (beat_count + 16'd1 == INPUT_BEATS)
-                            cstate <= C_WAIT;
-                    end
-                end
-                C_WAIT: begin
-                    if (all_slices_done) begin
-                        if (chunk_idx + 16'd1 == 16'd{passes}) begin
-                            cstate <= C_HANDOFF;
-                        end else begin
-                            chunk_idx <= chunk_idx + 16'd1;
-                            beat_count <= 16'd0;
-{rom_addr_wait}
-                            cstate <= C_RUN;
-                        end
-                    end
-                end
-                C_HANDOFF: begin
-                    // Stall here (accumulators held, undisturbed) until the
-                    // drain engine has freed the previous capture -- at most
-                    // one captured-but-undrained group in flight.
-                    if (capture_pulse) begin
-                        cap_ng <= ng;
-                        cap_rows <= group_logical_rows;
-                        cap_last <= (frame_c + 16'd1 == 16'd{total_frames});
-                        if (frame_c + 16'd1 == 16'd{total_frames}) begin
-                            cstate <= C_DONE;
-{rom_addr_output_done}
-                        end else begin
-                            frame_c <= frame_c + 16'd1;
-                            chunk_idx <= 16'd0;
-                            beat_count <= 16'd0;
-{rom_addr_output_next_group}
-                            cstate <= C_RUN;
-                        end
-                    end
-                end
-                C_DONE: begin
-                    // All compute issued; wait for the final drain to finish
-                    // before the module is ready to accept a new preload.
-                    if (dstate == D_IDLE && !drain_active)
-                        cstate <= C_IDLE;
-                end
-                default: cstate <= C_IDLE;
-            endcase
-        end
-    end
-
-    // DRAIN engine: shadow readout via op[0]/op[1], advancing an independent
-    // drain-group index (cap_ng/cap_rows/cap_last, latched by the compute
-    // engine at each capture_pulse). Owns dstate, out_row_count,
-    // drain_active and the module's c_row/out_valid/out_last outputs.
-    // #RUTHWIK: this duplicates the single-axis emitters' per-row S_OUTPUT
-    // drain shape (row_mux capture + out_row_count walk); unify once that
-    // generalizes to a shared drain-engine helper.
-    always @(posedge clk) begin
-        if (rst) begin
-            dstate <= D_IDLE;
+            feed_frame <= 16'd0;
+            drain_frame <= 16'd0;
             out_row_count <= 16'd0;
-            drain_active <= 1'b0;
+            frames_fed <= 16'd0;
+            frames_emitted <= 16'd0;
+            // row_take is combinational only (driven in the row_mux always @(*)
+            // block); it must not be written from this clocked block or the two
+            // drivers race and the drain desyncs from the slices' own ptr.
+            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1)
+                done_count[hd] <= 16'd0;
             c_row <= {c_width}'d0;
             out_valid <= 1'b0;
             out_last <= 1'b0;
+{rom_addr_reset}
         end else if (en) begin
             out_valid <= 1'b0;
             out_last <= 1'b0;
-            case (dstate)
-                D_IDLE: begin
-                    out_row_count <= 16'd0;
-                    if (capture_pulse) begin
-                        drain_active <= 1'b1;
-                        dstate <= D_OUTPUT;
+            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1)
+                if (done_mat_mul[hd])
+                    done_count[hd] <= done_count[hd] + 16'd1;
+
+            case (state)
+                S_IDLE: begin
+                    beat_count <= 16'd0;
+                    chunk_idx <= 16'd0;
+{rom_addr_idle}
+                    if (preload_valid_q) begin
+                        feed_frame <= frames_fed;
+                        frames_fed <= frames_fed + 16'd1;
+                        state <= S_PRELOAD;
                     end
                 end
-                D_OUTPUT: begin
-                    if (any_avail) begin
-                        c_row <= row_mux;
-                        out_valid <= 1'b1;
-                        out_last <= cap_last && (out_row_count + 16'd1 == cap_rows);
-                        out_row_count <= out_row_count + 16'd1;
-                        if (out_row_count + 16'd1 == cap_rows) begin
-                            out_row_count <= 16'd0;
-                            drain_active <= 1'b0;
-                            dstate <= D_IDLE;
+                S_PRELOAD: begin
+                    // Consume the first data beat HERE: the input register
+                    // already holds beat 0 this cycle (see the chunked
+                    // emitter's S_PRELOAD note).
+                    if (in_beat_active) begin
+                        beat_count <= beat_count + 16'd1;
+{rom_addr_run}
+                        if (beat_count + 16'd1 == INPUT_BEATS) begin
+                            if (final_chunk) begin
+                                beat_count <= 16'd0;
+{rom_addr_final}
+                                state <= S_IDLE;
+                            end else begin
+                                chunk_idx <= chunk_idx + 16'd1;
+                                beat_count <= 16'd0;
+{rom_addr_wait}
+                                state <= S_RUN;
+                            end
+                        end else begin
+                            state <= S_RUN;
+                        end
+                    end else begin
+                        state <= S_RUN;
+                    end
+                end
+                S_RUN: begin
+                    if (in_beat_active) begin
+                        beat_count <= beat_count + 16'd1;
+{rom_addr_run}
+                        if (beat_count + 16'd1 == INPUT_BEATS) begin
+                            if (final_chunk) begin
+                                beat_count <= 16'd0;
+{rom_addr_final}
+                                state <= S_IDLE;
+                            end else begin
+                                chunk_idx <= chunk_idx + 16'd1;
+                                beat_count <= 16'd0;
+{rom_addr_wait}
+                            end
                         end
                     end
                 end
-                default: dstate <= D_IDLE;
             endcase
+
+            // Independent emission of the head frame's rows; frame t+1 feeds
+            // while frame t drains.
+            if (emit_active && row_take) begin
+                c_row <= row_mux;
+                out_valid <= 1'b1;
+                out_last <= (out_row_count + 16'd1 == drain_rows);
+                out_row_count <= out_row_count + 16'd1;
+                if (out_row_count + 16'd1 == drain_rows) begin
+                    out_row_count <= 16'd0;
+                    frames_emitted <= frames_emitted + 16'd1;
+                    drain_frame <= (drain_frame + 16'd1 == 16'd{total_frames}) ?
+                        drain_frame : drain_frame + 16'd1;
+                end
+            end
         end
     end
 
@@ -2470,99 +2036,58 @@ def generate_k_spatial_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k
     )
 
 
-def generate_k_spatial_sim_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1,
-                                   s1=0, s2=0, out_width=16,
-                                   weight_rom=None, emit_rom=True, n_passes=1,
-                                   bias_codes=None, emit_bias_rom=True):
-    sim = generate_sim_verilog(m, k, n, module_name, k_spatial=k_spatial,
-                               s1=s1, s2=s2, out_width=out_width,
-                               weight_rom=weight_rom, emit_rom=emit_rom, n_passes=n_passes,
-                               bias_codes=bias_codes, emit_bias_rom=emit_bias_rom)
-    if k_spatial == 1:
-        return sim
-    banner = (
-        f"// Experimental K-spatial behavioral simulation model, K_SPATIAL={k_spatial}\n"
-        "// WARNING: structural K-spatial partial outputs are INT16; simulation uses exact INT32 reference math.\n"
-    )
-    return banner + sim
-
-
 def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", k_spatial=1, out_bits=None,
                                             s1=0, s2=0, out_width=None, weight_rom=None, n_passes=1,
-                                            bias_codes=None, a_zero_point=0, b_zero_point=0):
+                                            bias_codes=None, a_zero_point=0, b_zero_point=0,
+                                            m_passes=1, logical_m=None, logical_n=None):
+    """Structural-only K-spatial combined core (single-branch RTL)."""
     if out_width is None:
         out_width = out_bits if out_bits is not None else 8
-    if k_spatial == 1:
+    _require_symmetric_quant(a_zero_point, b_zero_point,
+                             who=f"{module_name} (generate_k_spatial_combined_core_verilog)")
+    if k_spatial == 1 and int(m_passes) <= 1:
         return generate_combined_core_verilog(m, k, n, module_name, out_width=out_width,
                                               s1=s1, s2=s2,
                                               weight_rom=weight_rom, n_passes=n_passes,
                                               bias_codes=bias_codes,
                                               a_zero_point=a_zero_point, b_zero_point=b_zero_point)
-    if a_zero_point or b_zero_point:
-        raise NotImplementedError(
-            f"{module_name}: k_spatial={k_spatial} structural K-spatial RTL "
-            "does not implement the zero-point running-sum correction across "
-            "partitions; only k_spatial==1 (chunked) supports a zero-pointed "
-            "operand today."
-        )
-    _k_spatial_partitions(k, k_spatial)
-    # Weight-stationary and/or bias: each branch emits its OWN ROM(s). Unlike
-    # the chunked combined core -- which splits the two modules apart to hoist
-    # a single shared ROM above the `ifndef -- the K-spatial core keeps sim
-    # and synth as whole modules, so hoisting would mean the same module
-    # surgery on an experimental structural body. Both ROMs are built from the
-    # same weight_rom/bias_codes, so sim and synth stay identical by
-    # construction (byte-for-byte the same declaration in each branch); only
-    # one branch is ever compiled.
-    sim_top = generate_k_spatial_sim_verilog(m, k, n, module_name, k_spatial,
-                                            s1=s1, s2=s2, out_width=out_width,
-                                            weight_rom=weight_rom, n_passes=n_passes,
-                                            bias_codes=bias_codes)
+    if k_spatial != 1:
+        _k_spatial_partitions(k, k_spatial)
+    # Weight-stationary and/or bias: the structural body emits its OWN ROM(s)
+    # as a whole module. Both ROMs are built from the same
+    # weight_rom/bias_codes single source of truth.
     synth_top = generate_k_spatial_synth_verilog(m, k, n, module_name, k_spatial,
                                                 s1=s1, s2=s2, out_width=out_width,
                                                 weight_rom=weight_rom, n_passes=n_passes,
-                                                bias_codes=bias_codes)
+                                                bias_codes=bias_codes, m_passes=m_passes,
+                                                logical_m=logical_m, logical_n=logical_n)
 
     lines = []
     lines.append("// Auto-generated by rtl.py")
     lines.append(f"// Combined K-spatial core: M={m}, K={k}, N={n}, K_SPATIAL={k_spatial}")
-    lines.append("//   ifndef SYNTHESIS -> behavioral simulation model")
-    lines.append("//   else             -> experimental structural K-spatial wrapper")
+    lines.append("//   structural K-spatial wrapper (single-branch RTL: simulation + HLS synthesis)")
     lines.append("// WARNING: INT16 partial overflow is possible in K-spatial structural mode.")
     lines.append("")
-    lines.append("`ifndef SYNTHESIS")
-    lines.append("")
-    lines.extend(sim_top.splitlines())
-    lines.append("")
-    lines.append("`else")
-    lines.append("")
     lines.extend(synth_top.splitlines())
-    lines.append("")
-    lines.append("`endif")
     return "\n".join(lines) + "\n"
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate Verilog grid wrapper for tensor_slice_int8 modules")
+        description="Generate Verilog grid wrapper for tensor_slice_int8_atlas modules")
     parser.add_argument("--m", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--n", type=int, required=True)
     parser.add_argument("--name", type=str, default="gemm_grid_wrapper")
     parser.add_argument("--output", type=str, default="gemm_grid.v")
-    parser.add_argument("--sim-output", type=str, default=None)
     parser.add_argument("--synth-output", type=str, default=None)
     parser.add_argument("--debug", action="store_true",
                         help="Emit Verilog $display debug traces")
     args = parser.parse_args()
 
-    if args.sim_output or args.synth_output:
-        sim_output = args.sim_output or args.output.replace(".v", "_sim.v")
-        synth_output = args.synth_output or args.output.replace(".v", "_synth.v")
-        Path(sim_output).write_text(generate_sim_verilog(args.m, args.k, args.n, args.name))
-        Path(synth_output).write_text(generate_synth_verilog(args.m, args.k, args.n, args.name, debug=args.debug))
-        print(f"Generated {sim_output} and {synth_output}  (M={args.m}, K={args.k}, N={args.n})")
-    else:
-        content = generate_synth_verilog(args.m, args.k, args.n, args.name, debug=args.debug)
-        Path(args.output).write_text(content)
-        print(f"Generated {args.output}  (M={args.m}, K={args.k}, N={args.n})")
+    # Single-branch RTL: --output (or --synth-output) always gets the
+    # structural wrapper. The former --sim-output behavioral option is gone.
+    out_path = args.synth_output or args.output
+    content = generate_synth_verilog(args.m, args.k, args.n, args.name, debug=args.debug)
+    Path(out_path).write_text(content)
+    print(f"Generated {out_path}  (M={args.m}, K={args.k}, N={args.n})")

@@ -8,8 +8,8 @@ is hls4ml-native and is intended to be included through `GEMM_IP_HEADER`.
 
 For a package named `gemm_8x8x8`, the generator emits:
 
-- `gemm_8x8x8_core.v`: tensor-slice GEMM RTL hardblock (combined behavioral +
-  structural core, split by `ifndef SYNTHESIS`)
+- `gemm_8x8x8_core.v`: tensor-slice GEMM RTL hardblock (structural core only,
+  one source of truth for simulation and synthesis)
 - `gemm_8x8x8_gemm_ip.h`: hls4ml-native C++ wrapper and blackbox binding
 - `gemm_8x8x8_inst.cpp`: standalone Catapult top used for package synthesis
 - `gemm_8x8x8_tb.cpp`: standalone C-simulation testbench
@@ -115,8 +115,13 @@ phases:
 3. Output capture (inside `RUN`): on each `out_valid`, the raw 16-bit integer
    lanes are rescaled by `2^-(frac_a + frac_b)`, the full-precision bias is
    added, and the result is cast to the result type (round/saturate).
-4. `DRAIN_PADDED_ROWS`: `MR - M` idle calls, flushing the hardblock's 8-row
-   burst granularity.
+4. At the final logical M row, the structural core pulses `op[1]`
+   (`drain_stop`) to abort the unused masked rows in the hardblock's physical
+   8-row burst. `pe_reset` and `final_mat_mul_size` are tied off in the
+   wrapper instantiation (the slice never acts on them); `rst` is the only
+   recovery path. K- and N-fold wrappers therefore need no padded drain
+   calls. Fold-M retains a conservative legacy flush hook (currently
+   zero-trip because its core M is tile-aligned).
 
 Because capture is polled from step 0, rows are collected as they emerge —
 including while later beats of the same frame are still being fed.
@@ -149,11 +154,13 @@ For each generated package:
 
 1. Standalone RTL simulation via iverilog passes for all DEFAULT_CASES (10 configs,
    sequential + back-to-back).
-2. Standalone Catapult synthesis completes using `run_catapult.tcl`.
-3. SCVerify RTL vs C++ co-simulation passes (0 comparison errors) — the C++ simulation
-   model and behavioral Verilog model produce identical output.
-4. Synth structural smoke compiles with `-DSYNTHESIS` flag using a stub
-   `tensor_slice_int8`.
-
-Note that the structural (`SYNTHESIS`) branch is synthesis-only and is not a
-cycle-accurate reference; the behavioral branch is the verification authority.
+2. Standalone Catapult synthesis completes using `run_catapult.tcl`
+   (`-RESET_KIND sync`, VTR-ready RTL).
+3. SCVerify RTL vs C++ co-simulation passes (0 comparison errors) — the C++
+   simulation model and the structural Verilog core produce identical output.
+4. Structural cores are the only cores: there is no separate `SYNTHESIS`
+   branch or stub `tensor_slice_int8` to compile against; both simulation and
+   synthesis instantiate the same `tensor_slice_int8_atlas` black-box slices
+   (`(* blackbox *)` on the module definition, so yosys/parmys discards the
+   body for VTR). The model ships once per package root, added via
+   `gemm_ip_sources.tcl`. Quantization is symmetric only.
