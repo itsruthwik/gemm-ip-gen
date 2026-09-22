@@ -32,17 +32,29 @@ int captured = 0;                // result rows captured so far (this frame)
 
 RUN: for (step = 0; step < total_steps; step++) { ... }  // the frame schedule
 
-DRAIN_PADDED_ROWS: ...           // MR - M idle calls (8-row burst headroom)
+// The structural core's padded tail rows (physical row count above logical M)
+// are terminated by op1, not by pe_reset: pe_reset is tied low on every slice
+// (each slice masks it on any start edge and self-clears at capture, so
+// `rst` is the only recovery path). Fold-M retains a conservative legacy
+// flush hook (`DRAIN_ARRAY_WL_PADDED_ROWS`/`DRAIN_ARRAY_PADDED_ROWS`, `physical_rows - m`
+// idle calls); it's normally zero-trip because fold-M's generated core M is
+// tile-aligned today.
 ```
 
 ```text
 period      = total_beats + 1
-total_steps = (n_frames - 1) * period + first_out + MR + 6
+total_steps = (n_frames - 1) * period + first_out + M + 6
 ```
 
 `first_out` is the mode-aware first output offset (full-K-spatial packages get
-the shorter single-pass value); `MR = grid_rows * 8 >= M`. The `+6` is the
-port-lag tail (3 calls worst-case RTL lag + 2 spare + 1 for the preload beat).
+the shorter single-pass value). The `+6` is the port-lag tail (3 calls
+worst-case RTL lag + 2 spare + 1 for the preload beat). The tail is sized on
+the logical row count `M`, not the physical tile burst (`grid_rows * 8`): the
+structural core's op1 signal stops the drain at the logical M'th row, so the
+remaining physical rows never need to be walked by the loop. A combined
+K/N-fold package adds one extra `period` of slack (`_struct_tail`) on top of
+this budget, to guarantee the loop outlives the structural core's registered
+handshake latency on the last frame.
 Generation fails hard if the single-frame budget `first_out + M + 6` cannot
 cover `total_beats + 2` — i.e. if the loop would be shorter than the feed.
 
@@ -138,21 +150,24 @@ stages may add up to 3 calls of lag. The bound
 
 ```
 total_steps = (n_frames - 1) * period   start of the last frame
-            + (first_out + MR + 1)      its last row, core schedule
+            + (first_out + M + 1)       its last logical row, core schedule
             + 3                         worst RTL port lag
             + 2                         spare
 ```
 
-guarantees every row lands inside the loop's capture window; generation fails
-hard if the budget cannot cover the feed itself. Note the tail uses `MR`, not
-`M`, so shapes with a non-8-aligned M get the padded-row headroom too.
-`DRAIN_PADDED_ROWS` then
-issues `MR − M` idle calls (zero for 8-aligned M) as flush headroom for the
-hard block's 8-row burst granularity.
+guarantees every logical row lands inside the loop's capture window; generation
+fails hard if the budget cannot cover the feed itself. K- and N-fold packages
+size the tail on the logical `M`, not the physical `MR = ceil(M/8)*8`: op1
+stops the structural core's drain at the logical M'th row, so the masked
+physical tail rows never need loop headroom (pe_reset plays no part in this —
+it stays tied low throughout). Fold-M retains its conservative legacy flush
+hook (`DRAIN_ARRAY_WL_PADDED_ROWS`/`DRAIN_ARRAY_PADDED_ROWS`, `physical_rows - m`
+idle calls); its generated core M is tile-aligned today, so that hook is
+zero-trip.
 
 ## Timing diagram — 8×8×8
 
-`total_beats = 8`, `first_out = 16`, `M = MR = 8`, `n_frames = 1`, so
+`total_beats = 8`, `first_out = 16`, `M = 8`, `n_frames = 1`, so
 `total_steps = 30`. One column =
 one RUN iteration = one core cycle:
 
@@ -177,7 +192,7 @@ spare columns absorb it.
 
 ## Timing diagram — conv2d full-K (16×72×8)
 
-`total_beats = 16` (single full-K pass), `first_out = 80`, `M = MR = 16`, so
+`total_beats = 16` (single full-K pass), `first_out = 80`, `M = 16`, so
 `total_steps = 102` — phase view:
 
 ```
