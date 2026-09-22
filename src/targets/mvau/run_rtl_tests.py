@@ -70,7 +70,8 @@ def _tools_env():
 
 
 def _find_case_plan(shape, **kw):
-    return _geom.resolve_plan(shape, **_COMMON, **kw)
+    cfg = {**_COMMON, **kw}   # kw overrides _COMMON (e.g. a case-specific output_precision)
+    return _geom.resolve_plan(shape, **cfg)
 
 
 def _round_bits(n):
@@ -79,14 +80,22 @@ def _round_bits(n):
 
 # ── case builders: each returns (workdir, module_name, sv_files, kind, tb_args) ──
 
+def _synth_bias(n, seed):
+    """Deterministic per-column bias: a mix of positive, negative and exactly-zero
+    real values so the folded-constant width/no-op-skip logic sees all three."""
+    return [((i * 3 + seed) % 7 - 3) * 0.25 for i in range(n)]
+
+
 def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_stall=False,
-                   **plan_kw):
+                   bias=None, **plan_kw):
     plan = _find_case_plan(shape, **plan_kw)
     t = plan["tile"]
     N, K, K_pad = plan["n"], plan["k"], plan["k_pad"]
     WW, AW, outW = t["weight_width"], t["activation_width"], t["output_width"]
     signed = bool(t["signed_activations"])
     shift = plan["product_frac"] - plan["output_frac"]
+    bias_codes = (_pkg._wpack.bias_acc_codes(bias, plan["product_frac"], N, True)
+                 if bias is not None else None)
 
     B = _tb.synth_weights(N, K_pad, WW)   # [K_pad][N]; K_pad>=K, extra rows unused (K real)
     NTILE = plan["n_tile"]                # padded per-tile width (>= N; PE must divide it)
@@ -112,7 +121,7 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_
     core_v = _rtl.generate_shim(shape, module_name=module_name, force_behavioral=True,
                                 tile=t, weights_in_core=True, init_files=init_files,
                                 n_tiles=1, k_tiles=k_tiles,
-                                bias_codes=None, raw_k=K, raw_n=N)
+                                bias_codes=bias_codes, raw_k=K, raw_n=N)
     (work / f"{module_name}.v").write_text(core_v)
 
     a_words, exp_words = [], []
@@ -123,6 +132,8 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_
             row = []
             for o in range(N):
                 acc = sum(B[kk][o] * X[v][kk] for kk in range(K))
+                if bias_codes is not None:
+                    acc += bias_codes[o]
                 row.append(_tb.requant_ref(acc, shift, outW))
             exp_words.append(_tb.pack_beat(row, outW))
 
@@ -143,8 +154,8 @@ def _build_2op_case(work, name, shape, seed, kind=None, backpressure=True, fsm_d
                     late_b_delay=15, **plan_kw):
     """Single-tile two-operand case (``dynamic_load_2op``), any depth including the
     fully-spatial DEPTH==1 case (SF=NF=1) -- 2-op only ever folds within one MVU
-    tile (see jojo-track/defer/mvau-two-operand-dynamic-load/plan.md's "Cleanup:
-    collapse 2-op to a single dynamic_load_2op tile"). ``kind`` is accepted for
+    tile, so this is the sole 2-op weight supply; multi-tile 2-op and the register
+    form were retired. ``kind`` is accepted for
     backward-compat call sites and ignored. ``mode``: 0 = row-major (dynamic_load_2op
     MODE=0), 1 = col-major (MODE=1) -- selects the loader's narrow B beat
     layout/order (see rtl.py's generate_two_operand_shim)."""
@@ -308,6 +319,34 @@ CASES = {
         backpressure=kw.get("backpressure", True)),
     "q3_2op_late_b_col_major": lambda work, seed, **kw: _build_2op_case(
         work, "q3", (4, 4, 8), seed, reuse_factor=2, fold_axis="n", mode=1, late_b=True, late_b_node=1,
+        backpressure=kw.get("backpressure", True)),
+    # ── K-tiled + bias, NF==1/NF>1 bias, and a positive-shift folded-round-constant
+    # carry, covering the shared requant-width-and-const-bias rework ──
+    "r_ktiled_bias_large": lambda work, seed, **kw: _build_ws_case(
+        # k_tiles=4 at the largest inputs this suite uses, WITH a bias (NF=16/8=2>1):
+        # exercises the K-tile-sum-then-bias order and the per-lane case(nf_cnt) select.
+        work, "r", (4, 32, 16), seed, pe=8, simd=8, k_tiles=4, bias=_synth_bias(16, seed),
+        backpressure=kw.get("backpressure", True)),
+    "s_ktiled_no_bias_large": lambda work, seed, **kw: _build_ws_case(
+        # Same grid, no bias -- confirms accu (sized off full k_pad, no separate
+        # accu_sum widening) still doesn't overflow summing k_tiles=4 partials.
+        work, "s", (4, 32, 16), seed, pe=8, simd=8, k_tiles=4,
+        backpressure=kw.get("backpressure", True)),
+    "t_bias_nf1": lambda work, seed, **kw: _build_ws_case(
+        # NF==1: the folded bias+round constant renders as a plain per-lane literal.
+        work, "t", (2, 8, 4), seed, pe=4, simd=4, bias=_synth_bias(4, seed),
+        backpressure=kw.get("backpressure", True)),
+    "u_bias_nf_gt1": lambda work, seed, **kw: _build_ws_case(
+        # NF==2 (PE=4 < N=8): each physical lane carries two different output
+        # columns' bias values over time -> exercises the case(nf_cnt) select.
+        work, "u", (2, 8, 8), seed, pe=4, simd=8, bias=_synth_bias(8, seed),
+        backpressure=kw.get("backpressure", True)),
+    "v_positive_shift_carry": lambda work, seed, **kw: _build_ws_case(
+        # output_precision fixed<8,2> (frac=6) vs. product_frac=8 -> shift=+2, so
+        # the folded round-half constant (2) is added into a real, nonzero bias --
+        # must carry into the sum correctly (round-half-up, not truncate).
+        work, "v", (2, 8, 4), seed, pe=4, simd=4, bias=_synth_bias(4, seed),
+        output_precision="fixed<8,2>",
         backpressure=kw.get("backpressure", True)),
 }
 

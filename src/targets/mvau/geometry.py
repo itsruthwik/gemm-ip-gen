@@ -294,7 +294,7 @@ def resolve_fold(k, n, reuse_factor, fold_axis="n", name=None):
     else:  # kn
         simd = simd_k
         pe = pe  # already n_pad // rf_n from the N-side branch
-        legal_rf = rf_n if rf_n == rf_k else rf_n  # report the N-side RF; see effective reuse
+        legal_rf = rf_n  # report the N-side RF; see effective reuse
 
     return {
         "pe": pe,
@@ -327,13 +327,32 @@ def stream_widths(pe, simd, weight_width, act_width, accu, out_width=None):
     }
 
 
-def rv_width(accu, has_bias):
-    """Just-wide-enough intermediate width for the requant stage's biased
-    accumulator value (shared by the C twin and the RTL requant stage so the
-    two never drift). With a bias add, headroom is kept wide (>= 32b) plus a
-    couple guard bits; without one, one guard bit above the accumulator
-    suffices."""
-    return (max(int(accu), 32) + 2) if has_bias else (int(accu) + 1)
+def _signed_const_width(v):
+    """Bits needed to hold *v* as a two's-complement signed value (0 for v==0)."""
+    v = int(v)
+    if v == 0:
+        return 0
+    return (v.bit_length() + 1) if v > 0 else ((~v).bit_length() + 1)
+
+
+def requant_width(accu, consts):
+    """Just-wide-enough intermediate width for the requant stage's biased value
+    (shared by the C twin and the RTL requant stage so the two never drift, and
+    sized from the actual folded per-lane constants rather than a runtime-width
+    floor).
+
+    ``consts`` is the flat collection of folded per-lane constants (bias +
+    rounding-half, see ``weightpack.fold_requant_constants``) an instance bakes,
+    or empty/None when every lane's constant is zero (no bias, no rounding --
+    the add is skipped entirely, both for width and for the generated add).
+
+    Returns ``(biased_w, const_w)``: ``const_w`` is the signed width needed for
+    the widest nonzero constant (0 when every constant is zero), ``biased_w =
+    max(accu, const_w) + 1`` -- one guard bit over whichever of the raw
+    accumulator or the constant is wider, enough headroom for the add.
+    """
+    const_w = max((_signed_const_width(c) for c in (consts or [])), default=0)
+    return max(int(accu), const_w) + 1, const_w
 
 
 def check_beat_limits(pe, simd, weight_width, act_width, output_ba, n_tiles=1,
@@ -454,7 +473,10 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         raise ValueError(f"k_tiles={gk} must divide SF={sf_full} (K_pad/SIMD)")
     k_per_tile = k_pad // gk
     sf = sf_full // gk                     # per-tile SF
-    accu_sum = accu + (math.ceil(math.log2(gk)) if gk > 1 else 0)  # summed-partials width
+    # No separate summed-partials width: accu is sized from the full (pre-tiling)
+    # k_pad, so k_tiles partial sums -- each individually within accu bits --
+    # never exceed accu bits when added together either (an earlier "K-tiled sum
+    # overflows" review finding was wrong).
 
     # Post-requant per-tile output beat (PE*out_width): the beat the shim now emits
     # after the requantize stage, not the raw pre-drain accumulator beat.
@@ -483,7 +505,6 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         "output_int": output_int,
         "output_frac": output_frac,
         "product_frac": input_frac + weight_frac,
-        "accu_sum": accu_sum,
         "weight_stream_width_ba": widths["weight_ba"],
         "input_stream_width_ba": widths["input_ba"],
         "output_stream_width_ba": widths["output_ba"],
@@ -512,11 +533,11 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         "effective_reuse": effective_reuse,
         "fold_warnings": fold_warnings,
         # K-tiling: k_tiles MVU cores each reduce K_pad/k_tiles for all outputs; partials
-        # summed (accumulator widened to accu_sum). k_tiles=1 => single K-core (default).
+        # summed (no extra width -- accu already covers the full pre-tiling k_pad).
+        # k_tiles=1 => single K-core (default).
         "k_tiles": gk,                     # number of K-tiles (MVU cores summed along K)
         "k_per_tile": k_per_tile,          # each tile's MW (K slice), a multiple of SIMD
         "sf_full": sf_full,                # pre-tiling SF; k_tiles=SF_full => SF_tile=1
-        "accu_sum": accu_sum,              # width of the summed-partials accumulator
     }
 
 

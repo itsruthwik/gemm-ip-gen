@@ -240,30 +240,38 @@ def test_bias_scaled_and_added(tmp_path):
     bias = [0.5, -0.25, 0.0, 0.25, 1.0, -1.0, 0.75, -0.5]
     pkg = _gen(tmp_path, (2, 8, 8), "gb", reuse_factor=1, bias=bias)
     core = (pkg / "gb_core.cpp").read_text()
-    assert "static const long gb_core_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in core
+    # shift = product_frac(8) - output_frac(10) = -2 <= 0, so no round constant is
+    # folded in -- the array is exactly the scaled bias codes.
+    assert "gb_core_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in core
     assert "gb_core_bias[oc]" in core
     top = (pkg / "gb_top.cpp").read_text()
     assert "gb_core_bias" not in top
 
 
 def test_truncating_result_floors_through_the_bias_codes(tmp_path):
-    # The requant stage only rounds half-up; floor(x / 2^s) == round_half_up(x - 2^(s-1), s),
-    # so a TRN result gets the half folded into the baked codes. Product frac 8, result
-    # frac 6: shift 2, half 2.
+    # The requant stage's shift is now a plain arithmetic shift: the round-half-up
+    # constant (2^(shift-1), when shift>0) is folded into the baked bias codes
+    # (weightpack.fold_requant_constants), one add instead of an add-then-add.
+    # package.py's own TRN pre-adjustment pre-subtracts that same half so it
+    # cancels back out here -- net effect: a TRN layer's *folded* codes equal its
+    # plain scaled bias (floor, not round). Product frac 8, result frac 6: shift 2,
+    # half 2.
     bias = [0.5, -0.25, 0.0, 0.25, 1.0, -1.0, 0.75, -0.5]
     pkg = _gen(tmp_path, (2, 8, 8), "gt", reuse_factor=1, bias=bias,
                output_precision="fixed<12,6,TRN,WRAP,0>")
     core = (pkg / "gt_core.cpp").read_text()
-    assert "static const long gt_core_bias[8] = {126, -66, -2, 62, 254, -258, 190, -130}" in core
-    # A bias-free TRN layer still needs the half, so the codes are created for it.
+    assert "gt_core_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in core
+    # A bias-free TRN layer's pre-subtracted half exactly cancels the folded-in
+    # round constant -> the folded codes are all zero -> no add, no array at all.
     pkg = _gen(tmp_path, (2, 8, 8), "gtn", reuse_factor=1, has_bias=False,
                output_precision="fixed<12,6,TRN,WRAP,0>")
-    assert "static const long gtn_core_bias[8] = {-2, -2, -2, -2, -2, -2, -2, -2}" in (
-        pkg / "gtn_core.cpp").read_text()
-    # A rounding result keeps the plain codes.
+    gtn_core = (pkg / "gtn_core.cpp").read_text()
+    assert "gtn_core_bias" not in gtn_core
+    # A rounding (RND) result is not TRN-pre-adjusted, so the round-half constant
+    # folds straight into the plain scaled bias.
     pkg = _gen(tmp_path, (2, 8, 8), "gr", reuse_factor=1, bias=bias,
                output_precision="fixed<12,6,RND,WRAP,0>")
-    assert "static const long gr_core_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in (
+    assert "gr_core_bias[8] = {130, -62, 2, 66, 258, -254, 194, -126}" in (
         pkg / "gr_core.cpp").read_text()
 
 
@@ -287,16 +295,17 @@ def test_has_bias_false_ignores_nonzero_bias_values(tmp_path):
 
 
 def test_has_bias_true_bakes_sublsb_bias(tmp_path):
-    # A bias that scales to all-zero codes at this fixed-point precision must
-    # still be baked and added when has_bias is True -- hardware has to match the
-    # manifest (and hls4ml's csim expectation), not silently re-derive presence
-    # from the (here, sub-LSB) scaled values.
+    # has_bias=True still routes a sub-LSB bias through bias_acc_codes (it bakes
+    # an N-long all-zero codes list rather than treating this as "no bias") --
+    # but adding a zero constant is a value no-op, so the requant width helper
+    # (geometry.requant_width) correctly skips the add/array for it: the
+    # generated result is bit-identical to a true no-bias layer either way, only
+    # without the wasted fabric a forced all-zero add/ROM would cost.
     tiny = 1.0 / (1 << 20)   # far below the 2^8 accumulator scale -> rounds to 0
     bias = [tiny] * 8
     pkg = _gen(tmp_path, (2, 8, 8), "gsl", reuse_factor=1, has_bias=True, bias=bias)
     core = (pkg / "gsl_core.cpp").read_text()
-    assert "static const long gsl_core_bias[8] = {0, 0, 0, 0, 0, 0, 0, 0}" in core
-    assert "gsl_core_bias[oc]" in core
+    assert "gsl_core_bias" not in core
 
 
 def test_has_bias_true_without_bias_raises(tmp_path):

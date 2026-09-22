@@ -23,24 +23,27 @@ def _plan(shape, plan=None, **kw):
     return plan if plan is not None else _geom.resolve_plan(shape, **kw)
 
 
-def _requant_block(shift, out_width, acc_expr, q_var, indent=""):
-    """Round-half-up shift by *shift* (accumulator's product_frac -> the output's
-    frac), then wrap (drop high bits, no saturation) to a signed *out_width*-bit
-    code -- the arithmetic the RTL requant stage and every C twin/golden reference
-    share, so all three land on the identical code. ``acc_expr`` is a ``long``
-    expression already at the accumulator's fixed-point scale (bias already added,
-    if any); the result is bound to a fresh ``long {q_var}``, sign-extended from the
-    wrapped low *out_width* bits (i.e. the two's-complement value that bit pattern
-    represents)."""
-    lines = [f"{indent}long {q_var};"]
+def _requant_block(shift, out_width, biased_w, acc_expr, q_var, indent=""):
+    """Shift by *shift* (accumulator's product_frac -> the output's frac), then
+    wrap (drop high bits, no saturation) to a signed *out_width*-bit code -- the
+    arithmetic the RTL requant stage and every C twin/golden reference share, so
+    all three land on the identical code. The round-half-up constant is NOT added
+    here: it is folded into ``acc_expr``'s bias constant upstream (see
+    ``weightpack.fold_requant_constants``), so this stage is a plain arithmetic
+    shift, mirroring the RTL wire exactly. ``acc_expr`` is an expression already
+    at the biased scale (sum + folded bias+round constant, if any); intermediates
+    are ``ap_int<biased_w>`` -- the same width the RTL's ``_biased`` wire uses
+    (:func:`geometry.requant_width`), so the two are bit-identical by
+    construction, not just by matching arithmetic."""
+    lines = [f"{indent}ap_int<{biased_w}> {q_var}_biased = {acc_expr};"]
     if shift > 0:
-        lines.append(f"{indent}{q_var} = ({acc_expr} + (1L << {shift - 1})) >> {shift};")
+        lines.append(f"{indent}ap_int<{biased_w}> {q_var}_shifted = {q_var}_biased >> {shift};")
     elif shift < 0:
-        lines.append(f"{indent}{q_var} = {acc_expr} << {-shift};")
+        lines.append(f"{indent}ap_int<{biased_w}> {q_var}_shifted = {q_var}_biased << {-shift};")
     else:
-        lines.append(f"{indent}{q_var} = {acc_expr};")
-    lines.append(f"{indent}{{ unsigned long _m = (1UL << {out_width}) - 1; {q_var} &= (long)_m; "
-                 f"if ({q_var} & (1L << ({out_width} - 1))) {q_var} -= (1L << {out_width}); }}")
+        lines.append(f"{indent}ap_int<{biased_w}> {q_var}_shifted = {q_var}_biased;")
+    lines.append(f"{indent}ap_int<{out_width}> {q_var} = {q_var}_shifted.range({out_width} - 1, 0);"
+                 f"   // wrap: low {out_width} bits, reinterpreted signed")
     return "\n".join(lines)
 
 
@@ -145,13 +148,16 @@ def _ws_core_twin(p, t, func_name, B, bias_codes=None):
     actt = _act_ctype(t["signed_activations"], AW)
     wlit = _w_matrix_literal(B, N, KPAD)
     pad = ' ' * (len(func_name) + 6)
-    if bias_codes:
-        bias_decl = ("static const long %s_bias[%d] = {%s};\n"
-                      % (func_name, N, ", ".join(str(c) for c in bias_codes)))
+    folded = _wpack.fold_requant_constants(bias_codes, shift, N)
+    biased_w, const_w = _geom.requant_width(ACCU, folded)
+    _wpack.assert_constants_fit(folded, const_w)
+    if _wpack.has_real_add(folded):
+        bias_decl = ("static const ap_int<%d> %s_bias[%d] = {%s};\n"
+                      % (const_w, func_name, N, ", ".join(str(c) for c in folded)))
         bias_add = f" + {func_name}_bias[oc]"
     else:
         bias_decl, bias_add = "", ""
-    req = _requant_block(shift, outW, f"(long)acc{bias_add}", "q", ' ' * 12)
+    req = _requant_block(shift, outW, biased_w, f"(ap_int<{biased_w}>)acc{bias_add}", "q", ' ' * 12)
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 
@@ -203,7 +209,6 @@ def _kt_core_twin(p, t, func_name, B, bias_codes=None):
     K-sum-then-requant order)."""
     PE, SIMD, MW = t["pe"], t["simd"], t["mw"]
     ACCU = t["accu_width"]
-    ACCU_SUM = p["accu_sum"]
     AW = t["activation_width"]
     NF = t["nf"]
     KT, NT = p["k_tiles"], p["n_tiles"]
@@ -220,13 +225,16 @@ def _kt_core_twin(p, t, func_name, B, bias_codes=None):
     wlit = _w_matrix_literal(B, N, KPAD)
     pad = ' ' * (len(func_name) + 6)
     apmax = max(1024, ((max(AB, PB) + 1023) // 1024 + 1) * 1024)
-    if bias_codes:
-        bias_decl = ("static const long %s_bias[%d] = {%s};\n"
-                      % (func_name, N, ", ".join(str(c) for c in bias_codes)))
+    folded = _wpack.fold_requant_constants(bias_codes, shift, N)
+    biased_w, const_w = _geom.requant_width(ACCU, folded)
+    _wpack.assert_constants_fit(folded, const_w)
+    if _wpack.has_real_add(folded):
+        bias_decl = ("static const ap_int<%d> %s_bias[%d] = {%s};\n"
+                      % (const_w, func_name, N, ", ".join(str(c) for c in folded)))
         bias_add = f" + {func_name}_bias[oc]"
     else:
         bias_decl, bias_add = "", ""
-    req = _requant_block(shift, outW, f"(long)raw{bias_add}", "q", ' ' * 12)
+    req = _requant_block(shift, outW, biased_w, f"(ap_int<{biased_w}>)raw{bias_add}", "q", ' ' * 12)
     return f"""#define AP_INT_MAX_W {apmax}   // raw K-wide activation row may exceed the 1024-bit default
 #include <hls_stream.h>
 #include <ap_int.h>
@@ -253,7 +261,7 @@ void {func_name}(hls::stream<ap_uint<{AB}> >& a,
         for (int j = 0; j < {NT}; j++)
             for (int local_oc = 0; local_oc < {NTILE}; local_oc++) {{
                 int oc = j * {NTILE} + local_oc;   // global output column
-                ap_int<{ACCU_SUM}> raw = 0;
+                ap_int<{ACCU}> raw = 0;
                 for (int i = 0; i < {KT}; i++) {{
                     ap_int<{ACCU}> acc = 0;
                     for (int kk = 0; kk < {MW}; kk++)
@@ -392,7 +400,15 @@ def _2op_core_twin(p, t, func_name):
     shift = p["product_frac"] - p["output_frac"]
     actt = _act_ctype(t["signed_activations"], AW)
     pad = ' ' * (len(func_name) + 6)
-    req = _requant_block(shift, outW, "(long)acc", "q", ' ' * 16)
+    # Two-operand GEMM never has a real bias, but a positive shift still needs the
+    # round-half-up constant folded in (same helper, bias_codes=None -> N identical
+    # round-only "lanes").
+    folded = _wpack.fold_requant_constants(None, shift, 1)
+    biased_w, const_w = _geom.requant_width(ACCU, folded)
+    _wpack.assert_constants_fit(folded, const_w)
+    acc_expr = (f"(ap_int<{biased_w}>)acc + (ap_int<{biased_w}>){folded[0]}"
+               if folded else f"(ap_int<{biased_w}>)acc")
+    req = _requant_block(shift, outW, biased_w, acc_expr, "q", ' ' * 16)
     if mode == 0:
         # Mode A: SIMD*N_TLS beats; nf-fast/simd-mid/sf-slow; beat = PE-wide, lane pe
         # holds W[nf*PE+pe][sf*SIMD+simd].
@@ -576,9 +592,8 @@ int main() {{
 def generate_2op_core_twin(shape, func_name="mvau_core", plan=None, **kw):
     """Public entry for the two-operand C twin: the single-tile ``dynamic_load_2op``
     form (``_2op_core_twin``) is the sole two-operand path -- 2-op only ever folds
-    within one MVU tile (no N/K-tiling, no register/grid form; see
-    jojo-track/defer/mvau-two-operand-dynamic-load/plan.md's "Cleanup: collapse
-    2-op to a single dynamic_load_2op tile"). Covers every depth, including the
+    within one MVU tile, so multi-tile 2-op and the register/grid form were
+    retired. Covers every depth, including the
     fully-spatial DEPTH==1 case (SF=NF=1), both B-layout modes."""
     p = _plan(shape, plan=plan, **kw)
     return _2op_core_twin(p, p["tile"], func_name)

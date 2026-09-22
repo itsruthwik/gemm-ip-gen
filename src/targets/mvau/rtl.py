@@ -28,7 +28,7 @@ def _tile(shape, tile=None, **plan_kwargs):
     return _geom.resolve_plan(shape, **plan_kwargs)["tile"]
 
 
-def _requant_lanes(t, n_lanes, raw_exprs, bias_codes, reg_prefix, bias_index_exprs=None):
+def _requant_lanes(t, n_lanes, raw_exprs, const_lists, reg_prefix, nf_cnt_expr="nf_cnt"):
     """Return Verilog for a bank of *n_lanes* per-column requantize stages: one
     pipeline stage each, sitting after the K-tile partial-sum adder (if the tile's
     lane has more than one raw partial) and producing the narrow, final,
@@ -37,50 +37,73 @@ def _requant_lanes(t, n_lanes, raw_exprs, bias_codes, reg_prefix, bias_index_exp
 
     ``raw_exprs[i]`` is either one Verilog expression (a signed ``ACCU_WIDTH``-bit
     value, k_tiles==1) or a list of such expressions to sum first (k_tiles>1,
-    mirrors the C twin's raw += loop order). ``bias_codes`` (or None) is the FULL
-    bias ROM this bank shares -- at product_frac scale, from
-    ``weightpack.bias_acc_codes``/``bias_codes_for_tile`` (the same source of truth
-    the C twin bakes) -- addressed per lane by ``bias_index_exprs[i]`` (a Verilog
-    expression, e.g. a runtime ``nf_cnt*PE+pe`` when a shim's PE lanes carry
-    different output columns on different cycles; a compile-time literal ``i`` when
-    they don't). Defaults to the lane's own static index when *bias_index_exprs* is
-    omitted. Padded lanes' bias entries may be 0 -- their requantized value is
-    unused downstream (dropped by the HLS-side unpack), consistent with today's
-    raw-beat behavior for padding.
+    mirrors the C twin's raw += loop order).
 
-    Returns ``(decls, reg_names)``: the Verilog text (bias ROM if any + one
-    combinational sum/round/shift + one register per lane) and the list of
-    per-lane register names (each ``out_width`` bits wide) to slice into ``p_din``.
+    ``const_lists`` (or None) is per PHYSICAL lane, not per logical output column:
+    ``const_lists[i]`` is the list of folded bias+round constants (see
+    ``weightpack.fold_requant_constants``) lane *i* adds across the ``NF`` output
+    columns it carries over time (length 1 when NF==1, or when every one of the
+    NF constants happens to be equal -- rendered as a single literal either way;
+    otherwise a small ROM read via `nf_cnt_expr`). ``None``/empty/
+    all-zero entries add nothing (the add is skipped, not just zeroed) -- this is
+    what lets a bias-free, non-rounding lane cost no fabric at all. Padded lanes'
+    constants may be 0 -- their requantized value is unused downstream (dropped
+    by the HLS-side unpack), consistent with today's raw-beat behavior for
+    padding.
+
+    Returns ``(decls, reg_names)``: the Verilog text (one combinational
+    sum/(case)/shift + one register per lane) and the list of per-lane register
+    names (each ``out_width`` bits wide) to slice into ``p_din``.
     """
     accu = t["accu_width"]
     out_width = t["output_width"]
     shift = t["product_frac"] - t["output_frac"]
-    has_bias = bias_codes is not None
-    codes = list(bias_codes) if has_bias else []
-    bias_width = _geom.rv_width(accu, has_bias)
+    all_consts = [c for lst in (const_lists or []) if lst for c in lst]
+    biased_w, const_w = _geom.requant_width(accu, all_consts)
+    _wpack.assert_constants_fit(all_consts, const_w)
+
+    def _lit(c):
+        return f"{const_w}'sd{c}" if c >= 0 else f"-{const_w}'sd{-c}"
+
     lines = []
-    rom_name = f"{reg_prefix}_bias_rom"
-    if has_bias:
-        lines.append(_wpack.bias_verilog_rom(rom_name, codes, bias_width))
     reg_names = []
     for i in range(n_lanes):
         raw = raw_exprs[i]
         parts = raw if isinstance(raw, (list, tuple)) else [raw]
         sum_expr = " + ".join(f"$signed({p})" for p in parts) if len(parts) > 1 else f"$signed({parts[0]})"
-        idx_expr = (bias_index_exprs[i] if bias_index_exprs is not None else str(i))
-        bias_term = f" + $signed({rom_name}[{idx_expr}])" if has_bias else ""
-        biased = f"({sum_expr}){bias_term}"
+        consts = const_lists[i] if const_lists is not None else None
         reg = f"{reg_prefix}_{i}"
+        bias_term = ""
+        if consts and any(c != 0 for c in consts):
+            if len(set(consts)) == 1:
+                const_expr = _lit(consts[0])
+            else:
+                # A small ROM (initial-block array) read via a continuous `assign`,
+                # NOT an `always @(*) case (nf_cnt)`: xsim (observed on this target)
+                # never re-evaluates a level-sensitive `always @(*)` off of a reg's
+                # own inline initial value (`reg nf_cnt = 0;` doesn't count as a
+                # triggering "event" until nf_cnt's first real transition) -- so a
+                # case keyed off nf_cnt reads X for the entire nf_cnt==0 phase of
+                # the very first output beat. A continuous assign indexing an
+                # `initial`-populated array does not have this gap (same pattern
+                # proven by the old bias ROM this replaces).
+                romname = f"{reg}_c_rom"
+                cname = f"{reg}_c"
+                rom_lines = "\n".join(f"        {romname}[{nf}] = {_lit(c)};"
+                                      for nf, c in enumerate(consts))
+                lines.append(f"    reg signed [{const_w - 1}:0] {romname} [0:{len(consts) - 1}];")
+                lines.append(f"    initial begin\n{rom_lines}\n    end")
+                lines.append(f"    wire signed [{const_w - 1}:0] {cname} = {romname}[{nf_cnt_expr}];")
+                const_expr = cname
+            bias_term = f" + $signed({const_expr})"
+        biased = f"({sum_expr}){bias_term}"
         reg_names.append(reg)
-        lines.append(f"    wire signed [{bias_width - 1}:0] {reg}_biased = {biased};")
+        lines.append(f"    wire signed [{biased_w - 1}:0] {reg}_biased = {biased};")
+        # The round-half-up constant is already folded into `consts` (see
+        # fold_requant_constants), so shifting is now a plain arithmetic shift --
+        # no separate round-add stage.
         if shift > 0:
-            # RHS operands are self-determined to this wire's declared width, so the
-            # signed {reg}_biased is sign-extended automatically -- no manual
-            # sign-extension concatenation needed.
-            rnd_width = bias_width + 1
-            lines.append(f"    wire signed [{rnd_width - 1}:0] {reg}_rnd = "
-                         f"{reg}_biased + {rnd_width}'sd{1 << (shift - 1)};")
-            shifted = f"({reg}_rnd >>> {shift})"
+            shifted = f"({reg}_biased >>> {shift})"
         elif shift < 0:
             shifted = f"({reg}_biased <<< {-shift})"
         else:
@@ -411,16 +434,17 @@ def _generate_kt_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
         for pe_i in range(pe):
             raw_exprs.append([
                 f"out_tdata_{j * k_tiles + i}[{pe_i * accu} +: {accu}]" for i in range(k_tiles)])
-    if bias_codes:
-        full_codes = []
-        for j in range(n_tiles):
-            full_codes += _wpack.bias_codes_for_tile(bias_codes, j, ntile_real, t["mh"])
-        bias_idx = [f"{j} * {t['mh']} + {nf_expr} * {pe} + {pe_i}"
-                   for j in range(n_tiles) for pe_i in range(pe)]
+    shift = t["product_frac"] - t["output_frac"]
+    folded = _wpack.fold_requant_constants(bias_codes, shift, N)
+    if folded:
+        buckets = [_wpack.bias_codes_for_tile(folded, j, ntile_real, t["mh"])
+                  for j in range(n_tiles)]
+        const_lists = [[buckets[j][nfv * pe + pe_i] for nfv in range(nf)]
+                       for j in range(n_tiles) for pe_i in range(pe)]
     else:
-        full_codes, bias_idx = None, None
-    req_decls, req_regs = _requant_lanes(t, n_tiles * pe, raw_exprs, full_codes, "rq",
-                                         bias_index_exprs=bias_idx)
+        const_lists = None
+    req_decls, req_regs = _requant_lanes(t, n_tiles * pe, raw_exprs, const_lists, "rq",
+                                         nf_cnt_expr=nf_expr)
 
     def _w(n):
         return max(1, (n - 1).bit_length())
@@ -588,9 +612,8 @@ def generate_two_operand_shim(shape, module_name="mvau_core", force_behavioral=T
 
     Scope: single tile, any (PE, SIMD, SF, NF) including the fully-spatial
     DEPTH==1 case (one weight word/vector, SF=NF=1); no N/K-tiling (2-op only
-    ever folds within one MVU tile -- see
-    jojo-track/defer/mvau-two-operand-dynamic-load/plan.md's "Cleanup: collapse
-    2-op to a single dynamic_load_2op tile")."""
+    ever folds within one MVU tile, so multi-tile 2-op and the register/grid
+    form were retired)."""
     t = tile if tile is not None else _geom.resolve_plan(shape, **plan_kwargs)["tile"]
     p = plan if plan is not None else _geom.resolve_plan(shape, **plan_kwargs)
     fb = 1 if force_behavioral else 0
@@ -619,8 +642,14 @@ def generate_two_operand_shim(shape, module_name="mvau_core", force_behavioral=T
     odat_pad = WB - PE * SIMD * WW
     w_odat_expr = ("w_odat_raw" if odat_pad == 0
                    else f"{{{odat_pad}'b0, w_odat_raw}}")
+    # Two-operand GEMM never has a real bias, but a positive shift still needs the
+    # round-half-up constant folded in (same value on every lane/cycle -> a
+    # literal, not a case).
+    _2op_shift = t["product_frac"] - t["output_frac"]
+    _2op_folded = _wpack.fold_requant_constants(None, _2op_shift, PE)
+    _2op_consts = [[c] for c in _2op_folded] if _2op_folded else None
     req_decls, req_regs = _requant_lanes(
-        t, PE, [f"out_tdata_raw[{i * ACCU} +: {ACCU}]" for i in range(PE)], None, "rq")
+        t, PE, [f"out_tdata_raw[{i * ACCU} +: {ACCU}]" for i in range(PE)], _2op_consts, "rq")
     in_total = M * SF
     ctrl_decls, ctrl_late, _ = _decoupled_ctrl(in_total, run_total, in_advance="in_tvalid & in_tready",
                                                out_advance="p_write",
@@ -802,19 +831,21 @@ def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
     nf_expr = "nf_cnt" if need_nf_cnt else "0"
     raw_exprs = [f"out_tdata_{i}[{pe_i * accu} +: {accu}]"
                 for i in range(n_tiles) for pe_i in range(pe)]
-    if bias_codes:
-        # Bucket the N-long baked bias into each tile's own n_pad (=NF*PE) local
-        # lanes (bias_codes is real-column length; ntile_real derives from it since
-        # all n_tiles are equal-width).
-        full_codes = []
-        for i in range(n_tiles):
-            full_codes += _wpack.bias_codes_for_tile(bias_codes, i, ntile_real, t["mh"])
-        bias_idx = [f"{i} * {t['mh']} + {nf_expr} * {pe} + {pe_i}"
-                   for i in range(n_tiles) for pe_i in range(pe)]
+    # Bucket the N-long folded bias+round constants into each tile's own n_pad
+    # (=NF*PE) local lanes (bias_codes is real-column length; ntile_real derives
+    # from it since all n_tiles are equal-width). fold_requant_constants handles
+    # bias_codes=None (pure rounding, no real bias) too.
+    shift = t["product_frac"] - t["output_frac"]
+    folded = _wpack.fold_requant_constants(bias_codes, shift, N)
+    if folded:
+        buckets = [_wpack.bias_codes_for_tile(folded, i, ntile_real, t["mh"])
+                  for i in range(n_tiles)]
+        const_lists = [[buckets[i][nfv * pe + pe_i] for nfv in range(nf)]
+                       for i in range(n_tiles) for pe_i in range(pe)]
     else:
-        full_codes, bias_idx = None, None
-    req_decls, req_regs = _requant_lanes(t, n_tiles * pe, raw_exprs, full_codes, "rq",
-                                         bias_index_exprs=bias_idx)
+        const_lists = None
+    req_decls, req_regs = _requant_lanes(t, n_tiles * pe, raw_exprs, const_lists, "rq",
+                                         nf_cnt_expr=nf_expr)
 
     def _w(n):
         return max(1, (n - 1).bit_length())

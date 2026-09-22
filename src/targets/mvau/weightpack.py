@@ -84,19 +84,44 @@ def bias_codes_for_tile(bias_codes, ti, ntile_real, ntile_pad):
     return real + [0] * (ntile_pad - len(real))
 
 
-def bias_verilog_rom(reg_name, codes, width):
-    """Verilog ``reg`` array + ``initial`` block rendering of *codes* (the same
-    integer codes the C twin bakes as a ``static const long[]``), synthesizable as a
-    small ROM indexed combinationally by the shim's per-lane output-column index.
-    ``width`` must be wide enough to hold every code as a signed two's-complement
-    value (the requant stage's biased-accumulator width)."""
-    lines = [f"    reg signed [{width - 1}:0] {reg_name} [0:{len(codes) - 1}];",
-             "    initial begin"]
-    for i, c in enumerate(codes):
+def fold_requant_constants(bias_codes, shift, n):
+    """Fold the round-half-up constant (``2^(shift-1)``, when ``shift > 0``) into
+    the per-column bias codes ``bias_acc_codes`` bakes, so the RTL/C requant stage
+    performs one add (sum + folded constant) instead of a separate bias add and
+    round add. Called once, after ``bias_acc_codes`` (and after ``package.py``'s
+    own TRN pre-adjustment, if any -- that adjustment already pre-subtracts this
+    same half so the two cancel and floor, rather than round, results).
+
+    Returns an *n*-long list of folded ints, or ``None`` when there is truly
+    nothing to add (no bias and ``shift <= 0``) -- callers skip the add stage
+    entirely in that case.
+    """
+    round_c = (1 << (shift - 1)) if shift > 0 else 0
+    if bias_codes is None:
+        return [round_c] * n if round_c else None
+    if len(bias_codes) != n:
+        raise ValueError(f"bias_codes length {len(bias_codes)} != n {n}")
+    return [int(b) + round_c for b in bias_codes]
+
+
+def has_real_add(consts):
+    """True iff *consts* (a folded-constants list, or None) has at least one
+    nonzero entry -- an all-zero list (e.g. a TRN layer whose pre-subtracted
+    half exactly cancels the folded-in round constant) adds nothing, exactly
+    like ``None``, so callers skip the add stage (and the width/array it would
+    otherwise need) in both cases."""
+    return bool(consts) and any(int(c) != 0 for c in consts)
+
+
+def assert_constants_fit(consts, const_w):
+    """Assert every folded constant (or None/empty/all-zero) fits signed
+    *const_w* bits -- the width :func:`geometry.requant_width` computed for
+    them."""
+    if not has_real_add(consts):
+        return
+    lo, hi = -(1 << (const_w - 1)), (1 << (const_w - 1)) - 1
+    for c in consts:
         c = int(c)
-        if c >= 0:
-            lines.append(f"        {reg_name}[{i}] = {width}'sd{c};")
-        else:
-            lines.append(f"        {reg_name}[{i}] = -{width}'sd{-c};")
-    lines.append("    end")
-    return "\n".join(lines) + "\n"
+        if not (lo <= c <= hi):
+            raise ValueError(f"folded requant constant {c} does not fit signed "
+                             f"const_w={const_w} bits [{lo}, {hi}]")
