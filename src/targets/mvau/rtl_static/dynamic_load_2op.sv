@@ -1,8 +1,8 @@
 /******************************************************************************
  * Forked from FINN finn-rtllib/dynload/hdl/dynamic_load.sv (AMD, BSD-3-Clause)
  * to support two storage/streaming layout modes for the two-operand MVAU
- * dynamic weight loader. See jojo-track/defer/mvau-two-operand-dynamic-load/
- * plan.md ("Customization: two layout modes") for the design rationale.
+ * dynamic weight loader: two storage/streaming layout modes, chosen so feed_b
+ * never needs more than a single arriving wide beat (no reorder buffer).
  *
  * MODE=0 ("row_major", Mode A): identical organization to the original
  *   dynamic_load -- SIMD parallel physical RAMs (one per SIMD lane), each RAM
@@ -88,9 +88,10 @@ typedef enum logic  {ST_RD_0, ST_RD_1} state_rd_t;
 // curr_lane (=curr_pe), then curr_nf outermost/slowest -- matches col-major B
 // arrival (a full K-wide column per beat; the whole column = all sf at fixed
 // nf). This is the true mirror of Mode A, required so feed_b only ever needs
-// to hold the single arriving column (no reorder buffer) -- see
-// jojo-track/defer/mvau-two-operand-dynamic-load/plan.md, "Mode B ordering
-// resolution".
+// to hold the single arriving column (no reorder buffer): the Mode B writer
+// counter nesting is transposed (sf fastest, lane middle, nf slowest) to
+// mirror Mode A, so feed_b's natural per-column split matches consumption
+// order.
 //
 // Write address = offsets[nf] + sf = nf*SF + sf in BOTH modes (unchanged);
 // one lane (a_we[bank][curr_lane]) written per beat with the full WORDW-wide

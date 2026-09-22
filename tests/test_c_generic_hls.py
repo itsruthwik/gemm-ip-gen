@@ -1,5 +1,4 @@
-"""Unit tests for the generic/catapult kernel emitter (step 3 of
-jojo-track/open/catapult-generic-target/plan.md), `src/targets/c_generic/hls.py`.
+"""Unit tests for the generic/catapult kernel emitter, `src/targets/c_generic/hls.py`.
 
 All tool-free except the final g++ syntax-check smoke test (no Catapult/Vitis
 invocation).

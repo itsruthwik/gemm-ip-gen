@@ -124,8 +124,7 @@ def _normalize_config_items(cfg):
                 "weight_precision": item.get("weight_precision"),
                 # accum_precision drives tensor_slice's S1 (in-slice pre-round)
                 # derivation; has_bias/bias are the single source of truth for
-                # whether/what compile-time bias to bake (see
-                # jojo-track/open/tensor-slice-bias-in-rtl).
+                # whether/what compile-time bias to bake.
                 "accum_precision": item.get("accum_precision"),
                 "bias_precision": item.get("bias_precision"),
                 "has_bias": item.get("has_bias"),

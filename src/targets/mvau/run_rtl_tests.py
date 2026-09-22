@@ -11,9 +11,8 @@ xvlog/xelab/xsim directly, the way tensor_slice drives its combined core with
 iverilog -- much cheaper than a full HLS csim+csynth+cosim round trip per case.
 
 xvlog/xelab/xsim invocation flags below were harvested from a real
-``vitis-run --tcl run_vitis.tcl --mode hls`` cosim run kept under
-temp_space/mvau-spike (MVAU_SPIKE PASS) and a hand probe under
-temp_space/mvau-rtlsim: xvlog analyzes glbl.v (and our sources) into the
+``vitis-run --tcl run_vitis.tcl --mode hls`` cosim run (PASS) and a hand
+probe of xvlog/xelab/xsim directly: xvlog analyzes glbl.v (and our sources) into the
 ``work`` library; xelab elaborates ``tb glbl`` with
 ``--timescale 1ns/1ps -relax -L unisims_ver -L unimacro_ver -L secureip``;
 xsim runs the elaborated snapshot in batch mode with ``-R``.

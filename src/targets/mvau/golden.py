@@ -1,7 +1,7 @@
 """mvau C twin (blackbox behavioral model) + self-checking csim/cosim testbench.
 
-Both encode the FINN MVU beat protocol for one tile, generalized from the
-cosim-validated ``temp_space/mvau-spike`` (which was the SF=NF=1 case):
+Both encode the FINN MVU beat protocol for one tile, generalized from a
+cosim-validated SF=NF=1 spike:
 
   * activations: ``SF`` beats per input vector (``x[sf*SIMD+simd]``); the replay
     buffer re-streams them ``NF`` times internally.

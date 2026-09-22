@@ -1,13 +1,11 @@
-"""Unit tests for the c-generic package/verify flow (step 4 of
-jojo-track/open/catapult-generic-target/plan.md), `src/targets/c-generic/package.py`.
+"""Unit tests for the c-generic package/verify flow, `src/targets/c-generic/package.py`.
 
 Two tiers:
 - File-set / content checks that always run (no tool needed).
 - A Catapult-gated ``verify()`` test (csim + SCVerify) over the two SMALL
   shapes only (RF regimes covered elsewhere by the tool-free checks); the
-  (16,32,32) RF-8 mha_large-projection proof is exercised manually (see
-  jojo-track/open/catapult-generic-target/plan.md and
-  hgq2-examples-from-qkeras-configs/status.md) rather than as a permanent test.
+  (16,32,32) RF-8 mha_large-projection proof is exercised manually rather
+  than as a permanent test.
 """
 import re
 import shutil

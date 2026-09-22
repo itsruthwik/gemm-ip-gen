@@ -21,7 +21,7 @@ tail_mask_hex, vm, _total_cycles = _geometry.tail_mask_hex, _geometry.vm, _geome
 
 # ── Two-stage requant, shared by every sim/synth emitter below ────────────────
 #
-# Phase 1 of jojo-track/open/tensor-slice-bias-in-rtl: the slice's raw K
+# The slice's raw K
 # contraction is requantised in exactly two stages, both round-half-up + wrap
 # (never saturate):
 #   stage 1 (in-slice, S1): round-half-up shift by S1, wrap to 16 bits. S1 is a
@@ -523,8 +523,7 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
                                      a_zero_point_correct=None, b_zero_point_correct=None,
                                      m_passes=1, logical_m=None, logical_n=None,
                                      a_replay_n_passes=None):
-    """Unified internal SYNTH emitter (jojo-track/open/tensor-slice-general-synth-grid,
-    sub-phase 2a-ii).
+    """Unified internal SYNTH emitter.
 
     Per the confirmed tensor-slice contract, the general grid is ``k_spatial``
     copies of an ``Ms x Ns`` FLOWING grid (A left->right, B top->bottom):
@@ -681,7 +680,7 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
         );""")
 
     # ── Zero-storage output collector (op[0]/op[1]/op[2] contract) ───────────
-    # tensor_slice_int8_atlas contract (jojo-track/open/tensor-slice-op-shadow-drain):
+    # tensor_slice_int8_atlas contract:
     #   op[0] out_ctrl (level): 1 HOLDS the tile's result inside the array (no
     #     burst, including after intermediate K-chunks); 0 shifts one result
     #     row/cycle onto c_data_out, qualified by c_data_available. Readout
@@ -1669,8 +1668,7 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
                                  s1=0, s2=0, out_width=16,
                                  weight_rom=None, emit_rom=True,
                                  bias_codes=None, emit_bias_rom=True, bias_rom_name="bias_rom"):
-    """ADDITIVE combined-fold general synth emitter (jojo-track/open/
-    tensor-slice-general-synth-grid, sub-phase 2b).
+    """ADDITIVE combined-fold general synth emitter.
 
     Used ONLY when 2+ of (m_passes, k time-passes, n_passes) fold -- see the
     dispatch in ``_generate_general_synth_verilog``. The verified single-axis

@@ -5,8 +5,8 @@ Unlike golden.py (which emits a C++ TB for Vitis HLS csim/cosim), this module
 drives the *raw shim* Verilog (rtl.generate_shim / generate_two_operand_shim)
 directly at the RTL level with a hand-written SV TB, exactly the way
 tensor_slice/golden.py drives its combined core with an iverilog TB. The two
-port "shapes" actually emitted (see rtl.py, confirmed by reading generated .v
-output under temp_space/mvau-ws and the mvu_vvu_axi shim sources):
+port "shapes" actually emitted (see rtl.py, confirmed by reading generated
+.v output and the mvu_vvu_axi shim sources):
 
   ws       -- weight-stationary: ap_ctrl_chain + a_dout/a_empty_n/a_read +
               p_din/p_full_n/p_write. One raw K-wide beat in, one raw N-wide

@@ -1,7 +1,7 @@
 """Codegen tests for the mvau target: package assembly, shim, JSON, C twin/TB.
 
-These are tool-free (no Vitis). Simulation (csim/cosim) is validated separately
-(temp_space; jojo-track status).
+These are tool-free (no Vitis). Simulation (csim/cosim) is validated separately,
+via standalone Vitis runs, not this suite.
 """
 import json
 import sys

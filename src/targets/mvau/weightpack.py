@@ -3,8 +3,8 @@
 The weight-stationary shim bakes B (= the GEMM's B^T mapped to the MVU weight
 matrix) into a FINN ``memstream`` whose ``INIT_FILE`` this module generates. The
 layout is exactly what the vendored ``mvu_vvu_axi`` expects on
-``s_axis_weights_tdata``, validated byte-for-byte against the cosim-PASS
-``temp_space/mvau-ws`` spike:
+``s_axis_weights_tdata``, validated byte-for-byte against a cosim-PASS
+weight-stationary spike:
 
     memstream line (address)   wmem = nf*SF + sf        (nf outer, sf inner)
     within a WIDTH = PE*SIMD*WW word, weight W[nf*PE+pe][sf*SIMD+s] occupies

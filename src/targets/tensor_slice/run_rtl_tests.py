@@ -81,8 +81,8 @@ ROM_CASES = [
 # back-to-back multi-frame mode (back2back=True, num_vectors=m_passes) is the
 # regression hook -- it feeds m_passes distinct frames of M_g rows each and
 # checks every output row against golden in frame order, exactly how the
-# wrapper RUN loop replays the same rf=1 core (proven in
-# temp_space/multiframe-probe/). (9,17,10,2) pads the last pass; (16,40,16,2)
+# wrapper RUN loop replays the same rf=1 core (confirmed by standalone probing
+# of the RTL). (9,17,10,2) pads the last pass; (16,40,16,2)
 # is an exact-division fold; (8,16,8,1) is the RF=1 (m_passes=1, single-frame)
 # identity case; (16,40,16,5) drives RF to its grid_rows bound (5 -> legalizes
 # down since grid_rows(16)=2).
@@ -113,8 +113,7 @@ FOLD_N_CASES = [
 ]
 
 
-# Combined M+N fold regression (jojo-track/open/tensor-slice-combined-fold-sim-validation,
-# 5b-i): (m, k, n, rf_m, rf_n). K stays single-pass (k_spatial=k_chunks, no K
+# Combined M+N fold regression: (m, k, n, rf_m, rf_n). K stays single-pass (k_spatial=k_chunks, no K
 # fold) so this isolates the M+N composition. m=33 (grid_rows=5) with rf_m=3
 # legalizes to mg=2 row-tiles/group, m_passes=3 (ragged last mg block, only 1
 # real row-tile); n=40 (grid_cols=5) with rf_n=3 legalizes to cg=2
@@ -178,7 +177,7 @@ def _compile(out_path, tb_path, rtl_path):
 
 # ── Two-stage requant (S1/S2/bias/out_width) regression ───────────────────────
 #
-# Exercises jojo-track/open/tensor-slice-bias-in-rtl phase 1 directly at the
+# Exercises the two-stage requant directly at the
 # rtl.py/golden.py level (package.py's accum_precision-driven S1/S2 derivation
 # is exercised separately, at the packaging layer). Each case pins s1/s2/
 # out_width/bias_codes explicitly.
@@ -234,7 +233,7 @@ def run_requant_case(label, m, k, n, k_spatial, s1, s2, out_width, bias_codes, s
 
 
 # Real Catapult ``*_gemm_ip_stream_buffered_b`` protocol regression
-# (jojo-track: gemm_mha_aV_h0 av_pkg_tb). _gen_catapult_tb's
+# (modeled on the gemm_mha_aV_h0 av_pkg_tb). _gen_catapult_tb's
 # sequential/back2back templates drive a_rows/b_cols together every beat --
 # which turns out to be EXACTLY the same per-cycle cadence the real
 # wrapper's RUN loop uses (weight_cols is a plain array pre-buffered by
@@ -314,8 +313,7 @@ def _full_width_catapult_tb(m, k, n, module_name, seed, all_a_stim, all_b_stim, 
     per column tile), for shapes ``_gen_catapult_tb`` cannot check every lane
     of (its own ``c_row``/``golden`` width, ``grid_cols * out_width // 8``
     bytes, is missing the "8 lanes per column tile" factor rtl.py's c_width
-    actually uses -- see the K-padding zero-point regression below and
-    jojo-track/open/tensor-slice-zero-point-k-pad). Every vector runs
+    actually uses -- see the K-padding zero-point regression below). Every vector runs
     back-to-back (no reset in between, like the real streaming wrapper),
     checking c_row against the full-width golden row on every out_valid beat.
     """
@@ -476,7 +474,7 @@ def run_case(m, k, n, seed, rf=None, weights_in_core=False, fold_axis="k",
         num_vectors = fn["n_passes"]
         k_spatial = _k_chunks(k)
     elif fold_axis == "mn":
-        # Combined M+N (jojo-track 5b-i) / M+K+N (5b-ii/iii): rf is (rf_m, rf_n)
+        # Combined M+N / M+K+N: rf is (rf_m, rf_n)
         # -- unchanged, K stays single-pass (k_spatial=k_chunks) -- or
         # (rf_m, rf_k, rf_n) to ALSO fold K. M and N are legalized independently
         # via the same fold-M/fold-N geometry the single-axis paths use; K is

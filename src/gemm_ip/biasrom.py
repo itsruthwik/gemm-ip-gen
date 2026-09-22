@@ -1,7 +1,7 @@
 """Bias baking: one codes list, two renderings (C twin static array + Verilog ROM).
 
-Target-agnostic (moved out of ``mvau/weightpack.py`` per
-``jojo-track/open/tensor-slice-bias-in-rtl``): both mvau and tensor_slice bake a
+Target-agnostic (moved out of ``mvau/weightpack.py`` since both mvau and
+tensor_slice bake a
 per-column bias into their generated core at a *scale* the caller chooses (mvau:
 the MAC product scale; tensor_slice: the stage-1/stage-2 intermediate scale), so
 these helpers take that scale as a plain ``product_frac`` argument rather than

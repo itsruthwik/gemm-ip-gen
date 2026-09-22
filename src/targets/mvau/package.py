@@ -1,6 +1,6 @@
 """mvau package assembly: emit a Vitis-HLS RTL-blackbox GEMM IP package.
 
-Generalizes the cosim-validated ``temp_space/mvau-spike``. Per package ``<name>``:
+Generalizes a cosim-validated single-tile spike. Per package ``<name>``:
 
     <name>_core.v      shim (FINN mvu_vvu_axi wrapped) -- module name == c_function_name
     <name>_core.cpp    the C twin (blackbox behavioral model, csim)
@@ -500,8 +500,7 @@ def _2op_dataflow_top(name, plan):
     passthrough of A, the affine requant drain (no bias; act×act product scale
     ``fa+fb``), and a ``feed_b`` gearbox that reindexes hls4ml's wide B beat down to
     ``dynamic_load_2op``'s narrow input beat -- AT MOST a 1-wide-beat register, no
-    reorder buffer (see jojo-track/archive/mvau-two-operand-dynamic-load/plan.md,
-    "Input width gearbox").
+    reorder buffer.
 
     Mode A (``mode=0``, row-major B): one N-wide K-row arrives per beat (K beats
     total); feed_b holds it in a 1xN register and drains it PE at a time, NF
@@ -624,9 +623,8 @@ def _2op_gemm_ip_header(name, plan):
     """hls4ml-facing two-operand IP: ``<name>_gemm_stream<data0_T,data1_T,res_T,CONFIG_T>``
     (repack A -> shim activations, repack B -> the loader's narrow beat via the HLS
     feed_b gearbox, internal MVU blackbox, requant drain). Single-tile only -- 2-op
-    only ever folds within one MVU tile (no N/K-tiling; see
-    jojo-track/archive/mvau-two-operand-dynamic-load/plan.md's "Cleanup: collapse 2-op
-    to a single dynamic_load_2op tile"), any depth including the fully-spatial
+    only ever folds within one MVU tile (no N/K-tiling; multi-tile 2-op and the
+    register/grid form were retired), any depth including the fully-spatial
     DEPTH==1 case (SF=NF=1), both B-layout modes (``SecondOperandRowMajor``)."""
     t = plan["tile"]
     m = plan["num_input_vectors"]
@@ -706,8 +704,7 @@ void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res
 }}"""
 
     # repack B: reindex hls4ml's wide beat down to the loader's narrow beat (the HLS
-    # feed_b gearbox -- see rtl.py's dynamic_load_2op instantiation and
-    # jojo-track/archive/mvau-two-operand-dynamic-load/plan.md, "Input width gearbox").
+    # feed_b gearbox -- see rtl.py's dynamic_load_2op instantiation).
     # Materializes AT MOST one arriving wide beat (a 1xN or 1xK register), never a
     # reorder buffer. Padding (K -> KPAD rows for Mode A, N -> PE*NF columns for Mode
     # B) is a zero-filled pass with no stream read, matching the old zero-pad semantics
@@ -855,9 +852,8 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     Both operands are runtime streams: A activations, B (= the MVU weight matrix)
     loaded at runtime into the forked ``dynamic_load_2op`` module (double-buffered
     ping-pong), replayed across the M rows of A. No baked weights; no bias. 2-op
-    only ever folds within ONE MVU tile -- no N/K-tiling (see
-    jojo-track/archive/mvau-two-operand-dynamic-load/plan.md's "Cleanup: collapse
-    2-op to a single dynamic_load_2op tile"); any depth (including the
+    only ever folds within ONE MVU tile -- no N/K-tiling (multi-tile 2-op and the
+    register/grid form were retired); any depth (including the
     fully-spatial DEPTH==1 case), both B-layout modes."""
     if cfg.get("interface") == "array":
         raise ValueError(f"mvau two-operand does not support io_parallel for '{name}'.")
@@ -1015,8 +1011,8 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
             dat_path.write_text(_wpack.pack_memstream_hex(
                 B_ti, NTILE, K, PE, SIMD, WW, word_bits=t["weight_stream_width_ba"]))
             # Absolute $readmemh path: relative is unresolvable in Vitis cosim's XSIM dir
-            # (empirically -- see jojo-track); the package builds in place, so the
-            # absolute path computed here stays valid for csim/cosim/impl.
+            # (found empirically); the package builds in place, so the absolute path
+            # computed here stays valid for csim/cosim/impl.
             init_files.append(str(dat_path.resolve()))
 
     # has_bias is the single gate. Pre-has_bias manifests (the field absent from

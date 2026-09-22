@@ -778,7 +778,7 @@ def _gen_all_stimulus_fold_n(core_m, k, core_n, n_passes, base_seed, k_spatial, 
 def _gen_all_stimulus_mn(core_m, k, core_n, m_passes, n_passes, base_seed, k_spatial,
                          fixed_b_full=None, bias_codes=None, s1=0, s2=0, out_width=8,
                          has_bias=False):
-    """Combined M+N fold stimulus (jojo-track 5b-i): ``m_passes`` distinct A
+    """Combined M+N fold stimulus: ``m_passes`` distinct A
     row-groups crossed with ``n_passes`` shared column-groups of ONE full-width
     B, fed as ``m_passes * n_passes`` back-to-back frames in mg-major/ng-minor
     order (frame ``t`` -> ``mg = t // n_passes``, ``ng = t % n_passes`` --
@@ -868,7 +868,7 @@ def generate_tb(m, k, n, module_name="gemm_grid_wrapper", seed=42, protocol="cat
     """
     tb_n_passes = 1
     if fold_mn is not None:
-        # Combined M+N (jojo-track 5b-i): m_passes*n_passes frames, A keyed by
+        # Combined M+N: m_passes*n_passes frames, A keyed by
         # mg = frame // n_passes, B group keyed by ng = frame % n_passes.
         m_passes, n_passes = fold_mn
         tb_n_passes = n_passes

@@ -149,7 +149,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # Frame slots for the pipelined sim core: feed of frame t+1 may overlap
     # compute/drain of frame t (min frame period = total_beats + 1 calls).
     #
-    # op-contract note (jojo-track/open/tensor-slice-op-shadow-drain): this C
+    # op-contract note: this C
     # core has no op/pe_reset/shadow state -- it is a grid-level `gemm.run()`
     # frame-period abstraction, not a port-level model. The op[0..2] pins live
     # only in the synth branch's tensor_slice_int8_atlas black-box instantiation
@@ -336,8 +336,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
             f"{name}: result type {result_type!r} carries {_out_frac} fraction bits, "
             f"more than the {gemm_shift} the product carries; a left shift is not "
             "supported by the tensor_slice requant.")
-    # Two-stage requant (jojo-track/open/tensor-slice-bias-in-rtl, phase 1):
-    # this ccore mirrors the Verilog sim branch's folded model exactly. Stage 1
+    # Two-stage requant: this ccore mirrors the Verilog sim branch's folded model exactly. Stage 1
     # (round-half-up shift by S1, wrap to 16) is applied PER K-spatial partition
     # in-slice -- the RTL computes each of the ``ks`` partitions in its own
     # 16-bit slice partial and then sums those 16-bit partials (accum16), so the
@@ -420,9 +419,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # single-axis fold-N package (resolve_mkn_geometry defaults k_spatial
         # to K_CHUNKS, i.e. passes == 1, unless the caller ALSO explicitly
         # folds K), so this branch is byte-identical there. Once K also folds
-        # in time (passes > 1) -- only reachable via a combined M/K/N fold
-        # (jojo-track/open/tensor-slice-general-synth-grid) -- the ROM is
-        # built by build_weight_rom_combined_fold instead, whose layout is
+        # in time (passes > 1) -- only reachable via a combined M/K/N fold --
+        # the ROM is built by build_weight_rom_combined_fold instead, whose layout is
         # chunk-major/ng-minor ((kc*n_passes + grp)*n + t); address it to match.
         bbuf_src = (
             f"B_ROM[((cc_slot[wr_slot] / {input_beats}) * {n_passes} + _grp) * {n} + _t]"
@@ -1417,8 +1415,7 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
     }}
 """
 
-    # Two-stage requant, no saturation (jojo-track/open/tensor-slice-bias-in-
-    # rtl, phase 1): the core now ALWAYS applies stage 1 (S1, unknown to this
+    # Two-stage requant, no saturation: the core now ALWAYS applies stage 1 (S1, unknown to this
     # standalone smoke harness -- treated as 0, a single round) + stage 2
     # (round-half-up shift by the TOTAL `requant_shift`, wrap to out_width),
     # bias baked in at generation time (this harness never forwards a real
@@ -2018,7 +2015,7 @@ def gen_integration_manifest(items):
         np_ = item["n_passes"]
         gc_pad = item["grid_cols_pad"]
         core_cols = item["core_cols"]
-        # Closed-form overlapped cycle model (jojo-track 5c/5d): predicted
+        # Closed-form overlapped cycle model: predicted
         # latency/interval/frame-count for the DSE, valid for every fold_axis
         # (mp == np_ == 1 for fold_axis "k"/single-axis reduces to the
         # existing single-group model -- see geometry.combined_fold_cycles).
@@ -2201,8 +2198,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     fold_m = m_passes > 1
     fold_n = n_passes > 1
     fold_k = passes > 1
-    # Combined M/K/N folding (jojo-track/open/tensor-slice-general-synth-grid,
-    # sub-phase 2e): 2+ folded axes now route to the general structural synth
+    # Combined M/K/N folding: 2+ folded axes now route to the general structural synth
     # emitter (`_general_synth_combined_fold`, dispatched from
     # `_generate_general_synth_verilog`/`generate_k_spatial_synth_verilog`
     # whenever 2+ of {m_passes, k time-passes, n_passes} > 1) instead of the
@@ -2268,8 +2264,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
                 f"{name}: weight ROM has {len(weight_rom)} beats, expected "
                 f"{expected_beats}"
             )
-    # Two-stage requant (jojo-track/open/tensor-slice-bias-in-rtl, phase 1).
-    # S1 (in-slice pre-round) is derived from accum_precision when given; S2
+    # Two-stage requant. S1 (in-slice pre-round) is derived from accum_precision when given; S2
     # is the remainder of the total gemm->result shift. The output lane
     # narrows to out_width = _output_bits(output_precision) -- 8 bits when
     # output_precision is unset (the legacy/no-result-type case: this matches

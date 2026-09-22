@@ -152,7 +152,7 @@ def test_resolve_fold_invalid_axis():
 # ── the full plan (fold_plan) ────────────────────────────────────────────────────
 
 def test_fold_plan_matches_validated_spike():
-    # Must reproduce temp_space/mvau-spike geometry (the cosim-PASS config).
+    # Must reproduce a cosim-PASS spike's geometry.
     p = g.fold_plan(1, 4, 4, weight_precision="fixed<8,4>",
                     input_precision="fixed<8,4>", output_precision="fixed<16,6>",
                     part=VERSAL, reuse_factor=1)

@@ -1,7 +1,7 @@
 """mvau RTL emission: the thin shim around FINN's ``mvu_vvu_axi``.
 
-Generalizes the cosim-validated ``temp_space/mvau-spike/mvau_bb.v``. One shim =
-one MVU tile: it instantiates ``mvu_vvu_axi`` with the tile's folding parameters
+Generalizes a cosim-validated single-tile spike. One shim = one MVU tile: it
+instantiates ``mvu_vvu_axi`` with the tile's folding parameters
 and adapts the FINN AXIS interface to the Vitis-HLS RTL-blackbox contract:
 
   * active-high ``ap_rst``  ->  FINN's active-low ``ap_rst_n`` (inverted)
@@ -797,8 +797,8 @@ def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
         latch into one ``orow_reg`` (this cycle's last-``NF`` lanes bypass the
         register and read the live combinational requant value, since ``p_din``
         must be valid the same cycle ``p_write`` fires); ``p_write`` fires once
-        per external row, on the last of the ``NF`` beats. Generalizes
-        temp_space/mvau-ws (cosim PASS)."""
+        per external row, on the last of the ``NF`` beats. Generalizes a
+        cosim-PASS weight-stationary spike."""
     if not init_files or any(not f for f in init_files):
         raise ValueError("weight-stationary shim requires an init_file per tile "
                          "(memstream $readmemh path)")

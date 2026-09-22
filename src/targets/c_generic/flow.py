@@ -3,8 +3,8 @@
 The Catapult twin of the (resource-only) Vitis ``v-generic`` target: no RTL
 blackbox / hardblock, Catapult synthesizes the emitted C++ directly. Shares
 the tool-neutral ReuseFactor-snapping and geometry rules with ``v-generic`` via
-``gemm_ip.behavioral`` (see jojo-track/open/catapult-generic-target/plan.md,
-step 1) but does not share an emitter: the kernel body (``hls.py``) and
+``gemm_ip.behavioral`` but does not share an emitter: the kernel body
+(``hls.py``) and
 package layout (``package.py``) are Catapult idiom (``ac_int`` / ``ac_fixed``,
 ``ac_channel``, ``hls_unroll`` / ``hls_pipeline_init_interval``), added in
 steps 3-4. Until then every content-producing entry point raises

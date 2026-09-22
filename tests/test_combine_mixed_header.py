@@ -6,7 +6,7 @@ the copied generic soft kernels reference gemm_rf<CONFIG_T> and
 gemm_ip_has_bias<CONFIG_T::gemm_ip_id>, so the merge must declare both traits, and every
 gemm_stream_const_weights signature is 2-arg (bias is never a call argument -- soft reads
 CONFIG_T::gemm_bias() gated by the trait; an IP bakes it into the core). csim/cosim of the
-mixed build is validated separately (temp_space; jojo-track status).
+mixed build is validated separately (via standalone csim/cosim runs, not this suite).
 """
 import sys
 from pathlib import Path

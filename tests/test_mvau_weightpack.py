@@ -45,7 +45,7 @@ def _finn_reference(B, n, k, pe, simd, ww):
 
 
 def test_pack_matches_cosim_spike_golden():
-    # temp_space/mvau-ws spike (cosim PASS). WS_W[pe][s] used as W[pe][s];
+    # A cosim-PASS weight-stationary spike. WS_W[pe][s] used as W[pe][s];
     # B is [K][N] = W^T, i.e. B[k][n] = WS_W[n][k].
     WS_W = [[1, -2, 2, -4], [-3, 4, -3, 1], [-4, 4, -1, -4], [-3, 2, 2, -3]]
     B = [[WS_W[nn][kk] for nn in range(4)] for kk in range(4)]   # B[k][n]

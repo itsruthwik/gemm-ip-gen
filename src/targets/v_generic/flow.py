@@ -25,7 +25,7 @@ class GenericTarget(Target):
     # The combined header reads either ROM order straight from CONFIG_T (weights_row_major).
     weight_layouts = ("column_major", "row_major")
 
-    # Resource-only target: no per-layer knobs (see jojo-track/open/generic-vitis-target).
+    # Resource-only target: no per-layer knobs.
     knobs = []
 
     def geometry(self, shape):

@@ -9,8 +9,8 @@ testbench), ``package`` (the blackbox package: JSON + dataflow top + drain +
 run_vitis.tcl). The vendored FINN RTL lives in ``rtl_static/`` (see
 FINN_COMMIT.txt).
 
-Interface, shim and packaging are validated end-to-end on Vitis 2025.2 -- see
-jojo-track/open/mvau-vitis-target and temp_space/mvau-spike (cosim PASS).
+Interface, shim and packaging are validated end-to-end on Vitis 2025.2
+(cosim PASS).
 """
 
 from pathlib import Path

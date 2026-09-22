@@ -133,9 +133,9 @@ def build_weight_rom_combined_fold(B_full, m, core_n, k, k_spatial, n_passes):
     ``[K, n_passes*core_n]`` (real columns first, zero-padded tail), same
     convention as :func:`build_weight_rom_fold_n`.
 
-    Per the confirmed contract and the csim-verified simplification (see
-    jojo-track/open/tensor-slice-general-synth-grid), weight contents depend
-    only on ``(k_pass, n_group)`` -- never ``m_group`` -- so this builder
+    Per the confirmed contract and the csim-verified simplification, weight
+    contents depend only on ``(k_pass, n_group)`` -- never ``m_group`` -- so
+    this builder
     covers every ``m_group`` in a combined M+K+N fold by construction (the
     emitter replays the same ROM for every ``mg``).
 

@@ -1,5 +1,4 @@
-"""Skeleton tests for the generic/catapult target (step 2 of
-jojo-track/open/catapult-generic-target/plan.md).
+"""Skeleton tests for the generic/catapult target.
 
 generic/catapult (c_generic) shares the Target contract surface with
 generic/vitis (v_generic): registry resolution, tool/knobs, and geometry /

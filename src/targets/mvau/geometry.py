@@ -144,7 +144,7 @@ def dsp_estimate(pe, simd):
 def latency_cycles(sf, simd, segmentlen):
     """Deterministic fill latency (first input beat -> first output beat) of one
     MVU tile. RTL is a fixed pipeline, so this is exact, not an estimate --
-    calibrated against standalone XSIM runs (temp_space/mvau-lat):
+    calibrated against standalone XSIM runs:
 
       SF + ceil(CHAINLEN/SEGMENTLEN) + 2   (CHAINLEN = ceil(SIMD/3))
 
