@@ -21,3 +21,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "targets.tensor_slice" = ["*.v"]
+"targets.cmvu" = ["rtl_static/*.sv", "rtl_static/*.txt"]

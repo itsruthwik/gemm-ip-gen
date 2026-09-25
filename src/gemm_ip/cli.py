@@ -24,10 +24,11 @@ def main():
     parser.add_argument("--target", choices=TARGETS,
                         default="generic",
                         help="Hardblock target (default: generic)")
-    parser.add_argument("--tool", choices=("vitis", "catapult"), default="vitis",
-                        help="HLS tool the target is welded to (default: vitis); "
-                             "selects which concrete implementation 'generic' "
-                             "resolves to (v_generic / c_generic).")
+    parser.add_argument("--tool", choices=("vitis", "catapult"), default=None,
+                        help="HLS tool the target is welded to (default: the "
+                             "target's own tool); selects which concrete "
+                             "implementation 'generic' resolves to "
+                             "(v_generic / c_generic).")
     parser.add_argument("--describe", type=str, metavar="TARGET",
                         help="Print JSON capability metadata {name, tool} for TARGET "
                              "and exit (the target->tool source of truth for callers "
@@ -54,6 +55,12 @@ def main():
     parser.add_argument("--reuse-factor", type=int, default=None,
                         help="mvau: ReuseFactor, how many times each MAC is used per "
                              "input vector (RF = K*N/(PE*SIMD)), when --pe/--simd are unset.")
+    parser.add_argument("--kfold", type=int, default=None,
+                        help="cmvu: K-axis temporal pass count (required; legal "
+                             "1..ceil(K/4), 1 = fully spatial).")
+    parser.add_argument("--nfold", type=int, default=None,
+                        help="cmvu: N-axis temporal group count (required; legal "
+                             "1..ceil(N/8), 1 = fully spatial).")
     parser.add_argument("--fold-axis", type=str, choices=("n", "k", "kn", "m"), default=None,
                         help="mvau: which dimension ReuseFactor folds -- 'n' (default) "
                              "pads N and sets SIMD=K, PE=N_pad/RF; 'k' pads K and sets "
@@ -143,6 +150,8 @@ def _run(args):
                 # that don't distinguish these pop/ignore them (see generic).
                 "weights_in_core": item.get("weights_in_core"),
                 "second_operand_row_major": item.get("second_operand_row_major"),
+                # The manifest's B layout; cmvu's runtime-B beat format follows it.
+                "weight_layout": item.get("weight_layout"),
                 # has_bias: derived from the bias tensor itself (non-all-zero) AND
                 # not row-varying (a row-varying EinsumDense bias is added in
                 # hls4ml's generated wrapper instead, so the IP never sees it) by

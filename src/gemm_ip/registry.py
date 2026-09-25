@@ -13,7 +13,7 @@ import importlib
 
 
 # User-facing target names.
-TARGETS = ("tensor_slice", "generic", "mvau")
+TARGETS = ("tensor_slice", "generic", "mvau", "cmvu")
 
 # (target, tool) -> the concrete implementation package under src/targets/.
 _IMPLS = {
@@ -21,6 +21,7 @@ _IMPLS = {
     ("generic", "catapult"): "c_generic",
     ("tensor_slice", "catapult"): "tensor_slice",
     ("mvau", "vitis"): "mvau",
+    ("cmvu", "catapult"): "cmvu",
 }
 
 # The tool a target resolves to when the caller doesn't specify one.
@@ -28,6 +29,7 @@ _DEFAULT_TOOL = {
     "generic": "vitis",
     "tensor_slice": "catapult",
     "mvau": "vitis",
+    "cmvu": "catapult",
 }
 
 

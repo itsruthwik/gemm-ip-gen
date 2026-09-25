@@ -2,8 +2,10 @@
 
 Generates GEMM IP blackbox / behavioral packages for hardblock **targets**:
 `tensor_slice` (an INT8 GEMM hardblock, tool: Catapult), `generic` (a
-resource-only behavioral-HLS soft kernel, tool: Vitis or Catapult), and `mvau`
-(FINN's RTL MVU blackboxed into a Vitis dataflow top). Each package contains
+resource-only behavioral-HLS soft kernel, tool: Vitis or Catapult), `mvau`
+(FINN's RTL MVU blackboxed into a Vitis dataflow top), and `cmvu` (a
+spatial/temporal INT8 GEMM hardblock built from the `cmvu_mode1` block, tool:
+Catapult; see below and `src/targets/cmvu/docs/`). Each package contains
 the RTL core (or synthesizable C++, for `generic`), an hls4ml-native C++
 wrapper, and the tool's synthesis script. A combined dispatch header is
 emitted when multiple packages are generated together.
@@ -22,7 +24,24 @@ src/
     v_generic/      generic's Vitis implementation (tool=vitis)
     c_generic/      generic's Catapult implementation (tool=catapult)
     mvau/           FINN MVU blackbox (tool=vitis)
+    cmvu/           cmvu_mode1 hardblock wrapper (tool=catapult); see docs/
 ```
+
+### cmvu
+
+A spatial/temporal INT8 GEMM hardblock built by generating a Verilog wrapper
+around the vendored `cmvu_mode1` block (Catapult only; no Vitis path). Knobs
+are `KFold`/`NFold` (both required — no `FoldAxis`/`ReuseFactor`, which cmvu
+ignores): `KFold=1`/`NFold=1` means the whole K/N extent is spatial;
+larger values trade spatial blocks for temporal passes. Limits: stream
+interface only (no `io_parallel`/array); effective output width `W` up to
+16 bits; a per-block resident-tile budget of 8 (`KFold`\*`NFold`-derived
+K-passes times N-passes must fit); output rounding is `RND` or `TRN` only
+(no `SAT`/`SAT_SYM`); and runtime-B (two-operand) packages need
+`K_PASSES<=2` when `weight_layout='column_major'`. See
+`src/targets/cmvu/docs/design.md` for the full set of design rules and
+`src/targets/cmvu/docs/architecture.md` / `mode_1_user_guide.md` for the
+vendored block itself.
 
 A **target** = one hardblock + the HLS tool(s) it's welded to. A target's
 `flow.py` implements the `Target` contract (`geometry`, `emit_rtl`,
@@ -52,6 +71,9 @@ python -m gemm_ip --m 8 --k 8 --n 8 --name gemm_8x8x8 --output_dir ./output
 
 # tensor_slice (tool is always catapult for this target)
 python -m gemm_ip --target tensor_slice --m 8 --k 8 --n 8 --name gemm_8x8x8 --output_dir ./output
+
+# cmvu (tool is always catapult for this target; KFold/NFold required)
+python -m gemm_ip --target cmvu --m 8 --k 8 --n 8 --kfold 1 --nfold 1 --name gemm_8x8x8 --output_dir ./output
 
 # generic under Catapult
 python -m gemm_ip --target generic --tool catapult --m 8 --k 8 --n 8 --name gemm_8x8x8 --output_dir ./output

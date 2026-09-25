@@ -1,0 +1,24 @@
+Vendored from MVU at commit 678a60a ("Mode-1: 16-bit output lanes with runtime
+effective width (out_w)").
+
+Vendored 2026-09-22. Files:
+  - cmvu_mode1.sv
+  - cmvu_w_mem.sv
+  - cmvu_regbank.sv
+
+These are copied verbatim, unmodified.
+
+Local modifications (not in MVU), 2026-09-23:
+  - cmvu_mode1.sv — BIAS_WIDTH default changed 8 -> 32 (bias_in is now a 32-bit
+    per-lane accumulator-scale value, sign-extended into ACC_WIDTH on acc_first,
+    with the sign-extension made legal when BIAS_WIDTH == ACC_WIDTH); the
+    round-half-up adder and its ACC_WIDTH+1 guard bit were removed from requant,
+    which is now a plain arithmetic (floor/TRN) shift. Rounding, where wanted,
+    is now supplied by the integrator via the bias.
+  - docs/architecture.md and docs/mode_1_user_guide.md — requant and bias
+    sections updated to match (BIAS_WIDTH=32, TRN-only requant, no
+    rounding-mode/saturation ports).
+
+cmvu_mode1.sv, docs/architecture.md and docs/mode_1_user_guide.md are therefore
+no longer verbatim copies of the vendored MVU source; cmvu_w_mem.sv and
+cmvu_regbank.sv are unaffected and remain verbatim.
