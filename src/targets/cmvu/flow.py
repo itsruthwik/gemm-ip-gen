@@ -333,7 +333,7 @@ class CmvuTarget(Target):
             shape[0], shape[1], shape[2], name, output_dir, kfold, nfold,
             weight_matrix, bias_codes=bias_codes, shift=shift,
             a_signed=a_signed, b_signed=b_signed,
-            clock_period_ns=cfg.get("clock_period_ns") or 5.0,
+            clock_period_ns=cfg.get("clock_period_ns") or 3.0,
             runtime_b=runtime_b, b_row_major=b_row_major, interface=interface,
             result_width=result_width)
 

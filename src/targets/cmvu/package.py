@@ -1117,9 +1117,11 @@ solution design set ${name}_inst -top
 go analyze
 go compile
 
-solution library add mgc_Xilinx-KINTEX-u-2_beh -- -rtlsyntool Vivado -manufacturer Xilinx -family KINTEX-u -speed -2 -part xcku115-flvb2104-2-i
-solution library add Xilinx_RAMS
-solution library add Xilinx_ROMS
+solution library add mgc_Altera-Agilex-2_beh -- -rtlsyntool Quartus -manufacturer Altera -family Agilex -speed 2 -part AGFB014R24B2E2V
+solution library add Altera_M20K
+solution library add Altera_MLAB
+solution library add Altera_DIST
+solution library add Altera_ROMS
 go libraries
 
 directive set -CLOCKS {clk {-CLOCK_PERIOD ${clock_period} -CLOCK_EDGE rising -CLOCK_UNCERTAINTY 0.0 -CLOCK_HIGH_TIME ${clock_high} -RESET_SYNC_NAME rst -RESET_ASYNC_NAME arst_n -RESET_KIND sync -RESET_SYNC_ACTIVE high -RESET_ASYNC_ACTIVE low}}
@@ -1144,7 +1146,7 @@ puts "${name} Catapult run complete."
 """)
 
 
-def gen_tcl(name, clock_period_ns=5.0, runtime_b=False):
+def gen_tcl(name, clock_period_ns=3.0, runtime_b=False):
     b_map = (f"directive set /{name}_inst/b_stream:rsc "
              f"-MAP_TO_MODULE ccs_ioport.ccs_in_wait"
              if runtime_b else "")
@@ -1422,7 +1424,7 @@ def gen_integration_manifest(items):
 
 def generate_catapult_pkg(m, k, n, name, output_dir, kfold, nfold,
                           weight_matrix, bias_codes=None, shift=0,
-                          a_signed=True, b_signed=True, clock_period_ns=5.0,
+                          a_signed=True, b_signed=True, clock_period_ns=3.0,
                           runtime_b=False, result_width=None,
                           b_row_major=False, **kwargs):
     if str(kwargs.get("interface", "stream")).lower() != "stream":
@@ -1455,7 +1457,11 @@ def generate_catapult_pkg(m, k, n, name, output_dir, kfold, nfold,
                               module_name=f"{name}_core", name=name,
                               runtime_b=runtime_b, b_row_major=b_row_major,
                               result_width=geo["result_width"])
-    bb_delay = max(1.5, 0.7 * float(clock_period_ns))
+    # Same blackbox budget as tensor_slice: 70% of the period, but always
+    # leaving Catapult >= 1.5 ns for the glue around the block, below which
+    # its scheduler rejects the component.
+    period = float(clock_period_ns)
+    bb_delay = round(min(0.7 * period, period - 1.5), 2)
 
     (pkg_dir / f"{name}_core.sv").write_text(core)
     (pkg_dir / "nnet_types.h").write_text(gen_nnet_types_header())
