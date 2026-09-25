@@ -1672,7 +1672,7 @@ void {name}_inst(
 """
 
 
-def gen_tcl(name, m, k, n, interface="stream", weights_in_core=False):
+def gen_tcl(name, m, k, n, interface="stream", weights_in_core=False, clock_period_ns=None):
     # Map each top-level port to a ccs_ioport resource. The resource name is the
     # top argument's variable name, so the map MUST track the four signatures'
     # actual ports: the const_weights tops carry NO B operand (weights live in the
@@ -1697,6 +1697,11 @@ def gen_tcl(name, m, k, n, interface="stream", weights_in_core=False):
 directive set /{name}_inst/a_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
 {b_map}directive set /{name}_inst/biases:rsc -MAP_TO_MODULE ccs_ioport.ccs_in_wait
 directive set /{name}_inst/res_stream:rsc -MAP_TO_MODULE ccs_ioport.ccs_out_wait"""
+
+    # Follow the design's clock when the caller has one (matches the hls4ml/build_prj.tcl
+    # side of the same package); fall back to Catapult's Agilex default of 3 ns otherwise.
+    clock_period = float(clock_period_ns) if clock_period_ns else 3.0
+    clock_high = clock_period / 2.0
 
     return f"""\
 set project_name "{name}_proj"
@@ -1742,12 +1747,14 @@ solution design set {name}_inst -top
 go analyze
 go compile
 
-solution library add mgc_Xilinx-KINTEX-u-2_beh -- -rtlsyntool Vivado -manufacturer Xilinx -family KINTEX-u -speed -2 -part xcku115-flvb2104-2-i
-solution library add Xilinx_RAMS
-solution library add Xilinx_ROMS
+solution library add mgc_Altera-Agilex-2_beh -- -rtlsyntool Quartus -manufacturer Altera -family Agilex -speed 2 -part AGFB014R24B2E2V
+solution library add Altera_M20K
+solution library add Altera_MLAB
+solution library add Altera_DIST
+solution library add Altera_ROMS
 go libraries
 
-directive set -CLOCKS {{clk {{-CLOCK_PERIOD 5.0 -CLOCK_EDGE rising -CLOCK_UNCERTAINTY 0.0 -CLOCK_HIGH_TIME 2.5 -RESET_SYNC_NAME rst -RESET_ASYNC_NAME arst_n -RESET_KIND sync -RESET_SYNC_ACTIVE high -RESET_ASYNC_ACTIVE low}}}}
+directive set -CLOCKS {{clk {{-CLOCK_PERIOD {clock_period} -CLOCK_EDGE rising -CLOCK_UNCERTAINTY 0.0 -CLOCK_HIGH_TIME {clock_high} -RESET_SYNC_NAME rst -RESET_ASYNC_NAME arst_n -RESET_KIND sync -RESET_SYNC_ACTIVE high -RESET_ASYNC_ACTIVE low}}}}
 
 {map_lines}
 
@@ -2454,7 +2461,8 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         s1=s1, s2=s2, k_spatial=k_spatial,
     ))
     (pkg_dir / "run_catapult.tcl").write_text(
-        gen_tcl(name, m, k, n, interface, weights_in_core=weight_matrix is not None))
+        gen_tcl(name, m, k, n, interface, weights_in_core=weight_matrix is not None,
+                clock_period_ns=clock_period_ns))
     print(f"Generated {pkg_dir}  (M={m}, K={k}, N={n}, interface={interface}, "
           f"reuse_factor={rf_legalized}, k_spatial={k_spatial}, fold_axis={fold_axis}, "
           f"m_passes={m_passes}, n_passes={n_passes})")
