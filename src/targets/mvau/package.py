@@ -1199,7 +1199,7 @@ def _resolve_manifest_plan(it):
     cfg = {key: it.get(key) for key in
            ("input_precision", "weight_precision", "output_precision", "part",
             "clock_period_ns", "reuse_factor", "fold_axis", "n_tiles", "k_tiles",
-            "weights", "weights_in_core", "name")}
+            "weights", "weights_in_core", "name", "pe", "simd")}
     try:
         return _resolve_plan((m, k, n), cfg)
     except Exception:
