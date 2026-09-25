@@ -75,7 +75,12 @@ block itself (not the wrapper this target generates around it).
 - **The blackbox reset is synchronous, active-high.** This matches how
   Catapult's own generated design resets in the SCVerify/Catapult build, so
   the vendored block and the wrapper's registers reset in lockstep with the
-  rest of the design instead of on a different reset discipline.
+  rest of the design instead of on a different reset discipline. Catapult
+  sees only the wrapper, and every register the wrapper owns (including its
+  skew and de-skew delay lines) resets on `posedge clk` only. The vendored
+  block keeps its internal async reset, but its `rst` pin is driven only by
+  the wrapper's clock-synchronous `rst`, so it behaves as a sync reset from
+  outside the wrapper.
 - **Pack/unpack is raw-bit, not value.** Packing an A row or unpacking a
   result lane copies each element's bits directly (`.slc<8>()`/`.set_slc()`)
   rather than assigning the `ac_int` by value — a value assignment would

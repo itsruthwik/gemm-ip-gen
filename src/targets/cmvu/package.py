@@ -87,12 +87,22 @@ template <typename T, unsigned N> struct array {
 """
 
 
-# ── public header (blackbox binding + behavioral twin) ────────────────────────
+# ── header building blocks shared by compile-time-weight and runtime-B ────────
+#
+# _HEADER (compile-time weights) and _HEADER_RB (runtime B) are two-thirds
+# identical: same guard/includes, same pack/unpack/requant helpers, same
+# result-slot polling loop inside ccore::run(), same KP/NP/D/QN state and
+# reset_state() shape. The pieces below render those shared spans once each;
+# gen_public_header/gen_runtime_b_header substitute them into ${...}
+# placeholders in _HEADER/_HEADER_RB, so each template's literal text is only
+# the part that's genuinely different (blackbox result value, compute_row's
+# weight source, extra runtime-B state, the stream-loop bodies).
 
-_HEADER = Template("""\
+_HEADER_GUARD_OPEN = Template("""\
 #ifndef ${NAME}_GEMM_IP_H
 #define ${NAME}_GEMM_IP_H
 
+#include <cassert>
 #include "ac_int.h"
 #include "ac_channel.h"
 
@@ -100,12 +110,18 @@ _HEADER = Template("""\
 #include "ac_blackbox.h"
 #endif
 
-namespace nnet {
+namespace nnet {""")
 
-// Lane packing (architecture.md 11.1): lane 0 in the LSBs.
-// Pack/unpack loops are unrolled on purpose: a rolled loop inside the II=1
-// feed loop is an unschedulable feedback path (SCHD-3), the same trap
-// tensor_slice documents for its capture body.
+_HEADER_GUARD_CLOSE = Template("""\
+} // namespace nnet
+
+#endif // ${NAME}_GEMM_IP_H
+""")
+
+# Pack/unpack loops are unrolled on purpose: a rolled loop inside the II=1
+# feed loop is an unschedulable feedback path (SCHD-3), the same trap
+# tensor_slice documents for its capture body.
+_PACK_A_ROW_FN = Template("""\
 template <class data_T>
 ac_int<${A_BITS}, false> ${name}_pack_a_row(const data_T &row) {
     ac_int<${A_BITS}, false> packed = 0;
@@ -113,8 +129,9 @@ ac_int<${A_BITS}, false> ${name}_pack_a_row(const data_T &row) {
     for (int i = 0; i < ${k}; i++)
         packed.set_slc(i * 8, ac_int<8, false>(row[i].template slc<8>(0)));
     return packed;
-}
+}""")
 
+_UNPACK_RES_ROW_FN = Template("""\
 // Store each lane's W-bit code as the element's raw bits (the same bit-level
 // convention as pack): assigning the ac_int by value would read the code as an
 // integer value and wrap it into the fixed-point range.
@@ -131,18 +148,92 @@ res_T ${name}_unpack_res_row(ac_int<${RES_BITS}, false> packed) {
         out[j] = v;
     }
     return out;
-}
+}""")
+
+_REQUANT_FN = Template("""\
+static inline int ${name}_requant_cpp(int total) {
+    int q = total >> ${shift};
+    q &= (1 << ${W}) - 1;
+    return (q >= (1 << (${W} - 1))) ? (q - (1 << ${W})) : q;
+}""")
+
+_BLACKBOX_BIND = Template("""\
+        ac_blackbox()
+            .entity("${name}_core")
+            .verilog_files("${name}_core.sv")
+            .outputs("out_valid res_row")
+            .area(2048.0)
+            .delay(${bb_delay})
+            .latency(1)
+            .init_delay(1)
+            .clock_name("clk")
+            .posedge_clock(true)
+            .sync_reset_name("rst")
+            .active_high_sync_reset(true)
+            .has_state(true)
+            .start_name("en")
+            .end();""")
+
+# Common to both ccore::run() behavioral bodies: drain any result slot whose
+# countdown just hit zero, then arm a fresh slot for a newly-accepted row.
+_RESULT_SLOT_POLL_CAPTURE = Template("""\
+        for (int q = 0; q < QN; q++) {
+            if (rem[q] > 0) {
+                rem[q]--;
+                if (rem[q] == 0) {
+                    res_row   = pending[q];
+                    out_valid = 1;
+                }
+            }
+        }
+        if (in_valid) {
+            // QN is sized so a free slot always exists at the fixed cadence;
+            // a geometry that breaks that must fail here, not walk off rem[].
+            int q = 0;
+            while (q < QN && rem[q] > 0) q++;
+            assert(q < QN && "cmvu C model: no free result slot (QN too small)");
+            rem[q]     = KP * NP + D + 1;
+            pending[q] = ${name}_compute_row(a_row);
+        }""")
+
+# extra_members/extra_reset let the runtime-B header append its per-instance
+# B_model buffer without duplicating the KP/NP/D/QN block or the rem/pending
+# reset loop.
+_STATE_MEMBERS_BLOCK = Template("""\
+  private:
+    static const int KP = ${KP};
+    static const int NP = ${NP};
+    static const int D  = ${D};
+    static const int QN = ${QN};
+#if !(defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW))
+    ac_int<${RES_BITS}, false> pending[QN];
+    int rem[QN];${extra_members}
+#endif""")
+
+_RESET_STATE_FN = Template("""\
+    void ${name}_reset_state() {
+#if !(defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW))
+        for (int q = 0; q < QN; q++) { rem[q] = 0; pending[q] = 0; }${extra_reset}
+#endif
+    }""")
+
+
+# ── public header (blackbox binding + behavioral twin) ────────────────────────
+
+_HEADER = Template("""\
+${guard_open}
+
+${pack_a_row_comment}
+${pack_a_row_fn}
+
+${unpack_res_row_fn}
 
 // Behavioral requant (the golden/TB/model all share this): truncating
 // (floor) arithmetic shift then two's-complement wrap-to-W, matching
 // cmvu_mode1 exactly. The block never rounds; RND output is reproduced by
 // folding the rounding constant into the bias (int32, accumulator scale)
 // before it reaches here -- see golden.bias_codes.
-static inline int ${name}_requant_cpp(int total) {
-    int q = total >> ${shift};
-    q &= (1 << ${W}) - 1;
-    return (q >= (1 << (${W} - 1))) ? (q - (1 << ${W})) : q;
-}
+${requant_fn}
 
 #if !(defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW))
 ${weights_decl}
@@ -159,21 +250,7 @@ class ${name}_ccore {
              ac_int<${RES_BITS}, false>       &res_row,
              ac_int<1, false>         &out_valid) {
 #if defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW)
-        ac_blackbox()
-            .entity("${name}_core")
-            .verilog_files("${name}_core.sv")
-            .outputs("out_valid res_row")
-            .area(2048.0)
-            .delay(${bb_delay})
-            .latency(1)
-            .init_delay(1)
-            .clock_name("clk")
-            .posedge_clock(true)
-            .sync_reset_name("rst")
-            .active_high_sync_reset(true)
-            .has_state(true)
-            .start_name("en")
-            .end();
+${blackbox_bind}
         out_valid = 0;
         res_row   = (ac_int<${RES_BITS}, false>)a_row;
 #else
@@ -184,21 +261,7 @@ class ${name}_ccore {
         // in flight. `in_ready` is intentionally NOT a model output: the HLS
         // schedule must not depend on any DUT signal.
         out_valid = 0;
-        for (int q = 0; q < QN; q++) {
-            if (rem[q] > 0) {
-                rem[q]--;
-                if (rem[q] == 0) {
-                    res_row   = pending[q];
-                    out_valid = 1;
-                }
-            }
-        }
-        if (in_valid) {
-            int q = 0;
-            while (rem[q] > 0) q++;
-            rem[q]     = KP * NP + D + 1;
-            pending[q] = ${name}_compute_row(a_row);
-        }
+${result_slot_poll_capture}
 #endif
     }
 
@@ -219,24 +282,12 @@ class ${name}_ccore {
     }
 #endif
 
-  private:
-    static const int KP = ${KP};
-    static const int NP = ${NP};
-    static const int D  = ${D};
-    static const int QN = ${QN};
-#if !(defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW))
-    ac_int<${RES_BITS}, false> pending[QN];
-    int rem[QN];
-#endif
+${state_members}
 
   public:
     // In Catapult the object is persistent across run() calls; csim initializes
     // the in-flight slots on construction (the RTL resets from `rst`).
-    void ${name}_reset_state() {
-#if !(defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW))
-        for (int q = 0; q < QN; q++) { rem[q] = 0; pending[q] = 0; }
-#endif
-    }
+${reset_state_fn}
 };
 
 template <class data_T, class res_T, typename CONFIG_T>
@@ -276,10 +327,7 @@ void ${name}_gemm_stream_const_weights(ac_channel<data_T> &a_stream,
     }
 }
 
-} // namespace nnet
-
-#endif // ${NAME}_GEMM_IP_H
-""")
+${guard_close}""")
 
 
 def gen_public_header(name, m, k, n, weight_codes, bias_codes, shift,
@@ -302,63 +350,45 @@ def gen_public_header(name, m, k, n, weight_codes, bias_codes, shift,
     LAT = KP * NP + D + 1
     TOTAL = (int(m) - 1) * PERIOD + LAT + 1
     QN = (LAT + PERIOD - 1) // PERIOD + 2
+    A_BITS, RES_BITS, W = geo["a_port_bits"], geo["res_port_bits"], geo["result_width"]
+    pack_a_row_comment = (
+        "// Lane packing (architecture.md 11.1): lane 0 in the LSBs.\n"
+        "// Pack/unpack loops are unrolled on purpose: a rolled loop inside the II=1\n"
+        "// feed loop is an unschedulable feedback path (SCHD-3), the same trap\n"
+        "// tensor_slice documents for its capture body.")
+    state_members = _STATE_MEMBERS_BLOCK.substitute(
+        KP=KP, NP=NP, D=D, QN=QN, RES_BITS=RES_BITS, extra_members="")
+    reset_state_fn = _RESET_STATE_FN.substitute(name=name, extra_reset="")
     return _HEADER.substitute(
         NAME=name.upper(), name=name, m=int(m), k=int(k), n=int(n),
-        A_BITS=geo["a_port_bits"], RES_BITS=geo["res_port_bits"],
+        A_BITS=A_BITS, RES_BITS=RES_BITS,
         shift=int(shift), weights_decl=weights_decl,
         bias_decl=bias_decl, bias_expr=bias_expr, W_NAME=W_NAME,
         KP=KP, NP=NP, D=D, QN=QN, PERIOD=PERIOD, TOTAL=TOTAL,
-        W=geo["result_width"], bb_delay=bb_delay)
+        W=W, bb_delay=bb_delay,
+        guard_open=_HEADER_GUARD_OPEN.substitute(NAME=name.upper()),
+        guard_close=_HEADER_GUARD_CLOSE.substitute(NAME=name.upper()),
+        pack_a_row_comment=pack_a_row_comment,
+        pack_a_row_fn=_PACK_A_ROW_FN.substitute(name=name, k=int(k), A_BITS=A_BITS),
+        unpack_res_row_fn=_UNPACK_RES_ROW_FN.substitute(
+            name=name, n=int(n), W=W, RES_BITS=RES_BITS),
+        requant_fn=_REQUANT_FN.substitute(name=name, shift=int(shift), W=W),
+        blackbox_bind=_BLACKBOX_BIND.substitute(name=name, bb_delay=bb_delay),
+        result_slot_poll_capture=_RESULT_SLOT_POLL_CAPTURE.substitute(name=name),
+        state_members=state_members, reset_state_fn=reset_state_fn)
 
 
 # ── runtime-B header (two-stream: load B, then stream A) ──────────────────────
 
 _HEADER_RB = Template("""\
-#ifndef ${NAME}_GEMM_IP_H
-#define ${NAME}_GEMM_IP_H
+${guard_open}
 
-#include "ac_int.h"
-#include "ac_channel.h"
+${pack_a_row_comment}
+${pack_a_row_fn}
 
-#if defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW)
-#include "ac_blackbox.h"
-#endif
+${unpack_res_row_fn}
 
-namespace nnet {
-
-// Lane packing (architecture.md 11.1): lane 0 in the LSBs.
-template <class data_T>
-ac_int<${A_BITS}, false> ${name}_pack_a_row(const data_T &row) {
-    ac_int<${A_BITS}, false> packed = 0;
-    #pragma hls_unroll
-    for (int i = 0; i < ${k}; i++)
-        packed.set_slc(i * 8, ac_int<8, false>(row[i].template slc<8>(0)));
-    return packed;
-}
-
-// Store each lane's W-bit code as the element's raw bits (the same bit-level
-// convention as pack): assigning the ac_int by value would read the code as an
-// integer value and wrap it into the fixed-point range.
-template <class res_T>
-res_T ${name}_unpack_res_row(ac_int<${RES_BITS}, false> packed) {
-    typedef typename res_T::value_type res_elem_T;
-    static_assert(res_T::size == ${n}, "cmvu expects one N-wide result row per beat");
-    static_assert(res_elem_T::width == ${W}, "cmvu result lanes are W bits wide");
-    res_T out;
-    #pragma hls_unroll
-    for (int j = 0; j < ${n}; j++) {
-        res_elem_T v;
-        v.set_slc(0, packed.template slc<${W}>(j * ${W}));
-        out[j] = v;
-    }
-    return out;
-}
-
-static inline int ${name}_requant_cpp(int total) {
-    int q = total >> ${shift};
-    q &= (1 << ${W}) - 1;
-    return (q >= (1 << (${W} - 1))) ? (q - (1 << ${W})) : q;
-}
+${requant_fn}
 
 #if !(defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW))
 ${bias_decl}
@@ -376,21 +406,7 @@ class ${name}_ccore {
              ac_int<${RES_BITS}, false>       &res_row,
              ac_int<1, false>         &out_valid) {
 #if defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW)
-        ac_blackbox()
-            .entity("${name}_core")
-            .verilog_files("${name}_core.sv")
-            .outputs("out_valid res_row")
-            .area(2048.0)
-            .delay(${bb_delay})
-            .latency(1)
-            .init_delay(1)
-            .clock_name("clk")
-            .posedge_clock(true)
-            .sync_reset_name("rst")
-            .active_high_sync_reset(true)
-            .has_state(true)
-            .start_name("en")
-            .end();
+${blackbox_bind}
         out_valid = 0;
         res_row   = 0;
 #else
@@ -407,21 +423,7 @@ ${B_MODEL_STORE}
             }
 ${B_MODEL_ADVANCE}
         }
-        for (int q = 0; q < QN; q++) {
-            if (rem[q] > 0) {
-                rem[q]--;
-                if (rem[q] == 0) {
-                    res_row   = pending[q];
-                    out_valid = 1;
-                }
-            }
-        }
-        if (in_valid) {
-            int q = 0;
-            while (rem[q] > 0) q++;
-            rem[q]     = KP * NP + D + 1;
-            pending[q] = ${name}_compute_row(a_row);
-        }
+${result_slot_poll_capture}
 #endif
     }
 
@@ -443,27 +445,10 @@ ${B_MODEL_ADVANCE}
     }
 #endif
 
-  private:
-    static const int KP = ${KP};
-    static const int NP = ${NP};
-    static const int D  = ${D};
-    static const int QN = ${QN};
-#if !(defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW))
-    ac_int<${RES_BITS}, false> pending[QN];
-    int rem[QN];
-    signed char B_model[${k}][${n}];
-    int ${B_MODEL_IDX};
-#endif
+${state_members}
 
   public:
-    void ${name}_reset_state() {
-#if !(defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW))
-        for (int q = 0; q < QN; q++) { rem[q] = 0; pending[q] = 0; }
-        for (int a = 0; a < ${k}; a++)
-            for (int b = 0; b < ${n}; b++) B_model[a][b] = 0;
-        ${B_MODEL_IDX} = 0;
-#endif
-    }
+${reset_state_fn}
 };
 
 // hls4ml's two-operand contract (nnet_gemm_stream.h gemm_stream) streams B
@@ -523,10 +508,7 @@ void ${name}_gemm_stream_runtime_b(ac_channel<data_T> &a_stream,
     }
 }
 
-} // namespace nnet
-
-#endif // ${NAME}_GEMM_IP_H
-""")
+${guard_close}""")
 
 
 def _runtime_b_load_schedule(k, n, geo, b_row_major):
@@ -602,9 +584,18 @@ def gen_runtime_b_header(name, m, k, n, bias_codes, shift, geo, bb_delay=3.5,
         B_MODEL_ADVANCE = "            ld_idx++;"
         B_MODEL_IDX = "ld_idx"
 
+    A_BITS, RES_BITS, W = geo["a_port_bits"], geo["res_port_bits"], geo["result_width"]
+    extra_members = (f"\n    signed char B_model[{int(k)}][{int(n)}];"
+                     f"\n    int {B_MODEL_IDX};")
+    extra_reset = (f"\n        for (int a = 0; a < {int(k)}; a++)"
+                  f"\n            for (int b = 0; b < {int(n)}; b++) B_model[a][b] = 0;"
+                  f"\n        {B_MODEL_IDX} = 0;")
+    state_members = _STATE_MEMBERS_BLOCK.substitute(
+        KP=KP, NP=NP, D=D, QN=QN, RES_BITS=RES_BITS, extra_members=extra_members)
+    reset_state_fn = _RESET_STATE_FN.substitute(name=name, extra_reset=extra_reset)
     return _HEADER_RB.substitute(
         NAME=name.upper(), name=name, m=int(m), k=int(k), n=int(n),
-        A_BITS=geo["a_port_bits"], RES_BITS=geo["res_port_bits"],
+        A_BITS=A_BITS, RES_BITS=RES_BITS,
         shift=int(shift), bias_decl=bias_decl, bias_expr=bias_expr,
         KP=KP, NP=NP, D=D, QN=QN, PERIOD=PERIOD, TOTAL=TOTAL, LOAD=LOAD,
         LOAD_LEN=LOAD_LEN, LOAD_VALID=LOAD_VALID,
@@ -612,7 +603,68 @@ def gen_runtime_b_header(name, m, k, n, bias_codes, shift, geo, bb_delay=3.5,
         B_ASSERT_SIZE=B_ASSERT_SIZE, B_ASSERT_MSG=B_ASSERT_MSG,
         B_LANES=B_LANES, B_MODEL_STORE=B_MODEL_STORE,
         B_MODEL_ADVANCE=B_MODEL_ADVANCE, B_MODEL_IDX=B_MODEL_IDX,
-        W=geo["result_width"], bb_delay=bb_delay)
+        W=W, bb_delay=bb_delay,
+        guard_open=_HEADER_GUARD_OPEN.substitute(NAME=name.upper()),
+        guard_close=_HEADER_GUARD_CLOSE.substitute(NAME=name.upper()),
+        pack_a_row_comment="// Lane packing (architecture.md 11.1): lane 0 in the LSBs.",
+        pack_a_row_fn=_PACK_A_ROW_FN.substitute(name=name, k=int(k), A_BITS=A_BITS),
+        unpack_res_row_fn=_UNPACK_RES_ROW_FN.substitute(
+            name=name, n=int(n), W=W, RES_BITS=RES_BITS),
+        requant_fn=_REQUANT_FN.substitute(name=name, shift=int(shift), W=W),
+        blackbox_bind=_BLACKBOX_BIND.substitute(name=name, bb_delay=bb_delay),
+        result_slot_poll_capture=_RESULT_SLOT_POLL_CAPTURE.substitute(name=name),
+        state_members=state_members, reset_state_fn=reset_state_fn)
+
+
+# ── inst/TB building blocks shared across const-weights and runtime-B ─────────
+#
+# The Catapult top (_INST/_INST_RB) and csim TBs (_TB/_TB_RB/_TB_RB_MULTI) all
+# open with the same "#include + CONFIG_T struct" (and the TBs all wrap main()
+# in the same CCS_SCVERIFY/mc_testbench guard and end with the same
+# PASS/FAIL-and-return footer). These pieces render those spans once; the
+# per-variant differences (typedefs, weight source, single- vs multi-call
+# body, the pass message) stay inline in each template.
+
+_CONFIG_STRUCT = Template("""\
+struct ${name}_config {
+    static const unsigned gemm_m = ${m};
+    static const unsigned gemm_k = ${k};
+    static const unsigned gemm_n = ${n};
+    static const unsigned n_in = ${k};
+    static const unsigned n_out = ${n};
+};""")
+
+_SCVERIFY_OR_STDIO = """\
+#ifdef CCS_SCVERIFY
+#include "mc_testbench.h"
+#include "mc_scverify.h"
+#else
+#include <stdio.h>
+#endif"""
+
+_MAIN_OPEN = """\
+#ifdef CCS_SCVERIFY
+CCS_MAIN(int argc, char **argv) {
+#else
+int main(int argc, char **argv) {
+#endif"""
+
+_PASS_FAIL_FOOTER = Template("""\
+    if (failed) {
+        printf("CMVU CSIM: FAIL\\n");
+#ifdef CCS_SCVERIFY
+        CCS_RETURN(1);
+#else
+        return 1;
+#endif
+    }
+    printf("CMVU CSIM: PASS (${pass_msg})\\n");
+#ifdef CCS_SCVERIFY
+    CCS_RETURN(0);
+#else
+    return 0;
+#endif
+}""")
 
 
 # ── inst top + TB ─────────────────────────────────────────────────────────────
@@ -621,13 +673,7 @@ _INST = Template("""\
 #include "nnet_types.h"
 #include "${name}_gemm_ip.h"
 
-struct ${name}_config {
-    static const unsigned gemm_m = ${m};
-    static const unsigned gemm_k = ${k};
-    static const unsigned gemm_n = ${n};
-    static const unsigned n_in = ${k};
-    static const unsigned n_out = ${n};
-};
+${config_struct}
 
 typedef nnet::array<ac_int<8, true>, ${k}> a_beat_t;
 typedef nnet::array<ac_int<${W}, true>, ${n}> res_t;
@@ -642,28 +688,18 @@ void ${name}_inst(ac_channel<a_beat_t> &a_stream,
 
 
 def gen_inst_cpp(name, m, k, n, result_width):
-    return _INST.substitute(name=name, m=int(m), k=int(k), n=int(n),
-                            W=int(result_width))
+    return _INST.substitute(
+        name=name, m=int(m), k=int(k), n=int(n), W=int(result_width),
+        config_struct=_CONFIG_STRUCT.substitute(name=name, m=int(m), k=int(k), n=int(n)))
 
 
 _TB = Template("""\
-#ifdef CCS_SCVERIFY
-#include "mc_testbench.h"
-#include "mc_scverify.h"
-#else
-#include <stdio.h>
-#endif
+${scverify_or_stdio}
 
 #include "nnet_types.h"
 #include "${name}_gemm_ip.h"
 
-struct ${name}_config {
-    static const unsigned gemm_m = ${m};
-    static const unsigned gemm_k = ${k};
-    static const unsigned gemm_n = ${n};
-    static const unsigned n_in = ${k};
-    static const unsigned n_out = ${n};
-};
+${config_struct}
 
 typedef nnet::array<ac_int<8, true>, ${k}> a_beat_t;
 typedef nnet::array<ac_int<${W}, true>, ${n}> res_t;
@@ -692,11 +728,7 @@ static int check_row(const res_t &out, int row, int &failed) {
     return failed;
 }
 
-#ifdef CCS_SCVERIFY
-CCS_MAIN(int argc, char **argv) {
-#else
-int main(int argc, char **argv) {
-#endif
+${main_open}
     ac_channel<a_beat_t> a_stream;
     ac_channel<res_t> res_stream;
     int failed = 0;
@@ -720,41 +752,22 @@ int main(int argc, char **argv) {
         check_row(out, i, failed);
     }
 
-    if (failed) {
-        printf("CMVU CSIM: FAIL\\n");
-#ifdef CCS_SCVERIFY
-        CCS_RETURN(1);
-#else
-        return 1;
-#endif
-    }
-    printf("CMVU CSIM: PASS (${m} rows)\\n");
-#ifdef CCS_SCVERIFY
-    CCS_RETURN(0);
-#else
-    return 0;
-#endif
-}
+${pass_fail_footer}
 """)
 
 
 def gen_runtime_b_inst_cpp(name, m, k, n, result_width, b_row_major=False):
     b_size = int(n) if b_row_major else int(k)
-    return _INST_RB.substitute(name=name, m=int(m), k=int(k), n=int(n),
-                               B_SIZE=b_size, W=int(result_width))
+    return _INST_RB.substitute(
+        name=name, m=int(m), k=int(k), n=int(n), B_SIZE=b_size, W=int(result_width),
+        config_struct=_CONFIG_STRUCT.substitute(name=name, m=int(m), k=int(k), n=int(n)))
 
 
 _INST_RB = Template("""\
 #include "nnet_types.h"
 #include "${name}_gemm_ip.h"
 
-struct ${name}_config {
-    static const unsigned gemm_m = ${m};
-    static const unsigned gemm_k = ${k};
-    static const unsigned gemm_n = ${n};
-    static const unsigned n_in = ${k};
-    static const unsigned n_out = ${n};
-};
+${config_struct}
 
 typedef nnet::array<ac_int<8, true>, ${k}> a_beat_t;
 typedef nnet::array<ac_int<8, true>, ${B_SIZE}> b_beat_t;
@@ -823,7 +836,11 @@ def gen_runtime_b_tb(name, m, k, n, weight_codes, bias_codes, shift, geo,
         n_beats=n_beats, b_beats=b_beats, b_comment=b_comment,
         b_write_loop=b_write_loop, w_rows=w_rows, a_rows=a_rows,
         bias_lit=", ".join(str(b) for b in bias_list),
-        W=geo["result_width"])
+        W=geo["result_width"],
+        scverify_or_stdio=_SCVERIFY_OR_STDIO,
+        config_struct=_CONFIG_STRUCT.substitute(name=name, m=int(m), k=int(k), n=int(n)),
+        main_open=_MAIN_OPEN,
+        pass_fail_footer=_PASS_FAIL_FOOTER.substitute(pass_msg=f"{int(m)} rows"))
 
 
 def gen_runtime_b_multi_call_tb(name, m, k, n, bias_codes, shift, geo,
@@ -876,7 +893,7 @@ def gen_runtime_b_multi_call_tb(name, m, k, n, bias_codes, shift, geo,
 
     data_decls, calls_code = [], []
     for c in range(int(n_calls)):
-        Wc = rng.integers(-128, 128, size=(int(k), int(n)))
+        Wc = rng.integers(-128, 128, size=(int(k), int(n)), dtype=np.int64)
         Ac = rng.integers(-128, 128, size=(int(m), int(k)), dtype=np.int64)
         data_decls.append(f"""\
 static const signed char _W{c}[{k}][{n}] = {{
@@ -916,27 +933,21 @@ static const int _A{c}[{m}][{k}] = {{
         name=name, m=int(m), k=int(k), n=int(n), b_size=b_size,
         n_calls=int(n_calls), data_decls="\n".join(data_decls),
         calls_code="\n".join(calls_code),
-        bias_lit=", ".join(str(b) for b in bias_list), W=W)
+        bias_lit=", ".join(str(b) for b in bias_list), W=W,
+        scverify_or_stdio=_SCVERIFY_OR_STDIO,
+        config_struct=_CONFIG_STRUCT.substitute(name=name, m=int(m), k=int(k), n=int(n)),
+        main_open=_MAIN_OPEN,
+        pass_fail_footer=_PASS_FAIL_FOOTER.substitute(
+            pass_msg=f"{int(n_calls)} calls x {int(m)} rows"))
 
 
 _TB_RB_MULTI = Template("""\
-#ifdef CCS_SCVERIFY
-#include "mc_testbench.h"
-#include "mc_scverify.h"
-#else
-#include <stdio.h>
-#endif
+${scverify_or_stdio}
 
 #include "nnet_types.h"
 #include "${name}_gemm_ip.h"
 
-struct ${name}_config {
-    static const unsigned gemm_m = ${m};
-    static const unsigned gemm_k = ${k};
-    static const unsigned gemm_n = ${n};
-    static const unsigned n_in = ${k};
-    static const unsigned n_out = ${n};
-};
+${config_struct}
 
 typedef nnet::array<ac_int<8, true>, ${k}> a_beat_t;
 typedef nnet::array<ac_int<8, true>, ${b_size}> b_beat_t;
@@ -962,51 +973,22 @@ static void check_row(const res_t &out, int callc, int row,
     }
 }
 
-#ifdef CCS_SCVERIFY
-CCS_MAIN(int argc, char **argv) {
-#else
-int main(int argc, char **argv) {
-#endif
+${main_open}
     int failed = 0;
 
 ${calls_code}
 
-    if (failed) {
-        printf("CMVU CSIM: FAIL\\n");
-#ifdef CCS_SCVERIFY
-        CCS_RETURN(1);
-#else
-        return 1;
-#endif
-    }
-    printf("CMVU CSIM: PASS (${n_calls} calls x ${m} rows)\\n");
-#ifdef CCS_SCVERIFY
-    CCS_RETURN(0);
-#else
-    return 0;
-#endif
-}
+${pass_fail_footer}
 """)
 
 
 _TB_RB = Template("""\
-#ifdef CCS_SCVERIFY
-#include "mc_testbench.h"
-#include "mc_scverify.h"
-#else
-#include <stdio.h>
-#endif
+${scverify_or_stdio}
 
 #include "nnet_types.h"
 #include "${name}_gemm_ip.h"
 
-struct ${name}_config {
-    static const unsigned gemm_m = ${m};
-    static const unsigned gemm_k = ${k};
-    static const unsigned gemm_n = ${n};
-    static const unsigned n_in = ${k};
-    static const unsigned n_out = ${n};
-};
+${config_struct}
 
 typedef nnet::array<ac_int<8, true>, ${k}> a_beat_t;
 typedef nnet::array<ac_int<8, true>, ${b_size}> b_beat_t;
@@ -1039,11 +1021,7 @@ static int check_row(const res_t &out, int row, int &failed) {
     return failed;
 }
 
-#ifdef CCS_SCVERIFY
-CCS_MAIN(int argc, char **argv) {
-#else
-int main(int argc, char **argv) {
-#endif
+${main_open}
     ac_channel<a_beat_t> a_stream;
     ac_channel<b_beat_t> b_stream;
     ac_channel<res_t> res_stream;
@@ -1069,21 +1047,7 @@ ${b_write_loop}
         check_row(out, i, failed);
     }
 
-    if (failed) {
-        printf("CMVU CSIM: FAIL\\n");
-#ifdef CCS_SCVERIFY
-        CCS_RETURN(1);
-#else
-        return 1;
-#endif
-    }
-    printf("CMVU CSIM: PASS (${m} rows)\\n");
-#ifdef CCS_SCVERIFY
-    CCS_RETURN(0);
-#else
-    return 0;
-#endif
-}
+${pass_fail_footer}
 """)
 
 
@@ -1098,10 +1062,15 @@ def gen_tb(name, m, k, n, weight_codes, bias_codes, shift, result_width,
                        for i in range(int(m)))
     bias_list = [int(v) for v in (bias_codes if bias_codes is not None
                                   else [0] * n)]
-    return _TB.substitute(name=name, m=int(m), k=int(k), n=int(n),
-                          w_rows=w_rows, a_rows=a_rows,
-                          bias_lit=", ".join(str(b) for b in bias_list),
-                          W=int(result_width))
+    return _TB.substitute(
+        name=name, m=int(m), k=int(k), n=int(n),
+        w_rows=w_rows, a_rows=a_rows,
+        bias_lit=", ".join(str(b) for b in bias_list),
+        W=int(result_width),
+        scverify_or_stdio=_SCVERIFY_OR_STDIO,
+        config_struct=_CONFIG_STRUCT.substitute(name=name, m=int(m), k=int(k), n=int(n)),
+        main_open=_MAIN_OPEN,
+        pass_fail_footer=_PASS_FAIL_FOOTER.substitute(pass_msg=f"{int(m)} rows"))
 
 
 # ── Catapult tcl ──────────────────────────────────────────────────────────────
@@ -1438,7 +1407,7 @@ def gen_integration_manifest(items):
             "n_passes": item.get("n_passes"),
             "slots_per_block": item.get("slots_per_block"),
             "interface": "stream",
-            "reset": "async_active_high",
+            "reset": {"name": "rst", "sync_active": "high"},
         })
     return json.dumps({
         "package_format": "single_top_catapult_blackboxes",
@@ -1474,7 +1443,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, kfold, nfold,
             W = _codes(weight_matrix, k, n)
         else:
             seed = zlib.crc32(str(name).encode()) & 0xFFFFFFFF
-            W = np.random.default_rng(seed).integers(-128, 128, size=(int(k), int(n)))
+            W = np.random.default_rng(seed).integers(-128, 128, size=(int(k), int(n)), dtype=np.int64)
     else:
         W = _codes(weight_matrix, k, n)
 

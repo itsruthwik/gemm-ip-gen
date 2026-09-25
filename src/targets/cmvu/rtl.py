@@ -28,6 +28,11 @@ datapath split):
   the ``always_ff`` banks; Icarus cannot force array words). Zero cycles, no
   load FSM, no runtime ``.dat``.
 
+* Reset is synchronous, active-high, at the wrapper boundary: every register
+  the wrapper owns resets on ``posedge clk`` only, and Catapult sees just the
+  wrapper. The vendored blocks keep their internal async reset, but their
+  ``rst`` pin is driven only by the wrapper's clock-synchronous ``rst``.
+
 The single-block temporal core (no spatial replication) is the 1x1 grid
 degenerate case of this same generator.
 """
@@ -96,6 +101,21 @@ def _init_block(block_slots):
 
 
 # ── Generated wrapper ─────────────────────────────────────────────────────────
+
+
+def _sync_reg(add, reg, width, d, q):
+    """One en-gated, sync-reset pipeline register ``d -> q``.
+
+    The wrapper's own delay lines use this instead of the vendored
+    ``cmvu_regbank``, whose reset is asynchronous: every register the wrapper
+    owns resets synchronously, and the async reset stays inside the blocks.
+    """
+    add(f"    reg [{width}-1:0] {reg};")
+    add("    always_ff @(posedge clk) begin")
+    add(f"        if (rst)     {reg} <= '0;")
+    add(f"        else if (en) {reg} <= {d};")
+    add("    end")
+    add(f"    assign {q} = {reg};")
 
 
 def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0,
@@ -249,9 +269,9 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
     add("    // register, not a level-sensitive latch, so it is DFT/lint clean)")
     add("    // so it is already stable low-to-low across the whole high phase of")
     add("    // clk -- the standard glitch-free ICG. Force the gate open during")
-    add("    // rst so the blocks' own posedge-rst resets are not gated off.")
+    add("    // rst so the blocks see clock edges while rst is held.")
     add("    reg en_n;")
-    add("    always @(negedge clk or posedge rst) begin")
+    add("    always @(negedge clk) begin")
     add("        if (rst) en_n <= 1'b0;")
     add("        else     en_n <= en;")
     add("    end")
@@ -270,7 +290,7 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
         add("    // counter is enough to detect it without knowing the schedule.")
         add(f"    reg  [{m_w}-1:0]          res_count;")
         add("    wire call_done = out_valid_r && (res_count == M_ROWS - 1);")
-        add("    always_ff @(posedge clk or posedge rst) begin")
+        add("    always_ff @(posedge clk) begin")
         add("        if (rst) begin")
         add("            res_count <= '0;")
         add("        end else if (en) begin")
@@ -324,7 +344,7 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
                 f"{{{zero_pad_bits}'d0, b_beat_r}};")
         else:
             add(f"    wire [{pad_k * 8}-1:0] b_col_pad = b_beat_r;")
-        add("    always_ff @(posedge clk or posedge rst) begin")
+        add("    always_ff @(posedge clk) begin")
         add("        if (rst) begin")
         add("            loading <= 1'b1; b_valid_r <= 1'b0;")
         add("            ld_np <= '0; ld_r <= '0; ld_col <= '0;")
@@ -418,7 +438,7 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
             add(f"    reg  [{c_w}-1:0]          tgt_c;")
             add(f"    reg  [{kp_w}-1:0]         tgt_kp;")
             add("    reg                       tgt_first;")
-            add("    always_ff @(posedge clk or posedge rst) begin")
+            add("    always_ff @(posedge clk) begin")
             add("        if (rst) begin")
             add("            loading <= 1'b1; b_valid_r <= 1'b0;")
             add("            ld_kt <= '0; ld_i <= '0;")
@@ -478,7 +498,7 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
             add(f"    reg  [{np_w}-1:0]         tgt_npd;")
             add("    reg  [1:0]                tgt_i;")
             add("    reg                       tgt_first;")
-            add("    always_ff @(posedge clk or posedge rst) begin")
+            add("    always_ff @(posedge clk) begin")
             add("        if (rst) begin")
             add("            loading <= 1'b1; b_valid_r <= 1'b0;")
             add("            ld_kt <= '0; ld_phase <= 1'b0; ld_i <= '0; "
@@ -581,9 +601,8 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
             add(f"    wire [BUS_W-1:0] col_skew_c{c} [0:{c}];")
             add(f"    assign col_skew_c{c}[0] = entry_c{c};")
             for i in range(c):
-                add(f"    cmvu_regbank #(.W(BUS_W), .PRESENT(1'b1)) "
-                    f"u_skew_c{c}_s{i} (.clk(clk), .rst(rst), .ena(en), "
-                    f".d(col_skew_c{c}[{i}]), .q(col_skew_c{c}[{i+1}]));")
+                _sync_reg(add, f"u_skew_c{c}_s{i}", "BUS_W",
+                          f"col_skew_c{c}[{i}]", f"col_skew_c{c}[{i+1}]")
             add(f"    wire [BUS_W-1:0] col_c{c} = col_skew_c{c}[{c}];")
     add("")
     add("    // Broadcast rows: one forwarding register per row hop.")
@@ -592,9 +611,8 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
             add(f"    wire [BUS_W-1:0] bus_r{r}_c{c};")
         add(f"    assign bus_r0_c{c} = col_c{c};")
         for r in range(1, ns):
-            add(f"    cmvu_regbank #(.W(BUS_W), .PRESENT(1'b1)) "
-                f"u_bcast_r{r}_c{c} (.clk(clk), .rst(rst), .ena(en), "
-                f".d(bus_r{r-1}_c{c}), .q(bus_r{r}_c{c}));")
+            _sync_reg(add, f"u_bcast_r{r}_c{c}", "BUS_W",
+                      f"bus_r{r-1}_c{c}", f"bus_r{r}_c{c}")
     add("")
     add("    // Block grid: cascade along columns. cascade_out may only drive the")
     add("    // next block's cascade_in; unused endpoint pins (head cascade_in,")
@@ -612,6 +630,8 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
             tail = (c == ks - 1)
             params = " #(.CASCADE_EN(1'b0))" if c == 0 else ""
             add(f"    cmvu_mode1{params} u_blk_r{r}_c{c} (")
+            # The block's reset is async internally; the wrapper's rst is
+            # synchronous to clk, so it behaves as a sync reset from outside.
             add("        .clk(gclk), .rst(rst),")
             if tail:
                 # Tail: temporal accumulation (reset at each group's pass 0)
@@ -677,9 +697,8 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
             add(f"    wire [{res_group_w}-1:0] y_ds_r{r} [0:{hops}];")
             add(f"    assign y_ds_r{r}[0] = y_tail_r{r};")
             for i in range(hops):
-                add(f"    cmvu_regbank #(.W(GROUP_W), .PRESENT(1'b1)) "
-                    f"u_yds_r{r}_s{i} (.clk(clk), .rst(rst), .ena(en), "
-                    f".d(y_ds_r{r}[{i}]), .q(y_ds_r{r}[{i+1}]));")
+                _sync_reg(add, f"u_yds_r{r}_s{i}", "GROUP_W",
+                          f"y_ds_r{r}[{i}]", f"y_ds_r{r}[{i+1}]")
             add(f"    assign y_align[{r}] = y_ds_r{r}[{hops}];")
     hops_d = ns - 1
     add(f"    wire done_tail0 = done_blk_r0_c{ks - 1};")
@@ -689,16 +708,15 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
         add(f"    wire done_ds [0:{hops_d}];")
         add("    assign done_ds[0] = done_tail0;")
         for i in range(hops_d):
-            add(f"    cmvu_regbank #(.W(1), .PRESENT(1'b1)) u_dds_s{i} "
-                f"(.clk(clk), .rst(rst), .ena(en), "
-                f".d(done_ds[{i}]), .q(done_ds[{i+1}]));")
+            _sync_reg(add, f"u_dds_s{i}", "1",
+                      f"done_ds[{i}]", f"done_ds[{i+1}]")
         add(f"    wire done_align = done_ds[{hops_d}];")
     add("")
     add(f"    // Group-index pipe: aligned done is {done_depth} cycles after its")
     add("    // last pass is issued (L + column skew + row de-skew).")
     add(f"    reg [{np_w}-1:0] grp_pipe [0:{done_depth - 1}];")
     add("    integer gi;")
-    add("    always_ff @(posedge clk or posedge rst) begin")
+    add("    always_ff @(posedge clk) begin")
     add("        if (rst) begin")
     add(f"            for (gi = 0; gi < {done_depth}; gi = gi + 1) grp_pipe[gi] <= '0;")
     add("        end else if (en) begin")
@@ -712,7 +730,7 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
     add("    // back-to-back. Single always_ff per variable: VCS rejects")
     add("    // always_ff variables with more than one procedural driver.")
     add("    integer ri;")
-    add("    always_ff @(posedge clk or posedge rst) begin")
+    add("    always_ff @(posedge clk) begin")
     add("        if (rst) begin")
     add("            busy        <= 1'b0;")
     add("            kp          <= '0;")

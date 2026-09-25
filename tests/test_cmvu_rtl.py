@@ -72,6 +72,11 @@ def test_spatial_core_structure():
     # output de-skew for row 0 (ns-1 hops) and aligned done
     assert "u_yds_r0_s0" in core
     assert "wire done_align" in core
+    # Reset is sync at the wrapper boundary: no wrapper-owned register has an
+    # async reset, and the delay lines are wrapper registers, not the
+    # vendored (async-reset) regbank.
+    assert "posedge rst" not in core
+    assert "cmvu_regbank" not in core
     # non-tail cascade stages reset every pass; tails own framing + bias
     assert ".acc_first(bus_r0_c0[B_VALID])" in core
     assert ".acc_first(bus_r0_c1[B_FIRST])" in core
@@ -176,7 +181,7 @@ def test_gclk_gate_is_glitch_free():
     core = cmvu_rtl.generate_core(2, 8, 8, 2, 1, B, shift=3,
                                   module_name="cmvu_core")
     assert "wire gclk = clk & en;" not in core
-    assert "always @(negedge clk or posedge rst)" in core
+    assert "always @(negedge clk) begin" in core
     assert "en_n <= en;" in core
     assert "wire gclk = clk & (en_n | rst);" in core
 
