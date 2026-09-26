@@ -176,3 +176,26 @@ def test_finalize_ships_the_vtr_model_outside_the_sources_tcl(tmp_path):
     # distinct from the real vendored file of a similar name
     assert model_path.name != "cmvu_mode1.sv"
     assert (tmp_path / "cmvu_mode1.sv").is_file()
+
+
+def test_const_weights_entry_is_a_free_running_block():
+    # The entry pipelines its own main loop (no Catapult Tcl directive, no
+    # hls4ml change): synthesized, it is one wrapper clock per call with state
+    # kept across calls, so frames overlap; the C model stays one frame/call.
+    from targets.cmvu import geometry as g
+    m, k, n, kf, nf = 4, 16, 16, 2, 2
+    geo = g.resolve_geometry(m, k, n, kf, nf)
+    W = [[(i * n + j) % 7 - 3 for j in range(n)] for i in range(k)]
+    header = pkg.gen_public_header("gemm_t", m, k, n, W, [0] * n, 4, geo)
+    entry = header[header.index("#pragma hls_design block"):]
+    assert entry.startswith("#pragma hls_design block\n"
+                            "#pragma hls_pipeline_init_interval 1\n"
+                            "template <class data_T, class res_T, typename CONFIG_T>\n"
+                            "void gemm_t_gemm_stream_const_weights(")
+    synth, c_model = entry.split("#else", 1)
+    assert "a_stream.nb_read(beat)" in synth
+    assert "static ac_int<4, false> gap" in synth
+    period = geo["k_passes"] * geo["n_passes"]
+    assert f"gap = {period} - 1;" in synth
+    assert "RUN: for" not in synth
+    assert "reset_state()" in c_model and "RUN: for" in c_model

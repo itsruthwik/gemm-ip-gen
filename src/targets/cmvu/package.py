@@ -290,15 +290,51 @@ ${state_members}
 ${reset_state_fn}
 };
 
+// The entry is its own free-running block: its main loop is pipelined at
+// II=1, so every call is one clock of the wrapper and frames overlap (the next
+// frame's row enters while the previous frame's result is still draining).
+// hls4ml's per-layer stage only forwards its channels to it.
+#pragma hls_design block
+#pragma hls_pipeline_init_interval 1
 template <class data_T, class res_T, typename CONFIG_T>
 void ${name}_gemm_stream_const_weights(ac_channel<data_T> &a_stream,
                                        ac_channel<res_T> &res_stream) {
     // One K-wide A row per beat; a narrower beat would under-read each row.
     static_assert(data_T::size == ${k}, "cmvu expects one K-wide A row per beat");
     static ${name}_ccore ccore;
-#if !(defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW))
+#if defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW)
+    // One wrapper clock per call. State persists across calls, so there is no
+    // per-frame drain: a result is written whenever the wrapper emits one.
+    // `gap` counts calls until the wrapper takes its next row (one every
+    // KP*NP = ${PERIOD} cycles); it depends only on this side's own history,
+    // never on a DUT output. The non-blocking read lets in-flight rows keep
+    // draining when no new row is waiting; a full output channel stalls the
+    // whole block, which gates `en` and freezes the wrapper with it.
+    static ac_int<${A_BITS}, false> a_row = 0;
+    static ac_int<4, false> gap = 0;
+    ac_int<1, false> in_valid = 0;
+    if (gap == 0) {
+        data_T beat;
+        if (a_stream.nb_read(beat)) {
+            a_row = ${name}_pack_a_row<data_T>(beat);
+            in_valid = 1;
+            gap = ${PERIOD} - 1;
+        }
+    } else {
+        gap--;
+    }
+    ac_int<${RES_BITS}, false> res_row;
+    ac_int<1, false> out_valid;
+    ccore.run(a_row, in_valid, res_row, out_valid);
+    if (out_valid) {
+        res_stream.write(${name}_unpack_res_row<res_T>(res_row));
+    }
+#else
+    // C model: one whole frame per call (hls4ml csim and the SCVerify golden
+    // call the layer once per frame). The output stream is identical to the
+    // free-running RTL's; only the timing differs, and SCVerify compares
+    // streams, not cycles.
     ccore.${name}_reset_state();
-#endif
     // Feed-forward schedule: the blackbox contract has no
     // in_ready, so the HLS schedule cannot depend on any DUT output. One A row
     // is presented every PERIOD calls (compile-time constant) and results are
@@ -325,6 +361,7 @@ void ${name}_gemm_stream_const_weights(ac_channel<data_T> &a_stream,
             res_stream.write(${name}_unpack_res_row<res_T>(res_row));
         }
     }
+#endif
 }
 
 ${guard_close}""")
