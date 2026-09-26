@@ -33,8 +33,9 @@ carry the contract.
 Terms: `M` rows per node, `SF = k_pad / SIMD`, `NF = n_pad / PE`.
 
 **Within a node (intra-frame).** One row is accepted and one row emitted every
-`SF*NF` cycles. This is the II the blackbox JSON reports and it holds on every
-fold measured.
+`SF*NF` cycles. This holds on every fold measured. The blackbox JSON reports
+Vitis's unit, per invocation: one call is one node of `M` rows, so its `II` is
+the node interval below and its `latency` runs to the last row out.
 
 **Node to node (inter-frame).** Nodes run back to back through a decoupled
 ap_ctrl_chain handshake; up to `MAX_INFLIGHT` nodes may be admitted before the
@@ -54,7 +55,8 @@ load before its first output, which is a one-off cost, not a steady-state one.
 **Latency at the ports** (first row in to first row out, B resident):
 `fill + 2`, plus `(NF-1)*SF + 2` when `NF > 1`, where `fill = SF +
 ceil(ceil(SIMD/3)/SEGMENTLEN) + 2` is the core's pipeline depth. Measured to be
-exact across the fold space (`geometry.port_latency_cycles`); the JSON reports it.
+exact across the fold space (`geometry.port_latency_cycles`). The JSON adds the
+remaining `(M-1)*SF*NF` cycles to it, since Vitis's latency is per call.
 
 ## When steady-state II equals ReuseFactor
 

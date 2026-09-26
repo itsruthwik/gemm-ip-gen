@@ -186,7 +186,21 @@ static void drain_c(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{PB}> >
 """
 
 
-def _blackbox_json(name, t, tiles=1, resources=None):
+def _call_performance(t, m, load_beats=0):
+    """``rtl_performance`` for the blackbox JSON, in the units Vitis reads them:
+    per INVOCATION of the function, i.e. per node of ``m`` rows. ``II`` is the
+    node interval -- the ports' per-row cadence ``SF*NF`` times the rows, or, for a
+    two-operand node, the B load beats if those take longer (``load_beats``);
+    ``latency`` is first row in to last row out: the row-port latency plus the
+    remaining rows at the per-row cadence. Per-row values stay in the manifest as
+    ``ii_per_row`` / ``port_latency``."""
+    ii_row = int(t["ii_per_row"])
+    ii_call = max(int(m) * ii_row, int(load_beats))
+    latency = int(t["port_latency"]) + (int(m) - 1) * ii_row
+    return {"latency": str(latency), "II": str(ii_call)}
+
+
+def _blackbox_json(name, t, m, tiles=1, resources=None):
     WB, AB, PB = t["weight_stream_width_ba"], t["input_stream_width_ba"], t["output_stream_width_ba"]
     fn = public_fn(name)
     # Cost-model resource estimate over all copies.K·copies.N tiles: DSP + BRAM18 from
@@ -217,15 +231,15 @@ def _blackbox_json(name, t, tiles=1, resources=None):
             "ap_ctrl_chain_protocol_done": "ap_done",
             "ap_ctrl_chain_protocol_continue": "ap_continue",
         },
-        # Row-port numbers (what the ports actually do, measured under xsim): latency =
-        # first row in -> first row out; II = cycles per row = SF*NF. Deterministic:
-        # the RTL is a fixed pipeline (geometry.port_latency_cycles).
-        "rtl_performance": {"latency": str(t["port_latency"]), "II": str(t["ii_per_row"])},
+        # Per invocation (one node of m rows), the unit Vitis reads: II = node interval
+        # = m*SF*NF, latency = first row in -> last row out. Built on the measured
+        # row-port numbers (geometry.port_latency_cycles, SF*NF per row).
+        "rtl_performance": _call_performance(t, m),
         # JSON has no comment syntax; this underscore-key carries a note in the file.
-        "_comment": "latency/II: measured row-port values (first row in -> first row out, "
-                    "cycles per row). DSP: FINN cost model PE*ceil(SIMD/3) per tile, scaled "
-                    "by the tile count (within a few percent of post-route). FF/LUT: rough "
-                    "per-DSP hints only; BRAM from the plan.",
+        "_comment": "latency/II are per invocation (one node of m rows), from the measured "
+                    "row-port values (SF*NF cycles per row). DSP: FINN cost model "
+                    "PE*ceil(SIMD/3) per tile, scaled by the tile count (within a few percent "
+                    "of post-route). FF/LUT: rough per-DSP hints only; BRAM from the plan.",
         "rtl_resource_usage": {"FF": str(30 * dsp), "LUT": str(40 * dsp),
                                "DSP": str(dsp), "BRAM": str(bram), "URAM": "0"},
     }, indent=2) + "\n"
@@ -424,6 +438,10 @@ def _2op_blackbox_json(name, plan, resources=None):
     """Blackbox JSON for the two-operand core: two input FIFOs (a, b) + one output (p),
     at the shim's raw boundary widths (``rtl.two_operand_ports``)."""
     t = plan["tile"]
+    m = plan["num_input_vectors"]
+    mode = plan.get("mode", 0)
+    # loader beats per node: one narrow sub-beat per cycle (see generate_two_operand_shim)
+    load_beats = plan["k_pad"] * t["nf"] if mode == 0 else plan["n"] * t["sf"]
     fn = public_fn(name)
     res = resources or {"dsp": t["dsp_estimate"], "bram18": 0}
     dsp, bram = int(res["dsp"]), int(res.get("bram18", 0))
@@ -449,14 +467,15 @@ def _2op_blackbox_json(name, plan, resources=None):
             "ap_ctrl_chain_protocol_done": "ap_done",
             "ap_ctrl_chain_protocol_continue": "ap_continue",
         },
-        # Row-port numbers with B resident (the loader's bank for this node already
-        # filled): latency = first row in -> first row out, II = cycles per row = SF*NF.
-        # Identical to the weight-stationary shim once B is loaded (measured). A node
-        # whose B load (k_pad*NF or n*SF loader beats) exceeds M*SF*NF is load-bound
-        # and runs slower than this II.
-        "rtl_performance": {"latency": str(t["port_latency"]), "II": str(t["ii_per_row"])},
-        "_comment": "latency/II: measured row-port values with B resident. DSP: FINN "
-                    "cost model PE*ceil(SIMD/3). FF/LUT: rough per-DSP hints only.",
+        # Per invocation (one node of m rows), the unit Vitis reads. II is the node
+        # interval: m*SF*NF of compute, or the B load beats (k_pad*NF row-major, n*SF
+        # col-major -- the loader takes one narrow beat per cycle) when those take
+        # longer. Latency is first row in -> last row out with B resident; the first
+        # node of a run additionally waits for its whole B load.
+        "rtl_performance": _call_performance(t, m, load_beats=load_beats),
+        "_comment": "latency/II are per invocation (one node of m rows): compute m*SF*NF "
+                    "or the B load beats, whichever is larger. DSP: FINN cost model "
+                    "PE*ceil(SIMD/3). FF/LUT: rough per-DSP hints only.",
         "rtl_resource_usage": {"FF": str(30 * dsp), "LUT": str(40 * dsp),
                                "DSP": str(dsp), "BRAM": str(bram), "URAM": "0"},
     }, indent=2) + "\n"
@@ -666,7 +685,7 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
                else _dataflow_top(name, plan))
     (pkg / f"{name}_top.cpp").write_text(_with_ap_int_max_w(top_src))
     (pkg / f"{name}.json").write_text(_blackbox_json(
-        name, t, tiles=KT * NT, resources=plan.get("resources")))
+        name, t, plan["num_input_vectors"], tiles=KT * NT, resources=plan.get("resources")))
     (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
         _golden.generate_tb(shape, top_name=name, func_name=public_fn(name), plan=plan,
                             bias_codes=bias_codes, baked_weights=B,

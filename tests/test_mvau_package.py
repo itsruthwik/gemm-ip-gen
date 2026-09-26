@@ -51,8 +51,9 @@ def test_blackbox_json_contract(tmp_path):
         assert f"ap_ctrl_chain_protocol_{k}" in rcs
     # FIFO port map, not AXIS. Weight-stationary: weights are baked in the memstream,
     # so there is no weight port -- only the activation input and the result output.
-    # row-port numbers: M=4 K=4 N=4 RF=1 -> SF=1 NF=1 SIMD=4: fill 4 + 2 = 6, one row/cycle
-    assert j["rtl_performance"] == {"latency": "6", "II": "1"}
+    # per invocation (one node of M=4 rows), K=4 N=4 RF=1 -> SF=1 NF=1 SIMD=4: row-port
+    # latency fill 4 + 2 = 6, one row/cycle -> latency 6 + 3 rows = 9, II = 4 rows
+    assert j["rtl_performance"] == {"latency": "9", "II": "4"}
     assert j["rtl_resource_usage"]["DSP"] == "8"      # PE*ceil(SIMD/3) = 4*2
     assert "measured" in j["_comment"]
     pnames = {p["c_name"]: p["rtl_ports"] for p in j["c_parameters"]}
