@@ -43,7 +43,7 @@ def test_blackbox_json_contract(tmp_path):
     pkg = _gen(tmp_path, (4, 4, 4), "gemm_4x4x4", reuse_factor=1)
     j = json.loads((pkg / "gemm_4x4x4.json").read_text())
     # module name must equal the C function name (Vitis cosim gotcha)
-    assert j["c_function_name"] == j["rtl_top_module_name"] == "gemm_4x4x4_core"
+    assert j["c_function_name"] == j["rtl_top_module_name"] == "gemm_stream_gemm_4x4x4"
     rcs = j["rtl_common_signal"]
     # CE mandatory + all five ap_ctrl keys present (2025.2 requirements)
     assert rcs["module_clock_enable"] == "ap_ce"
@@ -51,7 +51,10 @@ def test_blackbox_json_contract(tmp_path):
         assert f"ap_ctrl_chain_protocol_{k}" in rcs
     # FIFO port map, not AXIS. Weight-stationary: weights are baked in the memstream,
     # so there is no weight port -- only the activation input and the result output.
-    assert "not synthesis-accurate" in j["_comment"]
+    # row-port numbers: M=4 K=4 N=4 RF=1 -> SF=1 NF=1 SIMD=4: fill 4 + 2 = 6, one row/cycle
+    assert j["rtl_performance"] == {"latency": "6", "II": "1"}
+    assert j["rtl_resource_usage"]["DSP"] == "8"      # PE*ceil(SIMD/3) = 4*2
+    assert "measured" in j["_comment"]
     pnames = {p["c_name"]: p["rtl_ports"] for p in j["c_parameters"]}
     assert "w" not in pnames
     assert pnames["a"]["FIFO_data_read_in"] == "a_dout"
@@ -61,7 +64,7 @@ def test_blackbox_json_contract(tmp_path):
 def test_shim_module_name_matches_c_function(tmp_path):
     pkg = _gen(tmp_path, (4, 4, 4), "gemm_4x4x4", reuse_factor=1)
     v = (pkg / "gemm_4x4x4_core.v").read_text()
-    assert "module gemm_4x4x4_core (" in v
+    assert "module gemm_stream_gemm_4x4x4 (" in v
     assert ".VERSION(3)" in v
     assert "ap_ce" in v and "~ap_rst" in v   # active-high reset + CE stall
 
@@ -73,7 +76,8 @@ def test_folded_top_beat_counts(tmp_path):
     # one raw K*AW-bit beat/vector in, one raw N*out_width-bit beat/vector out.
     pkg = _gen(tmp_path, (3, 16, 8), "gemm_3x16x8_f", reuse_factor=16, fold_axis="k")
     top = (pkg / "gemm_3x16x8_f_top.cpp").read_text()
-    assert "feed_w" not in top and "feed_a" not in top
+    # one-beat feed/drain copies around the blackbox (Vitis 214-149), no repacking
+    assert "feed_w" not in top and "feed_a" in top and "drain_c" in top and "unpack(" not in top
     assert "a_in" in top and "ap_uint<128> >& a_in" in top    # K*AW = 16*8, unpadded
     assert "ap_uint<128> >& c_out" in top                     # N*out_width = 8*16, unpadded
 
@@ -90,7 +94,7 @@ def test_weight_stationary_package(tmp_path):
     assert "w_dout" not in v                                 # no external weight port
     # C twin + TB bake the weights (no w stream)
     twin = (pkg / "gemm_4x4x4_core.cpp").read_text()
-    assert "gemm_4x4x4_core_W[4][4]" in twin
+    assert "gemm_stream_gemm_4x4x4_W[4][4]" in twin
     tb = (pkg / "gemm_4x4x4_tb.cpp").read_text()
     assert "static const long W[4][4]" in tb and "w_in" not in tb
 
@@ -137,7 +141,7 @@ def test_n_tiling_stitched_in_rtl(tmp_path):
     # C twin does the N-tile stitching + pad-column drop (mirroring the RTL); the
     # top is now a pure passthrough (that logic moved into the RTL wrapper).
     twin = (pkg / "gemm_nt_core.cpp").read_text()
-    assert "ti < 2" in twin and "gemm_nt_core_W[8][8]" in twin
+    assert "ti < 2" in twin and "gemm_stream_gemm_nt_W[8][8]" in twin
     top = (pkg / "gemm_nt_top.cpp").read_text()
     assert "for (int ti" not in top
     assert "ap_uint<64> >& a_in" in top and "ap_uint<128> >& c_out" in top
@@ -156,15 +160,16 @@ def test_k_tiling_unpadded_boundary_and_grid_stitched_in_rtl(tmp_path):
     assert "sf_cnt" in v   # per-tile SF fan-out now lives in the wrapper
 
     top = (pkg / "gemm_kt_top.cpp").read_text()
-    assert "feed_a" not in top and "static void unpack(" not in top   # pure passthrough
+    assert "feed_a" in top and "drain_c" in top and "static void unpack(" not in top   # copies only
     assert "ap_uint<128> >& a_in" in top and "ap_uint<64> >& c_out" in top
 
     core = (pkg / "gemm_kt_core.cpp").read_text()
-    assert "gemm_kt_core_W[4][" in core   # W[N][k_pad] (k_pad may exceed raw K=16)
+    assert "gemm_stream_gemm_kt_W[4][" in core   # W[N][k_pad] (k_pad may exceed raw K=16)
 
     ip_hdr = (pkg / "gemm_kt_gemm_ip.h").read_text()
-    assert "static_assert" in ip_hdr and "_repack_a" in ip_hdr and "_drain" in ip_hdr
-    assert "data_T::size == 16" in ip_hdr
+    # declaration-only header: the public function IS the blackbox, no HLS glue
+    assert "void gemm_stream_" in ip_hdr and "_repack_a" not in ip_hdr and "_drain" not in ip_hdr
+    assert "hls::stream<ap_uint<128> >&" in ip_hdr   # A: one raw K=16*8-bit row per beat
 
 
 def test_k_tiling_csim_matches_golden(tmp_path):
@@ -194,7 +199,7 @@ def test_k_and_n_tiling_combined_with_bias_and_nf(tmp_path):
     assert v.count("memstream #(") == 4 and v.count("mvu_vvu_axi #(") == 4   # 2x2 grid
     assert "nf_cnt" in v and "orow_reg" in v
     core = (pkg / "gemm_kt2_core.cpp").read_text()
-    assert "gemm_kt2_core_bias[8]" in core
+    assert "gemm_stream_gemm_kt2_bias[8]" in core
 
 
 def test_n_tiling_manifest_lists_all_weight_files(tmp_path):
@@ -217,10 +222,11 @@ def test_affine_drain_present(tmp_path):
     core = (pkg / "gemm_3x16x8_f_core.cpp").read_text()
     assert "round-half-up" in core and "wrap" in core
     top = (pkg / "gemm_3x16x8_f_top.cpp").read_text()
-    assert "static void unpack(" not in top and "static void feed" not in top
+    assert "static void unpack(" not in top and "static void feed_a" in top and "drain_c" in top
     # the dedicated hls4ml-facing IP is where the pure bit-reinterpretation lives
     ip_hdr = (pkg / "gemm_3x16x8_f_gemm_ip.h").read_text()
-    assert "static_assert" in ip_hdr and "_repack_a" in ip_hdr and "_drain" in ip_hdr
+    # declaration-only header: the public function IS the blackbox, no HLS glue
+    assert "void gemm_stream_" in ip_hdr and "_repack_a" not in ip_hdr and "_drain" not in ip_hdr
 
 
 def test_reject_wide_precision(tmp_path):
@@ -242,10 +248,10 @@ def test_bias_scaled_and_added(tmp_path):
     core = (pkg / "gb_core.cpp").read_text()
     # shift = product_frac(8) - output_frac(10) = -2 <= 0, so no round constant is
     # folded in -- the array is exactly the scaled bias codes.
-    assert "gb_core_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in core
-    assert "gb_core_bias[oc]" in core
+    assert "gemm_stream_gb_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in core
+    assert "gemm_stream_gb_bias[oc]" in core
     top = (pkg / "gb_top.cpp").read_text()
-    assert "gb_core_bias" not in top
+    assert "gemm_stream_gb_bias" not in top
 
 
 def test_truncating_result_floors_through_the_bias_codes(tmp_path):
@@ -260,18 +266,18 @@ def test_truncating_result_floors_through_the_bias_codes(tmp_path):
     pkg = _gen(tmp_path, (2, 8, 8), "gt", reuse_factor=1, bias=bias,
                output_precision="fixed<12,6,TRN,WRAP,0>")
     core = (pkg / "gt_core.cpp").read_text()
-    assert "gt_core_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in core
+    assert "gemm_stream_gt_bias[8] = {128, -64, 0, 64, 256, -256, 192, -128}" in core
     # A bias-free TRN layer's pre-subtracted half exactly cancels the folded-in
     # round constant -> the folded codes are all zero -> no add, no array at all.
     pkg = _gen(tmp_path, (2, 8, 8), "gtn", reuse_factor=1, has_bias=False,
                output_precision="fixed<12,6,TRN,WRAP,0>")
     gtn_core = (pkg / "gtn_core.cpp").read_text()
-    assert "gtn_core_bias" not in gtn_core
+    assert "gemm_stream_gtn_bias" not in gtn_core
     # A rounding (RND) result is not TRN-pre-adjusted, so the round-half constant
     # folds straight into the plain scaled bias.
     pkg = _gen(tmp_path, (2, 8, 8), "gr", reuse_factor=1, bias=bias,
                output_precision="fixed<12,6,RND,WRAP,0>")
-    assert "gr_core_bias[8] = {130, -62, 2, 66, 258, -254, 194, -126}" in (
+    assert "gemm_stream_gr_bias[8] = {130, -62, 2, 66, 258, -254, 194, -126}" in (
         pkg / "gr_core.cpp").read_text()
 
 
@@ -305,7 +311,7 @@ def test_has_bias_true_bakes_sublsb_bias(tmp_path):
     bias = [tiny] * 8
     pkg = _gen(tmp_path, (2, 8, 8), "gsl", reuse_factor=1, has_bias=True, bias=bias)
     core = (pkg / "gsl_core.cpp").read_text()
-    assert "gsl_core_bias" not in core
+    assert "gemm_stream_gsl_bias" not in core
 
 
 def test_has_bias_true_without_bias_raises(tmp_path):
@@ -405,16 +411,19 @@ def test_two_operand_depth1_unpadded_boundary(tmp_path):
     pkg = _gen_2op(tmp_path, (4, 4, 4), "gemm_2op_d1", reuse_factor=1)
     v = (pkg / "gemm_2op_d1_core.v").read_text()
     assert "dynamic_load_2op" in v
-    assert "input  wire [31:0] a_dout" in v    # SIMD*AW = 4*8, unpadded (SF=1)
-    assert "input  wire [31:0] b_dout" in v    # PE*WEIGHT_WIDTH = 4*8 (loader's narrow beat)
-    assert "output wire [63:0] p_din" in v     # PE*ACCU raw (post-requant it's PE*out_width)
+    # Raw boundary: one K-row of A, one N-row of B (Mode A), one N-row of C per beat.
+    assert "input  wire [31:0] a_dout" in v    # K*AW = 4*8
+    assert "input  wire [31:0] b_dout" in v    # N*WEIGHT_WIDTH = 4*8 (one B row/beat)
+    assert "output wire [63:0] p_din" in v     # N*out_width = 4*16
+    assert "brow_reg" in v                     # the B loader gearbox lives in the shim
 
     top = (pkg / "gemm_2op_d1_top.cpp").read_text()
-    assert "feed_a" in top and "feed_b" in top
+    assert "feed_a" in top and "feed_b" in top and "drain_c" in top   # one-beat copies, no repacking
 
     ip_hdr = (pkg / "gemm_2op_d1_gemm_ip.h").read_text()
-    assert "static_assert" in ip_hdr and "_repack_a" in ip_hdr and "_repack_b" in ip_hdr
-    assert "data1_T::size == 4" in ip_hdr   # repack_b's row-major (Mode A) static_assert
+    # declaration-only header: A one K-row/beat (32 bits), B one N-row/beat, C one N-row/beat
+    assert "void gemm_stream_gemm_2op_d1(hls::stream<ap_uint<32> >&" in ip_hdr
+    assert "_repack_a" not in ip_hdr and "_repack_b" not in ip_hdr
 
     _csim_check_2op(tmp_path, pkg, "gemm_2op_d1")
 
@@ -428,8 +437,8 @@ def test_two_operand_depth1_col_major_csim_matches_golden(tmp_path):
     assert "dynamic_load_2op" in v and ".MODE(1)" in v
 
     ip_hdr = (pkg / "gemm_2op_d1b_gemm_ip.h").read_text()
-    assert "data0_T::size == 4" not in ip_hdr   # repack_a has no static_assert
-    assert "data1_T::size == 4" in ip_hdr        # repack_b's col-major static_assert (data1_T::size==K)
+    assert "void gemm_stream_gemm_2op_d1b(hls::stream<ap_uint<32> >&" in ip_hdr
+    assert "K-column/beat" in ip_hdr   # col-major B declaration
 
     _csim_check_2op(tmp_path, pkg, "gemm_2op_d1b")
 

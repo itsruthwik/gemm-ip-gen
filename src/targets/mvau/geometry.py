@@ -155,6 +155,17 @@ def latency_cycles(sf, simd, segmentlen):
     return sf + max_pipe + 2
 
 
+def port_latency_cycles(sf, nf, simd, segmentlen):
+    """Latency at the shim's ROW ports (first raw row in -> first raw row out, B
+    resident): the tile fill latency plus the wrapper's row register and requant
+    stage, plus, when a row spans NF output beats, the (NF-1)*SF cycles until the
+    row's last beat and two more for the beat stitch. Measured under xsim on the
+    weight-stationary, K-tiled and two-operand shims (NF 1/2/4, SF 1/2/3,
+    SIMD 3..16): every point lands exactly on this."""
+    base = latency_cycles(sf, simd, segmentlen) + 2
+    return base if nf <= 1 else base + (nf - 1) * sf + 2
+
+
 def output_ii(sf):
     """Deterministic steady-state II (cycles between output beats): the core
     accumulates over SF synapse-fold beats per output at 1 beat/cycle, so one
@@ -510,8 +521,11 @@ def fold_plan(m, k, n, *, weight_precision=None, input_precision=None,
         "output_stream_width_ba": widths["output_ba"],
         "wmem": (k_per_tile * n_pad) // (pe * simd),  # weight beats per input vector
         "dsp_estimate": dsp_estimate(pe, simd),         # FINN cost model, per tile
-        "latency_cycles": latency_cycles(sf, simd, seg),  # deterministic fill latency
-        "ii": output_ii(sf),                            # deterministic output II (= SF)
+        "latency_cycles": latency_cycles(sf, simd, seg),  # tile fill latency (raw beats)
+        "ii": output_ii(sf),                            # tile output II per raw beat (= SF)
+        # the shim's row-port numbers: what the blackbox JSON reports to Vitis
+        "port_latency": port_latency_cycles(sf, nf, simd, seg),
+        "ii_per_row": sf * nf,
     }
 
     return {

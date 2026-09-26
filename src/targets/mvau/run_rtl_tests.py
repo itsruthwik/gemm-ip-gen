@@ -86,6 +86,7 @@ def _synth_bias(n, seed):
 
 
 def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_stall=False,
+                   fsm_debug=False,
                    bias=None, **plan_kw):
     plan = _find_case_plan(shape, **plan_kw)
     t = plan["tile"]
@@ -143,7 +144,7 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_
 
     sv_tb = _tb.generate_sv_tb("ws", module_name, ab, pb, len(a_words), len(exp_words),
                                N_NODES, str(a_dat), str(exp_dat), backpressure=backpressure,
-                               sustained_output_stall=sustained_output_stall)
+                               sustained_output_stall=sustained_output_stall, fsm_debug=fsm_debug)
     (work / "tb.sv").write_text(sv_tb)
     return module_name, [work / f"{module_name}.v"]
 
@@ -172,50 +173,27 @@ def _build_2op_case(work, name, shape, seed, kind=None, backpressure=True, fsm_d
                                             mode=mode)
     (work / f"{module_name}.v").write_text(core_v)
 
-    ab_bits = t["input_stream_width_ba"]
-    # dynamic_load_2op's own NARROW input beat -- PE-wide (mode 0) or SIMD-wide
-    # (mode 1) -- fed directly (no wide-beat gearbox at this RTL-level harness; that
-    # lives in the HLS feed_b process for the real package, see package.py).
-    lanes_raw = PE if mode == 0 else SIMD
-    bb_bits = ((lanes_raw * WW) + 7) // 8 * 8
-    pb_bits = t["output_stream_width_ba"]
+    # Raw, unpadded boundary (rtl.two_operand_ports): A one K-row/beat, B one
+    # N-row (mode 0) / K-column (mode 1) per beat, P one N-row/beat. The wide-to-
+    # narrow loader gearbox and the K-padding live inside the shim now.
+    K = plan["k"]
+    ports = _rtl.two_operand_ports(plan, t, mode)
+    ab_bits, bb_bits, pb_bits = ports["a"], ports["b"], ports["p"]
     a_words, b_words, exp_words = [], [], []
     for node in range(N_NODES):
-        Bm = _tb.synth_b_stream(K_pad, N, WW, seed, node)   # [K_pad][N]
-        X = _tb.synth_activations(plan["num_input_vectors"], K_pad, AW, signed, seed, node)
-        # B beats in the loader's own writer order (see rtl_static/dynamic_load_2op.sv):
-        #   mode 0 (row-major): nf-fast/simd-mid/sf-slow, PE-wide beat = Bm[sf*SIMD+simd][nf*PE+pe]
-        #   mode 1 (col-major, transposed): sf-fast/pe-mid/nf-slow, SIMD-wide beat = Bm[sf*SIMD+s][nf*PE+pe]
+        Bm = _tb.synth_b_stream(K, N, WW, seed, node)   # [K][N]
+        X = _tb.synth_activations(plan["num_input_vectors"], K, AW, signed, seed, node)
         if mode == 0:
-            for sf in range(SF):
-                for simd in range(SIMD):
-                    kk = sf * SIMD + simd
-                    for nf in range(NF):
-                        lane = [Bm[kk][nf * PE + pe] if nf * PE + pe < N else 0
-                                for pe in range(PE)]
-                        b_words.append(_tb.pack_beat(lane, WW))
+            for kk in range(K):
+                b_words.append(_tb.pack_beat([Bm[kk][o] for o in range(N)], WW))
         else:
-            for nf in range(NF):
-                for pe in range(PE):
-                    oc = nf * PE + pe
-                    for sf in range(SF):
-                        lane = [Bm[sf * SIMD + s][oc] if oc < N else 0
-                                for s in range(SIMD)]
-                        b_words.append(_tb.pack_beat(lane, WW))
+            for o in range(N):
+                b_words.append(_tb.pack_beat([Bm[kk][o] for kk in range(K)], WW))
         for v in range(plan["num_input_vectors"]):
-            for sf in range(SF):
-                lane = X[v][sf * SIMD:(sf + 1) * SIMD]
-                a_words.append(_tb.pack_beat(lane, AW))
-            for nf in range(NF):
-                row = []
-                for pe in range(PE):
-                    oc = nf * PE + pe
-                    if oc < N:
-                        acc = sum(Bm[kk][oc] * X[v][kk] for kk in range(K_pad))
-                        row.append(_tb.requant_ref(acc, shift, outW))
-                    else:
-                        row.append(0)
-                exp_words.append(_tb.pack_beat(row, outW))
+            a_words.append(_tb.pack_beat(X[v], AW))
+            row = [_tb.requant_ref(sum(Bm[kk][oc] * X[v][kk] for kk in range(K)), shift, outW)
+                   for oc in range(N)]
+            exp_words.append(_tb.pack_beat(row, outW))
     ab, bb, pb = ab_bits, bb_bits, pb_bits
 
     a_dat, b_dat, exp_dat = work / f"{name}_a.dat", work / f"{name}_b.dat", work / f"{name}_exp.dat"
@@ -235,20 +213,20 @@ def _build_2op_case(work, name, shape, seed, kind=None, backpressure=True, fsm_d
 
 CASES = {
     "a_plain_ws": lambda work, seed, **kw: _build_ws_case(
-        work, "a", (4, 4, 4), seed, backpressure=kw.get("backpressure", True)),
+        work, "a", (4, 4, 4), seed, backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "b_padded_ws": lambda work, seed, **kw: _build_ws_case(
         work, "b", (2, 7, 5), seed, reuse_factor=2, fold_axis="kn",
-        backpressure=kw.get("backpressure", True)),
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "c_sf2_ws": lambda work, seed, **kw: _build_ws_case(
-        work, "c", (2, 8, 4), seed, pe=4, simd=4, backpressure=kw.get("backpressure", True)),
+        work, "c", (2, 8, 4), seed, pe=4, simd=4, backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "d_ktiled_ws": lambda work, seed, **kw: _build_ws_case(
         work, "d", (2, 16, 4), seed, pe=4, simd=4, k_tiles=2,
-        backpressure=kw.get("backpressure", True)),
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     # SF=1/NF=2 DSP58 path.  Continuous input plus the deterministic eight-cycle
     # output stall catches the free-running core's one-cycle-late OLock credit.
     "p_sf1_output_queue": lambda work, seed, **kw: _build_ws_case(
         work, "p", (4, 16, 16), seed, pe=8, simd=16,
-        backpressure=False, sustained_output_stall=True),
+        backpressure=False, sustained_output_stall=True, fsm_debug=kw.get("fsm_debug", False)),
     "e_2op_register": lambda work, seed, **kw: _build_2op_case(
         work, "e", (2, 4, 4), seed, pe=4, simd=4,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
@@ -300,7 +278,7 @@ CASES = {
     # (seeded) span, exercising done_pending accumulating multiple completions.
     "p1_2op_ap_continue_hold_depth1": lambda work, seed, **kw: _build_2op_case(
         work, "p1", (2, 4, 4), seed, pe=4, simd=4, ap_continue_hold=True,
-        backpressure=kw.get("backpressure", True)),
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "p2_2op_ap_continue_hold_foldn": lambda work, seed, **kw: _build_2op_case(
         work, "p2", (4, 4, 8), seed, reuse_factor=2, fold_axis="n", ap_continue_hold=True,
         backpressure=kw.get("backpressure", True)),
@@ -325,28 +303,28 @@ CASES = {
         # k_tiles=4 at the largest inputs this suite uses, WITH a bias (NF=16/8=2>1):
         # exercises the K-tile-sum-then-bias order and the per-lane case(nf_cnt) select.
         work, "r", (4, 32, 16), seed, pe=8, simd=8, k_tiles=4, bias=_synth_bias(16, seed),
-        backpressure=kw.get("backpressure", True)),
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "s_ktiled_no_bias_large": lambda work, seed, **kw: _build_ws_case(
         # Same grid, no bias -- confirms accu (sized off full k_pad, no separate
         # accu_sum widening) still doesn't overflow summing k_tiles=4 partials.
         work, "s", (4, 32, 16), seed, pe=8, simd=8, k_tiles=4,
-        backpressure=kw.get("backpressure", True)),
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "t_bias_nf1": lambda work, seed, **kw: _build_ws_case(
         # NF==1: the folded bias+round constant renders as a plain per-lane literal.
         work, "t", (2, 8, 4), seed, pe=4, simd=4, bias=_synth_bias(4, seed),
-        backpressure=kw.get("backpressure", True)),
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "u_bias_nf_gt1": lambda work, seed, **kw: _build_ws_case(
         # NF==2 (PE=4 < N=8): each physical lane carries two different output
         # columns' bias values over time -> exercises the case(nf_cnt) select.
         work, "u", (2, 8, 8), seed, pe=4, simd=8, bias=_synth_bias(8, seed),
-        backpressure=kw.get("backpressure", True)),
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "v_positive_shift_carry": lambda work, seed, **kw: _build_ws_case(
         # output_precision fixed<8,2> (frac=6) vs. product_frac=8 -> shift=+2, so
         # the folded round-half constant (2) is added into a real, nonzero bias --
         # must carry into the sum correctly (round-half-up, not truncate).
         work, "v", (2, 8, 4), seed, pe=4, simd=4, bias=_synth_bias(4, seed),
         output_precision="fixed<8,2>",
-        backpressure=kw.get("backpressure", True)),
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
 }
 
 RTL_STATIC_DIR = HERE / "rtl_static"

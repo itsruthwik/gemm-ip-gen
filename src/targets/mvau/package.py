@@ -38,35 +38,10 @@ _TIMESCALE = "`timescale 1ns / 1ps\n"
 
 
 
-def _glue_pipeline_fn(m):
-    """Function-level PIPELINE for the repack/drain glue when a node is one row
-    (M == 1): Vitis removes the single-trip row loop, so a loop-level pragma is
-    dropped and the process stays an unpipelined ap_ctrl_chain leaf that costs a
-    start/done handshake per frame. Pipelining the whole function makes it a
-    flushable pipeline (II 1 across frames)."""
-    return "    #pragma HLS PIPELINE II=1\n" if int(m) == 1 else ""
-
-
-
-def _drain_pipeline_fn(m, t):
-    """Function-level PIPELINE for the drain only when the node is one row AND
-    the core emits one output beat per cycle (SF*NF == 1). Measured on the fc
-    set: at RF 1 the unpipelined drain's per-frame handshake caps the interval
-    at 2 (fc_tiny 1 -> 2 without it), but at RF >= 2 the interval is already
-    the core's RF and a function-pipelined (flushable) drain instead adds SF-1
-    cycles to every frame's latency (fc_large 18 -> 25). Loop-level pipelining
-    for M > 1 nodes is unaffected."""
-    if int(m) != 1:
-        return ""
-    return "    #pragma HLS PIPELINE II=1\n" if int(t["sf"]) * int(t["nf"]) == 1 else ""
-
-
-def _glue_pipeline_loop(m):
-    """Loop-level PIPELINE for the row loop when a node is M > 1 rows: one row
-    per cycle inside the frame; the per-frame handshake is amortised over M.
-    Flushable (flp): a stalling auto-rewind pipeline deeper than one stage holds
-    the frame's last row until the next frame's first beat arrives."""
-    return "" if int(m) == 1 else "        #pragma HLS PIPELINE II=1 style=flp\n"
+def public_fn(name):
+    """The one function hls4ml calls for this node -- and, being an RTL blackbox, the
+    JSON ``c_function_name`` and the RTL module name too (Vitis instantiates by it)."""
+    return f"gemm_stream_{name}"
 
 
 def _with_timescale(text):
@@ -172,7 +147,7 @@ def _dataflow_top(name, plan):
     AB = K * AW      # raw, unpadded activation beat (one hls4ml row)
     PB = N * outW    # raw, unpadded result beat (one hls4ml row)
     pad = ' ' * (len(name) + 6)
-    core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{pad}hls::stream<ap_uint<{PB}> >&);"
+    core_decl = f"void {public_fn(name)}(hls::stream<ap_uint<{AB}> >&,\n{pad}hls::stream<ap_uint<{PB}> >&);"
     indent = ' ' * (len(name) + 1)
     top_sig = f"void {name}(hls::stream<ap_uint<{AB}> >& a_in,\n{indent}hls::stream<ap_uint<{PB}> >& c_out)"
     return f"""#include <hls_stream.h>
@@ -180,18 +155,40 @@ def _dataflow_top(name, plan):
 
 {core_decl}
 
-// Pure passthrough: {name}_core's RTL wrapper does all K/N padding and the
-// row<->beat fan-out/stitching internally, so the boundary here is already
-// hls4ml's own unpadded row width on both sides -- {m} rows in, {m} rows out.
+// Passthrough feed/drain processes around the blackbox: Vitis will not pass a
+// top-level argument straight into a blackbox (HLS 214-149), so the DUT is a
+// dataflow region with one-beat-per-iteration copies on each side. The boundary
+// is already hls4ml's own unpadded row width on both sides -- {m} rows in, {m}
+// rows out; the copies add no repacking.
+static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
+    for (int i = 0; i < {m}; i++) {{
+#pragma HLS PIPELINE II=1
+        out.write(in.read());
+    }}
+}}
+static void drain_c(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{PB}> >& out) {{
+    for (int i = 0; i < {m}; i++) {{
+#pragma HLS PIPELINE II=1
+        out.write(in.read());
+    }}
+}}
+
 {top_sig} {{
-    {name}_core(a_in, c_out);   // <-- FINN MVU RTL blackbox (weights + bias baked; already requantized)
+#pragma HLS DATAFLOW
+    hls::stream<ap_uint<{AB}> > a_s;
+    hls::stream<ap_uint<{PB}> > p_s;
+#pragma HLS STREAM variable=a_s depth=4
+#pragma HLS STREAM variable=p_s depth=4
+    feed_a(a_in, a_s);
+    {public_fn(name)}(a_s, p_s);   // <-- FINN MVU RTL blackbox (weights + bias baked; already requantized)
+    drain_c(p_s, c_out);
 }}
 """
 
 
 def _blackbox_json(name, t, tiles=1, resources=None):
     WB, AB, PB = t["weight_stream_width_ba"], t["input_stream_width_ba"], t["output_stream_width_ba"]
-    fn = f"{name}_core"
+    fn = public_fn(name)
     # Cost-model resource estimate over all copies.K·copies.N tiles: DSP + BRAM18 from
     # geometry/cost (validated against Vivado OOC synth). If the caller didn't resolve a
     # plan (legacy path), fall back to the per-tile DSP × tiles and no BRAM.
@@ -207,7 +204,7 @@ def _blackbox_json(name, t, tiles=1, resources=None):
     return json.dumps({
         "c_function_name": fn,
         "rtl_top_module_name": fn,     # MUST equal c_function_name (Vitis cosim gotcha)
-        "c_files": [{"c_file": f"{fn}.cpp", "cflag": ""}],
+        "c_files": [{"c_file": f"{name}_core.cpp", "cflag": ""}],   # C twin file; the function inside is `fn`
         "rtl_files": _core_rtl_files(name),
         "c_parameters": c_params,
         "rtl_common_signal": {
@@ -220,13 +217,15 @@ def _blackbox_json(name, t, tiles=1, resources=None):
             "ap_ctrl_chain_protocol_done": "ap_done",
             "ap_ctrl_chain_protocol_continue": "ap_continue",
         },
-        # Deterministic (RTL is a fixed pipeline): latency + II are exact functions
-        # of the fold, verified against XSIM (geometry.latency_cycles / output_ii).
-        "rtl_performance": {"latency": str(t["latency_cycles"]), "II": str(t["ii"])},
+        # Row-port numbers (what the ports actually do, measured under xsim): latency =
+        # first row in -> first row out; II = cycles per row = SF*NF. Deterministic:
+        # the RTL is a fixed pipeline (geometry.port_latency_cycles).
+        "rtl_performance": {"latency": str(t["port_latency"]), "II": str(t["ii_per_row"])},
         # JSON has no comment syntax; this underscore-key carries a note in the file.
-        "_comment": "FINN cost-model DSP estimate scaled by the tile count; FF/LUT/BRAM "
-                    "are rough hints, not synthesis-accurate (TODO: measure).",
-        # DSP + BRAM18 over all tiles from the cost model; FF/LUT are rough per-DSP hints.
+        "_comment": "latency/II: measured row-port values (first row in -> first row out, "
+                    "cycles per row). DSP: FINN cost model PE*ceil(SIMD/3) per tile, scaled "
+                    "by the tile count (within a few percent of post-route). FF/LUT: rough "
+                    "per-DSP hints only; BRAM from the plan.",
         "rtl_resource_usage": {"FF": str(30 * dsp), "LUT": str(40 * dsp),
                                "DSP": str(dsp), "BRAM": str(bram), "URAM": "0"},
     }, indent=2) + "\n"
@@ -251,107 +250,56 @@ exit
 """
 
 
-def _gemm_ip_header(name, plan):
-    """The dedicated hls4ml-facing IP for one gemm config: an HLS C++ dataflow IP
-    with the internal FINN-MVU blackbox. The blackbox's RTL wrapper now does ALL
-    K/N padding and row<->beat fan-out/stitching internally (see ``rtl.py``'s
-    ``_generate_ws_shim`` and its C twin in ``golden.py``), so its port widths are
-    already hls4ml's own unpadded ``data_T``/``res_T`` row widths
-    (``K*activation_width`` in, ``N*out_width`` out). The glue here is therefore a
-    PURE bit-reinterpretation -- one fully-unrolled concatenation per row, zero
-    additional pipeline cycles -- not a lane-by-lane repack/drain loop. The
-    combined header routes nnet::gemm_* to this by CONFIG_T::gemm_ip_id (template
-    dispatch).
-
-    Weight-stationary only (weights + bias baked in the RTL memstream / bias ROM);
-    two-operand IPs use ``_2op_gemm_ip_header``.
-    """
+def ws_ports(plan):
+    """Boundary contract of the weight-stationary (plain, K-tiled, N-tiled) shim:
+    one raw ``K*activation_width`` row per beat in, one raw ``N*out_width`` row per
+    beat out, ``M`` beats each per node. Exact bit counts, no byte alignment -- the
+    same numbers hls4ml computes from its own stream types."""
     t = plan["tile"]
-    m = plan["num_input_vectors"]
-    AW, K, N = t["activation_width"], plan["k"], plan["n"]
-    outW = plan["output_width"]
-    AB = K * AW      # raw, unpadded activation beat -- must equal data_T::size*AW
-    PB = N * outW    # raw, unpadded result beat -- must equal res_T::size*out_width
-    core_hdr_pad = ' ' * (len(name) + 6)
-    core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{core_hdr_pad}hls::stream<ap_uint<{PB}> >&);"
-    ws_streams = (f"    hls::stream<ap_uint<{AB}> > a_s;\n"
-                  f"    hls::stream<ap_uint<{PB}> > p_s;\n"
-                  f"#pragma HLS STREAM variable=a_s depth=4\n"
-                  f"#pragma HLS STREAM variable=p_s depth=4")
-    ws_calls = (f"    {name}_repack_a<data_T>(a_stream, a_s);\n"
-                f"    {name}_core(a_s, p_s);\n"
-                f"    {name}_drain<res_T, CONFIG_T>(p_s, res_stream);")
+    K, N = plan["k"], plan["n"]
+    return {"a": K * t["activation_width"], "a_beats": plan["num_input_vectors"],
+            "p": N * plan["output_width"], "p_beats": plan["num_input_vectors"]}
+
+
+def _gemm_ip_header(name, plan, two_operand=False):
+    """The per-node header hls4ml's build includes: the DECLARATION of this node's
+    public function, ``gemm_stream_<name>`` -- which is the RTL blackbox itself.
+    hls4ml calls it directly from its top dataflow region (with its own pack/unpack
+    processes converting its array streams to these packed beats), so there is no
+    HLS-side wrapper, no nested dataflow region and no per-id dispatch. The shim
+    does ALL K/N padding, the SF fan-out, the B loader gearbox (two-operand), the
+    NF-beat stitching, bias and requant internally, so the ports are exactly
+    hls4ml's own row widths."""
+    fn = public_fn(name)
+    pad = " " * (len(fn) + 6)
+    if two_operand:
+        ports = _rtl.two_operand_ports(plan, plan["tile"], plan.get("mode", 0))
+        b_what = "N-row" if plan.get("mode", 0) == 0 else "K-column"
+        args = (f"hls::stream<ap_uint<{ports['a']}> >&,   // A: one K-row/beat, {ports['a_beats']} beats/node" + "\n"
+                + f"{pad}hls::stream<ap_uint<{ports['b']}> >&,   // B: one {b_what}/beat, {ports['b_beats']} beats/node" + "\n"
+                + f"{pad}hls::stream<ap_uint<{ports['p']}> >&);  // C: one N-row/beat, {ports['p_beats']} beats/node")
+        widest = max(ports["a"], ports["b"], ports["p"])
+        kind = "two-operand, B at runtime"
+    else:
+        ports = ws_ports(plan)
+        args = (f"hls::stream<ap_uint<{ports['a']}> >&,   // A: one K-row/beat, {ports['a_beats']} beats/node" + "\n"
+                + f"{pad}hls::stream<ap_uint<{ports['p']}> >&);  // C: one N-row/beat, {ports['p_beats']} beats/node")
+        widest = max(ports["a"], ports["p"])
+        kind = "weight-stationary, weights + bias baked"
+    guard = ("#ifndef AP_INT_MAX_W" + "\n" + f"#define AP_INT_MAX_W {_apmaxw(widest)}" + "\n" + "#endif" + "\n"
+             if widest > 1024 else "")
+    m, K, N = plan["num_input_vectors"], plan["k"], plan["n"]
     return f"""#ifndef {name.upper()}_GEMM_IP_H_
 #define {name.upper()}_GEMM_IP_H_
-#include <hls_stream.h>
+{guard}#include <hls_stream.h>
 #include <ap_int.h>
 
-// internal FINN-MVU blackbox (shim {name}_core.v; C twin {name}_core.cpp) -- ALL
-// K/N padding, bias (if any), and the shift/round-half-up/wrap to out_width are
-// baked/performed inside it (RTL wrapper + its C twin), so its ports already sit
-// at hls4ml's own unpadded row widths.
-{core_decl}
+// {fn}: the FINN-MVU RTL blackbox for gemm config M={m} K={K} N={N} ({kind}).
+// hls4ml calls this directly from its top dataflow region on packed bit streams (its
+// pack/unpack processes convert its array beats); the shim does all padding, fan-out,
+// stitching and requant internally, so the ports are hls4ml's own unpadded row widths.
+void {fn}({args}
 
-namespace nnet {{
-
-// Dedicated IP for gemm config M={m} K={K} N={N} (core={t['compute_core']}).
-// Baked geometry; templated on the hls4ml stream/config types so the combined
-// header can route to it by id.
-
-// Pure bit-reinterpretation: hls4ml delivers one full, unpadded K-wide row per
-// beat (data_T::size == K by construction -- enforced below) -- reinterpret it as
-// one K*AW-bit word via a single fully-unrolled concatenation. No lane-by-lane
-// pipelined loop, no padding: {name}_core's RTL wrapper does the K-padding.
-template <class data_T>
-void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > &a_s) {{
-    static_assert(data_T::size == {K},
-        "{name}: hls4ml must deliver one full, unpadded K-wide row per stream beat");
-{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
-{_glue_pipeline_loop(m)}        data_T beat = a_stream.read();
-        ap_uint<{AB}> ab;
-        for (unsigned j = 0; j < {K}; j++) {{
-            #pragma HLS UNROLL
-            ab.range(j * {AW} + {AW} - 1, j * {AW}) = beat[j].range({AW} - 1, 0);
-        }}
-        a_s.write(ab);
-    }}
-}}
-
-// Pure bit-reinterpretation: {name}_core's RTL wrapper already emits one full,
-// unpadded N-wide row of requantized out_width-bit-per-lane codes per beat (bias,
-// shift, round-half-up, wrap, N-tile stitching and pad-column drop all happened
-// inside it -- see golden.py's core twin and the RTL requant stage). Slice one
-// lane per column via a single fully-unrolled loop; loaded via .range() (raw bit
-// pattern), never a value-preserving conversion, since the value is already
-// rounded/wrapped and re-converting would corrupt it.
-template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{PB}> > &p_s, hls::stream<res_T> &res_stream) {{
-    typedef typename res_T::value_type result_t;
-{_drain_pipeline_fn(m, t)}    for (unsigned mm = 0; mm < {m}; mm++) {{
-{_glue_pipeline_loop(m)}        ap_uint<{PB}> ob = p_s.read();
-        res_T crow;
-        for (unsigned oc = 0; oc < {N}; oc++) {{
-            #pragma HLS UNROLL
-            ap_uint<{outW}> raw = ob.range(oc * {outW} + {outW} - 1, oc * {outW});
-            result_t tmp;
-            tmp.range() = raw;     // load the already-requantized bit pattern as-is
-            crow[oc] = tmp;
-        }}
-        res_stream.write(crow);
-    }}
-}}
-
-// The dedicated IP: hls4ml io_stream const_weights GEMM -> internal MVU blackbox.
-// Bias (when present) is the baked constant above, never a function argument -- this
-// is the only signature; hls4ml's call site never passes a bias parameter.
-template <class data_T, class res_T, typename CONFIG_T>
-void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream) {{
-#pragma HLS DATAFLOW
-{ws_streams}
-{ws_calls}
-}}
-
-}} // namespace nnet
 #endif
 """
 
@@ -374,7 +322,7 @@ def _kt_dataflow_top(name, plan):
     AB = K * AW      # raw, unpadded activation beat (one hls4ml row)
     PB = N * outW    # raw, unpadded result beat (one hls4ml row)
     pad = ' ' * (len(name) + 6)
-    core_decl = f"void {name}_core(hls::stream<ap_uint<{AB}> >&,\n{pad}hls::stream<ap_uint<{PB}> >&);"
+    core_decl = f"void {public_fn(name)}(hls::stream<ap_uint<{AB}> >&,\n{pad}hls::stream<ap_uint<{PB}> >&);"
     indent = ' ' * (len(name) + 1)
     apmax = _apmaxw(max(AB, PB))
     top_sig = f"void {name}(hls::stream<ap_uint<{AB}> >& a_in,\n{indent}hls::stream<ap_uint<{PB}> >& c_out)"
@@ -384,437 +332,100 @@ def _kt_dataflow_top(name, plan):
 
 {core_decl}
 
-// Pure passthrough: {name}_core's RTL wrapper does all K/N padding, the K-tile
-// partial-sum, and the row<->beat fan-out/stitching internally, so the boundary
-// here is already hls4ml's own unpadded row width on both sides -- {m} rows in,
-// {m} rows out.
+// Passthrough feed/drain processes around the blackbox: Vitis will not pass a
+// top-level argument straight into a blackbox (HLS 214-149). No repacking: the
+// wrapper's boundary is already hls4ml's own unpadded row width on both sides --
+// {m} rows in, {m} rows out.
+static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
+    for (int i = 0; i < {m}; i++) {{
+#pragma HLS PIPELINE II=1
+        out.write(in.read());
+    }}
+}}
+static void drain_c(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{PB}> >& out) {{
+    for (int i = 0; i < {m}; i++) {{
+#pragma HLS PIPELINE II=1
+        out.write(in.read());
+    }}
+}}
+
 {top_sig} {{
-    {name}_core(a_in, c_out);   // <-- FINN MVU RTL blackbox (K-tiles summed, weights + bias baked; already requantized)
-}}
-"""
-
-
-def _kt_gemm_ip_header(name, plan):
-    """hls4ml-facing IP for a K-tiled gemm config. The blackbox's RTL wrapper now does
-    ALL K/N padding, the K-tile partial-sum, and row<->beat fan-out/stitching internally
-    (see ``rtl.py``'s ``_generate_kt_shim`` and its C twin in ``golden.py``), so its port
-    widths are already hls4ml's own unpadded ``data_T``/``res_T`` row widths
-    (``K*activation_width`` in, ``N*out_width`` out). The glue here is therefore a PURE
-    bit-reinterpretation -- one fully-unrolled concatenation per row, zero additional
-    pipeline cycles -- the K-tiling twin of ``_gemm_ip_header``."""
-    t = plan["tile"]
-    m = plan["num_input_vectors"]
-    AW, K, N = t["activation_width"], plan["k"], plan["n"]
-    outW = plan["output_width"]
-    AB = K * AW      # raw, unpadded activation beat -- must equal data_T::size*AW
-    PB = N * outW    # raw, unpadded result beat -- must equal res_T::size*out_width
-    core_hdr_pad = ' ' * (len(name) + 6)
-    apmax = _apmaxw(max(AB, PB))
-    KT = plan["k_tiles"]
-    return f"""#ifndef {name.upper()}_GEMM_IP_H_
-#define {name.upper()}_GEMM_IP_H_
-#ifndef AP_INT_MAX_W
-#define AP_INT_MAX_W {apmax}   // raw K-wide activation row may exceed the 1024-bit default
-#endif
-#include <hls_stream.h>
-#include <ap_int.h>
-
-// internal FINN-MVU blackbox (K-tiled grid shim {name}_core.v; C twin {name}_core.cpp) --
-// ALL K/N padding, the {KT}-way K-tile partial-sum, bias (if any), and the
-// shift/round-half-up/wrap to out_width are baked/performed inside it (RTL wrapper +
-// its C twin), so its ports already sit at hls4ml's own unpadded row widths.
-void {name}_core(hls::stream<ap_uint<{AB}> >&,
-{core_hdr_pad}hls::stream<ap_uint<{PB}> >&);
-
-namespace nnet {{
-
-// Dedicated K-tiled IP for gemm config M={m} K={K} N={N} (core={t['compute_core']},
-// KT={KT} K-tiles). Baked geometry; templated on the hls4ml stream/config types so
-// the combined header can route to it by id.
-
-// Pure bit-reinterpretation: hls4ml delivers one full, unpadded K-wide row per beat
-// (data_T::size == K by construction -- enforced below) -- reinterpret it as one
-// K*AW-bit word via a single fully-unrolled concatenation. No lane-by-lane pipelined
-// loop, no padding: {name}_core's RTL wrapper does the K-padding and K-tile split.
-template <class data_T>
-void {name}_repack_a(hls::stream<data_T> &a_stream, hls::stream<ap_uint<{AB}> > &a_s) {{
-    static_assert(data_T::size == {K},
-        "{name}: hls4ml must deliver one full, unpadded K-wide row per stream beat");
-{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
-{_glue_pipeline_loop(m)}        data_T beat = a_stream.read();
-        ap_uint<{AB}> ab;
-        for (unsigned j = 0; j < {K}; j++) {{
-            #pragma HLS UNROLL
-            ab.range(j * {AW} + {AW} - 1, j * {AW}) = beat[j].range({AW} - 1, 0);
-        }}
-        a_s.write(ab);
-    }}
-}}
-
-// Pure bit-reinterpretation: {name}_core's RTL wrapper already emits one full,
-// unpadded N-wide row of requantized out_width-bit-per-lane codes per beat (the
-// {KT} K-tile partials summed, bias, shift, round-half-up, wrap, N-tile stitching
-// and pad-column drop all happened inside it -- see golden.py's core twin and the
-// RTL requant stage). Slice one lane per column via a single fully-unrolled loop;
-// loaded via .range() (raw bit pattern), never a value-preserving conversion,
-// since the value is already rounded/wrapped and re-converting would corrupt it.
-template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{PB}> > &p_s, hls::stream<res_T> &res_stream) {{
-    typedef typename res_T::value_type result_t;
-{_drain_pipeline_fn(m, t)}    for (unsigned mm = 0; mm < {m}; mm++) {{
-{_glue_pipeline_loop(m)}        ap_uint<{PB}> ob = p_s.read();
-        res_T crow;
-        for (unsigned oc = 0; oc < {N}; oc++) {{
-            #pragma HLS UNROLL
-            ap_uint<{outW}> raw = ob.range(oc * {outW} + {outW} - 1, oc * {outW});
-            result_t tmp;
-            tmp.range() = raw;     // load the already-requantized bit pattern as-is
-            crow[oc] = tmp;
-        }}
-        res_stream.write(crow);
-    }}
-}}
-
-// The dedicated K-tiled IP: hls4ml io_stream const_weights GEMM -> internal MVU blackbox.
-// Bias (when present) is the baked constant above -- there is only ever this one
-// signature; hls4ml's call site never passes a bias parameter.
-template <class data_T, class res_T, typename CONFIG_T>
-void {name}_gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream) {{
 #pragma HLS DATAFLOW
     hls::stream<ap_uint<{AB}> > a_s;
     hls::stream<ap_uint<{PB}> > p_s;
 #pragma HLS STREAM variable=a_s depth=4
 #pragma HLS STREAM variable=p_s depth=4
-    {name}_repack_a<data_T>(a_stream, a_s);
-    {name}_core(a_s, p_s);
-    {name}_drain<res_T, CONFIG_T>(p_s, res_stream);
+    feed_a(a_in, a_s);
+    {public_fn(name)}(a_s, p_s);   // <-- FINN MVU RTL blackbox (K-tiles summed, weights + bias baked; already requantized)
+    drain_c(p_s, c_out);
 }}
-
-}} // namespace nnet
-#endif
 """
 
 
 def _2op_dataflow_top(name, plan):
-    """DUT for the two-operand blackbox (single-tile temporal fold, DEPTH=NF*SF>=2):
-    passthrough of A, the affine requant drain (no bias; act×act product scale
-    ``fa+fb``), and a ``feed_b`` gearbox that reindexes hls4ml's wide B beat down to
-    ``dynamic_load_2op``'s narrow input beat -- AT MOST a 1-wide-beat register, no
-    reorder buffer.
-
-    Mode A (``mode=0``, row-major B): one N-wide K-row arrives per beat (K beats
-    total); feed_b holds it in a 1xN register and drains it PE at a time, NF
-    sub-beats (nf=0..NF-1, nf-fast) -- matches the loader's Mode A writer
-    (nf-fast/simd-mid/sf-slow: rows arrive in natural k=sf*SIMD+simd order).
-
-    Mode B (``mode=1``, col-major B): one K-wide column arrives per beat (N beats
-    total, natural column order c=nf*PE+pe, pe-fast/nf-slow); feed_b holds it in a
-    1xK register and drains it SIMD at a time, SF sub-beats (sf=0..SF-1, sf-fast)
-    -- matches the loader's Mode B (transposed) writer (sf-fast/pe-mid/nf-slow)."""
+    """DUT for the two-operand blackbox: a straight passthrough into the blackbox. The shim's boundary is already hls4ml's own raw beat widths
+    (one K-row of A, one B row/column, one N-row of C per beat -- see
+    ``rtl.two_operand_ports``), and the wide-to-narrow loader gearbox, K-padding and
+    NF-beat stitching all live inside the RTL, so this top does no repacking of its
+    own -- it is only the dataflow region Vitis needs to drop the RTL blackbox into."""
     t = plan["tile"]
-    m = plan["num_input_vectors"]
-    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
-    N, WW = plan["n"], t["weight_width"]
-    K = plan["k_pad"]
-    outW = plan["output_width"]
-    CB = cbits(plan)
-    abeats = m * SF
+    mode = plan.get("mode", 0)
+    ports = _rtl.two_operand_ports(plan, t, mode)
+    AB, BB, CB = ports["a"], ports["b"], ports["p"]
+    A_BEATS, B_BEATS = ports["a_beats"], ports["b_beats"]
     pad = ' ' * (len(name) + 6)
     indent = ' ' * (len(name) + 1)
-    mode = plan.get("mode", 0)
-
-    LANES_RAW = PE if mode == 0 else SIMD
-    BWn = ((LANES_RAW * WW + 7) // 8) * 8   # narrow beat into the core (module idat width)
-
-    if mode == 0:
-        # Mode A: wide beat = one N-wide K-row (K beats); drain NF PE-wide sub-beats
-        # per row (nf-fast), lane pe = row bits [(nf*PE+pe)*WW +: WW].
-        WROW, WROW_BEATS, SUBBEATS = N, K, NF
-        feed_b_body = f"""static void feed_b(hls::stream<ap_uint<{((WROW * WW + 7) // 8) * 8}> >& in,
-                    hls::stream<ap_uint<{BWn}> >& out) {{
-    for (int k = 0; k < {WROW_BEATS}; k++) {{
-        ap_uint<{((WROW * WW + 7) // 8) * 8}> row = in.read();   // 1xN register (one arriving wide beat)
-        for (int nf = 0; nf < {SUBBEATS}; nf++) {{
-#pragma HLS PIPELINE II=1
-            ap_uint<{BWn}> nb = 0;
-            for (int pe = 0; pe < {PE}; pe++) {{
-#pragma HLS UNROLL
-                nb.range(pe * {WW} + {WW} - 1, pe * {WW}) =
-                    row.range((nf * {PE} + pe) * {WW} + {WW} - 1, (nf * {PE} + pe) * {WW});
-            }}
-            out.write(nb);
-        }}
-    }}
-}}"""
-    else:
-        # Mode B: wide beat = one K-wide column (N beats, natural column order
-        # c=nf*PE+pe pe-fast); drain SF SIMD-wide sub-beats per column (sf-fast),
-        # lane s = column bits [(sf*SIMD+s)*WW +: WW].
-        WROW, WROW_BEATS, SUBBEATS = K, N, SF
-        feed_b_body = f"""static void feed_b(hls::stream<ap_uint<{((WROW * WW + 7) // 8) * 8}> >& in,
-                    hls::stream<ap_uint<{BWn}> >& out) {{
-    for (int c = 0; c < {WROW_BEATS}; c++) {{
-        ap_uint<{((WROW * WW + 7) // 8) * 8}> col = in.read();   // 1xK register (one arriving wide beat)
-        for (int sf = 0; sf < {SUBBEATS}; sf++) {{
-#pragma HLS PIPELINE II=1
-            ap_uint<{BWn}> nb = 0;
-            for (int s = 0; s < {SIMD}; s++) {{
-#pragma HLS UNROLL
-                nb.range(s * {WW} + {WW} - 1, s * {WW}) =
-                    col.range((sf * {SIMD} + s) * {WW} + {WW} - 1, (sf * {SIMD} + s) * {WW});
-            }}
-            out.write(nb);
-        }}
-    }}
-}}"""
-    BB_top = ((WROW * WW + 7) // 8) * 8   # top-level (hls4ml-facing) wide-beat width
-
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 
-void {name}_core(hls::stream<ap_uint<{AB}> >&, hls::stream<ap_uint<{BWn}> >&,
-{pad}hls::stream<ap_uint<{PB}> >&);
+void {public_fn(name)}(hls::stream<ap_uint<{AB}> >&, hls::stream<ap_uint<{BB}> >&,
+{pad}hls::stream<ap_uint<{CB}> >&);
 
+// Passthrough feed/drain processes around the blackbox: Vitis will not pass a
+// top-level argument straight into a blackbox (HLS 214-149). No repacking: the
+// shim's boundary is already hls4ml's own raw beat widths.
 static void feed_a(hls::stream<ap_uint<{AB}> >& in, hls::stream<ap_uint<{AB}> >& out) {{
-    for (int i = 0; i < {abeats}; i++) out.write(in.read());
+    for (int i = 0; i < {A_BEATS}; i++) {{
+#pragma HLS PIPELINE II=1
+        out.write(in.read());
+    }}
 }}
-{feed_b_body}
-
-// Pure unpack (no bias -- two-operand GEMM never has one): {name}_core already
-// shift/round-half-up/wrapped each lane to out_width. Beat nf lane pe holds output
-// column nf*PE+pe. Walks one beat (one p_s.read()) per loop iteration -- rather
-// than NF reads per row inside one iteration -- so a PIPELINE II=1 loop can
-// actually schedule at II=1 per beat (II=NF per row, same throughput either way).
-static void unpack(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
-    ap_uint<{CB}> crow = 0;
-    for (int bt = 0; bt < {m * NF}; bt++) {{
-        int nf = bt % {NF};
-        ap_uint<{PB}> ob = in.read();
-        for (int pe = 0; pe < {PE}; pe++) {{
-            int oc = nf * {PE} + pe;
-            if (oc < {N}) {{   // drop the N-pad tail columns (untiled: n_tile == n)
-            crow.range(oc * {outW} + {outW} - 1, oc * {outW}) =
-                ob.range(pe * {outW} + {outW} - 1, pe * {outW});
-            }}
-        }}
-        if (nf == {NF} - 1) out.write(crow);
+static void feed_b(hls::stream<ap_uint<{BB}> >& in, hls::stream<ap_uint<{BB}> >& out) {{
+    for (int i = 0; i < {B_BEATS}; i++) {{
+#pragma HLS PIPELINE II=1
+        out.write(in.read());
+    }}
+}}
+static void drain_c(hls::stream<ap_uint<{CB}> >& in, hls::stream<ap_uint<{CB}> >& out) {{
+    for (int i = 0; i < {A_BEATS}; i++) {{
+#pragma HLS PIPELINE II=1
+        out.write(in.read());
     }}
 }}
 
-void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB_top}> >& b_in,
+void {name}(hls::stream<ap_uint<{AB}> >& a_in, hls::stream<ap_uint<{BB}> >& b_in,
 {indent}hls::stream<ap_uint<{CB}> >& c_out) {{
 #pragma HLS DATAFLOW
     hls::stream<ap_uint<{AB}> > a_s;
-    hls::stream<ap_uint<{BWn}> > b_s;
-    hls::stream<ap_uint<{PB}> > p_s;
-#pragma HLS STREAM variable=a_s depth=4
-#pragma HLS STREAM variable=b_s depth=4
+    hls::stream<ap_uint<{BB}> > b_s;
+    hls::stream<ap_uint<{CB}> > p_s;
+#pragma HLS STREAM variable=a_s depth={max(A_BEATS, 2)}
+#pragma HLS STREAM variable=b_s depth={max(B_BEATS, 2)}
 #pragma HLS STREAM variable=p_s depth=4
     feed_a(a_in, a_s);
     feed_b(b_in, b_s);
-    {name}_core(a_s, b_s, p_s);   // <-- FINN MVU RTL blackbox (B loaded+replayed in-core; already requantized)
-    unpack(p_s, c_out);
+    {public_fn(name)}(a_s, b_s, p_s);   // <-- FINN MVU RTL blackbox (B loaded+replayed in-core; already requantized)
+    drain_c(p_s, c_out);
 }}
 """
 
 
-def _2op_gemm_ip_header(name, plan):
-    """hls4ml-facing two-operand IP: ``<name>_gemm_stream<data0_T,data1_T,res_T,CONFIG_T>``
-    (repack A -> shim activations, repack B -> the loader's narrow beat via the HLS
-    feed_b gearbox, internal MVU blackbox, requant drain). Single-tile only -- 2-op
-    only ever folds within one MVU tile (no N/K-tiling; multi-tile 2-op and the
-    register/grid form were retired), any depth including the fully-spatial
-    DEPTH==1 case (SF=NF=1), both B-layout modes (``SecondOperandRowMajor``)."""
+def _2op_blackbox_json(name, plan, resources=None):
+    """Blackbox JSON for the two-operand core: two input FIFOs (a, b) + one output (p),
+    at the shim's raw boundary widths (``rtl.two_operand_ports``)."""
     t = plan["tile"]
-    m = plan["num_input_vectors"]
-    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
-    AW, WW = t["activation_width"], t["weight_width"]
-    N, K, KPAD = plan["n"], plan["k"], plan["k_pad"]
-    mode = plan.get("mode", 0)
-    # BB: the dynamic_load_2op loader's own NARROW input beat (core-side, module idat
-    # width) -- PE-wide (Mode A) or SIMD-wide (Mode B). The hls4ml-facing wide beat
-    # (data1_T, N-wide row / K-wide column) is reindexed down to this by repack_b below
-    # (the HLS feed_b gearbox), never materializing more than one arriving wide beat.
-    LANES_RAW = PE if mode == 0 else SIMD
-    BB = ((LANES_RAW * WW) + 7) // 8 * 8
-    outW = plan["output_width"]
-    a_width, p_width = AB, PB
-    apmax = _apmaxw(max(a_width, p_width))
-    guard = (f"#ifndef AP_INT_MAX_W\n#define AP_INT_MAX_W {apmax}\n#endif\n"
-             if max(a_width, p_width) > 1024 else "")
-    core_pad = ' ' * (len(name) + 6)
-
-    # repack A: pack SF SIMD-wide beats/vector (SF==1 -> one beat/vector).
-    repack_a = f"""template <class data0_T>
-void {name}_repack_a(hls::stream<data0_T> &a_stream, hls::stream<ap_uint<{AB}> > &a_s) {{
-{_glue_pipeline_fn(m)}    for (unsigned mm = 0; mm < {m}; mm++) {{
-{_glue_pipeline_loop(m)}        ap_int<{AW}> arow[{KPAD}];
-        #pragma HLS ARRAY_PARTITION variable=arow complete
-        for (unsigned i = 0; i < {KPAD}; i++) {{
-            #pragma HLS UNROLL
-            arow[i] = 0;
-        }}
-        for (unsigned kp = 0; kp < {K} / data0_T::size; kp++) {{
-            data0_T beat = a_stream.read();
-            for (unsigned j = 0; j < data0_T::size; j++) arow[kp * data0_T::size + j] = beat[j].range({AW} - 1, 0);
-        }}
-        for (unsigned sf = 0; sf < {SF}; sf++) {{
-            ap_uint<{AB}> ab = 0;
-            for (unsigned s = 0; s < {SIMD}; s++)
-                ab.range(s * {AW} + {AW} - 1, s * {AW}) = (ap_uint<{AW}>)arow[sf * {SIMD} + s];
-            a_s.write(ab);
-        }}
-    }}
-}}"""
-
-    # Pure unpack (no arithmetic): {name}_core already shift/round-half-up/wrapped
-    # each lane to out_width. Two-operand GEMM never carries a real bias (has_bias is
-    # always False by construction). Loaded via .range() (raw bit pattern), never a
-    # value-preserving conversion, since the value is already rounded/wrapped.
-    #
-    # NF>1 here means the drain must read NF beats per output row. Reading all NF
-    # beats inside a single PIPELINE II=1 loop iteration is unschedulable at II=1
-    # (Vitis emits HLS-200-880 and silently falls back to II=NF per row anyway --
-    # same throughput, but the [verify] step flags the warning as a failure), so this
-    # walks one beat per loop iteration (trip count m*NF) and only fires
-    # res_stream.write on the last beat of each row -- true II=1 per beat, II=NF per
-    # row (NF==1 -> one beat per row, same as before).
-    drain_body = f"""        unsigned nf = bt % {NF};
-        ap_uint<{p_width}> ob = p_s.read();
-        for (unsigned pe = 0; pe < {PE}; pe++) {{
-            unsigned local_oc = nf * {PE} + pe;
-            if (local_oc < {N}) {{   // drop the N-pad tail columns
-            unsigned oc = local_oc;
-            ap_uint<{outW}> raw = ob.range(pe * {outW} + {outW} - 1, pe * {outW});
-            result_t tmp; tmp.range() = raw; crow[oc] = tmp;
-            }}
-        }}
-        if (nf == {NF} - 1) res_stream.write(crow);"""
-
-    drain_fn = f"""template <class res_T, typename CONFIG_T>
-void {name}_drain(hls::stream<ap_uint<{p_width}> > &p_s, hls::stream<res_T> &res_stream) {{
-    typedef typename res_T::value_type result_t;
-    res_T crow;
-    for (unsigned bt = 0; bt < {m * NF}; bt++) {{
-        #pragma HLS PIPELINE II=1 style=flp
-{drain_body}
-    }}
-}}"""
-
-    # repack B: reindex hls4ml's wide beat down to the loader's narrow beat (the HLS
-    # feed_b gearbox -- see rtl.py's dynamic_load_2op instantiation).
-    # Materializes AT MOST one arriving wide beat (a 1xN or 1xK register), never a
-    # reorder buffer. Padding (K -> KPAD rows for Mode A, N -> PE*NF columns for Mode
-    # B) is a zero-filled pass with no stream read, matching the old zero-pad semantics
-    # bit-exact.
-    if mode == 0:
-        # Mode A: KPAD row-slots (K real + zero-pad), each split into NF PE-wide
-        # sub-beats (nf-fast) -- matches the loader's Mode A writer order.
-        repack_b = f"""template <class data1_T>
-void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BB}> > &b_s) {{
-    static_assert(data1_T::size == {N},
-        "{name}: hls4ml must deliver one N-wide K-row per beat (row-major B)");
-    for (unsigned k = 0; k < {KPAD}; k++) {{
-        ap_uint<{N * WW}> row = 0;
-        if (k < {K}) {{
-            data1_T beat = b_stream.read();
-            for (unsigned n = 0; n < {N}; n++)
-                row.range(n * {WW} + {WW} - 1, n * {WW}) = beat[n].range({WW} - 1, 0);
-        }}
-        for (unsigned nf = 0; nf < {NF}; nf++) {{
-            ap_uint<{BB}> nb = 0;
-            for (unsigned pe = 0; pe < {PE}; pe++)
-                nb.range(pe * {WW} + {WW} - 1, pe * {WW}) =
-                    row.range((nf * {PE} + pe) * {WW} + {WW} - 1, (nf * {PE} + pe) * {WW});
-            b_s.write(nb);
-        }}
-    }}
-}}"""
-        b_s_depth = KPAD * NF + 2
-    else:
-        # Mode B: PE*NF column-slots (N real + zero-pad), each split into SF SIMD-wide
-        # sub-beats (sf-fast) -- matches the loader's (transposed) Mode B writer order;
-        # natural column order c=nf*PE+pe (pe-fast) matches hls4ml's own beat order.
-        repack_b = f"""template <class data1_T>
-void {name}_repack_b(hls::stream<data1_T> &b_stream, hls::stream<ap_uint<{BB}> > &b_s) {{
-    static_assert(data1_T::size == {K},
-        "{name}: hls4ml must deliver one K-wide column per beat (col-major B)");
-    for (unsigned c = 0; c < {PE * NF}; c++) {{
-        ap_uint<{KPAD * WW}> col = 0;
-        if (c < {N}) {{
-            data1_T beat = b_stream.read();
-            for (unsigned k = 0; k < {K}; k++)
-                col.range(k * {WW} + {WW} - 1, k * {WW}) = beat[k].range({WW} - 1, 0);
-        }}
-        for (unsigned sf = 0; sf < {SF}; sf++) {{
-            ap_uint<{BB}> nb = 0;
-            for (unsigned s = 0; s < {SIMD}; s++)
-                nb.range(s * {WW} + {WW} - 1, s * {WW}) =
-                    col.range((sf * {SIMD} + s) * {WW} + {WW} - 1, (sf * {SIMD} + s) * {WW});
-            b_s.write(nb);
-        }}
-    }}
-}}"""
-        b_s_depth = PE * NF * SF + 2
-
-    return f"""#ifndef {name.upper()}_GEMM_IP_H_
-#define {name.upper()}_GEMM_IP_H_
-{guard}#include <hls_stream.h>
-#include <ap_int.h>
-
-// internal FINN-MVU blackbox (two-operand shim {name}_core.v; C twin {name}_core.cpp) --
-// sums any K-tile partials and shift/round-half-up/wraps to out_width internally.
-void {name}_core(hls::stream<ap_uint<{a_width}> >&, hls::stream<ap_uint<{BB}> >&,
-{core_pad}hls::stream<ap_uint<{p_width}> >&);
-
-namespace nnet {{
-
-// Dedicated two-operand IP for gemm config M={m} K={K} N={N} (core={t['compute_core']}).
-// B layout selected by SecondOperandRowMajor: MODE={mode} -- row-major (data1_T::size ==
-// N, one K-row per beat) when True/unset, col-major (data1_T::size == K, one N-column
-// per beat) when False.
-
-{repack_a}
-
-{repack_b}
-
-// pure unpack drain: no bias for two-operand GEMM (has_bias is always False by
-// construction) -- {name}_core already requantized each lane to out_width; this
-// only slices lanes and loads them via .range() (raw bit pattern).
-{drain_fn}
-
-// The dedicated IP: hls4ml io_stream two-operand GEMM -> internal MVU blackbox.
-// Two-operand GEMM never has a real bias, so hls4ml's call site carries no bias
-// parameter at all -- there is only ever this one signature.
-template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
-void {name}_gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
-{' ' * (len(name) + 17)}hls::stream<res_T> &res_stream) {{
-#pragma HLS DATAFLOW
-    hls::stream<ap_uint<{a_width}> > a_s;
-    hls::stream<ap_uint<{BB}> > b_s;
-    hls::stream<ap_uint<{p_width}> > p_s;
-#pragma HLS STREAM variable=a_s depth={SF + 2}
-#pragma HLS STREAM variable=b_s depth={b_s_depth}
-#pragma HLS STREAM variable=p_s depth={NF + 2}
-    {name}_repack_a<data0_T>(a_stream, a_s);
-    {name}_repack_b<data1_T>(b_stream, b_s);
-    {name}_core(a_s, b_s, p_s);
-    {name}_drain<res_T, CONFIG_T>(p_s, res_stream);
-}}
-
-}} // namespace nnet
-#endif
-"""
-
-
-def _2op_blackbox_json(name, t, n, ww, tiles=1, resources=None):
-    """Blackbox JSON for the two-operand core: two input FIFOs (a, b) + one output (p)."""
-    AB, PB = t["input_stream_width_ba"], t["output_stream_width_ba"]
-    fn = f"{name}_core"
-    # Cost-model resource estimate over all tiles (see _blackbox_json).
-    res = resources or {"dsp": t["dsp_estimate"] * int(tiles), "bram18": 0}
+    fn = public_fn(name)
+    res = resources or {"dsp": t["dsp_estimate"], "bram18": 0}
     dsp, bram = int(res["dsp"]), int(res.get("bram18", 0))
     a_param = {"c_name": "a", "c_port_direction": "in",
                "rtl_ports": {"FIFO_data_read_in": "a_dout", "FIFO_read_enable": "a_read", "FIFO_empty_flag": "a_empty_n"}}
@@ -825,7 +436,7 @@ def _2op_blackbox_json(name, t, n, ww, tiles=1, resources=None):
     return json.dumps({
         "c_function_name": fn,
         "rtl_top_module_name": fn,
-        "c_files": [{"c_file": f"{fn}.cpp", "cflag": ""}],
+        "c_files": [{"c_file": f"{name}_core.cpp", "cflag": ""}],   # C twin file; the function inside is `fn`
         "rtl_files": _core_rtl_files(name),
         "c_parameters": [a_param, b_param, p_param],
         "rtl_common_signal": {
@@ -838,9 +449,14 @@ def _2op_blackbox_json(name, t, n, ww, tiles=1, resources=None):
             "ap_ctrl_chain_protocol_done": "ap_done",
             "ap_ctrl_chain_protocol_continue": "ap_continue",
         },
-        "rtl_performance": {"latency": str(t["latency_cycles"]), "II": str(t["ii"])},
-        "_comment": "FINN cost-model DSP estimate scaled by the tile count; FF/LUT/BRAM "
-                    "are rough hints, not synthesis-accurate (TODO: measure).",
+        # Row-port numbers with B resident (the loader's bank for this node already
+        # filled): latency = first row in -> first row out, II = cycles per row = SF*NF.
+        # Identical to the weight-stationary shim once B is loaded (measured). A node
+        # whose B load (k_pad*NF or n*SF loader beats) exceeds M*SF*NF is load-bound
+        # and runs slower than this II.
+        "rtl_performance": {"latency": str(t["port_latency"]), "II": str(t["ii_per_row"])},
+        "_comment": "latency/II: measured row-port values with B resident. DSP: FINN "
+                    "cost model PE*ceil(SIMD/3). FF/LUT: rough per-DSP hints only.",
         "rtl_resource_usage": {"FF": str(30 * dsp), "LUT": str(40 * dsp),
                                "DSP": str(dsp), "BRAM": str(bram), "URAM": "0"},
     }, indent=2) + "\n"
@@ -872,7 +488,7 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
         # plan's "Cleanup" section); a config that still asks for it is a bug upstream.
         raise NotImplementedError(
             f"mvau two-operand IP '{name}': n_tiles/k_tiles>1 is not supported (2-op "
-            "only ever folds within one MVU tile). Got n_tiles={nt} k_tiles={kt}.")
+            f"only ever folds within one MVU tile). Got n_tiles={nt} k_tiles={kt}.")
     part = cfg.get("part") or "xcvu13p-flga2577-2-e"
     clock_ns = cfg.get("clock_period_ns") or 5
     pkg = Path(output_dir) / name
@@ -881,19 +497,18 @@ def generate_two_operand_pkg(shape, name, output_dir, **cfg):
     force_behavioral = bool(cfg.get("force_behavioral", False))
     shim, top_src = _rtl.generate_two_operand_shim, _2op_dataflow_top(name, plan)
     (pkg / f"{name}_core.v").write_text(_with_timescale(
-        shim(shape, module_name=f"{name}_core",
+        shim(shape, module_name=public_fn(name),
              force_behavioral=force_behavioral, tile=t, plan=plan, mode=mode)))
     (pkg / f"{name}_core.cpp").write_text(_with_ap_int_max_w(
-        _golden.generate_2op_core_twin(shape, func_name=f"{name}_core", plan=plan)))
+        _golden.generate_2op_core_twin(shape, func_name=public_fn(name), plan=plan)))
     (pkg / f"{name}_top.cpp").write_text(_with_ap_int_max_w(top_src))
     (pkg / f"{name}.json").write_text(
-        _2op_blackbox_json(name, t, plan["n"], t["weight_width"], tiles=1,
-                           resources=plan.get("resources")))
+        _2op_blackbox_json(name, plan, resources=plan.get("resources")))
     (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
-        _golden.generate_2op_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
+        _golden.generate_2op_tb(shape, top_name=name, func_name=public_fn(name), plan=plan,
                                 n_nodes=cfg.get("n_nodes", 6))))
     (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(
-        _2op_gemm_ip_header(name, plan)))
+        _gemm_ip_header(name, plan, two_operand=True)))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 
     for s in _STATIC_SOURCES:
@@ -1039,13 +654,13 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
     # XSIM unisim models). Set force_behavioral=True in cfg for unisim-free behavioral cosim.
     force_behavioral = bool(cfg.get("force_behavioral", False))
     (pkg / f"{name}_core.v").write_text(_with_timescale(
-        _rtl.generate_shim(shape, module_name=f"{name}_core",
+        _rtl.generate_shim(shape, module_name=public_fn(name),
                            force_behavioral=force_behavioral, tile=t,
                            weights_in_core=True, init_files=init_files,
                            n_tiles=NT, k_tiles=KT, bias_codes=bias_codes,
                            raw_k=plan["k"], raw_n=plan["n"])))
     (pkg / f"{name}_core.cpp").write_text(_with_ap_int_max_w(
-        _golden.generate_core_twin(shape, func_name=f"{name}_core", plan=plan,
+        _golden.generate_core_twin(shape, func_name=public_fn(name), plan=plan,
                                    baked_weights=B, bias_codes=bias_codes)))
     top_src = (_kt_dataflow_top(name, plan) if KT > 1
                else _dataflow_top(name, plan))
@@ -1053,11 +668,10 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
     (pkg / f"{name}.json").write_text(_blackbox_json(
         name, t, tiles=KT * NT, resources=plan.get("resources")))
     (pkg / f"{name}_tb.cpp").write_text(_with_ap_int_max_w(
-        _golden.generate_tb(shape, top_name=name, func_name=f"{name}_core", plan=plan,
+        _golden.generate_tb(shape, top_name=name, func_name=public_fn(name), plan=plan,
                             bias_codes=bias_codes, baked_weights=B,
                             n_nodes=cfg.get("n_nodes", 6))))
-    ip_hdr = (_kt_gemm_ip_header(name, plan) if KT > 1
-              else _gemm_ip_header(name, plan))
+    ip_hdr = _gemm_ip_header(name, plan)
     (pkg / f"{name}_gemm_ip.h").write_text(_with_ap_int_max_w(ip_hdr))
     (pkg / "run_vitis.tcl").write_text(_run_vitis_tcl(name, part, clock_ns))
 
@@ -1084,106 +698,21 @@ def gen_sources_tcl(items):
 
 
 def gen_combined_header(items):
-    """The whole-model header hls4ml includes when GEMM_IP_HEADER is set. Includes
-    each per-config dedicated IP, then routes nnet::gemm_* to it by CONFIG_T's
-    gemm_ip_id via template specialization (c++11-safe: only the matching IP
-    instantiates, so the other configs' shapes never compile against this CONFIG_T).
-    """
+    """The whole-model header hls4ml includes when GEMM_IP_HEADER is set: just the
+    per-node declaration headers. Each node's public function is ``gemm_stream_<name>``
+    (see ``public_fn``), which hls4ml calls by name from its top dataflow region, so
+    there is no per-id template dispatch any more -- a blackbox is a concrete function
+    and could not be reached through one anyway."""
     def _nm(it):
         return it.get("emit_name") or it["name"]
-
-    def _id(it):
-        v = it.get("gemm_ip_index")
-        return int(v) if v is not None else None
-
     incs = "\n".join(f'#include "{_nm(it)}/{_nm(it)}_gemm_ip.h"' for it in items)
-
-    # weights_in_core True (or missing) -> const_weights (baked-B) IP; False -> two-operand
-    # (runtime-B) IP. A two-operand IP emits <name>_gemm_stream instead of
-    # <name>_gemm_stream_const_weights, so it needs the two-operand dispatcher below.
-    wl_items = [it for it in items if it.get("weights_in_core", True)]
-    two_op_items = [it for it in items if not it.get("weights_in_core", True)]
-
-    specs = []
-    for it in wl_items:
-        i, nm = _id(it), _nm(it)
-        if i is None:
-            continue
-        specs.append(
-            f"template <> struct mvau_ip<{i}> {{\n"
-            f"    // Bias, when this item has one, is baked as a compile-time constant inside\n"
-            f"    // {nm}_gemm_ip.h -- never a function argument -- so there is only ever this\n"
-            f"    // one signature.\n"
-            f"    template <class data_T, class res_T, typename CONFIG_T>\n"
-            f"    static void stream_const_weights(hls::stream<data_T> &a, hls::stream<res_T> &r) {{\n"
-            f"        #pragma HLS INLINE\n"
-            f"        {nm}_gemm_stream_const_weights<data_T, res_T, CONFIG_T>(a, r);\n"
-            f"    }}\n"
-            f"}};")
-    specs_s = "\n".join(specs)
-
-    two_op_specs = []
-    for it in two_op_items:
-        i, nm = _id(it), _nm(it)
-        if i is None:
-            continue
-        two_op_specs.append(
-            f"template <> struct mvau_ip_stream<{i}> {{\n"
-            f"    // Two-operand GEMM never has a real bias -- there is only ever this one\n"
-            f"    // signature.\n"
-            f"    template <class data0_T, class data1_T, class res_T, typename CONFIG_T>\n"
-            f"    static void stream(hls::stream<data0_T> &a, hls::stream<data1_T> &b,\n"
-            f"                       hls::stream<res_T> &r) {{\n"
-            f"        #pragma HLS INLINE\n"
-            f"        {nm}_gemm_stream<data0_T, data1_T, res_T, CONFIG_T>(a, b, r);\n"
-            f"    }}\n"
-            f"}};")
-    two_op_specs_s = "\n".join(two_op_specs)
-
-    # The two-operand dispatcher + public gemm_stream entry are only emitted when a
-    # two-operand IP exists (no soft two-operand primary; an unrouted id is a compile
-    # error, the correct signal that a gemm_stream layer wasn't given an IP).
-    two_op_block = "" if not two_op_specs else f"""
-// id -> two-operand (runtime-B) IP dispatch.
-template <int ID> struct mvau_ip_stream;
-{two_op_specs_s}
-
-// io_stream two-operand entry hls4ml calls; routes to the config's IP by id. Two-operand
-// GEMM never has a real bias, so hls4ml's call site never passes one -- there is only
-// ever this one signature.
-template <class data0_T, class data1_T, class res_T, typename CONFIG_T>
-void gemm_stream(hls::stream<data0_T> &a_stream, hls::stream<data1_T> &b_stream,
-                 hls::stream<res_T> &res_stream) {{
-    #pragma HLS INLINE
-    mvau_ip_stream<CONFIG_T::gemm_ip_id>::template stream<data0_T, data1_T, res_T, CONFIG_T>(
-        a_stream, b_stream, res_stream);
-}}
-"""
-
-    return f"""#ifndef GEMM_IP_COMBINED_H_
-#define GEMM_IP_COMBINED_H_
-#include <hls_stream.h>
+    return f"""#ifndef GEMM_IP_COMBINED_MVAU_H_
+#define GEMM_IP_COMBINED_MVAU_H_
+// mvau (Vitis RTL blackbox) package: one declaration per GEMM node. hls4ml calls each
+// node's gemm_stream_<name> directly on packed bit streams; see the per-node headers
+// for the exact port contract.
 {incs}
-
-namespace nnet {{
-
-// id -> dedicated IP dispatch (specialized per gemm config below).
-template <int ID> struct mvau_ip;
-{specs_s}
-
-// io_stream const_weights entry hls4ml calls; routes to the config's IP by id. Bias
-// (when an item has one) is baked as a compile-time constant inside that item's
-// <name>_gemm_ip.h -- never a function argument -- so there is only ever this one
-// signature.
-template <class data_T, class res_T, typename CONFIG_T>
-void gemm_stream_const_weights(hls::stream<data_T> &a_stream, hls::stream<res_T> &res_stream) {{
-    #pragma HLS INLINE
-    mvau_ip<CONFIG_T::gemm_ip_id>::template stream_const_weights<data_T, res_T, CONFIG_T>(
-        a_stream, res_stream);
-}}
-{two_op_block}
-}} // namespace nnet
-#endif // GEMM_IP_COMBINED_H_
+#endif // GEMM_IP_COMBINED_MVAU_H_
 """
 
 
@@ -1218,7 +747,9 @@ def gen_integration_manifest(items):
     for it in items:
         nm = it.get("emit_name") or it["name"]
         core = {"name": nm, "kind": "rtl_blackbox", "tool": "vitis",
-                "entity": f"{nm}_core", "rtl": f"{nm}/{nm}_core.v",
+                # the one function hls4ml calls == the RTL module == the JSON c_function_name
+                "function": public_fn(nm),
+                "entity": public_fn(nm), "rtl": f"{nm}/{nm}_core.v",
                 # full RTL set (shim + vendored FINN cores), not just the shim
                 "rtl_files": _core_rtl_files(nm, prefix=f"{nm}/"),
                 "json": f"{nm}/{nm}.json",
@@ -1258,6 +789,14 @@ def gen_integration_manifest(items):
                 core["n_tiles"] = plan["n_tiles"]
             if "k_tiles" in plan:
                 core["k_tiles"] = plan["k_tiles"]
+            # the packed-stream port contract of `function` (exact bit widths + beats
+            # per node), so an integrator can check hls4ml's side against it
+            if it.get("weights_in_core", True):
+                core["ports"] = ws_ports(plan)
+            else:
+                mode = 0 if it.get("second_operand_row_major") is not False else 1
+                pp = _rtl.two_operand_ports(plan, tile, mode)
+                core["ports"] = {k: pp[k] for k in ("a", "a_beats", "b", "b_beats", "p", "p_beats")}
             for w in _reuse_factor_warnings(plan):
                 print(w)
         cores.append(core)
@@ -1305,8 +844,8 @@ def run_vitis_smoke(package=None, cases=None, keep=False):
         {"shape": (4, 6, 8), "reuse_factor": 4, "weights_in_core": False},   # 2op K-tile, NF>1
         {"shape": (2, 12, 4), "reuse_factor": 8, "weights_in_core": True},   # baked K-tile, SF_tile>1
         {"shape": (2, 3, 8), "n_tiles": 2, "weights_in_core": True},         # N-tile (K fits one core)
-        {"shape": (4, 6, 8), "reuse_factor": 2, "n_tiles": 2,
-         "weights_in_core": False},                                          # two-operand combined N+K grid
+        # (no two-operand N-tiled case: 2-op only ever folds within one MVU tile and
+        # generate_two_operand_pkg rejects n_tiles > 1)
         {"shape": (2, 6, 8), "reuse_factor": 2, "n_tiles": 2,
          "weights_in_core": True},                                           # baked combined N+K grid
     ]

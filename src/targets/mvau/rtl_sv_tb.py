@@ -367,7 +367,23 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
   end"""
 
     fsm_debug_process = ""
-    if fsm_debug and kind != "ws":
+    if fsm_debug and kind == "ws":
+        # weight-stationary: no B side; FSM_RUN / A_BEAT / P_BEAT stamps only.
+        fsm_debug_process = """\
+  // ---- fsm_debug: latency-breakdown stamps ----
+  reg dbg_prev_run = 1'b0;
+  always @(posedge ap_clk) begin
+    if (ap_rst) dbg_prev_run <= 1'b0;
+    else begin
+      if (dut.in_open && !dbg_prev_run) $display("FSM_RUN cyc=%0d", cyc);
+      dbg_prev_run <= dut.in_open;
+    end
+  end
+  always @(posedge ap_clk)
+    if (!ap_rst && a_read && a_empty_n) $display("A_BEAT cyc=%0d", cyc);
+  always @(posedge ap_clk)
+    if (!ap_rst && p_write && p_full_n) $display("P_BEAT cyc=%0d", cyc);"""
+    elif fsm_debug:
         # NOTE: the two-operand shim no longer has an IDLE/FILL/WRITE/DRAIN/RUN state
         # register (dynamic_load_2op replaces that FSM), nor its own run_r/done_r pair
         # -- ap_ctrl now runs on the shared _decoupled_ctrl handshake (same as ws/kt).
@@ -388,7 +404,14 @@ def generate_sv_tb(kind, module_name, ab, pb, a_beats, p_beats, n_nodes,
   always @(posedge ap_clk)
     if (!ap_rst && a_read && a_empty_n) $display("A_BEAT cyc=%0d", cyc);
   always @(posedge ap_clk)
-    if (!ap_rst && p_write && p_full_n) $display("P_BEAT cyc=%0d", cyc);"""
+    if (!ap_rst && p_write && p_full_n) $display("P_BEAT cyc=%0d", cyc);
+  // B side: stream beats taken from the TB, and narrow beats handed to the loader
+  // (slot = which B row/column, sub = which sub-beat of it).
+  always @(posedge ap_clk)
+    if (!ap_rst && b_read && b_empty_n) $display("B_BEAT cyc=%0d", cyc);
+  always @(posedge ap_clk)
+    if (!ap_rst && dut.ld_ivld && dut.ld_irdy)
+      $display("LD_BEAT cyc=%0d next_slot=%0d sub=%0d wr_state=%0d", cyc, dut.slot_cnt, dut.sub_cnt, dut.loader.state_wr_C);"""
 
     if kind == "ws":
         b_ports_decl = ""

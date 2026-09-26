@@ -579,87 +579,161 @@ endmodule
 """
 
 
+def two_operand_ports(p, t, mode):
+    """Boundary contract of the two-operand shim (shared by the RTL emitter, the C
+    twin, the testbenches, the blackbox JSON and the per-node declaration header):
+    raw, unpadded widths of the three ap_fifo ports and the B beat geometry.
+
+    ``a``: one raw K*ACTIVATION_WIDTH row per beat, M beats per node.
+    ``b``: one raw B row (Mode A, N*WEIGHT_WIDTH, K beats) or column (Mode B,
+    K*WEIGHT_WIDTH, N beats) per beat -- ``b_elems``/``b_beats`` say which.
+    ``p``: one raw N*out_width row per beat, M beats per node."""
+    N, K = p["n"], p["k"]
+    AW, WW, outW = t["activation_width"], t["weight_width"], t["output_width"]
+    b_elems, b_beats = (N, K) if mode == 0 else (K, N)
+    # Exact bit counts, no byte alignment: these must equal the widths hls4ml computes
+    # from its own stream types (elements * element width); a FIFO port of any width
+    # is legal on the Vitis blackbox boundary (the weight-stationary shim already
+    # exposes e.g. N*13-bit result rows).
+    return {
+        "a": K * AW, "a_beats": p["num_input_vectors"],
+        "b": b_elems * WW, "b_elems": b_elems, "b_beats": b_beats,
+        "p": N * outW, "p_beats": p["num_input_vectors"],
+    }
+
+
 def generate_two_operand_shim(shape, module_name="mvau_core", force_behavioral=True,
                               tile=None, plan=None, mode=0, max_inflight=None, **plan_kwargs):
     """Emit the two-operand (``gemm_stream``) shim: A and B both runtime activation
     streams. B takes the MVU weight port, loaded at runtime into the forked
     ``dynamic_load_2op`` module (2-bank ping-pong, see
     ``rtl_static/dynamic_load_2op.sv``), then replayed across the M rows of A
-    (B-stationary). ``mode`` selects the B layout: 0 = row-major (Mode A, the
-    module's PE-wide input beat, one SIMD lane per beat) or 1 = col-major
-    (Mode B, the module's SIMD-wide input beat, one PE lane per beat). The
-    module's ``odat`` is the exact PE*SIMD*WEIGHT_WIDTH MVU weight word --
-    feeds ``s_axis_weights_tdata`` directly, no hand packing needed.
+    (B-stationary). ``mode`` selects the B layout: 0 = row-major (Mode A) or
+    1 = col-major (Mode B).
 
-    The B FIFO here carries the module's own NARROW input beat (PE-wide for
-    Mode A / SIMD-wide for Mode B) -- the wide-beat-to-narrow-beat gearbox
-    (``feed_b``) lives on the HLS side (see package.py), not in this shim.
+    Boundary ports are UNPADDED and match hls4ml's own beat widths exactly, so the
+    HLS side needs no gearbox process of its own (the same contract as the
+    weight-stationary shim):
 
-    ap_ctrl bookkeeping now runs on the same shared ``_decoupled_ctrl`` helper
-    as ``_generate_ws_shim``/``_generate_kt_shim`` (V2: overlap, no idle gap
-    between nodes) instead of a per-node ``run_r``/``done_r`` FSM. This is safe
-    because A/B pairing is purely positional: ``mvu_vvu_axi`` only consumes a
-    weight word while an activation is valid
-    (``s_axis_weights_tready = !idle && avld``), ``dynamic_load_2op`` emits an
-    ordered stream (all N_TLS*N_REPS words of bank n, then bank n+1, verified
-    never early and never from a partially-written bank -- see
-    ``rtl_static/dynamic_load_2op.sv``'s writer/reader FSMs and overtake
-    guard), and A is admitted in node order, cut off at exactly ``M*SF`` beats
-    per node by the helper's ``in_open``. So beat i of A always meets word i of
-    B; no bank-commit admission term is needed. B loading stays un-gated by
-    ap_ctrl (``b_read``), exactly as before -- only the A/weight *consumption*
-    side moves onto the helper.
+      * ``a_dout`` is one raw ``K*ACTIVATION_WIDTH`` row per beat; the K-padding to
+        ``k_pad`` and the SF-way fan-out into one SIMD-wide beat/cycle happen here in
+        an ``arow_reg`` shift register.
+      * ``b_dout`` is one raw B row (Mode A: ``N*WEIGHT_WIDTH``, K beats/node) or one
+        raw B column (Mode B: ``K*WEIGHT_WIDTH``, N beats/node) per beat. A ``brow_reg``
+        holds the one arriving wide beat and drains it into the loader's narrow
+        beat (Mode A: NF PE-wide sub-beats, Mode B: SF SIMD-wide sub-beats); the
+        K-pad rows (Mode A) / K-pad lanes (Mode B) are zero-filled here without a
+        stream read. B loading is never gated by ``ap_start``, so the loader's spare
+        bank fills as soon as the next node's B arrives.
+      * ``p_din`` is one raw ``N*out_width`` row per beat; the NF per-vector beats
+        latch into one ``orow_reg`` and ``p_write`` fires once per row.
+
+    ap_ctrl runs on the shared ``_decoupled_ctrl`` handshake: ``ap_ready`` on the
+    beat that accepts a node's last A row, ``ap_done`` on its last result row. A/B
+    pairing is positional: the loader emits an ordered stream (all words of bank n,
+    then bank n+1, never early, never from a partially-written bank) and A is
+    admitted in node order, so activation i always meets weight word i.
 
     Scope: single tile, any (PE, SIMD, SF, NF) including the fully-spatial
-    DEPTH==1 case (one weight word/vector, SF=NF=1); no N/K-tiling (2-op only
-    ever folds within one MVU tile, so multi-tile 2-op and the register/grid
-    form were retired)."""
+    DEPTH==1 case; no N/K-tiling (2-op only ever folds within one MVU tile)."""
     t = tile if tile is not None else _geom.resolve_plan(shape, **plan_kwargs)["tile"]
     p = plan if plan is not None else _geom.resolve_plan(shape, **plan_kwargs)
     fb = 1 if force_behavioral else 0
     N = p["n"]
+    K = p["k"]
+    KPAD = p["k_pad"]
     M = p["num_input_vectors"]
     PE, SIMD, SF, NF = t["pe"], t["simd"], t["sf"], t["nf"]
-    WW, ACCU = t["weight_width"], t["accu_width"]
+    WW, AW, ACCU = t["weight_width"], t["activation_width"], t["accu_width"]
+    outW = t["output_width"]
     WB = t["weight_stream_width_ba"]     # MVU weight-port word width (PE*SIMD*WW, byte-aligned)
-    AB = t["input_stream_width_ba"]      # activation beat (SIMD*AW)
-    PB = t["output_stream_width_ba"]     # output beat (PE*ACCU)
-    DEPTH = NF * SF
-    run_total = M * NF                    # output beats per node (NF beats per vector)
-
-    # Narrow B beat: dynamic_load_2op's idat width -- PE-wide (Mode A) or SIMD-wide
-    # (Mode B), byte-aligned for the ap_fifo/AXIS boundary. The raw (unaligned) width
-    # is what actually connects to the module; any byte-alignment pad bits above it
-    # are don't-cares (feed_b never sets them) and are simply dropped here.
-    LANES_RAW = PE if mode == 0 else SIMD
-    BW_RAW = LANES_RAW * WW
-    BW = ((BW_RAW + 7) // 8) * 8
+    AB = t["input_stream_width_ba"]      # SIMD-wide activation beat into the core
+    if PE * NF != N:
+        raise ValueError(f"{module_name}: two-operand fold must tile N exactly "
+                         f"(PE*NF={PE * NF} != N={N})")
+    if KPAD != SF * SIMD:
+        raise ValueError(f"{module_name}: k_pad={KPAD} != SF*SIMD={SF * SIMD}")
 
     def _w(n):                            # bit-width to hold values 0..n-1
         return max(1, (n - 1).bit_length())
+
+    # ---- boundary widths (raw, unpadded; byte-aligned like every ap_fifo port) ----
+    ports = two_operand_ports(p, t, mode)
+    ABR, PBR = ports["a"], ports["p"]
+    APAD = KPAD * AW
+    # B: one raw row (Mode A) / column (Mode B) per beat.
+    if mode == 0:
+        WROW, SLOTS, SUB, SUBW = N, KPAD, NF, PE * WW     # K-pad ROW slots, NF PE-wide sub-beats
+        REAL_SLOTS = K
+        BREG = N * WW
+    else:
+        WROW, SLOTS, SUB, SUBW = K, N, SF, SIMD * WW      # N column slots, SF SIMD-wide sub-beats
+        REAL_SLOTS = N
+        BREG = KPAD * WW
+    BBR = ports["b"]
+    assert WROW == ports["b_elems"]
+    b_pad_bits = BREG - WROW * WW
+    b_wide_expr = (f"b_dout[{WROW * WW - 1}:0]" if b_pad_bits == 0
+                   else f"{{{{{b_pad_bits}{{1'b0}}}}, b_dout[{WROW * WW - 1}:0]}}")
+    a_pad_bits = APAD - K * AW
+    arow_pad_expr = (f"a_dout[{K * AW - 1}:0]" if a_pad_bits == 0
+                     else f"{{{{{a_pad_bits}{{1'b0}}}}, a_dout[{K * AW - 1}:0]}}")
+
     raw_bits = PE * ACCU
-    # pad odat (exactly PE*SIMD*WW bits) up to the byte-aligned MVU weight-port width WB
     odat_pad = WB - PE * SIMD * WW
     w_odat_expr = ("w_odat_raw" if odat_pad == 0
                    else f"{{{odat_pad}'b0, w_odat_raw}}")
     # Two-operand GEMM never has a real bias, but a positive shift still needs the
-    # round-half-up constant folded in (same value on every lane/cycle -> a
-    # literal, not a case).
+    # round-half-up constant folded in (same value on every lane/cycle -> a literal).
     _2op_shift = t["product_frac"] - t["output_frac"]
     _2op_folded = _wpack.fold_requant_constants(None, _2op_shift, PE)
     _2op_consts = [[c] for c in _2op_folded] if _2op_folded else None
+    need_nf_cnt = NF > 1
+    nf_expr = "nf_cnt" if need_nf_cnt else "0"
+    if need_nf_cnt:
+        nf_cnt_decl, nf_cnt_seq = _nf_counter(NF, advance_cond="accept_beat", split=True)
+    else:
+        nf_cnt_decl, nf_cnt_seq = "", ""
     req_decls, req_regs = _requant_lanes(
-        t, PE, [f"out_tdata_raw[{i * ACCU} +: {ACCU}]" for i in range(PE)], _2op_consts, "rq")
-    in_total = M * SF
-    ctrl_decls, ctrl_late, _ = _decoupled_ctrl(in_total, run_total, in_advance="in_tvalid & in_tready",
+        t, PE, [f"out_tdata_raw[{i * ACCU} +: {ACCU}]" for i in range(PE)], _2op_consts, "rq",
+        nf_cnt_expr=nf_expr)
+    # output side: column oc = nf*PE + pe; the last NF phase is driven live.
+    p_din_assign = []
+    orow_latch = []
+    for nf_i in range(NF):
+        for pe_i in range(PE):
+            oc = nf_i * PE + pe_i
+            reg = req_regs[pe_i]
+            live = f"({nf_expr} == {nf_i})" if need_nf_cnt else "1'b1"
+            p_din_assign.append(
+                f"    assign p_din[{oc * outW} +: {outW}] = {live} ? {reg} : orow_reg[{oc * outW} +: {outW}];")
+            if nf_i != NF - 1:
+                orow_latch.append(
+                    f"        if (accept_beat && {nf_expr} == {nf_i}) orow_reg[{oc * outW} +: {outW}] <= {reg};")
+    p_din_assign = "\n".join(p_din_assign)
+    orow_latch = "\n".join(orow_latch)
+    if PBR > N * outW:
+        p_din_assign += f"\n    assign p_din[{PBR - 1}:{N * outW}] = 0;"
+
+    in_total = M          # one raw A row per beat
+    run_total = M         # one raw result row per beat
+    ctrl_decls, ctrl_late, _ = _decoupled_ctrl(in_total, run_total, in_advance="can_load",
                                                out_advance="p_write",
                                                max_inflight=_inflight_for(t, run_total, max_inflight))
+    sf_bits, sub_bits, slot_bits = _w(SF), _w(SUB), _w(SLOTS)
+    pad_slots = SLOTS > REAL_SLOTS
+    load_slot_pad = (f"(slot_cnt >= {REAL_SLOTS})" if pad_slots else "1'b0")
     return f"""// Generated by gemm-ip-gen (mvau target). Two-operand (gemm_stream) shim:
 // A + B both runtime streams; B loaded at runtime into dynamic_load_2op (2-bank
 // ping-pong), replayed across M. MODE={mode} (0=row-major/A, 1=col-major/B).
+// Boundary is UNPADDED (matches hls4ml's own beat widths): a_dout is one raw
+// K={K}*ACTIVATION_WIDTH row/beat (K-padding + the SF={SF}-way SIMD fan-out happen
+// here); b_dout is one raw B {'row (N=' + str(N) + ' wide, K=' + str(K) + ' beats/node)' if mode == 0 else 'column (K=' + str(K) + ' wide, N=' + str(N) + ' beats/node)'}
+// (the wide-to-narrow loader gearbox happens here); p_din is one raw N={N}*out_width
+// row/beat (the NF={NF} beats/vector are stitched here). See generate_two_operand_shim.
 // ap_ctrl: shared _decoupled_ctrl handshake (consecutive nodes overlap, no idle gap).
 // Tile: MW(K)={t['mw']} MH(N)={N} PE={PE} SIMD={SIMD} SF={SF} NF={NF} \
-core={t['compute_core']} ACCU={ACCU} DEPTH={DEPTH} M={M}
+core={t['compute_core']} ACCU={ACCU} DEPTH={NF * SF} M={M}
 // Module name MUST equal the JSON c_function_name (Vitis instantiates by it).
 module {module_name} (
     input  wire                 ap_clk,
@@ -671,17 +745,16 @@ module {module_name} (
     output wire                 ap_done,    // ap_ctrl_chain: held until ap_continue
     output wire                 ap_idle,    // ap_ctrl_chain: no invocation in flight/pending
 
-    // activation FIFO (input)  {AB} = ceil(SIMD*ACTIVATION_WIDTH/8)*8
-    input  wire [{AB - 1}:0] a_dout,
+    // activation FIFO (input)  {ABR} = raw K*ACTIVATION_WIDTH, UNPADDED (one hls4ml row/beat)
+    input  wire [{ABR - 1}:0] a_dout,
     input  wire                 a_empty_n,
     output wire                 a_read,
-    // B FIFO (input)           {BW} = ceil({LANES_RAW}*WEIGHT_WIDTH/8)*8 (dynamic_load_2op's
-    // narrow input beat -- the wide-beat gearbox lives in the HLS feed_b process)
-    input  wire [{BW - 1}:0] b_dout,
+    // B FIFO (input)           {BBR} = raw {'N' if mode == 0 else 'K'}*WEIGHT_WIDTH, UNPADDED (one hls4ml B {'row' if mode == 0 else 'column'}/beat)
+    input  wire [{BBR - 1}:0] b_dout,
     input  wire                 b_empty_n,
     output wire                 b_read,
-    // output FIFO (output)     {PB} = ceil(PE*out_width/8)*8 (post-requant; no bias -- two-operand)
-    output wire [{PB - 1}:0] p_din,
+    // output FIFO (output)     {PBR} = raw N*out_width, UNPADDED (post-requant; no bias -- two-operand)
+    output wire [{PBR - 1}:0] p_din,
     input  wire                 p_full_n,
     output wire                 p_write
 );
@@ -690,24 +763,92 @@ module {module_name} (
 {ctrl_decls}
     // ---- weight loader (runtime-loaded, double-buffered), MVU core, run-phase handshakes ----
     wire                          ld_ivld, ld_irdy;
-    wire [{BW_RAW - 1}:0]         ld_idat = b_dout[{BW_RAW - 1}:0];
+    wire [{SUBW - 1}:0]           ld_idat;
     wire                          w_ovld, w_ordy;
     wire [{PE * SIMD * WW - 1}:0] w_odat_raw;
     wire                          wgt_tvalid, wgt_tready;
     wire                          in_tvalid, in_tready, out_tvalid, out_tready;
     wire [{raw_bits - 1}:0] out_tdata_raw;   // raw PE*ACCU_WIDTH beat straight off the core
 
+    // ---- activation side: buffer one external (unpadded) row, zero-filled to
+    // k_pad={KPAD}, and fan it out to the {SF} SIMD-wide beats the MVU needs, one per cycle.
+    reg  [{APAD - 1}:0] arow_reg;
+    reg                  row_valid = 0;
+    reg  [{max(sf_bits - 1, 0)}:0] sf_cnt = 0;
+    wire [{APAD - 1}:0] arow_pad = {arow_pad_expr};
+    // look ahead to the cycle a row fully drains (its last SIMD slice accepted) so the
+    // next row loads the SAME cycle, back-to-back.
+    wire row_draining = row_valid & in_tready & (sf_cnt == {SF - 1});
+    wire need_load = ~row_valid | row_draining;
+    wire can_load  = ap_ce & in_open & need_load & a_empty_n;
+    assign a_read = can_load;
+    wire [{AB - 1}:0] cur_slice = arow_reg[sf_cnt * {AB} +: {AB}];
+    assign in_tvalid = ap_ce & row_valid;
+
+    // ---- B side gearbox: hold the one arriving wide beat and drain it into the
+    // loader's narrow beat. Slot = one B {'row' if mode == 0 else 'column'} ({SLOTS} per node, {REAL_SLOTS} real + zero pad);
+    // sub-beat = {SUB} per slot ({'NF PE-wide, nf-fast' if mode == 0 else 'SF SIMD-wide, sf-fast'}), matching the loader's writer order.
+    reg  [{BREG - 1}:0] brow_reg = 0;
+    reg                  b_valid = 0;
+    reg  [{max(sub_bits - 1, 0)}:0] sub_cnt = 0;
+    reg  [{max(slot_bits - 1, 0)}:0] slot_cnt = 0;   // the NEXT slot to load (advances on every load)
+    wire [{BREG - 1}:0] b_wide = {b_wide_expr};
+    wire sub_draining = b_valid & ld_irdy & (sub_cnt == {SUB - 1});
+    wire need_bload = ~b_valid | sub_draining;
+    wire load_is_pad = {load_slot_pad};
+    // a pad slot needs no stream beat; a real slot needs b_empty_n
+    wire can_bload = ap_ce & need_bload & (load_is_pad | b_empty_n);
+    assign b_read  = can_bload & ~load_is_pad;
+    assign ld_ivld = ap_ce & b_valid;
+    assign ld_idat = brow_reg[sub_cnt * {SUBW} +: {SUBW}];
+
+    always @(posedge ap_clk) begin
+        if (ap_rst) begin
+            b_valid <= 0; sub_cnt <= 0; slot_cnt <= 0; brow_reg <= 0;
+        end else if (ap_ce) begin
+            if (can_bload) begin
+                brow_reg <= load_is_pad ? {BREG}'d0 : b_wide;
+                b_valid <= 1'b1; sub_cnt <= 0;
+                slot_cnt <= (slot_cnt == {SLOTS - 1}) ? {slot_bits}'d0 : slot_cnt + 1'b1;
+            end else if (b_valid & ld_irdy) begin
+                if (sub_cnt == {SUB - 1}) begin b_valid <= 0; sub_cnt <= 0; end
+                else sub_cnt <= sub_cnt + 1'b1;
+            end
+        end
+    end
+
+    // nf_cnt (0..{NF - 1}, advancing on accept_beat): which of the NF beats/vector is on
+    // the wire this cycle (output stitching).
+{nf_cnt_decl}    assign out_tready = ap_ce & (({nf_expr} != {NF - 1}) | p_full_n);
+    wire accept_beat = ap_ce & out_tvalid & out_tready;
+    assign p_write = accept_beat & ({nf_expr} == {NF - 1});   // one row/beat, unpadded
+{nf_cnt_seq}
     // per-lane requantize stage (no bias -- two-operand GEMM never has one): shift +
     // round-half-up + wrap to out_width
 {req_decls}
-    assign p_din = {{{', '.join(reversed(req_regs))}}};
+    // output accumulator: latch every phase but the last (driven live) into p_din.
+    reg [{N * outW - 1}:0] orow_reg;
+    always @(posedge ap_clk) begin
+        if (accept_beat) begin
+{orow_latch if orow_latch else "            // NF == 1: every column is driven live, nothing to latch"}
+        end
+    end
+{p_din_assign}
 
 {ctrl_late}
-    // b handshake: dynamic_load_2op accepts B beats whenever it has room (its own
-    // writer FSM/guard, not gated by ap_ctrl -- filling ahead of a node's RUN phase
-    // is safe by construction and simply a side effect of always-open b_read).
-    assign ld_ivld = ap_ce & b_empty_n;
-    assign b_read  = ld_ivld & ld_irdy;
+    // activation row buffer sequencing
+    always @(posedge ap_clk) begin
+        if (ap_rst) begin
+            row_valid <= 0; sf_cnt <= 0;
+        end else if (ap_ce) begin
+            if (can_load) begin
+                arow_reg <= arow_pad; row_valid <= 1'b1; sf_cnt <= 0;
+            end else if (row_valid & in_tready) begin
+                if (sf_cnt == {SF - 1}) begin row_valid <= 0; sf_cnt <= 0; end
+                else sf_cnt <= sf_cnt + 1'b1;
+            end
+        end
+    end
 
     dynamic_load_2op #(
         .PE({PE}), .SIMD({SIMD}), .WEIGHT_WIDTH({WW}),
@@ -719,18 +860,13 @@ module {module_name} (
         .ovld(w_ovld), .ordy(w_ordy), .odat(w_odat_raw)
     );
 
-    // RUN-phase AXIS binding. A side: the decoupled handshake's in_open. Weight side:
-    // open while a node is being admitted OR is admitted and not yet drained -- with
-    // NF>1 the core pulls NF weight words after each accepted activation, so gating on
-    // in_open alone starves the last activation's tail (in_open drops at MAX_INFLIGHT)
-    // and hangs. Never open with no node started. B loading (b_read) stays un-gated.
+    // RUN-phase AXIS binding. Weight side: open while a node is being admitted OR is
+    // admitted and not yet drained -- with NF>1 the core pulls NF weight words after
+    // each accepted activation, so gating on in_open alone starves the last
+    // activation's tail (in_open drops at MAX_INFLIGHT) and hangs.
     wire wgt_open = in_open | (inflight != 0);
     assign wgt_tvalid = ap_ce & wgt_open & w_ovld;
     assign w_ordy     = ap_ce & wgt_open & wgt_tready;
-    assign in_tvalid  = ap_ce & in_open & a_empty_n;
-    assign a_read     = ap_ce & in_open & in_tready;
-    assign out_tready = ap_ce & p_full_n;
-    assign p_write    = ap_ce & out_tvalid & p_full_n;   // count only real transfers
 
     mvu_vvu_axi #(
         .IS_MVU({t['is_mvu']}),
@@ -747,7 +883,7 @@ module {module_name} (
         .s_axis_weights_tdata({w_odat_expr}),
         .s_axis_weights_tvalid(wgt_tvalid),
         .s_axis_weights_tready(wgt_tready),
-        .s_axis_input_tdata(a_dout),
+        .s_axis_input_tdata(cur_slice),
         .s_axis_input_tvalid(in_tvalid),
         .s_axis_input_tready(in_tready),
         .m_axis_output_tdata(out_tdata_raw),
@@ -756,9 +892,6 @@ module {module_name} (
     );
 endmodule
 """
-
-
-
 
 
 def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_tiles, m,
