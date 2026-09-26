@@ -188,15 +188,22 @@ static void drain_c(hls::stream<ap_uint<{PB}> >& in, hls::stream<ap_uint<{PB}> >
 
 def _call_performance(t, m, load_beats=0):
     """``rtl_performance`` for the blackbox JSON, in the units Vitis reads them:
-    per INVOCATION of the function, i.e. per node of ``m`` rows. ``II`` is the
-    node interval -- the ports' per-row cadence ``SF*NF`` times the rows, or, for a
-    two-operand node, the B load beats if those take longer (``load_beats``);
-    ``latency`` is first row in to last row out: the row-port latency plus the
-    remaining rows at the per-row cadence. Per-row values stay in the manifest as
+    per INVOCATION of the function, i.e. per node of ``m`` rows. These are
+    scheduling hints for Vitis only; measured results come from cosim and Vivado.
+
+    ``II`` is the node interval: the ports' per-row cadence ``SF*NF`` times the
+    rows, or, for a two-operand node, the B load beats if those take longer
+    (``load_beats``, one B row / column per beat; the next node's B loads into
+    the loader's spare bank while this node computes).
+
+    ``latency`` is first input beat in to last row out. For a two-operand node the
+    first A row is not admitted to the core until the whole B bank is written,
+    so the load beats come first; then the row-port latency, then the remaining
+    rows at the per-row cadence. Per-row values stay in the manifest as
     ``ii_per_row`` / ``port_latency``."""
     ii_row = int(t["ii_per_row"])
     ii_call = max(int(m) * ii_row, int(load_beats))
-    latency = int(t["port_latency"]) + (int(m) - 1) * ii_row
+    latency = int(load_beats) + int(t["port_latency"]) + (int(m) - 1) * ii_row
     return {"latency": str(latency), "II": str(ii_call)}
 
 
@@ -440,8 +447,9 @@ def _2op_blackbox_json(name, plan, resources=None):
     t = plan["tile"]
     m = plan["num_input_vectors"]
     mode = plan.get("mode", 0)
-    # loader beats per node: one narrow sub-beat per cycle (see generate_two_operand_shim)
-    load_beats = plan["k_pad"] * t["nf"] if mode == 0 else plan["n"] * t["sf"]
+    # loader beats per node: one whole B row (mode 0) / column (mode 1) per cycle,
+    # no narrow sub-beat gearbox (see generate_two_operand_shim / dynamic_load_2op.sv)
+    load_beats = plan["k_pad"] if mode == 0 else plan["n"]
     fn = public_fn(name)
     res = resources or {"dsp": t["dsp_estimate"], "bram18": 0}
     dsp, bram = int(res["dsp"]), int(res.get("bram18", 0))
@@ -468,10 +476,10 @@ def _2op_blackbox_json(name, plan, resources=None):
             "ap_ctrl_chain_protocol_continue": "ap_continue",
         },
         # Per invocation (one node of m rows), the unit Vitis reads. II is the node
-        # interval: m*SF*NF of compute, or the B load beats (k_pad*NF row-major, n*SF
-        # col-major -- the loader takes one narrow beat per cycle) when those take
-        # longer. Latency is first row in -> last row out with B resident; the first
-        # node of a run additionally waits for its whole B load.
+        # interval: m*SF*NF of compute, or the B load beats (k_pad row-major, n
+        # col-major -- the loader takes one whole B row/column per cycle) when those
+        # take longer. Latency is first row in -> last row out with B resident; the
+        # first node of a run additionally waits for its whole B load.
         "rtl_performance": _call_performance(t, m, load_beats=load_beats),
         "_comment": "latency/II are per invocation (one node of m rows): compute m*SF*NF "
                     "or the B load beats, whichever is larger. DSP: FINN cost model "

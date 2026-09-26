@@ -4,23 +4,38 @@
  * dynamic weight loader: two storage/streaming layout modes, chosen so feed_b
  * never needs more than a single arriving wide beat (no reorder buffer).
  *
- * MODE=0 ("row_major", Mode A): identical organization to the original
- *   dynamic_load -- SIMD parallel physical RAMs (one per SIMD lane), each RAM
- *   word PE-wide. Input beat (idat) is PE-wide; writer fills one SIMD lane
- *   per beat (curr_lane == curr_simd, SIMD*N_TLS beats total).
+ * ONE FULL B ROW/COLUMN PER BEAT: unlike the original dynamic_load (and this
+ * module's earlier revision), the writer never sub-divides an arriving B beat
+ * -- ``idat`` carries an ENTIRE B row (Mode A) or column (Mode B) at once, and
+ * the writer commits it to every relevant RAM group in the same cycle.  This
+ * cuts the load-side beat count from k_pad*NF (Mode A) / n*SF (Mode B) down
+ * to k_pad / n -- the aV node of an attention layer, for example, used to be
+ * load-bound (load cost == compute cost); now the load finishes in a small
+ * fraction of the compute time.
  *
- * MODE=1 ("col_major", Mode B): the transpose -- PE parallel physical RAMs
- *   (one per PE lane), each RAM word SIMD-wide. Input beat (idat) is
- *   SIMD-wide; writer fills one PE lane per beat (curr_lane == curr_pe,
- *   PE*N_TLS beats total).
+ * MODE=0 ("row_major", Mode A): storage is NF groups of SIMD physical RAMs,
+ *   each RAM word PE-wide, depth SF (address = sf). idat is the whole row:
+ *   NF*PE elements, arranged idat[nf][pe] (element index nf*PE+pe, matching
+ *   hls4ml's own row-major element order -- see generate_two_operand_shim's
+ *   b_wide). A row arriving at lane=simd, address=sf writes slice nf into
+ *   group nf's RAM at [lane][sf], for every nf in the same cycle. The writer
+ *   counter nest is lane (=simd) fastest, sf slowest -- no nf counter at all.
+ *
+ * MODE=1 ("col_major", Mode B): the mirror -- storage is SF groups of PE
+ *   physical RAMs, each RAM word SIMD-wide, depth NF (address = nf). idat is
+ *   the whole column: SF*SIMD elements, arranged idat[sf][simd] (element
+ *   index sf*SIMD+simd). A column arriving at lane=pe, address=nf writes
+ *   slice sf into group sf's RAM at [lane][nf], for every sf in the same
+ *   cycle. Writer counter nest is lane (=pe) fastest, nf slowest -- no sf
+ *   counter.
  *
  * Both modes produce the identical output word odat[PE-1:0][SIMD-1:0]
- * [WEIGHT_WIDTH-1:0] and identical replay semantics (N_TLS distinct words
- * replayed N_REPS times each, 2-bank ping-pong double buffering). The writer
- * FSM/counter structure and the reader overtake guard are shared verbatim
- * between modes by parameterizing on LANES (= SIMD for Mode A, PE for Mode
- * B) instead of hardcoding SIMD; only the physical RAM shape/count and the
- * write-address-to-RAM mapping differ per mode (generate-selected).
+ * [WEIGHT_WIDTH-1:0] and identical replay semantics (N_TLS = SF*NF distinct
+ * words replayed N_REPS times each, 2-bank ping-pong double buffering). The
+ * reader's consumption counter (cons_sfnf, nf-slow/sf-fast) and the 2-bank
+ * handshake (ST_WR_*_WAIT vs state_rd) are unchanged from the original
+ * dynamic_load; only the write-side counter/RAM-group structure and the
+ * overtake guard were reworked for the one-beat-per-row/column write.
  *****************************************************************************/
 
 `timescale 1ns/1ps
@@ -40,9 +55,9 @@ module dynamic_load_2op #(
 
     input   logic  ivld,
     output  logic  irdy,
-    // Mode A: PE-wide input beat (one SIMD lane per beat).
-    // Mode B: SIMD-wide input beat (one PE lane per beat).
-    input   logic  [(MODE == 0 ? PE : SIMD)-1:0][WEIGHT_WIDTH-1:0] idat,
+    // Mode A: one whole B row per beat, idat[nf][pe] (NF*PE elements).
+    // Mode B: one whole B column per beat, idat[sf][simd] (SF*SIMD elements).
+    input   logic  [(MODE == 0 ? MH/PE : MW/SIMD)-1:0][(MODE == 0 ? PE : SIMD)-1:0][WEIGHT_WIDTH-1:0] idat,
 
     output  logic  ovld,
     input   logic  ordy,
@@ -57,22 +72,27 @@ localparam int unsigned  SF = MW/SIMD;
 localparam int unsigned  NF = MH/PE;
 localparam int unsigned  N_TLS = SF*NF;
 
-// LANES: number of physical RAM banks per ping-pong bank, and the range of
-// the innermost writer serial-fill counter (curr_lane).
-//   Mode A (MODE==0): LANES = SIMD (one physical RAM per SIMD lane, PE-wide word)
-//   Mode B (MODE==1): LANES = PE   (one physical RAM per PE lane,   SIMD-wide word)
-localparam int unsigned  LANES = (MODE == 0) ? SIMD : PE;
-// WORDW: per-RAM word width in elements (the "other" dimension from LANES).
-localparam int unsigned  WORDW = (MODE == 0) ? PE : SIMD;
+// GROUPS: number of parallel RAM groups (one full set of LANES RAMs per group).
+//   Mode A (MODE==0): GROUPS = NF (one group per output-fold slice of the row)
+//   Mode B (MODE==1): GROUPS = SF (one group per K-fold slice of the column)
+// LANES: writer's fast (innermost) counter range == the RAM count per group.
+//   Mode A: LANES = SIMD (one physical RAM per SIMD lane, PE-wide word)
+//   Mode B: LANES = PE   (one physical RAM per PE lane,   SIMD-wide word)
+// DEPTH: per-RAM depth == the writer's slow (outermost) counter range.
+//   Mode A: DEPTH = SF (address = sf)
+//   Mode B: DEPTH = NF (address = nf)
+localparam int unsigned  GROUPS = (MODE == 0) ? NF : SF;
+localparam int unsigned  LANES  = (MODE == 0) ? SIMD : PE;
+localparam int unsigned  WORDW  = (MODE == 0) ? PE : SIMD;   // per-RAM word width in elements
+localparam int unsigned  DEPTH  = (MODE == 0) ? SF : NF;
 
 localparam int unsigned LANES_BITS = (LANES == 1) ? 1 : $clog2(LANES);
-localparam int unsigned WGT_ADDR_BITS = (N_TLS == 1) ? 1 : $clog2(N_TLS);
+localparam int unsigned DEPTH_BITS = (DEPTH == 1) ? 1 : $clog2(DEPTH);
+localparam int unsigned GROUPS_BITS = (GROUPS == 1) ? 1 : $clog2(GROUPS);
 localparam int unsigned NF_BITS = (NF == 1) ? 1 : $clog2(NF);
 localparam int unsigned SF_BITS = (SF == 1) ? 1 : $clog2(SF);
 localparam int unsigned N_TLS_BITS = (N_TLS == 1) ? 1 : $clog2(N_TLS);
 localparam int unsigned N_REPS_BITS = (N_REPS == 1) ? 1 : $clog2(N_REPS);
-
-logic [NF-1:0][WGT_ADDR_BITS-1:0] offsets;
 
 typedef enum logic[1:0]  {ST_WR_0, ST_WR_0_WAIT, ST_WR_1, ST_WR_1_WAIT} state_wr_t;
 typedef enum logic  {ST_RD_0, ST_RD_1} state_rd_t;
@@ -80,56 +100,36 @@ typedef enum logic  {ST_RD_0, ST_RD_1} state_rd_t;
 // ----------------------------------------------------------------------------
 // Writer
 //
-// Mode A (MODE==0, row-major): curr_nf innermost, then curr_lane (=curr_simd),
-// then curr_sf outermost/slowest -- matches row-major B arrival (a full N-wide
-// row per beat; the whole row = all nf at fixed sf).
-//
-// Mode B (MODE==1, col-major): TRANSPOSED nesting -- curr_sf innermost, then
-// curr_lane (=curr_pe), then curr_nf outermost/slowest -- matches col-major B
-// arrival (a full K-wide column per beat; the whole column = all sf at fixed
-// nf). This is the true mirror of Mode A, required so feed_b only ever needs
-// to hold the single arriving column (no reorder buffer): the Mode B writer
-// counter nesting is transposed (sf fastest, lane middle, nf slowest) to
-// mirror Mode A, so feed_b's natural per-column split matches consumption
-// order.
-//
-// Write address = offsets[nf] + sf = nf*SF + sf in BOTH modes (unchanged);
-// one lane (a_we[bank][curr_lane]) written per beat with the full WORDW-wide
-// idat.
+// One whole row (Mode A) / column (Mode B) arrives per beat and is committed
+// to every GROUP's RAM in the same cycle -- there is no per-group counter at
+// all; only LANES (fast) and DEPTH (slow) advance, LANES*DEPTH beats total
+// (== k_pad in Mode A, == n in Mode B).
 // ----------------------------------------------------------------------------
 
 // -- Regs
 state_wr_t state_wr_C = ST_WR_0, state_wr_N;
 state_rd_t state_rd_C = ST_RD_0, state_rd_N;
 
-logic[NF_BITS-1:0] curr_nf_C = '0, curr_nf_N;
-logic[N_TLS_BITS-1:0] curr_sf_C = '0, curr_sf_N;
 logic[LANES_BITS-1:0] curr_lane_C = '0, curr_lane_N;
+logic[DEPTH_BITS-1:0] curr_addr_C = '0, curr_addr_N;
 
 // -- Signals
 logic [1:0][LANES-1:0] a_we;
-logic [1:0][WGT_ADDR_BITS-1:0] a_addr;
-
-// -- Offsets
-for(genvar i = 0; i < NF; i++) begin
-    assign offsets[i] = i * SF;
-end
+logic [1:0][DEPTH_BITS-1:0] a_addr;
 
 // -- REG
 always_ff @( posedge ap_clk ) begin : REG_PROC_WR
     if(~ap_rst_n) begin
         state_wr_C <= ST_WR_0;
 
-        curr_nf_C <= 0;
-        curr_sf_C <= 0;
         curr_lane_C <= 0;
+        curr_addr_C <= 0;
     end
     else begin
         state_wr_C <= state_wr_N;
 
-        curr_nf_C <= curr_nf_N;
-        curr_sf_C <= curr_sf_N;
         curr_lane_C <= curr_lane_N;
+        curr_addr_C <= curr_addr_N;
     end
 end
 
@@ -139,7 +139,7 @@ always_comb begin : NSL_PROC_WR
 
     unique case (state_wr_C)
         ST_WR_0:
-            if ((curr_lane_C == LANES - 1) && (curr_sf_C == SF - 1) && (curr_nf_C == NF - 1) && ivld) begin
+            if ((curr_lane_C == LANES - 1) && (curr_addr_C == DEPTH - 1) && ivld) begin
                 state_wr_N = (state_rd_C == ST_RD_0) ? ST_WR_1 : ST_WR_0_WAIT;
             end
 
@@ -147,7 +147,7 @@ always_comb begin : NSL_PROC_WR
             state_wr_N = (state_rd_C == ST_RD_0) ? ST_WR_1 : ST_WR_0_WAIT;
 
         ST_WR_1:
-            if ((curr_lane_C == LANES - 1) && (curr_sf_C == SF - 1) && (curr_nf_C == NF - 1) && ivld) begin
+            if ((curr_lane_C == LANES - 1) && (curr_addr_C == DEPTH - 1) && ivld) begin
                 state_wr_N = (state_rd_C == ST_RD_1) ? ST_WR_0 : ST_WR_1_WAIT;
             end
 
@@ -159,9 +159,8 @@ end
 
 // -- DP
 always_comb begin : DP_PROC_WR
-    curr_nf_N = curr_nf_C;
-    curr_sf_N = curr_sf_C;
     curr_lane_N = curr_lane_C;
+    curr_addr_N = curr_addr_C;
 
     // Input
     irdy = 1'b0;
@@ -169,7 +168,7 @@ always_comb begin : DP_PROC_WR
     // Buffers
     a_we = '0;
     for(int i = 0; i < 2; i++)
-        a_addr[i] = offsets[curr_nf_C] + curr_sf_C;
+        a_addr[i] = curr_addr_C;
 
     // Write and count
     case (state_wr_C)
@@ -179,18 +178,8 @@ always_comb begin : DP_PROC_WR
             if(ivld) begin
                 a_we[state_wr_C == ST_WR_1][curr_lane_C] = 1;
 
-                if (MODE == 0) begin
-                    // Mode A: nf fastest, lane middle, sf slowest.
-                    curr_nf_N   = (curr_nf_C == NF-1) ? 0 : curr_nf_C + 1;
-                    curr_lane_N = (curr_nf_C == NF-1) ? ((curr_lane_C == LANES-1) ? 0 : curr_lane_C + 1) : curr_lane_C;
-                    curr_sf_N   = (curr_nf_C == NF-1) ? ((curr_lane_C == LANES-1) ? ((curr_sf_C == SF-1) ? 0 : curr_sf_C + 1) : curr_sf_C) : curr_sf_C;
-                end
-                else begin
-                    // Mode B: sf fastest, lane middle, nf slowest (transposed).
-                    curr_sf_N   = (curr_sf_C == SF-1) ? 0 : curr_sf_C + 1;
-                    curr_lane_N = (curr_sf_C == SF-1) ? ((curr_lane_C == LANES-1) ? 0 : curr_lane_C + 1) : curr_lane_C;
-                    curr_nf_N   = (curr_sf_C == SF-1) ? ((curr_lane_C == LANES-1) ? ((curr_nf_C == NF-1) ? 0 : curr_nf_C + 1) : curr_nf_C) : curr_nf_C;
-                end
+                curr_lane_N = (curr_lane_C == LANES-1) ? 0 : curr_lane_C + 1;
+                curr_addr_N = (curr_lane_C == LANES-1) ? ((curr_addr_C == DEPTH-1) ? 0 : curr_addr_C + 1) : curr_addr_C;
             end
         end
     endcase
@@ -200,44 +189,40 @@ end
 // ----------------------------------------------------------------------------
 // Reader
 //
-// Overtake guard, re-derived per mode (the writer's *slow* (outermost) phase
-// differs between modes, so the counter that bounds safe early-reads differs
-// too):
+// cons_sfnf (0..N_TLS-1, nf-slow/sf-fast) is unchanged from the original
+// dynamic_load; it is decomposed into cons_nf = cons_sfnf/SF and
+// cons_sf = cons_sfnf%SF so it can address the split (group, depth-address)
+// RAM organization above:
+//   Mode A: RAM address = cons_sf (into every group's depth-SF RAM);
+//            selected group = cons_nf.
+//   Mode B: RAM address = cons_nf (into every group's depth-NF RAM);
+//            selected group = cons_sf.
 //
-// Mode A: sf is the slow phase. `curr_sf_C > cons_sfnf_C` is safe/correct for
-// the low address range (address < SF, i.e. the nf=0 block, where
-// cons_sfnf_C IS the sf-component of the address) because a full sf pass
-// writes every nf at that sf across all lanes before sf advances -- this is
-// the original dynamic_load guard, unchanged.
-//
-// Mode B: nf is now the slow phase, but -- unlike Mode A's sf-slow/nf-fast
-// nesting, where a fixed sf's *inner* nf sweep covers every nf for every
-// lane within one sf tick -- Mode B's nesting is nf-slow/lane-mid/sf-fast:
-// for a fixed nf, each lane pass sweeps *all* sf again, so a given address
-// (nf,sf) only receives its final (all-LANES) write partway through the
-// *last* lane's sweep for that nf, not linearly across the whole nf block.
-// So the address must be decomposed (cons_nf = cons_sfnf_C/SF, cons_sf =
-// cons_sfnf_C%SF) and the guard is:
-//   - safe once the writer has moved past this address's nf entirely
-//     (curr_nf_C > cons_nf), OR
-//   - the writer is still on this nf but on its LAST lane pass
-//     (curr_lane_C == LANES-1) and has advanced sf past this address's sf
-//     (curr_sf_C > cons_sf).
+// Overtake guard: since the writer no longer has a per-group counter, an
+// address is simply safe once the writer's single slow counter (curr_addr,
+// which IS the RAM address dimension in both modes) has passed the address
+// being read:
+//   Mode A: curr_addr_C (=sf) > cons_sf
+//   Mode B: curr_addr_C (=nf) > cons_nf
 // ----------------------------------------------------------------------------
 
+logic [NF_BITS-1:0] cons_nf;
+logic [SF_BITS-1:0] cons_sf;
+
 logic guard_ok;
+logic [DEPTH_BITS-1:0] b_addr_sel;
+logic [GROUPS_BITS-1:0] sel_grp;
 generate
-if (MODE == 0) begin : genGuardA
-    assign guard_ok = curr_sf_C > cons_sfnf_C;
-end : genGuardA
-else begin : genGuardB
-    logic [NF_BITS-1:0] cons_nf;
-    logic [SF_BITS-1:0] cons_sf;
-    assign cons_nf = cons_sfnf_C / SF;
-    assign cons_sf = cons_sfnf_C % SF;
-    assign guard_ok = (curr_nf_C > cons_nf) ||
-        ((curr_nf_C == cons_nf) && (curr_lane_C == LANES-1) && (curr_sf_C > cons_sf));
-end : genGuardB
+if (MODE == 0) begin : genModeSelA
+    assign b_addr_sel = cons_sf;
+    assign sel_grp = cons_nf;
+    assign guard_ok = curr_addr_C > cons_sf;
+end : genModeSelA
+else begin : genModeSelB
+    assign b_addr_sel = cons_nf;
+    assign sel_grp = cons_sf;
+    assign guard_ok = curr_addr_C > cons_nf;
+end : genModeSelB
 endgenerate
 
 // -- Regs
@@ -250,8 +235,12 @@ logic [1:0] vld_s1_C = '0, vld_s1_N;
 logic vld_C = '0, vld_N;
 logic [PE-1:0][SIMD-1:0][WEIGHT_WIDTH-1:0] odat_C = '0, odat_N;
 
+assign cons_nf = cons_sfnf_C / SF;
+assign cons_sf = cons_sfnf_C % SF;
+
 // -- Signals
-logic [1:0][WGT_ADDR_BITS-1:0] b_addr;
+logic [1:0][DEPTH_BITS-1:0] b_addr;
+logic [1:0][GROUPS_BITS-1:0] grp_sel_C = '0, grp_sel_N;
 logic [1:0][PE-1:0][SIMD-1:0][WEIGHT_WIDTH-1:0] odat_ram;
 
 // -- REG
@@ -266,6 +255,8 @@ always_ff @( posedge ap_clk ) begin : REG_PROC_RD
         vld_s1_C <= 0;
         vld_C <= 0;
         odat_C <= 0;
+
+        grp_sel_C <= '0;
     end
     else begin
         state_rd_C <= state_rd_N;
@@ -277,6 +268,8 @@ always_ff @( posedge ap_clk ) begin : REG_PROC_RD
         vld_s1_C <= vld_s1_N;
         vld_C <= vld_N;
         odat_C <= odat_N;
+
+        grp_sel_C <= grp_sel_N;
     end
 end
 
@@ -316,14 +309,22 @@ always_comb begin : DP_PROC_RD
     odat_N = ordy ? (vld_s1_C[0] ? odat_ram[0] : odat_ram[1]) : odat_C;
 
     for(int i = 0; i < 2; i++) begin
-        b_addr[i] = cons_sfnf_C;
+        b_addr[i] = b_addr_sel;
     end
+
+    // grp_sel tracks b_addr through the same 1-cycle "issued this cycle" timing
+    // (both are combinationally derived from cons_sfnf_C); it feeds the RAM
+    // read's group mux with the matching pipeline delay -- see the RAM block
+    // below, where grp_sel_C (its PRE-edge/old value, read on the same edge
+    // that samples Ram[b_addr] into RdReg) selects RdReg's old content.
+    grp_sel_N = grp_sel_C;
 
     case(state_rd_C)
         ST_RD_0: begin
             if(ordy) begin
                 if((state_wr_C == ST_WR_0) ? (guard_ok) : 1'b1) begin
                     vld_s0_N[0] = 1'b1;
+                    grp_sel_N[0] = sel_grp;
 
                     cons_sfnf_N = (cons_sfnf_C == N_TLS-1) ? 0 : cons_sfnf_C + 1;
                     cons_r_N = (cons_sfnf_C == N_TLS-1) ? ((cons_r_C == N_REPS-1) ? 0 : cons_r_C + 1) : cons_r_C;
@@ -336,6 +337,7 @@ always_comb begin : DP_PROC_RD
                 if((state_wr_C == ST_WR_1) ? (guard_ok) : 1'b1) begin
 
                     vld_s0_N[1] = 1'b1;
+                    grp_sel_N[1] = sel_grp;
 
                     cons_sfnf_N = (cons_sfnf_C == N_TLS-1) ? 0 : cons_sfnf_C + 1;
                     cons_r_N = (cons_sfnf_C == N_TLS-1) ? ((cons_r_C == N_REPS-1) ? 0 : cons_r_C + 1) : cons_r_C;
@@ -353,48 +355,43 @@ assign odat = odat_C;
 // ----------------------------------------------------------------------------
 // Weight RAMs
 //
-// Mode A (MODE==0): SIMD physical RAMs per bank (genSimd), each word
-//   PE-wide -- identical layout/shape to the original dynamic_load.
-// Mode B (MODE==1): PE physical RAMs per bank (genPe), each word SIMD-wide
-//   -- the transpose. Either way, odat_ram[bank][pe][simd] ends up populated
-//   identically for the shared reader logic above.
+// GROUPS x LANES physical RAMs per bank, each WORDW elements wide, depth
+// DEPTH. Every group is read at the same address (b_addr) every cycle; the
+// group actually feeding odat_ram is chosen by grp_sel_C, registered in
+// lockstep with RdReg (both updated only when ordy) so the group index
+// applied when RdReg's OLD (nonblocking pre-edge) content is copied into
+// odat_ram is the one that was in effect when THAT content was fetched from
+// Ram, one cycle earlier -- i.e. the same read-latency pipeline as the
+// original dynamic_load, just with an extra group dimension muxed in.
+//
+// Mode A (MODE==0): NF groups x SIMD lanes, each RAM PE-wide -- identical
+//   physical shape to the original dynamic_load's SIMD RAMs, just split into
+//   NF independent depth-SF copies instead of one depth-SF*NF RAM.
+// Mode B (MODE==1): SF groups x PE lanes, each RAM SIMD-wide -- the
+//   transpose, split into SF independent depth-NF copies.
 // ----------------------------------------------------------------------------
 
 generate
-if (MODE == 0) begin : genModeA
-    for(genvar i = 0; i < 2; i++) begin : genBank
-        for(genvar k = 0; k < SIMD; k++) begin : genSimd
-            (* RAM_STYLE = RAM_STYLE *)
-            logic [PE-1:0][WEIGHT_WIDTH-1:0]  Ram[2**WGT_ADDR_BITS];
-            logic [PE-1:0][WEIGHT_WIDTH-1:0]  RdReg;
+for(genvar i = 0; i < 2; i++) begin : genBank
+    for(genvar k = 0; k < LANES; k++) begin : genLane
+        (* RAM_STYLE = RAM_STYLE *)
+        logic [WORDW-1:0][WEIGHT_WIDTH-1:0]  Ram[GROUPS][2**DEPTH_BITS];
+        logic [GROUPS-1:0][WORDW-1:0][WEIGHT_WIDTH-1:0]  RdReg;
 
-            always_ff @(posedge ap_clk) begin
-                if(a_we[i][k])  Ram[a_addr[i]] <= idat;
-                if(ordy) begin
-                    RdReg <= Ram[b_addr[i]];
-                    foreach(RdReg[p])  odat_ram[i][p][k] <= RdReg[p];
-                end
+        always_ff @(posedge ap_clk) begin
+            if(a_we[i][k]) begin
+                for(int g = 0; g < GROUPS; g++)
+                    Ram[g][a_addr[i]] <= idat[g];
             end
-        end : genSimd
-    end : genBank
-end : genModeA
-else begin : genModeB
-    for(genvar i = 0; i < 2; i++) begin : genBank
-        for(genvar k = 0; k < PE; k++) begin : genPe
-            (* RAM_STYLE = RAM_STYLE *)
-            logic [SIMD-1:0][WEIGHT_WIDTH-1:0]  Ram[2**WGT_ADDR_BITS];
-            logic [SIMD-1:0][WEIGHT_WIDTH-1:0]  RdReg;
-
-            always_ff @(posedge ap_clk) begin
-                if(a_we[i][k])  Ram[a_addr[i]] <= idat;
-                if(ordy) begin
-                    RdReg <= Ram[b_addr[i]];
-                    foreach(RdReg[s])  odat_ram[i][k][s] <= RdReg[s];
-                end
+            if(ordy) begin
+                for(int g = 0; g < GROUPS; g++)
+                    RdReg[g] <= Ram[g][b_addr[i]];
+                for(int p = 0; p < WORDW; p++)
+                    odat_ram[i][ (MODE == 0) ? p : k ][ (MODE == 0) ? k : p ] <= RdReg[grp_sel_C[i]][p];
             end
-        end : genPe
-    end : genBank
-end : genModeB
+        end
+    end : genLane
+end : genBank
 endgenerate
 
 endmodule : dynamic_load_2op

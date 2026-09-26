@@ -23,6 +23,19 @@ _WS_CASE_PARAMS = {
     "d_ktiled_ws": ((2, 16, 4), dict(pe=4, simd=4, k_tiles=2)),
 }
 
+# Same idea for the two-operand (dynamic_load_2op) cases: the bound also has to
+# account for the loader's own beats/node (k_pad row-major / n col-major, one
+# whole B row/column per cycle -- see generate_two_operand_shim), since a node
+# can't finish before its B is fully loaded.
+_2OP_CASE_PARAMS = {
+    "e_2op_register": ((2, 4, 4), 0, dict(pe=4, simd=4)),
+    "e2_2op_register_col_major": ((2, 4, 4), 1, dict(pe=4, simd=4)),
+    "f_2op_memstream": ((2, 8, 4), 0, dict(pe=4, simd=4)),
+    "h_2op_col_major_memstream": ((2, 8, 4), 1, dict(pe=4, simd=4)),
+    "w_2op_nf2_row_major_av": ((8, 8, 16), 0, dict(pe=8, simd=8)),
+    "x_2op_sf2_col_major_qk": ((8, 16, 8), 1, dict(pe=4, simd=16)),
+}
+
 
 @pytest.fixture(scope="module")
 def xsim_env():
@@ -59,3 +72,27 @@ def test_mvau_rtl_ws_steady_state_interval(xsim_env, case_name):
     assert interval <= bound, (
         f"{case_name}: steady-state per-node interval {interval} exceeds "
         f"M*SF*NF+2={bound} (gaps={detail['cycles']['steady_state_gaps']})")
+
+
+@pytest.mark.parametrize("case_name", list(_2OP_CASE_PARAMS))
+def test_mvau_rtl_2op_steady_state_interval(xsim_env, case_name):
+    """Mirrors test_mvau_rtl_ws_steady_state_interval for the two-operand
+    (dynamic_load_2op) shim: with backpressure off, the steady-state per-node
+    interval should be at most max(M*SF*NF, load_beats) + 2, where load_beats
+    is the loader's beats/node (k_pad row-major / n col-major -- one whole B
+    row/column per cycle, not the old k_pad*NF / n*SF narrow-sub-beat cost)."""
+    shape, mode, plan_kw = _2OP_CASE_PARAMS[case_name]
+    plan = _rt._find_case_plan(shape, **plan_kw)
+    t = plan["tile"]
+    m, sf, nf = shape[0], t["sf"], t["nf"]
+    load_beats = plan["k_pad"] if mode == 0 else plan["n"]
+    bound = max(m * sf * nf, load_beats) + 2
+
+    ok, detail = _rt.run_case(case_name, seed=1, keep=False, env=xsim_env, backpressure=False)
+    assert ok, f"{case_name}: {detail.get('result_line', detail.get('log', ''))[-2000:]}"
+    interval = detail["cycles"]["steady_state_interval"]
+    print(f"{case_name}: M={m} SF={sf} NF={nf} load_beats={load_beats} "
+          f"steady_state_interval={interval} bound={bound}")
+    assert interval <= bound, (
+        f"{case_name}: steady-state per-node interval {interval} exceeds "
+        f"max(M*SF*NF, load_beats)+2={bound} (gaps={detail['cycles']['steady_state_gaps']})")

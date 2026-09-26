@@ -247,6 +247,16 @@ CASES = {
     "i_2op_col_major_qk_memstream": lambda work, seed, **kw: _build_2op_case(
         work, "i", (16, 12, 16), seed, pe=16, simd=6, mode=1,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    # NF>1, mode 0 (row-major): the aV node shape (M, K, N) = (8, 8, 16), one whole
+    # B row (N=16 wide) landing on 2 NF groups x 8 SIMD lanes per beat.
+    "w_2op_nf2_row_major_av": lambda work, seed, **kw: _build_2op_case(
+        work, "w", (8, 8, 16), seed, pe=8, simd=8,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    # SF>1, mode 1 (col-major): the QK node shape (M, K, N) = (8, 16, 8), one whole
+    # B column (K=16 wide) landing on 2 SF groups x 4 PE lanes per beat.
+    "x_2op_sf2_col_major_qk": lambda work, seed, **kw: _build_2op_case(
+        work, "x", (8, 16, 8), seed, pe=4, simd=16, mode=1,
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     # ── resolve_fold-driven single-tile cases (VERIFY-ONLY additions) ──
     # Unlike e-i above (hand-picked pe=/simd=, bypassing resolve_fold), these specify
     # fold_axis + reuse_factor so geometry.resolve_fold actually derives (PE, SIMD),
