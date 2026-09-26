@@ -59,10 +59,14 @@ def _ap_type(precision, default):
         parts = inner.split(",")
         wi = ",".join(parts[:2])
         return f"ap_fixed<{wi}>"
-    if p.startswith("fixed<"):
-        return "ap_" + p
-    if p.startswith("ufixed<"):
-        return "ap_" + p
+    if p.startswith("fixed<") or p.startswith("ufixed<"):
+        # hls4ml spells the rounding/overflow modes bare (RND, WRAP, SAT, ...); the
+        # ap_fixed enumerators are AP_RND, AP_WRAP, AP_SAT, ...
+        head, inner = p.split("<", 1)
+        parts = inner.rstrip(">").split(",")
+        parts = [("AP_" + x if x and x[0].isalpha() and not x.startswith("AP_") else x)
+                 for x in parts]
+        return "ap_" + head + "<" + ",".join(parts) + ">"
     m = re.match(r"u?int<(\d+)>", p)
     if m:
         return ("ap_uint<" if p.startswith("u") else "ap_int<") + m.group(1) + ">"
@@ -609,15 +613,62 @@ def combined_header(items=None):
     funcs = _GEMM_IP_COMBINED_FUNCS
     rf_trait = _gemm_rf_trait(items)
     has_bias_trait = _gemm_has_bias_trait(items)
+    entries = _packed_stream_entries(items)
     return (
-        "#ifndef GEMM_IP_COMBINED_H_\n"
-        "#define GEMM_IP_COMBINED_H_\n\n"
+        "#ifndef GEMM_IP_COMBINED_GENERIC_H_\n"
+        "#define GEMM_IP_COMBINED_GENERIC_H_\n\n"
         "#include <hls_stream.h>\n"
+        '#include "nnet_utils/nnet_gemm_pack.h"\n'
         f"{rf_trait}\n"
         f"{has_bias_trait}\n"
         f"{funcs}\n"
-        "#endif // GEMM_IP_COMBINED_H_\n"
+        f"{entries}"
+        "#endif // GEMM_IP_COMBINED_GENERIC_H_\n"
     )
+
+
+def _packed_stream_entries(items):
+    """One concrete ``gemm_stream_<name>`` per io_stream layer: the function hls4ml
+    calls directly from its top dataflow region, on packed bit streams (the same
+    contract an RTL-blackbox target exposes). Soft logic: unpack, the templated
+    resource kernel above keyed on the layer's ``config<index>``, pack -- through
+    hls4ml's ``nnet::gemm_stream_packed[_const_weights]`` (nnet_gemm_pack.h), so the
+    packing is defined once. Needs the layer configs, which is why hls4ml includes
+    this header after them. Layers without a ``gemm_ip_index`` (standalone packages)
+    have no config struct to key on and get no entry."""
+    out = []
+    for it in items:
+        idx = it.get("gemm_ip_index")
+        if idx is None or it.get("interface", "stream") != "stream":
+            continue
+        name = it["name"]
+        k, n = int(it["k"]), int(it["n"])
+        in_t = f"nnet::array<{_ap_type(it.get('input_precision'), 'ap_fixed<16,6>')}, {k}>"
+        out_t = f"nnet::array<{_ap_type(it.get('output_precision'), 'ap_fixed<16,6>')}, {n}>"
+        cfg = f"config{int(idx)}"
+        fn = f"gemm_stream_{name}"
+        if it.get("weights_in_core", False):
+            out.append(
+                f"// {name}: weight-stationary, config {cfg}\n"
+                f"inline void {fn}(hls::stream<ap_uint<nnet::gemm_packed_bits<{in_t}>::value> > &a,\n"
+                f"{' ' * (len(fn) + 13)}hls::stream<ap_uint<nnet::gemm_packed_bits<{out_t}>::value> > &p) {{\n"
+                f"    nnet::gemm_stream_packed_const_weights<{in_t}, {out_t}, {cfg}>(a, p);\n"
+                f"}}\n")
+        else:
+            b_elems = n if it.get("second_operand_row_major") else k
+            w_t = _ap_type(it.get("weight_precision"), _ap_type(it.get("input_precision"), "ap_fixed<16,6>"))
+            b_t = f"nnet::array<{w_t}, {b_elems}>"
+            out.append(
+                f"// {name}: two-operand, config {cfg}\n"
+                f"inline void {fn}(hls::stream<ap_uint<nnet::gemm_packed_bits<{in_t}>::value> > &a,\n"
+                f"{' ' * (len(fn) + 13)}hls::stream<ap_uint<nnet::gemm_packed_bits<{b_t}>::value> > &b,\n"
+                f"{' ' * (len(fn) + 13)}hls::stream<ap_uint<nnet::gemm_packed_bits<{out_t}>::value> > &p) {{\n"
+                f"    nnet::gemm_stream_packed<{in_t}, {b_t}, {out_t}, {cfg}>(a, b, p);\n"
+                f"}}\n")
+    if not out:
+        return ""
+    return ("\n// ---- packed-stream entry points (one per io_stream layer; called by name) ----\n"
+            + "\n".join(out) + "\n")
 
 
 def config_header(name, m, k, n, input_precision=None, weight_precision=None,
