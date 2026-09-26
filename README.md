@@ -37,8 +37,9 @@ larger values trade spatial blocks for temporal passes. Limits: stream
 interface only (no `io_parallel`/array); effective output width `W` up to
 16 bits; a per-block resident-tile budget of 8 (`KFold`\*`NFold`-derived
 K-passes times N-passes must fit); output rounding is `RND` or `TRN` only
-(no `SAT`/`SAT_SYM`); and runtime-B (two-operand) packages need
-`K_PASSES<=2` when `weight_layout='column_major'`. See
+(no `SAT`/`SAT_SYM`). The target only exposes the knobs; how to choose
+them for a design (blocks vs. frame interval) is in
+`src/targets/cmvu/README.md`. See
 `src/targets/cmvu/docs/design.md` for the full set of design rules and
 `src/targets/cmvu/docs/architecture.md` / `mode_1_user_guide.md` for the
 vendored block itself.

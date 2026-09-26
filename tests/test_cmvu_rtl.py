@@ -240,7 +240,7 @@ def test_en_gap_regression_icarus(tmp_path):
     sim = subprocess.run(["vvp", "simv"], cwd=tmp_path,
                          capture_output=True, text=True, timeout=120)
     out = sim.stdout + sim.stderr
-    assert sim.returncode == 0 and "ALL_PASS" in out, out
+    assert sim.returncode == 0 and "ALL_PASS" in out and "ERROR:" not in out, out
 
 
 # ── runtime-B multi-call re-arm ────────────────────────────────────────────
@@ -300,7 +300,7 @@ def test_runtime_b_multi_call_icarus(tmp_path, row_major):
     sim = subprocess.run(["vvp", "simv"], cwd=tmp_path,
                          capture_output=True, text=True, timeout=120)
     out = sim.stdout + sim.stderr
-    assert sim.returncode == 0 and "ALL_PASS" in out, out
+    assert sim.returncode == 0 and "ALL_PASS" in out and "ERROR:" not in out, out
 
 
 # ── sustained backpressure ──────────────────────────────────────────────────
@@ -347,7 +347,7 @@ def test_backpressure_regression_icarus_const_weight(tmp_path):
     sim = subprocess.run(["vvp", "simv"], cwd=tmp_path,
                          capture_output=True, text=True, timeout=120)
     out = sim.stdout + sim.stderr
-    assert sim.returncode == 0 and "ALL_PASS" in out, out
+    assert sim.returncode == 0 and "ALL_PASS" in out and "ERROR:" not in out, out
 
 
 @pytest.mark.skipif(shutil.which("iverilog") is None,
@@ -382,7 +382,7 @@ def test_backpressure_regression_icarus_runtime_b(tmp_path, row_major):
     sim = subprocess.run(["vvp", "simv"], cwd=tmp_path,
                          capture_output=True, text=True, timeout=120)
     out = sim.stdout + sim.stderr
-    assert sim.returncode == 0 and "ALL_PASS" in out, out
+    assert sim.returncode == 0 and "ALL_PASS" in out and "ERROR:" not in out, out
 
 
 @pytest.mark.skipif(shutil.which("iverilog") is None,
@@ -414,7 +414,7 @@ def test_backpressure_regression_icarus_multi_call(tmp_path):
     sim = subprocess.run(["vvp", "simv"], cwd=tmp_path,
                          capture_output=True, text=True, timeout=120)
     out = sim.stdout + sim.stderr
-    assert sim.returncode == 0 and "ALL_PASS" in out, out
+    assert sim.returncode == 0 and "ALL_PASS" in out and "ERROR:" not in out, out
 
 
 # ── Back-to-back rows ─────────────────────────────────────────────────────────
@@ -453,4 +453,39 @@ def test_streaming_rows_back_to_back_icarus(tmp_path, m, k, n, kf, nf,
     sim = subprocess.run(["vvp", "simv"], cwd=tmp_path,
                          capture_output=True, text=True, timeout=120)
     out = sim.stdout + sim.stderr
-    assert sim.returncode == 0 and "ALL_PASS" in out, out
+    assert sim.returncode == 0 and "ALL_PASS" in out and "ERROR:" not in out, out
+
+
+# ── Column-major runtime-B with more than two K passes ───────────────────────
+# Passes beyond the live pair are staged in the wrapper's tile store and
+# drained as row-major writes after each n-group; multi-call + backpressure
+# covers the drain across calls and under long en gaps.
+
+@pytest.mark.parametrize("m,k,n,kf,nf", [
+    (6, 12, 16, 3, 2),   # K_PASSES=3: odd base slot for n-group 1 -> single live tile
+    (4, 32, 16, 4, 2),   # K_PASSES=4 x N_PASSES=2, 2 cascade blocks: all 8 slots
+])
+def test_staged_k_passes_multi_call_backpressure_icarus(tmp_path, m, k, n, kf, nf):
+    if shutil.which("iverilog") is None:
+        pytest.skip("iverilog not on PATH")
+    rtl_dir = g.vendored_rtl_dir()
+    if rtl_dir is None:
+        pytest.skip("cmvu vendored block RTL not found")
+    rtl_files = [str((rtl_dir / f).resolve()) for f in g.VENDORED_SV]
+    core = cmvu_rtl.generate_core(m, k, n, kf, nf, None, shift=3,
+                                  module_name="cmvu_core", runtime_b=True,
+                                  result_width=16)
+    tb = gold.generate_runtime_b_multi_call_tb(
+        m, k, n, kf, nf, shift=3, module_name="cmvu_core", seed=17,
+        result_width=16, n_calls=3, backpressure=True)
+    (tmp_path / "cmvu_core.v").write_text(core)
+    (tmp_path / "cmvu_core_tb.v").write_text(tb)
+    build = subprocess.run(
+        ["iverilog", "-g2012", "-o", "simv", "-s", "cmvu_core_tb",
+         "cmvu_core_tb.v", "cmvu_core.v", *rtl_files],
+        cwd=tmp_path, capture_output=True, text=True, timeout=120)
+    assert build.returncode == 0, build.stdout + build.stderr
+    sim = subprocess.run(["vvp", "simv"], cwd=tmp_path,
+                         capture_output=True, text=True, timeout=300)
+    out = sim.stdout + sim.stderr
+    assert sim.returncode == 0 and "ALL_PASS" in out and "ERROR:" not in out, out

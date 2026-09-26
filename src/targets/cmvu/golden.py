@@ -453,17 +453,7 @@ def generate_runtime_b_tb(m, k, n, kfold, nfold, weight_matrix,
     # real rows the TB must idle through the rest of that band (self-
     # generated padding rows, no b_valid needed) plus the drain, or it will
     # overwrite/drop a beat the DUT hasn't consumed yet.
-    extra_wait = [0] * len(beats)
-    if b_row_major:
-        drain_cycles = geo["row_major_drain_cycles"]
-        idx = 0
-        kv = int(k)
-        while idx < kv:
-            group_size = min(4, kv - idx)
-            last = idx + group_size - 1
-            if idx + group_size < kv:
-                extra_wait[last] = (4 - group_size) + drain_cycles
-            idx += group_size
+    extra_wait = _geometry.runtime_b_beat_waits(k, n, geo, b_row_major)
     wait_lines = "\n".join(
         f"        wait_mem[{i}] = 32'd{w};" for i, w in enumerate(extra_wait))
 
@@ -581,19 +571,7 @@ def generate_runtime_b_multi_call_tb(m, k, n, kfold, nfold, bias_codes=None,
     beat_bits = (int(n) if b_row_major else int(k)) * 8
     n_beats = int(k) if b_row_major else int(n)
 
-    if b_row_major:
-        drain_cycles = geo["row_major_drain_cycles"]
-        extra_wait = [0] * n_beats
-        idx = 0
-        kv = int(k)
-        while idx < kv:
-            group_size = min(4, kv - idx)
-            last = idx + group_size - 1
-            if idx + group_size < kv:
-                extra_wait[last] = (4 - group_size) + drain_cycles
-            idx += group_size
-    else:
-        extra_wait = [0] * n_beats
+    extra_wait = _geometry.runtime_b_beat_waits(k, n, geo, b_row_major)
 
     a_init, e_init, b_init, wait_init = [], [], [], []
     for c in range(int(n_calls)):

@@ -549,36 +549,9 @@ ${guard_close}""")
 
 
 def _runtime_b_load_schedule(k, n, geo, b_row_major):
-    """Load-window valid/stall pattern, mirroring the RTL wrapper's load FSM
-    cycle-for-cycle (rtl.generate_core's load FSM is the reference this is
-    derived from -- unlike golden.py's closed-loop Icarus TB, which just
-    waits on ``in_ready``, this fixed-cadence C++ model has no DUT signal to
-    wait on and must predict the exact cycle count).
-
-    Column-major: the load FSM steps through all ``n_chunks_pad*N_PHYS``
-    virtual columns (real N columns consuming an external beat each, then
-    self-clocked padding columns with no ``b_valid`` needed) before
-    ``loading`` deasserts -- one cycle per virtual column, no stalls.
-
-    Row-major: the load FSM steps through all ``k_chunks_pad`` tiles
-    uniformly, each costing ``4`` fill cycles (real K rows consuming an
-    external beat each, padding rows self-clocked) plus, when
-    ``N_PASSES>1``, ``4*(N_PASSES-1)`` drain cycles with no external beat --
-    for *every* tile, including the last (padded or not), since the FSM's
-    fill/drain phase split is unconditional on tile index.
-    """
-    if not b_row_major:
-        total_cols = int(geo["n_chunks_pad"]) * _geometry.N_PHYS
-        return [i < int(n) for i in range(total_cols)]
-    kc_pad = int(geo["k_chunks_pad"])
-    np_n = int(geo["n_passes"])
-    sched = []
-    for kt in range(kc_pad):
-        for i in range(_geometry.K_PHYS):
-            sched.append((kt * _geometry.K_PHYS + i) < int(k))
-        if np_n > 1:
-            sched.extend([False] * (_geometry.K_PHYS * (np_n - 1)))
-    return sched
+    """The runtime-B load FSM's per-cycle beat pattern (see
+    ``geometry.runtime_b_load_schedule``)."""
+    return _geometry.runtime_b_load_schedule(k, n, geo, b_row_major)
 
 
 def gen_runtime_b_header(name, m, k, n, bias_codes, shift, geo, bb_delay=3.5,

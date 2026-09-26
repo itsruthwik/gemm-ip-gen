@@ -26,11 +26,6 @@ Design locks that live here rather than in the generators:
   defaulting to the physical ``RESULT_WIDTH`` (16) when unset; lanes are always
   sign-extended, even for unsigned ``output_precision`` -- there is no
   zero-extend path.
-* Column-major runtime-B needs K_PASSES<=2 (the load FSM pairs at most two
-  resident k-passes per column beat); checked here, up front, so a config
-  that needs a third resident k-pass fails at package time with a
-  ``ValueError`` naming the layer, not as a ``NotImplementedError`` deep in
-  RTL generation.
 * Every rejection above (and the ones in ``geometry.resolve_geometry`` --
   missing/illegal KFold/NFold, per-block slot-budget oversubscription) is a
   ``ValueError`` naming the layer and the reason, raised before any RTL is
@@ -311,23 +306,6 @@ class CmvuTarget(Target):
         # load FSM mis-decodes hls4ml's beat order.
         weight_layout = str(cfg.get("weight_layout") or "column_major").lower()
         b_row_major = runtime_b and weight_layout == "row_major"
-
-        # Column-major runtime-B's load FSM pairs at most two resident
-        # k-passes per column beat (rtl.generate_core's column-major branch);
-        # a third resident k-pass needs a load-time staging buffer that does
-        # not exist yet. Checked here, up front, so this fails at package
-        # time naming the layer, not as a NotImplementedError deep in RTL
-        # generation.
-        if runtime_b and not b_row_major:
-            geo = _geom.resolve_geometry(shape[0], shape[1], shape[2], kfold,
-                                         nfold, name, result_width=result_width)
-            if geo["k_passes"] > 2:
-                raise ValueError(
-                    f"layer '{name}': column-major runtime-B needs "
-                    f"K_PASSES<=2 (single or paired tile writes per column "
-                    f"beat); KFold={kfold}/K={shape[1]} legalizes to "
-                    f"K_PASSES={geo['k_passes']}. Lower KFold (more spatial "
-                    f"blocks) or use weight_layout='row_major'.")
 
         return _package().generate_catapult_pkg(
             shape[0], shape[1], shape[2], name, output_dir, kfold, nfold,

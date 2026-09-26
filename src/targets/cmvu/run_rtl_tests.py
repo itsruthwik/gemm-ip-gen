@@ -12,6 +12,7 @@ Run via the repo venv (numpy is needed by the generators):
     python -m targets.cmvu.run_rtl_tests --keep
 """
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -60,6 +61,13 @@ RUNTIME_B_CASES = [
     (8, 6, 10, 1, 1, 4, True, 16, True, "col"),   # column tail, K_PASSES=1
     (8, 6, 10, 1, 1, 4, True, 16, True, "row"),   # row tail, K_PASSES=1
     (4, 8, 16, 1, 2, 5, True, 16, True, "row"),   # row-major, N_PASSES=2 (residual buffer)
+    # Column-major with more than two K passes: tiles beyond the live pair
+    # are staged in the wrapper and drained after each n-group's columns.
+    (8, 24, 12, 3, 1, 3, True, 16, True, "col"),  # K_PASSES=3, 2 cascade blocks
+    (6, 12, 16, 3, 2, 4, True, 16, True, "col"),  # K_PASSES=3, odd group: single live tile
+    (5, 16, 8, 4, 1, 2, True, 16, False, "col"),  # K_PASSES=4, one block
+    (4, 32, 16, 4, 2, 2, True, 16, True, "col"),  # K_PASSES=4 x N_PASSES=2: all 8 slots
+    (3, 32, 10, 8, 1, 5, False, 16, True, "col"), # K_PASSES=8, N tail
 ]
 
 
@@ -70,6 +78,14 @@ def _run(cmd, cwd):
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except subprocess.TimeoutExpired:
         return 124, "TIMEOUT"
+
+
+def _sim_ok(out, rc):
+    """The TB printed ALL_PASS, the simulator exited cleanly, and no
+    assertion fired: the vendored block reports protocol misuse (e.g. an odd
+    paired-load base) with $error, which does not stop the simulation."""
+    errors = re.search(r"^\s*(ERROR:|Error\b)", out, re.M)
+    return "ALL_PASS" in out and rc == 0 and not errors
 
 
 def _tail(text, n=8):
@@ -164,7 +180,7 @@ def run(cases=None, seeds=None, keep=False, use_vcs=True, en_gaps=False,
                 failures += 1
             else:
                 rc, out = _run(["vvp", "simv_icarus"], d)
-                if not ("ALL_PASS" in out and rc == 0):
+                if not _sim_ok(out, rc):
                     print(f"  {tag} ICARUS FAIL\n{_tail(out)}")
                     failures += 1
 
@@ -178,7 +194,7 @@ def run(cases=None, seeds=None, keep=False, use_vcs=True, en_gaps=False,
                     failures += 1
                 else:
                     rc, out = _run(["./simv_vcs"], d)
-                    if not ("ALL_PASS" in out and rc == 0):
+                    if not _sim_ok(out, rc):
                         print(f"  {tag} VCS FAIL\n{_tail(out)}")
                         failures += 1
 
@@ -226,7 +242,7 @@ def run(cases=None, seeds=None, keep=False, use_vcs=True, en_gaps=False,
                 failures += 1
             else:
                 rc, out = _run(["vvp", "simv_icarus"], d)
-                if not ("ALL_PASS" in out and rc == 0):
+                if not _sim_ok(out, rc):
                     print(f"  {tag} ICARUS FAIL\n{_tail(out)}")
                     failures += 1
 
@@ -240,7 +256,7 @@ def run(cases=None, seeds=None, keep=False, use_vcs=True, en_gaps=False,
                     failures += 1
                 else:
                     rc, out = _run(["./simv_vcs"], d)
-                    if not ("ALL_PASS" in out and rc == 0):
+                    if not _sim_ok(out, rc):
                         print(f"  {tag} VCS FAIL\n{_tail(out)}")
                         failures += 1
 
@@ -292,7 +308,7 @@ def run(cases=None, seeds=None, keep=False, use_vcs=True, en_gaps=False,
                 failures += 1
             else:
                 rc, out = _run(["vvp", "simv_icarus"], d)
-                if not ("ALL_PASS" in out and rc == 0):
+                if not _sim_ok(out, rc):
                     print(f"  {tag} ICARUS FAIL\n{_tail(out)}")
                     failures += 1
 
@@ -306,7 +322,7 @@ def run(cases=None, seeds=None, keep=False, use_vcs=True, en_gaps=False,
                     failures += 1
                 else:
                     rc, out = _run(["./simv_vcs"], d)
-                    if not ("ALL_PASS" in out and rc == 0):
+                    if not _sim_ok(out, rc):
                         print(f"  {tag} VCS FAIL\n{_tail(out)}")
                         failures += 1
 

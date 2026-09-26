@@ -283,3 +283,51 @@ def n_tail_lanes(n, n_tile):
     if remain <= 0:
         return 0
     return min(N_PHYS, remain)
+
+
+# ── Runtime-B load schedule ───────────────────────────────────────────────────
+
+
+def runtime_b_load_schedule(k, n, geo, b_row_major):
+    """Per-cycle load-window pattern of the runtime-B wrapper's load FSM:
+    True where it consumes an external B beat, False where it runs on its own
+    (padding columns/rows, drains). The wrapper has no B ready, so the C++
+    model and the Icarus TBs must present beats exactly on the True cycles.
+
+    Column-major: every n-group (8 virtual columns, block rows inner) costs
+    one cycle per column; real N columns consume a beat, padding columns are
+    self-clocked. With K_PASSES > 2 each group is then followed by its drain,
+    4 cycles per staged tile (K_PASSES-2 staged when the group's base slot
+    n_group*K_PASSES is even, K_PASSES-1 when odd).
+
+    Row-major: every K tile costs 4 fill cycles (real rows consume a beat)
+    plus, when N_PASSES > 1, 4*(N_PASSES-1) drain cycles -- for every tile,
+    since the fill/drain split is unconditional on tile index.
+    """
+    if not b_row_major:
+        kp = int(geo["k_passes"])
+        ns = int(geo["n_spatial"])
+        sched = []
+        for g in range(int(geo["n_chunks_pad"])):
+            sched.extend((g * N_PHYS + c) < int(n) for c in range(N_PHYS))
+            if kp > 2:
+                n_group = g // ns
+                staged = kp - 2 if (n_group * kp) % 2 == 0 else kp - 1
+                sched.extend([False] * (K_PHYS * staged))
+        return sched
+    np_n = int(geo["n_passes"])
+    sched = []
+    for kt in range(int(geo["k_chunks_pad"])):
+        sched.extend((kt * K_PHYS + i) < int(k) for i in range(K_PHYS))
+        if np_n > 1:
+            sched.extend([False] * (K_PHYS * (np_n - 1)))
+    return sched
+
+
+def runtime_b_beat_waits(k, n, geo, b_row_major):
+    """Idle load cycles after each real B beat before the next one is taken
+    (0 after the last beat): what a beat-driving TB must wait so it never
+    presents a beat on a cycle the load FSM would not consume."""
+    sched = runtime_b_load_schedule(k, n, geo, b_row_major)
+    real = [i for i, v in enumerate(sched) if v]
+    return [real[j + 1] - real[j] - 1 for j in range(len(real) - 1)] + [0]

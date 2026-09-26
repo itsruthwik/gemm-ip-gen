@@ -323,10 +323,6 @@ _UNSUPPORTED_CASES = [
                                   input_precision="fixed<8,0>",
                                   weight_precision="fixed<8,0>",
                                   output_precision="fixed<8,0>"), (4, 64, 64)),
-    ("col_major_runtime_b_kpasses_gt2",
-     dict(kfold=8, nfold=1, weights_in_core=False, weight_layout="column_major",
-          input_precision="fixed<8,0>", weight_precision="fixed<8,0>",
-          output_precision="fixed<8,0>"), (4, 64, 8)),
 ]
 
 
@@ -341,6 +337,18 @@ def test_unsupported_layer_errors_name_the_layer(tmp_path, case_id, overrides,
         T.package(shape, cfg)
     assert not isinstance(excinfo.value, NotImplementedError)
     assert name in str(excinfo.value)
+
+
+def test_col_major_runtime_b_packages_with_more_than_two_k_passes(tmp_path):
+    # Passes beyond the live pair are staged in the wrapper's tile store, so
+    # deep K folding is legal for column-major runtime-B (K_PASSES=8 here).
+    cfg = _cfg(name="deep_k", output_dir=str(tmp_path), kfold=8, nfold=1,
+               weights_in_core=False, weight_layout="column_major",
+               input_precision="fixed<8,0>", weight_precision="fixed<8,0>",
+               output_precision="fixed<8,0>")
+    T.package((4, 64, 8), cfg)
+    core = next(tmp_path.rglob("deep_k_core.sv")).read_text()
+    assert "K_PASSES  = 8" in core and "stg_c0_j5" in core
 
 
 def test_vitis_tool_error_for_cmvu_is_clear():

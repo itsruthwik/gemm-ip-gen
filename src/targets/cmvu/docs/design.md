@@ -48,7 +48,9 @@ block itself (not the wrapper this target generates around it).
 - **Runtime-B's B layout comes from the manifest's `weight_layout`.**
   `column_major` streams one K-high beat per real N column (every block in
   the target block-row has its own write port, so paired k-passes load in
-  the same beat when `K_PASSES==2`); `row_major` streams one N-wide beat per
+  the same beat when `K_PASSES==2`, and with more K passes the rest are held
+  in a small per-block tile store and written after each n-group's columns,
+  stalling the B stream 4 cycles per held tile); `row_major` streams one N-wide beat per
   real K row into a block-column write port that holds its tile address
   across a whole 4-beat transaction, so it needs a small residual buffer
   (one tile's worth of rows) plus drain stalls to write more than one

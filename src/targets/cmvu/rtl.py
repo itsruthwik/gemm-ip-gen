@@ -140,9 +140,12 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
     one column beat is consumed per cycle and written to all K_SPATIAL
     columns of that row in parallel (paired k-passes when ``K_PASSES == 2``);
     once the real ``N`` columns are exhausted the wrapper synthesizes the
-    remaining zero columns of the tail/padding n-tiles itself. ``K_PASSES >
-    2`` is not yet supported in this format (would need a load-time staging
-    buffer for a third resident k-pass).
+    remaining zero columns of the tail/padding n-tiles itself. With
+    ``K_PASSES > 2`` the passes beyond the live pair (or single, for an odd
+    base slot) are collected in a per-block tile store as the group's 8
+    columns arrive and written after them as 4-beat row-major transactions,
+    stalling the B stream 4 cycles per staged tile
+    (``geometry.runtime_b_load_schedule``).
 
     ``b_row_major=True`` is hls4ml's row-major format: beat ``k`` is row
     ``k`` of B (real ``K`` beats), column ``n`` at bits ``[8n +: 8]``, port
@@ -319,12 +322,20 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
         add("        end")
         add("    end")
     if runtime_b and not b_row_major:
-        if kp_n > 2:
-            raise NotImplementedError(
-                f"runtime_b column-major load supports K_PASSES<=2 (single or "
-                f"paired tile writes per column beat); K_PASSES={kp_n} needs a "
-                f"load-time staging buffer for a third resident k-pass, not yet "
-                f"implemented -- lower KFold or raise K_SPATIAL.")
+        # A column beat carries every K pass's slice for its block row, but a
+        # block's write port takes at most two tiles per beat (paired column
+        # write) and holds its slot across the 8-beat transaction. With more
+        # than two K passes the rest are staged: each group's extra tiles are
+        # collected in a per-block tile store as the 8 columns stream in, then
+        # written as 4-beat row-major transactions (the "drain") while the B
+        # stream waits, 4 cycles per staged tile.
+        stg = kp_n > 2
+        # Live pair (k passes 0,1) needs an even base slot np*K_PASSES; with an
+        # odd K_PASSES the odd n-groups start on an odd slot and write pass 0
+        # alone, staging one tile more.
+        nb_pair = kp_n - 2
+        nb_single = kp_n - 1
+        nb_max = nb_single if kp_n % 2 else nb_pair
         c_w = max(1, (ks - 1).bit_length())
         r_w = max(1, (ns - 1).bit_length())
         pad_k = geo["k_chunks_pad"] * _geometry.K_PHYS
@@ -333,6 +344,8 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
         add(f"    reg  [{np_w}-1:0]         ld_np;")
         add(f"    reg  [{r_w}-1:0]          ld_r;")
         add("    reg [2:0]                ld_col;")
+        if stg:
+            add("    reg                       draining;")
         add("    // hls4ml sends N column beats in order; column n belongs to")
         add("    // ntile nt=n/8 (block row r=nt%N_SPATIAL, group np=nt/N_SPATIAL),")
         add("    // tile-column col=n%8. n_is_real gates the wait on b_valid: once")
@@ -347,7 +360,8 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
         add(f"    localparam int unsigned N_VAL = {n};")
         add("    wire n_is_real     = cur_n < N_VAL;")
         add("    wire beat_ready    = !n_is_real || b_valid;")
-        add("    wire ld_active     = loading && beat_ready;")
+        add("    wire ld_active     = loading && beat_ready"
+            + (" && !draining;" if stg else ";"))
         add("    // Register each load beat together with its target block-row/slot")
         add("    // so the blocks' write ports sample a stable (row, slot, beat)")
         add("    // triple (driving it combinationally from counters that change on")
@@ -357,15 +371,39 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
         add(f"    reg  [{np_w}-1:0]         tgt_np;")
         add(f"    reg  [{r_w}-1:0]          tgt_r;")
         add("    reg                       tgt_first;")
+        if stg:
+            j_w = max(1, (nb_max - 1).bit_length())
+            add("    reg  [2:0]                tgt_col;")
+            add(f"    localparam bit KP_ODD = 1'b{kp_n % 2};")
+            add("    // Staged-tile count for this group: K_PASSES-2 when the live")
+            add("    // write is a pair, K_PASSES-1 when it is a single tile.")
+            add("    wire ld_pair  = ~(ld_np[0] & KP_ODD);")
+            add("    wire tgt_pair = ~(tgt_np[0] & KP_ODD);")
+            add(f"    wire [{j_w}-1:0] nb_last = ld_pair ? {j_w}'d{nb_pair - 1} "
+                f": {j_w}'d{nb_single - 1};")
+            add(f"    reg  [{j_w}-1:0]          dr_j;")
+            add("    reg  [1:0]                dr_row;")
+            add("    reg                       dw_valid_r;")
+            add(f"    reg  [{j_w}-1:0]          dw_j_r;")
+            add("    reg  [1:0]                dw_row_r;")
+            add(f"    reg  [{r_w}-1:0]          dw_r_r;")
+            add("    reg  [2:0]                dw_slot_r;")
+            add("    // Tile store: one canonical row-major 4x8 tile per staged")
+            add("    // pass per cascade column, byte (row*8 + col).")
+            for c in range(ks):
+                for j in range(nb_max):
+                    add(f"    reg  [255:0]              stg_c{c}_j{j};")
         if zero_pad_bits > 0:
             add(f"    wire [{pad_k * 8}-1:0] b_col_pad = "
                 f"{{{zero_pad_bits}'d0, b_beat_r}};")
         else:
             add(f"    wire [{pad_k * 8}-1:0] b_col_pad = b_beat_r;")
+        stg_clr = (" draining <= 1'b0; dr_j <= '0; dr_row <= '0;"
+                   " dw_valid_r <= 1'b0;") if stg else ""
         add("    always_ff @(posedge clk) begin")
         add("        if (rst) begin")
         add("            loading <= 1'b1; b_valid_r <= 1'b0;")
-        add("            ld_np <= '0; ld_r <= '0; ld_col <= '0;")
+        add("            ld_np <= '0; ld_r <= '0; ld_col <= '0;" + stg_clr)
         add("        end else if (en) begin")
         add("            // Re-arm for the next call: hls4ml streams a NEW B")
         add("            // before every call's A rows, but this wrapper is")
@@ -378,33 +416,109 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
         add("            // to 1 in time for the very next cycle's first B beat.")
         add("            if (call_done) begin")
         add("                loading <= 1'b1; b_valid_r <= 1'b0;")
-        add("                ld_np <= '0; ld_r <= '0; ld_col <= '0;")
+        add("                ld_np <= '0; ld_r <= '0; ld_col <= '0;" + stg_clr)
         add("            end else begin")
         add("                b_valid_r <= ld_active;")
+        if stg:
+            add("                dw_valid_r <= loading && draining;")
+            add("                if (loading && draining) begin")
+            add("                    // One staged-tile row per cycle into slot")
+            add("                    // np*K_PASSES + (live tiles) + j, all blocks")
+            add("                    // of block row ld_r in parallel.")
+            add("                    dw_j_r <= dr_j; dw_row_r <= dr_row; dw_r_r <= ld_r;")
+            add("                    dw_slot_r <= ld_np * K_PASSES + (ld_pair ? 3'd2 : 3'd1) + dr_j;")
+            add("                    if (dr_row != 2'd3) begin")
+            add("                        dr_row <= dr_row + 1'b1;")
+            add("                    end else begin")
+            add("                        dr_row <= '0;")
+            add("                        if (dr_j != nb_last) begin")
+            add("                            dr_j <= dr_j + 1'b1;")
+            add("                        end else begin")
+            add("                            dr_j <= '0;")
+            add("                            draining <= 1'b0;")
+            add("                            if (ld_r != N_SPATIAL - 1) begin")
+            add("                                ld_r <= ld_r + 1'b1;")
+            add("                            end else begin")
+            add("                                ld_r <= '0;")
+            add("                                if (ld_np != N_GROUPS - 1) begin")
+            add("                                    ld_np <= ld_np + 1'b1;")
+            add("                                end else begin")
+            add("                                    loading <= 1'b0;")
+            add("                                end")
+            add("                            end")
+            add("                        end")
+            add("                    end")
+            add("                end")
         add("                if (ld_active) begin")
         add("                    b_beat_r <= n_is_real ? b_beat : '0;")
         add("                    tgt_np <= ld_np; tgt_r <= ld_r;")
         add("                    tgt_first <= (ld_col == '0);")
+        if stg:
+            add("                    tgt_col <= ld_col;")
         add("                    if (ld_col != 3'd7) begin")
         add("                        ld_col <= ld_col + 1'b1;")
         add("                    end else begin")
         add("                        ld_col <= '0;")
-        add("                        if (ld_r != N_SPATIAL - 1) begin")
-        add("                            ld_r <= ld_r + 1'b1;")
-        add("                        end else begin")
-        add("                            ld_r <= '0;")
-        add("                            if (ld_np != N_GROUPS - 1) begin")
-        add("                                ld_np <= ld_np + 1'b1;")
-        add("                            end else begin")
-        add("                                loading <= 1'b0;")
-        add("                            end")
-        add("                        end")
-        add("                    end")
-        add("                end")
-        add("            end")
-        add("        end")
-        add("    end")
-        add("    assign in_ready = (~busy | early_ok) & ~loading & ~b_valid_r;")
+        if stg:
+            add("                        // The group's 8 columns are in: drain its")
+            add("                        // staged tiles before moving on.")
+            add("                        draining <= 1'b1;")
+            add("                    end")
+            add("                end")
+            add("            end")
+            add("        end")
+            add("    end")
+        if not stg:
+            add("                        if (ld_r != N_SPATIAL - 1) begin")
+            add("                            ld_r <= ld_r + 1'b1;")
+            add("                        end else begin")
+            add("                            ld_r <= '0;")
+            add("                            if (ld_np != N_GROUPS - 1) begin")
+            add("                                ld_np <= ld_np + 1'b1;")
+            add("                            end else begin")
+            add("                                loading <= 1'b0;")
+            add("                            end")
+            add("                        end")
+            add("                    end")
+            add("                end")
+            add("            end")
+            add("        end")
+            add("    end")
+            add("    assign in_ready = (~busy | early_ok) & ~loading & ~b_valid_r;")
+        else:
+            # The last drain write lands the cycle after loading clears.
+            add("    assign in_ready = (~busy | early_ok) & ~loading & ~b_valid_r"
+                " & ~dw_valid_r;")
+            # Fill the tile store as each registered column beat is written:
+            # staged pass p of cascade column c is chunk kt = p*K_SPATIAL + c.
+            add("    // Tile store fill: column tgt_col of every staged tile, rows")
+            add("    // 0-3 from the pass's 32-bit column slice.")
+            add("    always_ff @(posedge clk) begin")
+            add("        if (en && b_valid_r) begin")
+            for c in range(ks):
+                for j in range(nb_max):
+                    for pair, first in ((True, 2), (False, 1)):
+                        p_ = first + j
+                        if p_ > kp_n - 1:
+                            continue
+                        cond = "tgt_pair" if pair else "!tgt_pair"
+                        add(f"            if ({cond}) begin")
+                        for row in range(4):
+                            add(f"                stg_c{c}_j{j}[({row}*8 + tgt_col)*8 +: 8] <= "
+                                f"b_col_pad[{(p_ * ks + c) * 32 + row * 8} +: 8];")
+                        add("            end")
+            add("        end")
+            add("    end")
+            add("    // Drain beat: staged tile dw_j_r, row dw_row_r, per cascade column.")
+            for c in range(ks):
+                last = f"stg_c{c}_j{nb_max - 1}[dw_row_r*64 +: 64]"
+                if nb_max == 1:
+                    add(f"    wire [63:0] dw_in_c{c} = {last};")
+                else:
+                    add(f"    wire [63:0] dw_in_c{c} =")
+                    for j in range(nb_max - 1):
+                        add(f"        (dw_j_r == {j}) ? stg_c{c}_j{j}[dw_row_r*64 +: 64] :")
+                    add(f"        {last};")
         add("    // Write-side slot base: slot s = n_group*K_PASSES + k_pass, so")
         add("    // np*K_PASSES is the (even, when paired) base slot for this column.")
         add("    wire [2:0] ld_tsel = tgt_np * K_PASSES;")
@@ -661,7 +775,22 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
                 # cascade_out carries only this pass's local partial.
                 add(f"        .valid({bus}[B_VALID]), "
                     f".acc_first({bus}[B_VALID]), .acc_last({bus}[B_VALID]),")
-            if runtime_b and not b_row_major:
+            if runtime_b and not b_row_major and kp_n > 2:
+                # Live column writes (paired when the base slot is even) and
+                # staged-tile drain writes (row-major) share the write port;
+                # they are never in the same cycle.
+                hit = f"(b_valid_r && (tgt_r == {r}))"
+                dhit = f"(dw_valid_r && (dw_r_r == {r}))"
+                add(f"        .a_in({bus}[0 +: A_SLICE_W]), "
+                    f".b_in(dw_valid_r ? dw_in_c{c} : b_in_c{c}),")
+                add(f"        .w_we({hit} || {dhit}),")
+                add(f"        .w_load_start(({hit} && tgt_first) || "
+                    f"({dhit} && dw_row_r == 2'd0)),")
+                add("        .w_col_major(~dw_valid_r), "
+                    ".w_dual_tile(~dw_valid_r & tgt_pair),")
+                add(f"        .tile_sel({bus}[B_TSEL_LO +: 3]), "
+                    f".w_tile_sel(dw_valid_r ? dw_slot_r : ld_tsel),")
+            elif runtime_b and not b_row_major:
                 add(f"        .a_in({bus}[0 +: A_SLICE_W]), .b_in(b_in_c{c}),")
                 add(f"        .w_we(b_valid_r && (tgt_r == {r})),")
                 add(f"        .w_load_start(b_valid_r && (tgt_r == {r}) "
