@@ -65,8 +65,11 @@ per row; per frame the layer needs `M * kp * np` cycles of work.
   fc 1x32x8 with `KFold=8` (1 block) runs at II 8; fc 1x64x16 with `KFold=8`
   (4 blocks) at II 8.
 - **Runtime-B layers** (both operands at run time, e.g. attention `QK^T`,
-  `attention x V`) currently load B at the start of every frame and drain
-  before the next, so their frame interval is about
+  `attention x V`) load a new B every frame. When two copies of the layer's
+  `kp * np` tiles fit in a block's 8 slots (`kp * np <= 4`), the next
+  frame's B loads while the current frame computes, so
+  **`II = max(M * kp * np, B load + 2)`**. Otherwise the load waits for the
+  current frame's last row, and `II` is about
   `B load + M * kp * np + (block latency and skew) + a few cycles`.
   The B load is one cycle per N column (rounded up to whole 8-column
   groups); with column-major B and `kp > 2`, each 8-column group is followed
@@ -88,9 +91,10 @@ is its own pipelined block), so pick folds per layer against one target:
    slightly (one cycle per cascade block or grid row).
 4. **Check the non-GEMM stages** (activations, quantizers, reshapes) meet the
    same `II`; Catapult's schedule report lists each stage's throughput.
-5. **For runtime-B layers, include the B load** in the stage's time (see
-   above) and keep `ns` small; deep K folding is fine but each staged tile
-   adds load stalls.
+5. **For runtime-B layers, keep `kp * np <= 4`** so B is double-buffered, and
+   check the B load (see above) fits under `M * kp * np`; keep `ns` small, as
+   every block row adds 8 load cycles. Deep K folding is fine but each staged
+   tile adds load stalls.
 
 Consequences worth knowing:
 
@@ -112,6 +116,13 @@ Worked example (MLP, 3 layers with M = 1, measured at 3 ns):
 
 11 blocks, design II 8, latency 55 cycles. Targeting II 4 instead needs about
 16 + 4 + 1 = 21 blocks.
+
+Worked example with runtime B (single-head attention, M = 8, measured at
+3 ns): projections 8x16x16 at `KFold=4, NFold=1` (2 blocks each), `QK^T`
+8x16x8 at `KFold=4, NFold=1` (1 block, 2 staged tiles), `attention x V`
+8x8x16 at `KFold=2, NFold=2` (1 block). Every GEMM is `M * kp * np = 32`
+with its B double-buffered; the design runs at II 32, the non-GEMM stages
+(softmax, transposes, head split/merge) scheduling at 10-27 cycles.
 
 ## Limits the knobs cannot lift
 

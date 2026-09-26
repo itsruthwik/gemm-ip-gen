@@ -199,3 +199,24 @@ def test_const_weights_entry_is_a_free_running_block():
     assert f"gap = {period} - 1;" in synth
     assert "RUN: for" not in synth
     assert "reset_state()" in c_model and "RUN: for" in c_model
+
+
+@pytest.mark.parametrize("k,kf,dbuf", [(16, 2, True), (32, 8, False)])
+def test_runtime_b_entry_is_a_free_running_block(k, kf, dbuf):
+    # Synthesized, the runtime-B entry is one wrapper clock per call and keeps
+    # a copy of the wrapper's control state (no DUT signal in the schedule);
+    # the C model stays one frame per call.
+    from targets.cmvu import geometry as g
+    m, n, nf = 4, 8, 1
+    geo = g.resolve_geometry(m, k, n, kf, nf)
+    header = pkg.gen_runtime_b_header("gemm_rb", m, k, n, [0] * n, 3, geo)
+    entry = header[header.index("#pragma hls_design block"):]
+    assert entry.startswith("#pragma hls_design block\n"
+                            "#pragma hls_pipeline_init_interval 1\n")
+    synth, c_model = entry.split("#else", 1)
+    assert "b_stream.nb_read(beat)" in synth and "a_stream.nb_read(beat)" in synth
+    slots = geo["slots_per_block"]
+    assert f"(pass == {slots} - 1)" in synth
+    assert f"({'true' if dbuf else 'false'} && full_other)" in synth
+    assert "RUN: for" not in synth
+    assert "reset_state()" in c_model and "RUN: for" in c_model

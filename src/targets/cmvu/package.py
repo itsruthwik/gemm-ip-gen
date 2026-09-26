@@ -498,6 +498,11 @@ ${reset_state_fn}
 // stalls) mirrors the RTL wrapper's load FSM exactly (see golden.py's
 // generate_runtime_b_tb / b_load_beats_col_major / b_load_beats_row_major,
 // the reference this cadence is derived from).
+// Free-running block, like the weight-stationary entry: one wrapper clock per
+// call, frames overlap, and with double-buffered slot sets the next frame's
+// B loads while the current frame computes.
+#pragma hls_design block
+#pragma hls_pipeline_init_interval 1
 template <class data_T, class b_T, class res_T, typename CONFIG_T>
 void ${name}_gemm_stream_runtime_b(ac_channel<data_T> &a_stream,
                                    ac_channel<b_T> &b_stream,
@@ -506,13 +511,112 @@ void ${name}_gemm_stream_runtime_b(ac_channel<data_T> &a_stream,
     static_assert(data_T::size == ${k}, "cmvu expects one K-wide A row per beat");
     static_assert(b_T::size == ${B_ASSERT_SIZE}, "${B_ASSERT_MSG}");
     static ${name}_ccore ccore;
-#if !(defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW))
-    ccore.${name}_reset_state();
-#endif
-    // Fixed-cadence feed: ${LOAD_LEN} load-window cycles (real B beats plus
-    // any precomputed stall cycles), a short gap, then one A row every
-    // ${PERIOD} calls. No DUT signal in the control flow.
+    // Per-cycle load pattern of the wrapper's load FSM: true where it takes a
+    // real B beat (and waits for one), false where it steps on its own.
     static const bool ${name}_load_valid[${LOAD_LEN}] = {${LOAD_VALID}};
+#if defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW)
+    // The blackbox has no ready outputs and the schedule may not depend on
+    // DUT signals, so this keeps a cycle-exact copy of the wrapper's control
+    // state (load FSM position, slot sets, row sequencer), advanced from the
+    // same inputs presented to it. Inputs are read non-blocking and only
+    // presented when the copy says the wrapper will take them; a missing B
+    // beat holds the load FSM on that entry, exactly as the wrapper does.
+    static bool loading = true;
+    static bool loading_d = false;
+    static bool busy = false;
+    static bool rd_set = false;
+    static bool wr_set = false;
+    static bool set_full0 = false;
+    static bool set_full1 = false;
+    static ac_int<${LD_W}, false> ld_idx = 0;
+    static ac_int<${PASS_W}, false> pass = 0;
+    static ac_int<${ACC_W}, false> acc = 0;
+    static ac_int<${A_BITS}, false> a_row = 0;
+    static ac_int<${B_BEAT_BITS}, false> b_beat = 0;
+
+    // Pre-edge view (what the wrapper sees on this clock).
+    bool full_rd = rd_set ? set_full1 : set_full0;
+    bool full_other = rd_set ? set_full0 : set_full1;
+    bool full_wr = wr_set ? set_full1 : set_full0;
+    bool row_last = busy && (pass == ${SLOTS} - 1);
+    bool frame_end = row_last && (acc == 0);
+    bool next_full = (busy && frame_end) ? (${DBUF} && full_other) : full_rd;
+    bool in_ready = (!busy || row_last) && next_full;
+    bool arm = !loading && !loading_d && !full_wr;
+
+    ac_int<1, false> b_valid = 0;
+    bool ld_step = false;
+    if (loading) {
+        if (${name}_load_valid[ld_idx]) {
+            b_T beat;
+            if (b_stream.nb_read(beat)) {
+                ac_int<${B_BEAT_BITS}, false> raw = 0;
+                #pragma hls_unroll
+                for (int i = 0; i < ${B_BEAT_LANES}; i++)
+                    raw.set_slc(i * 8, ac_int<8, false>(beat[i].template slc<8>(0)));
+                b_beat = raw;
+                b_valid = 1;
+                ld_step = true;
+            }
+        } else {
+            ld_step = true;
+        }
+    }
+    ac_int<1, false> in_valid = 0;
+    if (in_ready) {
+        data_T beat;
+        if (a_stream.nb_read(beat)) {
+            a_row = ${name}_pack_a_row<data_T>(beat);
+            in_valid = 1;
+        }
+    }
+    ac_int<${RES_BITS}, false> res_row;
+    ac_int<1, false> out_valid;
+    ccore.run(a_row, in_valid, b_beat, b_valid, res_row, out_valid);
+    if (out_valid) {
+        res_stream.write(${name}_unpack_res_row<res_T>(res_row));
+    }
+
+    // Post-edge state, from the pre-edge values above.
+    bool loading_next = loading;
+    if (loading) {
+        if (ld_step) {
+            if (ld_idx == ${LOAD_LEN} - 1) {
+                loading_next = false;
+                ld_idx = 0;
+            } else {
+                ld_idx++;
+            }
+        }
+    } else if (arm) {
+        loading_next = true;
+        ld_idx = 0;
+    }
+    if (loading_d && !loading) {             // the last write lands
+        if (wr_set) set_full1 = true; else set_full0 = true;
+        if (${DBUF}) wr_set = !wr_set;
+    }
+    if (busy && frame_end) {                  // the frame's last pass issues
+        if (rd_set) set_full1 = false; else set_full0 = false;
+        if (${DBUF}) rd_set = !rd_set;
+    }
+    loading_d = loading;
+    loading = loading_next;
+    if (in_valid) {
+        busy = true;
+        pass = 0;
+        acc = (acc == ${m} - 1) ? ac_int<${ACC_W}, false>(0) : ac_int<${ACC_W}, false>(acc + 1);
+    } else if (busy) {
+        if (pass == ${SLOTS} - 1) {
+            pass = 0;
+            busy = false;
+        } else {
+            pass++;
+        }
+    }
+#else
+    // C model: one whole frame per call (load B, then the frame's M rows).
+    ccore.${name}_reset_state();
     ac_int<${A_BITS}, false> a_row = 0;
     ac_int<${B_BEAT_BITS}, false> b_beat = 0;
     int rows_in = 0;
@@ -543,6 +647,7 @@ void ${name}_gemm_stream_runtime_b(ac_channel<data_T> &a_stream,
             res_stream.write(${name}_unpack_res_row<res_T>(res_row));
         }
     }
+#endif
 }
 
 ${guard_close}""")
@@ -595,6 +700,10 @@ def gen_runtime_b_header(name, m, k, n, bias_codes, shift, geo, bb_delay=3.5,
         B_MODEL_IDX = "ld_idx"
 
     A_BITS, RES_BITS, W = geo["a_port_bits"], geo["res_port_bits"], geo["result_width"]
+    # Slot sets, as in the wrapper: two when two copies fit (set 1 on an even
+    # slot), one otherwise.
+    slots = KP * NP
+    dbuf = slots + slots % 2 + slots <= _geometry.MEM_TILES
     extra_members = (f"\n    signed char B_model[{int(k)}][{int(n)}];"
                      f"\n    int {B_MODEL_IDX};")
     extra_reset = (f"\n        for (int a = 0; a < {int(k)}; a++)"
@@ -609,6 +718,10 @@ def gen_runtime_b_header(name, m, k, n, bias_codes, shift, geo, bb_delay=3.5,
         shift=int(shift), bias_decl=bias_decl, bias_expr=bias_expr,
         KP=KP, NP=NP, D=D, QN=QN, PERIOD=PERIOD, TOTAL=TOTAL, LOAD=LOAD,
         LOAD_LEN=LOAD_LEN, LOAD_VALID=LOAD_VALID,
+        SLOTS=slots, DBUF="true" if dbuf else "false",
+        LD_W=max(1, (LOAD_LEN - 1).bit_length()),
+        PASS_W=max(1, (slots - 1).bit_length()),
+        ACC_W=max(1, (int(m) - 1).bit_length()),
         B_BEAT_BITS=B_BEAT_BITS, B_BEAT_LANES=B_BEAT_LANES,
         B_ASSERT_SIZE=B_ASSERT_SIZE, B_ASSERT_MSG=B_ASSERT_MSG,
         B_LANES=B_LANES, B_MODEL_STORE=B_MODEL_STORE,
