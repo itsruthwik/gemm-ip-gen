@@ -247,17 +247,29 @@ def test_en_gap_regression_icarus(tmp_path):
 
 
 def test_runtime_b_core_rearms_loading_after_first_call():
-    """hls4ml streams a NEW B ahead of EVERY call's A rows (a fresh K for QK,
-    a fresh V for aV), but the wrapper is persistent hardware: `loading`
-    must go back to 1 once a call's results are all out, not just once at
-    reset, or only the first call's B is ever seen."""
+    """hls4ml streams a NEW B ahead of EVERY frame's A rows (a fresh K for QK,
+    a fresh V for aV), but the wrapper is persistent hardware: the load FSM
+    re-arms whenever its target slot set is empty, not just once at reset,
+    or only the first frame's B is ever seen."""
     B = _B(8, 8)
     core = cmvu_rtl.generate_core(4, 8, 8, 2, 1, B, shift=3,
                                   module_name="cmvu_core", runtime_b=True)
-    assert "call_done" in core
-    assert "if (call_done) begin" in core
+    assert "call_done" not in core
+    assert "assign arm = !loading && !loading_d && !set_full[wr_set];" in core
     assert "loading <= 1'b1; b_valid_r <= 1'b0;" in core.split(
-        "if (call_done) begin", 1)[1][:200]
+        "if (arm) begin", 1)[1][:200]
+
+
+@pytest.mark.parametrize("k,kf,dbuf", [(8, 2, True), (32, 8, False)])
+def test_runtime_b_slot_sets(k, kf, dbuf):
+    # Two slot sets (double buffering) when two copies of the layer's tiles
+    # fit in the block's 8 slots; one set otherwise.
+    core = cmvu_rtl.generate_core(4, k, 8, kf, 1, None, shift=3,
+                                  module_name="cmvu_core", runtime_b=True)
+    slots = g.resolve_geometry(4, k, 8, kf, 1)["slots_per_block"]
+    assert f"SET_BASE = {slots + slots % 2};" in core
+    assert f"DBUF = 1'b{1 if dbuf else 0};" in core
+    assert "rd_set*SET_BASE + np*K_PASSES + kp" in core
 
 
 def test_generate_runtime_b_multi_call_tb_structure():
@@ -478,6 +490,52 @@ def test_staged_k_passes_multi_call_backpressure_icarus(tmp_path, m, k, n, kf, n
     tb = gold.generate_runtime_b_multi_call_tb(
         m, k, n, kf, nf, shift=3, module_name="cmvu_core", seed=17,
         result_width=16, n_calls=3, backpressure=True)
+    (tmp_path / "cmvu_core.v").write_text(core)
+    (tmp_path / "cmvu_core_tb.v").write_text(tb)
+    build = subprocess.run(
+        ["iverilog", "-g2012", "-o", "simv", "-s", "cmvu_core_tb",
+         "cmvu_core_tb.v", "cmvu_core.v", *rtl_files],
+        cwd=tmp_path, capture_output=True, text=True, timeout=120)
+    assert build.returncode == 0, build.stdout + build.stderr
+    sim = subprocess.run(["vvp", "simv"], cwd=tmp_path,
+                         capture_output=True, text=True, timeout=300)
+    out = sim.stdout + sim.stderr
+    assert sim.returncode == 0 and "ALL_PASS" in out and "ERROR:" not in out, out
+
+
+# ── Double-buffered runtime-B, frames streamed back to back ──────────────────
+# With two slot sets the next frame's B loads while the current frame
+# computes, so the frame interval is max(M * slots, load + 2): the compute
+# (the reuse factor) whenever the load fits under it.
+
+@pytest.mark.parametrize("m,k,n,kf,nf,row_major", [
+    (8, 16, 8, 2, 1, False),   # 2 slots, paired column writes
+    (8, 12, 8, 3, 1, False),   # 3 slots (odd): set 1 on an even base, staging
+    (8, 8, 16, 2, 2, True),    # row-major, 4 slots
+    (8, 4, 8, 1, 1, False),    # 1 slot: load-bound (load + 2 > M * slots)
+    (6, 12, 16, 3, 2, False),  # 6 slots: one set, no double buffering
+])
+@pytest.mark.parametrize("backpressure", [False, True])
+def test_runtime_b_frames_stream_icarus(tmp_path, m, k, n, kf, nf, row_major,
+                                        backpressure):
+    if shutil.which("iverilog") is None:
+        pytest.skip("iverilog not on PATH")
+    rtl_dir = g.vendored_rtl_dir()
+    if rtl_dir is None:
+        pytest.skip("cmvu vendored block RTL not found")
+    rtl_files = [str((rtl_dir / f).resolve()) for f in g.VENDORED_SV]
+    geo = g.resolve_geometry(m, k, n, kf, nf)
+    slots = geo["slots_per_block"]
+    dbuf = slots + slots % 2 + slots <= g.MEM_TILES
+    load = len(g.runtime_b_load_schedule(k, n, geo, row_major))
+    interval = max(m * slots, load + 2) if dbuf else None
+    core = cmvu_rtl.generate_core(m, k, n, kf, nf, None, shift=4,
+                                  module_name="cmvu_core", runtime_b=True,
+                                  b_row_major=row_major, result_width=16)
+    tb = gold.generate_streaming_runtime_b_tb(
+        m, k, n, kf, nf, shift=4, module_name="cmvu_core", seed=3,
+        result_width=16, b_row_major=row_major, n_frames=5,
+        backpressure=backpressure, frame_interval=interval)
     (tmp_path / "cmvu_core.v").write_text(core)
     (tmp_path / "cmvu_core_tb.v").write_text(tb)
     build = subprocess.run(

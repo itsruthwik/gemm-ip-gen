@@ -56,11 +56,17 @@ block itself (not the wrapper this target generates around it).
   (one tile's worth of rows) plus drain stalls to write more than one
   resident N-pass slot. Each layout is what it is because of which write
   port (row vs. column) the block exposes, not a free choice.
-- **B is reloaded on every call, not just once at reset.** hls4ml streams a
-  new B ahead of every call's A rows (a fresh K for attention QK, a fresh V
-  for aV); the wrapper's load FSM re-arms (`loading<=1`) the cycle its
-  previous call's last result is emitted, because the wrapper is persistent
-  hardware across calls, not something hls4ml re-instantiates per call.
+- **B is reloaded for every frame, into one or two slot sets.** hls4ml
+  streams a new B ahead of every frame's A rows (a fresh K for attention QK,
+  a fresh V for aV), and the wrapper is persistent hardware, so its load FSM
+  re-arms whenever the slot set it fills is empty. When two copies of the
+  layer's `K_PASSES*N_GROUPS` tiles fit in the block's 8 slots (set 1 starts
+  on an even slot, so both sets load identically), the next frame's B loads
+  into the idle set while the current frame computes from the other; a set
+  is full from the edge its last write lands until the frame's last row
+  issues its last pass. A row is accepted only when the set it will read is
+  full, so a new frame can start right behind the previous one. With one set
+  the load waits for that release.
 - **Fixed-cadence, feed-forward control: no blackbox signal drives the HLS
   schedule.** The C++ entry presents inputs on a compile-time-fixed cadence
   and only polls `out_valid`/reads results — it never branches on
