@@ -160,13 +160,15 @@ def test_cmvu_mode1_vtr_model_compiles_with_iverilog(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
 
 
-def test_sources_tcl_and_finalize_ship_the_vtr_model(tmp_path):
+def test_finalize_ships_the_vtr_model_outside_the_sources_tcl(tmp_path):
     from targets.cmvu.flow import CmvuTarget
     from targets.cmvu import geometry as g
     t = CmvuTarget()
     tcl = t.sources_tcl([])
-    assert g.CMVU_MODE1_VTR_MODEL in tcl
-    assert "-exclude true" in tcl
+    # The stub declares `module cmvu_mode1` too; listed here, SCVerify would
+    # compile it after the real block and replace it.
+    assert g.CMVU_MODE1_VTR_MODEL not in tcl
+    assert "cmvu_mode1.sv" in tcl and "-exclude true" in tcl
     t.finalize([], str(tmp_path))
     model_path = tmp_path / g.CMVU_MODE1_VTR_MODEL
     assert model_path.is_file()

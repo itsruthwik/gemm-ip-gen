@@ -415,3 +415,42 @@ def test_backpressure_regression_icarus_multi_call(tmp_path):
                          capture_output=True, text=True, timeout=120)
     out = sim.stdout + sim.stderr
     assert sim.returncode == 0 and "ALL_PASS" in out, out
+
+
+# ── Back-to-back rows ─────────────────────────────────────────────────────────
+# The wrapper takes the next row on the current row's last pass, so rows issue
+# every K_PASSES*N_GROUPS cycles with no idle cycle between them. The other
+# Icarus TBs send one row and wait for its result, so they never exercise it.
+
+@pytest.mark.parametrize("m,k,n,kf,nf,backpressure", [
+    (8, 8, 16, 1, 1, False),    # fully spatial: a new row every cycle
+    (8, 8, 16, 2, 2, False),    # 2 K passes x 2 N groups
+    (6, 6, 10, 2, 2, False),    # K and N tails
+    (5, 16, 8, 4, 1, False),    # K passes only
+    (8, 8, 16, 2, 2, True),     # long en gaps mid-row
+])
+def test_streaming_rows_back_to_back_icarus(tmp_path, m, k, n, kf, nf,
+                                            backpressure):
+    if shutil.which("iverilog") is None:
+        pytest.skip("iverilog not on PATH")
+    rtl_dir = g.vendored_rtl_dir()
+    if rtl_dir is None:
+        pytest.skip("cmvu vendored block RTL not found")
+    rtl_files = [str((rtl_dir / f).resolve()) for f in g.VENDORED_SV]
+    B = _B(k, n)
+    core = cmvu_rtl.generate_core(m, k, n, kf, nf, B, shift=4,
+                                  module_name="cmvu_core", result_width=16)
+    tb = gold.generate_streaming_tb(m, k, n, kf, nf, B, shift=4,
+                                    module_name="cmvu_core", seed=21,
+                                    result_width=16, backpressure=backpressure)
+    (tmp_path / "cmvu_core.v").write_text(core)
+    (tmp_path / "cmvu_core_tb.v").write_text(tb)
+    build = subprocess.run(
+        ["iverilog", "-g2012", "-o", "simv", "-s", "cmvu_core_tb",
+         "cmvu_core_tb.v", "cmvu_core.v", *rtl_files],
+        cwd=tmp_path, capture_output=True, text=True, timeout=120)
+    assert build.returncode == 0, build.stdout + build.stderr
+    sim = subprocess.run(["vvp", "simv"], cwd=tmp_path,
+                         capture_output=True, text=True, timeout=120)
+    out = sim.stdout + sim.stderr
+    assert sim.returncode == 0 and "ALL_PASS" in out, out

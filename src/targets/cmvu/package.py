@@ -341,12 +341,12 @@ def gen_public_header(name, m, k, n, weight_codes, bias_codes, shift,
     bias_expr = f"_{name}_bias[j]"
     D = _geometry.L + (geo["k_spatial"] - 1) + (geo["n_spatial"] - 1)
     KP, NP = geo["k_passes"], geo["n_passes"]
-    # Feed-forward entry timing: the serialized wrapper accepts
-    # one row every KP*NP+1 en-cycles (`in_ready = ~busy`), and the model emits
-    # each result KP*NP + D + 1 calls after its accept call. TOTAL is the fixed
-    # trip count that covers every feed and every result; QN bounds the rows in
-    # flight so the model's slot table can't overflow.
-    PERIOD = KP * NP + 1
+    # Feed-forward entry timing: the wrapper accepts a row every KP*NP
+    # en-cycles (the next row is taken on the current row's last pass), and
+    # the model emits each result KP*NP + D + 1 calls after its accept call.
+    # TOTAL is the fixed trip count that covers every feed and every result;
+    # QN bounds the rows in flight so the model's slot table can't overflow.
+    PERIOD = KP * NP
     LAT = KP * NP + D + 1
     TOTAL = (int(m) - 1) * PERIOD + LAT + 1
     QN = (LAT + PERIOD - 1) // PERIOD + 2
@@ -552,7 +552,7 @@ def gen_runtime_b_header(name, m, k, n, bias_codes, shift, geo, bb_delay=3.5,
     bias_expr = f"_{name}_bias[j]"
     D = _geometry.L + (geo["k_spatial"] - 1) + (geo["n_spatial"] - 1)
     KP, NP = geo["k_passes"], geo["n_passes"]
-    PERIOD = KP * NP + 1
+    PERIOD = KP * NP
 
     load_sched = _runtime_b_load_schedule(k, n, geo, b_row_major)
     LOAD_LEN = len(load_sched)
@@ -1176,11 +1176,10 @@ def gen_sources_tcl():
     for sv in VENDORED_SV:
         lines.append(f'solution file add [file join [file dirname [info script]] '
                      f'{sv}] -type SystemVerilog -exclude true')
-    lines.append("# VTR-facing cmvu_mode1 hard-block model (blackbox stub, no body;")
-    lines.append("# see gen_cmvu_mode1_vtr_model): -exclude true keeps Catapult from")
-    lines.append("# compiling it into the netlist, same as the vendored sim models above.")
-    lines.append(f'solution file add [file join [file dirname [info script]] '
-                 f'{_geometry.CMVU_MODE1_VTR_MODEL}] -type SystemVerilog -exclude true')
+    # The VTR-facing cmvu_mode1 stub ships in the package root for VTR only and
+    # must NOT be added here: -exclude true only keeps a file out of synthesis,
+    # SCVerify still compiles it, and its port-only `module cmvu_mode1` then
+    # replaces the real block in the simulation library.
     return "\n".join(lines) + "\n"
 
 
