@@ -49,7 +49,11 @@ node interval = max( M*SF*NF ,  k_pad*NF  [row-major B]  or  n*SF  [col-major B]
 
 The loader is 2-bank ping-pong, so the load overlaps the previous node's
 compute; when the compute term is the larger the node runs at the compute II,
-otherwise it is load-bound. The first node of a run always waits for its whole B
+otherwise it is load-bound. When the two terms are exactly equal the bank
+turnaround has no slack and the node interval alternates `M*SF*NF` and
+`M*SF*NF + 1` (measured: 8/9 and 16/17 on the mha_small attention folds), a
+cost of half a cycle per node that a fold with a little compute headroom over
+the load avoids. The first node of a run always waits for its whole B
 load before its first output, which is a one-off cost, not a steady-state one.
 
 **Latency at the ports** (first row in to first row out, B resident):
