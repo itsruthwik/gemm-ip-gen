@@ -771,6 +771,7 @@ def _reuse_factor_warnings(plan):
 
 def gen_integration_manifest(items):
     cores = []
+    ap_int_max_w = None
     for it in items:
         nm = it.get("emit_name") or it["name"]
         core = {"name": nm, "kind": "rtl_blackbox", "tool": "vitis",
@@ -824,11 +825,22 @@ def gen_integration_manifest(items):
                 mode = 0 if it.get("second_operand_row_major") is not False else 1
                 pp = _rtl.two_operand_ports(plan, tile, mode)
                 core["ports"] = {k: pp[k] for k in ("a", "a_beats", "b", "b_beats", "p", "p_beats")}
+            widest_port = max(
+                width for port, width in core["ports"].items() if not port.endswith("_beats")
+            )
+            if widest_port > 1024:
+                required = _apmaxw(widest_port)
+                ap_int_max_w = required if ap_int_max_w is None else max(ap_int_max_w, required)
             for w in _reuse_factor_warnings(plan):
                 print(w)
         cores.append(core)
-    return json.dumps({"tool": "vitis", "flow": "rtl_blackbox",
-                       "header": "gemm_ip_combined.h", "cores": cores}, indent=2) + "\n"
+    manifest = {"tool": "vitis", "flow": "rtl_blackbox",
+                "header": "gemm_ip_combined.h", "cores": cores}
+    if ap_int_max_w is not None:
+        # Package consumer contract: this definition must also reach the hls4ml
+        # design translation unit, not only gemm-ip-gen's generated core TUs.
+        manifest["compile_definitions"] = {"AP_INT_MAX_W": ap_int_max_w}
+    return json.dumps(manifest, indent=2) + "\n"
 
 
 def run_vitis_smoke(package=None, cases=None, keep=False):

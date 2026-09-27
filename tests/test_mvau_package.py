@@ -215,6 +215,39 @@ def test_n_tiling_manifest_lists_all_weight_files(tmp_path):
     assert cores["gemm_1"]["weight_data"] == ["gemm_1/rtl_static/gemm_1_weights.dat"]
 
 
+def test_manifest_declares_ap_int_max_w_for_wide_hls4ml_port():
+    from targets.mvau import package as pkgmod
+
+    items = [{
+        "name": "gemm_wide", "m": 1, "k": 16, "n": 64,
+        "reuse_factor": 4, "fold_axis": "n", "weights_in_core": True,
+        "weight_precision": "fixed<6,1>", "input_precision": "fixed<8,4>",
+        "output_precision": "fixed<19,10>", "part": VERSAL,
+    }]
+    manifest = json.loads(pkgmod.gen_integration_manifest(items))
+
+    assert manifest["cores"][0]["ports"]["p"] == 1216
+    assert manifest["compile_definitions"] == {"AP_INT_MAX_W": 3072}
+
+
+def test_manifest_omits_ap_int_max_w_for_narrow_ports():
+    from targets.mvau import package as pkgmod
+
+    items = [{
+        "name": "gemm_narrow", "m": 1, "k": 4, "n": 4,
+        "reuse_factor": 1, "weights_in_core": True,
+        "weight_precision": "fixed<8,4>", "input_precision": "fixed<8,4>",
+        "output_precision": "fixed<16,6>", "part": VERSAL,
+    }]
+    manifest = json.loads(pkgmod.gen_integration_manifest(items))
+
+    assert max(
+        width for port, width in manifest["cores"][0]["ports"].items()
+        if not port.endswith("_beats")
+    ) <= 1024
+    assert "compile_definitions" not in manifest
+
+
 def test_affine_drain_present(tmp_path):
     pkg = _gen(tmp_path, (3, 16, 8), "gemm_3x16x8_f", reuse_factor=16, fold_axis="k")
     # requant (shift + round-half-up + wrap) lives in the core twin (and the RTL
