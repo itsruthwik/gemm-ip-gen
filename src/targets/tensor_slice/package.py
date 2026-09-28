@@ -595,17 +595,26 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                         }}
                     }}
                 }}"""
+        # The row lands in one row tile, picked at run time. Build its 64-bit chunk
+        # once, then write every tile slot unconditionally (the chunk or zero): a
+        # conditional set_slc per byte and tile made Catapult chain the writes onto
+        # one wide word, a feedback path longer than a 2 ns cycle at 13 row tiles
+        # x 7 K passes. Unconditional writes to constant slices are plain wiring.
         return f"""
-                #pragma hls_unroll
-                {label}_KL: for (int kl = 0; kl < 8; kl++) {{
-                    int kk = ({pass_expr}) * 8 + kl;
+                {{
+                    ac_int<64, false> {label}_chunk = 0;
+                    #pragma hls_unroll
+                    {label}_KL: for (int kl = 0; kl < 8; kl++) {{
+                        int kk = ({pass_expr}) * 8 + kl;
+                        if (kk < {k}) {{
+                            {label}_chunk.set_slc(kl * 8, {name}_to_gemm_int8(a_beat[kk]));
+                        }}
+                    }}
                     int row_tile = t / 8;
                     #pragma hls_unroll
                     {label}_RT: for (int rt = 0; rt < {grid_rows}; rt++) {{
-                        if (row_tile == rt && kk < {k}) {{
-                            {dest}.set_slc({base}rt * 64 + kl * 8,
-                                           {name}_to_gemm_int8(a_beat[kk]));
-                        }}
+                        {dest}.set_slc({base}rt * 64,
+                                       (row_tile == rt) ? {label}_chunk : ac_int<64, false>(0));
                     }}
                 }}"""
 

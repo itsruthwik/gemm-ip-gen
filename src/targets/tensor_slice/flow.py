@@ -61,16 +61,14 @@ class TensorSliceTarget(Target):
         {"name": "MFold", "key": "m_reuse_factor", "type": "int", "default": None,
          "description": "independent M-axis fold pass count (legal 1..ceil(m/8)); "
                          "1 (or unset) means M is fully spatial. Explicit MFold/KFold/"
-                         "NFold take precedence over legacy FoldAxis+ReuseFactor. Setting "
-                         "2+ axes to a value >1 at once (combined folding) is csim-valid "
-                         "but not yet synth-valid -- see KFold."},
+                         "NFold take precedence over legacy FoldAxis+ReuseFactor. Two or "
+                         "more axes may fold at once (combined folding); that path runs "
+                         "through csim, synthesis and place-and-route."},
         {"name": "KFold", "key": "k_reuse_factor", "type": "int", "default": None,
          "description": "independent K-axis fold pass count (legal 1..ceil(k/8)); "
                          "1 (or unset) means K is fully spatial (today's default/legacy "
-                         "ReuseFactor axis). See MFold for precedence and the combined-"
-                         "folding synth-grid limitation (a hard error is raised if 2+ of "
-                         "MFold/KFold/NFold resolve to a pass count >1 and a synth package "
-                         "is requested; the general synth grid is a pending roadmap item)."},
+                         "ReuseFactor axis). See MFold for precedence and combined "
+                         "folding."},
         {"name": "NFold", "key": "n_reuse_factor", "type": "int", "default": None,
          "description": "independent N-axis fold pass count (legal 1..ceil(n/8)); "
                          "1 (or unset) means N is fully spatial. See MFold."},
