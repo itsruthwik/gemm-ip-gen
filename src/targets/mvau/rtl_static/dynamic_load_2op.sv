@@ -134,25 +134,32 @@ always_ff @( posedge ap_clk ) begin : REG_PROC_WR
 end
 
 // -- NSL
+// The writer may move on to the other bank once the reader has left it. It tests the
+// reader's NEXT state: when the reader issues its last read of that bank in this cycle,
+// the read is sampled on this cycle's edge and the writer's first write to the bank lands
+// one edge later, so the old contents are still what the reader gets. Testing the
+// reader's current state instead cost one stall cycle (irdy low) every other node when
+// load and replay take the same number of cycles. state_rd_N depends on state_wr_C only,
+// so there is no combinational loop.
 always_comb begin : NSL_PROC_WR
     state_wr_N = state_wr_C;
 
     unique case (state_wr_C)
         ST_WR_0:
             if ((curr_lane_C == LANES - 1) && (curr_addr_C == DEPTH - 1) && ivld) begin
-                state_wr_N = (state_rd_C == ST_RD_0) ? ST_WR_1 : ST_WR_0_WAIT;
+                state_wr_N = (state_rd_N == ST_RD_0) ? ST_WR_1 : ST_WR_0_WAIT;
             end
 
         ST_WR_0_WAIT:
-            state_wr_N = (state_rd_C == ST_RD_0) ? ST_WR_1 : ST_WR_0_WAIT;
+            state_wr_N = (state_rd_N == ST_RD_0) ? ST_WR_1 : ST_WR_0_WAIT;
 
         ST_WR_1:
             if ((curr_lane_C == LANES - 1) && (curr_addr_C == DEPTH - 1) && ivld) begin
-                state_wr_N = (state_rd_C == ST_RD_1) ? ST_WR_0 : ST_WR_1_WAIT;
+                state_wr_N = (state_rd_N == ST_RD_1) ? ST_WR_0 : ST_WR_1_WAIT;
             end
 
         ST_WR_1_WAIT:
-            state_wr_N = (state_rd_C == ST_RD_1) ? ST_WR_0 : ST_WR_1_WAIT;
+            state_wr_N = (state_rd_N == ST_RD_1) ? ST_WR_0 : ST_WR_1_WAIT;
 
     endcase
 end
