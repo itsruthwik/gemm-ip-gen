@@ -147,7 +147,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     total_beats = passes * input_beats
     first_out = latency_cycles(m, k, n, grid_rows, grid_cols, k_spatial=ks)
     # Frame slots for the pipelined sim core: feed of frame t+1 may overlap
-    # compute/drain of frame t (min frame period = total_beats + 1 calls).
+    # compute/drain of frame t (min frame period = total_beats calls).
     #
     # op-contract note: this C
     # core has no op/pe_reset/shadow state -- it is a grid-level `gemm.run()`
@@ -156,14 +156,16 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # (see rtl.py). This frame-period overlap (feed of t+1 while t is still
     # draining) is the same compute/drain decoupling the op contract expresses
     # at the pin level; it is realized here without modeling the pins.
-    slots = -(-(first_out + 1 + m) // (total_beats + (0 if (_combined_fold and passes >= 2) else 1))) + 1
+    slots = -(-(first_out + m) // total_beats) + 1
 
     # Merged feed+drain call budget. The RUN loop polls out_valid on every
     # call, so it absorbs the core's port lag. The frame's last row sits at
-    # run()-call index first_out + (m-1) + 2 (preload call + clk_cnt->call
-    # offset), and the worst port lag is 3 calls (sim branch: 2 registered
-    # stages; structural branch adds an input register) — plus 2 calls spare.
-    run_calls = first_out + m + 6
+    # run()-call index first_out + (m-1) - 1 (the core has no preload call, so
+    # a frame's first in_valid beat is call 0, and its first row appears
+    # first_out - 1 calls later), and the worst port lag is 3 calls (sim
+    # branch: 2 registered stages; structural branch adds an input register)
+    # — plus 2 calls spare.
+    run_calls = first_out + m + 4
     if run_calls < total_beats + 2:
         raise RuntimeError(
             f"{name}: GEMM wrapper RUN budget shorter than the feed itself "
@@ -172,16 +174,16 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
 
     # Back-to-back multi-frame schedule. No BIAS preload step: bias is a
     # compile-time constant baked into the core (decision 4), not a runtime
-    # port. Each frame is ONE in_valid=0
-    # beat (p == 0, carrying a live preload_valid pulse - see the RUN loop comment)
-    # followed by total_beats in_valid beats; the idle beat drops the core's
-    # `feeding` flag so the next frame allocates a fresh slot.
-    # Steady-state frame period = total_beats + 1; the last frame's outputs drain
+    # port. The cores have no preload stage: a frame starts on its first
+    # in_valid beat and frames are gapless (one frame's last beat is followed
+    # directly by the next frame's first), so each frame is total_beats
+    # in_valid beats and preload_valid is tied to 0.
+    # Steady-state frame period = total_beats; the last frame's outputs drain
     # in the trailing first_out + m + slack tail. With n_frames == 1 this reduces
     # to a single frame (real hls4ml flow: one frame per wrapper call).
-    period = total_beats + 1
+    period = total_beats
     # in_valid is asserted only inside the feed region; feed_total covers every
-    # frame's total_beats feed cycles plus its trailing 1-cycle separator.
+    # frame's total_beats feed cycles.
     feed_total = n_frames * period
     # Loop length: the LAST frame starts feeding at (n_frames-1)*period and its
     # final output lands first_out + m later (the behavioral core emits m rows per
@@ -189,7 +191,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # so the tail is sized on m. Sizing on feed_total
     # here would over-run by a full period per frame (a serialized-latency
     # regression for n_frames == 1).
-    total_steps = (n_frames - 1) * period + first_out + m + 6
+    total_steps = (n_frames - 1) * period + first_out + m + 4
     total_rows = n_frames * m
 
     # Fold-M: ``m`` here is the CORE row count (M_g = 8*mg); ``logical_m`` is
@@ -282,14 +284,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # multi-frame batching (n_frames > 1 with m_passes == n_passes == 1) is
     # untouched -- it is an orthogonal feature (repeated activation frames
     # against the same weights), not geometry folding.
-    # The combined-fold core has no preload stage: with K in two or more passes
-    # its frames are gapless, one frame's last beat followed directly by the
-    # next frame's first. A one-pass frame is only as long as its row burst, so
-    # it keeps one in_valid=0 beat between waves, as the single-axis cores do.
-    _lead = 0 if (_combined_fold and passes >= 2) else 1
     if fold_m or fold_n:
         n_frames = int(m_passes) * int(n_passes)
-        period = total_beats + _lead
+        period = total_beats
         feed_total = n_frames * period
         # Structural-core tail: the last frame's rows are produced through the
         # tensor_slice_int8_atlas blackbox, whose registered inputs + handshake add
@@ -300,7 +297,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # `period` of slack guarantees the loop outlives the last drain for
         # every combined shape; harmless idle cycles otherwise.
         _struct_tail = period if _combined_fold else 0
-        total_steps = (n_frames - 1) * period + first_out + m + 6 + _struct_tail
+        total_steps = (n_frames - 1) * period + first_out + m + 4 + _struct_tail
         total_rows = n_frames * m
 
     # Choose the RHS expression for the final output assignment based on the
@@ -482,7 +479,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         array_bcols_run_arg = "b_cols_packed, "
         if ks > 1 or _combined_fold:
             array_bcols_pack = f"""
-        if (step > 0 && step <= {total_beats} && t < {n}) {{
+        if (step < {total_beats} && t < {n}) {{
             b_beat_T b_beat = weight_cols[{b_col_idx}];
             #pragma hls_unroll
             for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
@@ -498,7 +495,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         }}"""
         else:
             array_bcols_pack = f"""
-        if (step > 0 && step <= {total_beats} && t < {n}) {{
+        if (step < {total_beats} && t < {n}) {{
             b_beat_T b_beat = weight_cols[{b_col_idx}];
             #pragma hls_unroll
             for (int kl = 0; kl < 8; kl++) {{
@@ -721,15 +718,13 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                     }}
                 }}"""
 
-    _frame_preload_expr = "(in_feed && p == 0) ? 1 : 0" if _lead else "0"
-    _csim_gapless_new_frame = "" if _lead else f" || cc_slot[wr_slot] >= {total_beats}"
 
     stream_feed_loop = f"""
 {a_replay_decl}
     // Back-to-back feed of {n_frames} frame(s): M A rows + N B columns, each
     // pass carrying k_spatial={ks} K chunks (passes={passes} sweeps of K).
-    // Each frame is {_lead} in_valid=0 beat(s) (the preload pulse, p == 0)
-    // + {total_beats} in_valid beats (period {period}); bias is a
+    // Each frame is {total_beats} in_valid beats (period {period}, gapless:
+    // the core has no preload stage); bias is a
     // compile-time constant baked into the core (decision 4). Every step polls
     // out_valid, so rows are captured as they emerge — frame t+1 feeds while
     // frame t drains in the core's FRAME_SLOTS.
@@ -737,8 +732,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     RUN: for (int step = 0; step < {total_steps}; step++) {{
         bool in_feed = (step < {feed_total});
         int p = in_feed ? (step % {period}) : {period};{_stream_g_decl}
-        bool feeding_now = in_feed && (p >= {_lead}) && (p < {_lead + total_beats});
-        int pf = p - {_lead};
+        bool feeding_now = in_feed && (p < {total_beats});
+        int pf = p;
         int kc = pf / {input_beats};
         int t = pf % {input_beats};
         ac_int<{a_port_bits}, false> a_rows = 0;
@@ -753,13 +748,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
-        // preload_valid pulses on each frame's leading beat (p==0) so the
-        // structural core's S_IDLE->S_PRELOAD->S_RUN arm is a live, non-constant
-        // signal. Without it (literal 0) VTR synthesis proves transaction_active,
-        // hence the tensor_slice result path, dead and prunes every slice. This
-        // reuses the per-frame idle beat (formerly a trailing separator -> now a
-        // leading preload, same period); bias is baked into the core, not fed here.
-        ac_int<1, false> frame_preload = {_frame_preload_expr};
+        // preload_valid is an unused port (the core has no preload stage).
+        ac_int<1, false> frame_preload = 0;
         gemm.run(a_rows, {bcols_run_arg}frame_preload, feed_valid, c_row, v, l);
 {_stream_capture_use}
     }}
@@ -774,25 +764,25 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # array feed loop needs no replay buffer: every pass re-slices the row it
     # already has in hand.
     array_feed_loop = f"""
-    // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats} preload then
+    // Merged feed+drain: one run() call per cycle. Steps 0..{total_beats - 1}
     // feed M A rows (and, two-stream, N B columns), each pass carrying
     // k_spatial={ks} K chunks (passes={passes} sweeps of K). Every step polls
     // out_valid, so the frame's rows are captured as they emerge, not in a drain loop.
     #pragma hls_pipeline_init_interval 1
     RUN_ARRAY: for (int step = 0; step < {run_calls}; step++) {{
-        int eff_step = (step == 0 || step > {total_beats}) ? 0 : step - 1;
+        int eff_step = (step >= {total_beats}) ? 0 : step;
         int kc = eff_step / {input_beats};
         int t = eff_step % {input_beats};
         ac_int<{a_port_bits}, false> a_rows_packed = 0;{array_bcols_decl}
 
-        if (step > 0 && step <= {total_beats} && t < {m} && kc == 0) {{
+        if (step < {total_beats} && t < {m} && kc == 0) {{
             a_beat_T a_beat = a_rows[t];{_a_pack_block("a_rows_packed", "0", "ROW_PACK_ARRAY")}{_a_pack_later_passes("a_rows_packed", "PACK_ARRAY")}
         }}{array_bcols_pack}
 
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
-        ac_int<1, false> feed_valid = (step >= 1 && step <= {total_beats}) ? 1 : 0;
-        ac_int<1, false> feed_preload_valid = (step == 0) ? 1 : 0;
+        ac_int<1, false> feed_valid = (step < {total_beats}) ? 1 : 0;
+        ac_int<1, false> feed_preload_valid = 0;
         gemm.run(a_rows_packed, {array_bcols_run_arg}feed_preload_valid, feed_valid, c_row, v, l);
 {array_capture}
     }}
@@ -870,8 +860,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         int g = step / {period};
         int mg = g / {n_passes};
         int ng = g % {n_passes};
-        bool feeding_now = in_feed && (p >= {_lead}) && (p < {_lead + total_beats});
-        int pf = p - {_lead};
+        bool feeding_now = in_feed && (p < {total_beats});
+        int pf = p;
         int kc = pf / {input_beats};
         int t = pf % {input_beats};
         ac_int<{a_port_bits}, false> a_rows_packed = 0;{array_bcols_decl}
@@ -884,7 +874,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         ac_int<{c_bits}, false> c_row;
         ac_int<1, false> v, l;
         ac_int<1, false> feed_valid = feeding_now ? 1 : 0;
-        ac_int<1, false> feed_preload_valid = {_frame_preload_expr};
+        ac_int<1, false> feed_preload_valid = 0;
         gemm.run(a_rows_packed, {array_bcols_run_arg}feed_preload_valid, feed_valid, c_row, v, l);
 {_array_capture_use}
     }}
@@ -1109,11 +1099,11 @@ class {name}_ccore {{
 #else{brom_decl}
 {bias_c_decl_block}        // Frame-slot scheduler (mirrors the structural wrapper's overlapped-frame schedule): up to
         // {slots} frames in flight. A frame starts at the first in_valid call
-        // after a non-in_valid call (the FEED protocol always inserts the
-        // preload step between frames); each frame keeps a private operand
+        // after a non-in_valid call, or right after the previous frame's last
+        // beat when frames are gapless (no preload stage); each frame keeps a private operand
         // buffer and cycle counter and emits its {m} rows at
-        // [first_out+1, first_out+1+{m}) of its own clock. Back-to-back
-        // frames sustain a frame II of {total_beats + 1} calls.
+        // [first_out, first_out+{m}) of its own clock. Back-to-back
+        // frames sustain a frame II of {total_beats} calls.
         static ac_int<{a_bits}, false> a_buf[{slots}][{total_beats}];
         static ac_int<{b_bits}, false> b_buf[{slots}][{passes * n}];
         static int cc_slot[{slots}] = {{0}};
@@ -1126,7 +1116,7 @@ class {name}_ccore {{
         out_last = 0;
 
         if (in_valid) {{
-            if (!feeding{_csim_gapless_new_frame}) {{
+            if (!feeding || cc_slot[wr_slot] >= {total_beats}) {{
                 wr_slot = (wr_slot + 1) % {slots};
                 feeding = true;
                 slot_run[wr_slot] = true;
@@ -1150,8 +1140,8 @@ class {name}_ccore {{
         for (int s = 0; s < {slots}; s++) {{
             if (!slot_run[s]) continue;
             int scc = cc_slot[s];
-            if (scc >= {first_out + 1} && scc < {first_out + 1} + {m}) {{
-                int out_idx = scc - ({first_out + 1});
+            if (scc >= {first_out} && scc < {first_out} + {m}) {{
+                int out_idx = scc - ({first_out});
                 int actual_row = out_idx;
                 int row_tile = actual_row / 8;
                 (void) row_tile;
@@ -1197,7 +1187,7 @@ class {name}_ccore {{
                 out_last = (out_idx == {m} - 1) ? 1 : 0;
             }}
             cc_slot[s] = scc + 1;
-            if (scc + 1 >= {first_out + 1} + {m}) {{
+            if (scc + 1 >= {first_out} + {m}) {{
                 slot_run[s] = false;
                 cc_slot[s] = 0;
             }}

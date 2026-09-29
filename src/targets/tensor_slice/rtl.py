@@ -332,8 +332,16 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1, passes=1,
     else:
         grp_decl = grp_reset = grp_feeding = ""
         grp_idle = "                rom_addr <= 16'd0;"
+    if gapless:
+        # The wrap on a frame's last beat already lands rom_addr on the next
+        # frame's first entry (next group's base, or 0 after the last one), and
+        # frames may follow each other with no idle beat, so a group counter
+        # stepped by idle beats would drift from the frame sequence. An idle
+        # beat therefore only rewinds beat_ctr and holds rom_addr.
+        grp_decl = grp_reset = grp_feeding = grp_idle = ""
     # Gapless: entries are laid out in feed order (pass-major, or group-major
     # when only N folds), so the wrap past the last entry is the rewind.
+    grp_idle_nl = f"\n{grp_idle}" if grp_idle else ""
     rom_wrap = (f"(rom_addr + 16'd1 >= 16'd{nbeats}) ? 16'd0 : rom_addr + 16'd1"
                 if gapless else "rom_addr + 16'd1")
     text = f"""
@@ -358,8 +366,7 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1, passes=1,
             rom_addr <= 16'd0;{grp_reset}
         end else if (en) begin
             if (!in_valid) begin
-                beat_ctr <= 16'd0;
-{grp_idle}
+                beat_ctr <= 16'd0;{grp_idle_nl}
             end else if (beat_ctr < 16'd{input_beats - 1}) begin
                 beat_ctr <= beat_ctr + 16'd1;
                 if (beat_ctr + 16'd1 < 16'd{n}) rom_addr <= rom_addr + 16'd1;{grp_feeding}
@@ -484,7 +491,8 @@ def _a_replay_block(a_width, passes, n_passes, m, input_beats, k=None, gapless=F
     replay_row = f"(replay_beat < 16'd{m}) ? ({sel}) : {a_width}'d0" if padded else sel
     block = f"""
     // A-row replay: the row on the port this cycle is replay_beat of K pass
-    // replay_pass, both cleared by the frame's in_valid=0 preload beat. Fresh
+    // replay_pass, both cleared by an in_valid=0 beat (and wrapped at the
+    // frame's last beat in the gapless feed). Fresh
     // rows are stored as they pass; the read lands in a_rows_q on the same edge
     // port data would, so latency is unchanged. Contents need no reset.
     reg [15:0] replay_beat;
@@ -594,7 +602,7 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     a_port_width, a_replay_block, a_rows_src = _a_replay_block(
         a_width, (k + 7) // 8,
         n_passes if a_replay_n_passes is None else a_replay_n_passes, m, input_beats,
-        k=(k if grid_rows == 1 else None))
+        k=(k if grid_rows == 1 else None), gapless=True)
     # The slice emits 8 physical rows per tile.  The wrapper retires after M
     # logical rows and uses op[1] to truncate the masked remainder.
     logical_output_rows = m
@@ -778,8 +786,8 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
         debug_block = """
     always @(posedge clk) begin
         if (!slice_reset && (emit_active || row_take || |done_mat_mul)) begin
-            $display("DBG t=%0t st=%0d beat=%0d done=%b take=%0b out_rows=%0d fed=%0d emit=%0d head=%0b rav=%b cav=%b op0=%b op1=%b trunc=%b",
-                     $time, state, beat_count, done_mat_mul, row_take, out_row_count,
+            $display("DBG t=%0t chunk=%0d beat=%0d done=%b take=%0b out_rows=%0d fed=%0d emit=%0d head=%0b rav=%b cav=%b op0=%b op1=%b trunc=%b",
+                     $time, chunk_idx, beat_count, done_mat_mul, row_take, out_row_count,
                      frames_fed, frames_emitted, head_done,
                      row_avail_0, c_avail_0_0, op0_0, op1_0, slice_r0_c0.trunc);
         end
@@ -799,7 +807,8 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
         b_cols_port = ""
         b_cols_q_src = "w_rom_out"
         # emit_rom=False when the combined core provides the shared ROM above `ifndef.
-        w_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes) if emit_rom else ""
+        w_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes,
+                                        gapless=True) if emit_rom else ""
     else:
         b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
         b_cols_q_src = "b_cols"
@@ -818,7 +827,7 @@ module {module_name}(
     input  wire                   rst,
     input  wire                   en,
     input  wire [{a_port_width-1}:0]   a_rows,
-{b_cols_port}    input  wire                   preload_valid,
+{b_cols_port}    input  wire                   preload_valid,   // unused: this core has no preload stage
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
     output reg                    out_valid,
@@ -833,9 +842,7 @@ module {module_name}(
     localparam integer LAST_K_SIZE = {last_k_size};
     localparam integer LOGICAL_OUT_ROWS = {logical_output_rows};
     localparam integer PHYSICAL_OUT_ROWS = {physical_output_rows};
-    localparam [1:0] S_IDLE=2'd0, S_PRELOAD=2'd1, S_RUN=2'd2, S_WAIT=2'd3;
 
-    reg [1:0] state;
     reg [15:0] beat_count;
     reg [15:0] chunk_idx;
     reg [15:0] out_row_count;
@@ -845,13 +852,14 @@ module {module_name}(
 {"    reg [15:0] out_grp;" if _fold_n_bias else ""}
 {_zp_col_decl}{_zp_row_decl}{row_zp_corr_decl}
     // Continuous multi-frame bookkeeping (rev-3 overlapped frames).
-    // frames_fed counts preload pulses seen; frames_emitted counts frames
-    // whose LOGICAL_OUT_ROWS rows have been taken. done_count[s] counts the
+    // frames_fed counts frames whose first beat has been taken; frames_emitted
+    // counts frames whose LOGICAL_OUT_ROWS rows have been taken. done_count[s] counts the
     // committed-wave done pulses per slice; the head (oldest un-emitted)
     // frame's wave is complete when every slice has counted past
     // frames_emitted, so emission never waits on the feed FSM.
     reg [15:0] frames_fed;
     reg [15:0] frames_emitted;
+    wire [{grid_rows*grid_cols-1}:0] done_mat_mul;
     reg [15:0] done_count [0:{grid_rows*grid_cols-1}];
     reg        row_done [0:{grid_rows-1}];
     reg        any_row_done;
@@ -861,7 +869,7 @@ module {module_name}(
         for (hd = 0; hd < {grid_rows}; hd = hd + 1) begin
             row_done[hd] = 1'b1;
             for (hc = 0; hc < {grid_cols}; hc = hc + 1)
-                if (done_count[hd*{grid_cols} + hc] <= frames_emitted)
+                if (done_count[hd*{grid_cols} + hc] + done_mat_mul[hd*{grid_cols} + hc] <= frames_emitted)
                     row_done[hd] = 1'b0;
             if (row_done[hd]) any_row_done = 1'b1;
         end
@@ -874,14 +882,12 @@ module {module_name}(
 {a_replay_block}
     reg [{a_width-1}:0] a_rows_q;
     reg [{b_width-1}:0] b_cols_q;
-    reg preload_valid_q;
     reg in_valid_q;
 
     always @(posedge clk) begin
         if (rst) begin
             a_rows_q        <= {a_width}'d0;
             b_cols_q        <= {b_width}'d0;
-            preload_valid_q <= 1'b0;
             in_valid_q      <= 1'b0;
         end else if (en) begin
             // Symmetric-only quantization scope: operands reach the slices
@@ -889,18 +895,16 @@ module {module_name}(
             // raw 0 on the wire).
             a_rows_q        <= {a_rows_src};
             b_cols_q        <= {b_cols_q_src};
-            preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;
         end
     end
 
     wire slice_reset = rst;
-    wire in_beat_active = ((state == S_PRELOAD) || (state == S_RUN)) && in_valid_q && (beat_count < INPUT_BEATS);
+    wire in_beat_active = in_valid_q && (beat_count < INPUT_BEATS);
     wire slice_start = in_beat_active && (beat_count == 16'd0);
     wire final_chunk = (chunk_idx == K_CHUNKS - 1);
     wire [7:0] current_k_mask = final_chunk ? {vm(last_k_mask)} : 8'hFF;
 
-    wire [{grid_rows*grid_cols-1}:0] done_mat_mul;
     // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
     // done_count[s] tracks them; row_done[r] says every slice of tile-row r
     // has counted a done past frames_emitted, so each tile-row is released
@@ -949,7 +953,6 @@ module {module_name}(
 
     always @(posedge clk) begin
         if (rst) begin
-            state <= S_IDLE;
             beat_count <= 16'd0;
             chunk_idx <= 16'd0;
             out_row_count <= 16'd0;
@@ -968,61 +971,20 @@ module {module_name}(
                 if (done_mat_mul[hd])
                     done_count[hd] <= done_count[hd] + 16'd1;
 
-            case (state)
-                S_IDLE: begin
+            // A frame is K_CHUNKS * INPUT_BEATS consecutive in_valid beats and
+            // the next frame's first beat may follow its last directly: there
+            // is no preload stage, so the frame boundary is the beat/chunk wrap
+            // itself and frames_fed is bumped on the first beat.
+            if (in_beat_active) begin
+                if ((beat_count == 16'd0) && (chunk_idx == 16'd0))
+                    frames_fed <= frames_fed + 16'd1;
+{_zp_col_reset}{_zp_row_reset}                if (beat_count + 16'd1 == INPUT_BEATS) begin
                     beat_count <= 16'd0;
-                    chunk_idx <= 16'd0;
-                    if (preload_valid_q) begin
-                        frames_fed <= frames_fed + 16'd1;
-{_zp_col_reset}{_zp_row_reset}                        state <= S_PRELOAD;
-                    end
+                    chunk_idx <= final_chunk ? 16'd0 : chunk_idx + 16'd1;
+                end else begin
+                    beat_count <= beat_count + 16'd1;
                 end
-
-                S_PRELOAD: begin
-                    // Feed the first data beat HERE: the input register already
-                    // holds beat 0 during this cycle, and consuming only in
-                    // S_RUN would advance the register once more (dropping beat
-                    // 0). Launching in S_PRELOAD aligns the slice window for
-                    // both supported drive cadences (preload with in_valid held
-                    // off, or preload immediately followed by data).
-                    if (in_beat_active) begin
-                        beat_count <= beat_count + 16'd1;
-                        if (beat_count + 16'd1 == INPUT_BEATS) begin
-                            if (final_chunk) begin
-                                state <= S_IDLE;
-                            end else begin
-                                chunk_idx <= chunk_idx + 16'd1;
-                                beat_count <= 16'd0;
-                                state <= S_RUN;
-                            end
-                        end else begin
-                            state <= S_RUN;
-                        end
-{_zp_col_acc}{_zp_row_acc}                    end else begin
-                        state <= S_RUN;
-                    end
-                end
-
-                S_RUN: begin
-                    if (in_beat_active) begin
-                        if (beat_count + 16'd1 == INPUT_BEATS) begin
-                            if (final_chunk) begin
-                                state <= S_IDLE;
-                            end else begin
-                                // Chunks are fed back-to-back by the driver
-                                // (total_beats = k_chunks * input_beats with no
-                                // gaps), so advance to the next chunk IN PLACE:
-                                // the next cycle's beat_count==0 re-pulses
-                                // slice_start for the new chunk.
-                                chunk_idx <= chunk_idx + 16'd1;
-                                beat_count <= 16'd0;
-                            end
-                        end else begin
-                            beat_count <= beat_count + 16'd1;
-                        end
-{_zp_col_acc}{_zp_row_acc}                    end
-                end
-            endcase
+{_zp_col_acc}{_zp_row_acc}            end
 
             // Emission runs independently of the feed FSM: the head frame's
             // rows are taken one per edge as the slices present them. Feed
@@ -1138,7 +1100,8 @@ def generate_combined_core_verilog(m, k, n, module_name="gemm_grid_wrapper", out
         b_width = ((n + 7) // 8) * 64
         input_beats = _geometry.feed_beats(m, n, (k + 7) // 8)
         header, syn_body = _split_module(synth_top, module_name)   # header incl. 'module..);'
-        rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes) \
+        rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes,
+                                      gapless=True) \
             if weight_rom is not None else ""
         bias_rom = _bias_rom_block(bias_codes) if has_bias else ""
         tag = []
@@ -1244,7 +1207,7 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
     c_width = grid_cols * 8 * out_width
     input_beats = _geometry.feed_beats(m, n, passes)
     a_port_width, a_replay_block, a_rows_src = _a_replay_block(
-        a_width, passes, n_passes, m, input_beats, k=k)
+        a_width, passes, n_passes, m, input_beats, k=k, gapless=True)
     # K-spatial uses the same logical-row retirement contract as the chunked
     # wrapper; physical 8-row bursts are aborted after logical M.
     logical_output_rows = m
@@ -1255,7 +1218,8 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
     if ksp_ws:
         ksp_b_cols_port = ""
         ksp_b_cols_src = "w_rom_out"
-        ksp_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes) if emit_rom else ""
+        ksp_rom_block = _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=n_passes,
+                                          gapless=True) if emit_rom else ""
     else:
         ksp_b_cols_port = f"    input  wire [{b_width-1}:0]   b_cols,\n"
         ksp_b_cols_src = "b_cols"
@@ -1444,11 +1408,12 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
     )
 
     if full_k_spatial:
-        # Single pass: end of window -> feed FSM returns to S_IDLE while the
+        # Single pass: the window's last beat is the frame's last beat, so
+        # the next frame's first beat may follow it directly while the
         # independent emission block drains the committed wave.
         run_end_body = """\
-                            state <= S_IDLE;"""
-        wait_body = ""
+                            beat_count <= 16'd0;"""
+        frame_first_cond = "(beat_count == 16'd0)"
         op2_expr = "slice_start"
     else:
         # chunk_idx doubles as the pass counter here: it advances once per
@@ -1461,13 +1426,9 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
         # The feed FSM never waits for the grid; the emission block drains the
         # committed (final-pass) wave.
         run_end_body = f"""\
-                        if (chunk_idx + 16'd1 == 16'd{passes}) begin
-                            state <= S_IDLE;
-                        end else begin
-                            chunk_idx <= chunk_idx + 16'd1;
                             beat_count <= 16'd0;
-                        end"""
-        wait_body = ""
+                            chunk_idx <= (chunk_idx + 16'd1 == 16'd{passes}) ? 16'd0 : chunk_idx + 16'd1;"""
+        frame_first_cond = "(beat_count == 16'd0) && (chunk_idx == 16'd0)"
         op2_expr = f"slice_start && (chunk_idx + 16'd1 == 16'd{passes})"
 
     return f"""\
@@ -1483,7 +1444,7 @@ module {module_name}(
     input  wire                   rst,
     input  wire                   en,
     input  wire [{a_port_width-1}:0]   a_rows,
-{ksp_b_cols_port}    input  wire                   preload_valid,
+{ksp_b_cols_port}    input  wire                   preload_valid,   // unused: this core has no preload stage
     input  wire                   in_valid,
     output reg  [{c_width-1}:0]   c_row,
     output reg                    out_valid,
@@ -1496,9 +1457,7 @@ module {module_name}(
     localparam integer K_SPATIAL = {k_spatial};
     localparam integer LOGICAL_OUT_ROWS = {logical_output_rows};
     localparam integer PHYSICAL_OUT_ROWS = {physical_output_rows};
-    localparam [1:0] S_IDLE=2'd0, S_RUN=2'd1, S_WAIT=2'd2, S_OUTPUT=2'd3;
 
-    reg [1:0] state;
     reg [15:0] beat_count;
     reg [15:0] chunk_idx;
     reg [15:0] out_row_count;
@@ -1507,12 +1466,13 @@ module {module_name}(
 {_bias_grp_decl}
 {"    reg [15:0] out_grp;" if _fold_n_bias else ""}
     // Continuous multi-frame bookkeeping (rev-3 overlapped frames); same
-    // contract as the chunked emitter: frames_fed counts preload pulses,
+    // contract as the chunked emitter: frames_fed counts frames whose first beat was taken,
     // frames_emitted counts drained frames, and the head (oldest un-emitted)
     // frame's wave is complete when every slice has counted a done past
     // frames_emitted.
     reg [15:0] frames_fed;
     reg [15:0] frames_emitted;
+    wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
     reg [15:0] done_count [0:{k_spatial * grid_rows * grid_cols - 1}];
     reg        row_done [0:{grid_rows-1}];
     reg        any_row_done;
@@ -1523,7 +1483,7 @@ module {module_name}(
             row_done[hd] = 1'b1;
             for (hp = 0; hp < {k_spatial}; hp = hp + 1)
                 for (hc = 0; hc < {grid_cols}; hc = hc + 1)
-                    if (done_count[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] <= frames_emitted)
+                    if (done_count[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] + done_mat_mul[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] <= frames_emitted)
                         row_done[hd] = 1'b0;
             if (row_done[hd]) any_row_done = 1'b1;
         end
@@ -1536,27 +1496,23 @@ module {module_name}(
 {a_replay_block}
     reg [{a_width-1}:0] a_rows_q;
     reg [{b_width-1}:0] b_cols_q;
-    reg preload_valid_q;
     reg in_valid_q;
 
     always @(posedge clk) begin
         if (rst) begin
             a_rows_q        <= {a_width}'d0;
             b_cols_q        <= {b_width}'d0;
-            preload_valid_q <= 1'b0;
             in_valid_q      <= 1'b0;
         end else if (en) begin
             a_rows_q        <= {a_rows_src};
             b_cols_q        <= {ksp_b_cols_src};
-            preload_valid_q <= preload_valid;
             in_valid_q      <= in_valid;
         end
     end
 
     wire slice_reset = rst;
-    wire in_beat_active = (state == S_RUN) && in_valid_q && (beat_count < INPUT_BEATS);
+    wire in_beat_active = in_valid_q && (beat_count < INPUT_BEATS);
     wire slice_start = in_beat_active && (beat_count == 16'd0);
-    wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
     // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
     // done_count[s] tracks them; row_done[r] releases each tile-row as soon
     // as its own slices complete the head frame (not when all rows finish),
@@ -1604,7 +1560,6 @@ module {module_name}(
 
     always @(posedge clk) begin
         if (rst) begin
-            state <= S_IDLE;
             beat_count <= 16'd0;
             chunk_idx <= 16'd0;
             out_row_count <= 16'd0;
@@ -1623,24 +1578,19 @@ module {module_name}(
                 if (done_mat_mul[hd])
                     done_count[hd] <= done_count[hd] + 16'd1;
 {_bias_grp_body}
-            case (state)
-                S_IDLE: begin
-                    beat_count <= 16'd0;
-                    chunk_idx <= 16'd0;
-                    if (preload_valid_q) begin
-                        frames_fed <= frames_fed + 16'd1;
-                        state <= S_RUN;
-                    end
-                end
-                S_RUN: begin
-                    if (in_beat_active) begin
-                        beat_count <= beat_count + 16'd1;
-                        if (beat_count + 16'd1 == INPUT_BEATS)
+            // A frame is one contiguous run of in_valid beats and the next
+            // frame's first beat may follow its last directly: there is no
+            // preload stage, so frames_fed is bumped on the first beat and the
+            // beat/pass counters wrap at the frame's last beat.
+            if (in_beat_active) begin
+                if ({frame_first_cond})
+                    frames_fed <= frames_fed + 16'd1;
+                if (beat_count + 16'd1 == INPUT_BEATS) begin
 {run_end_body}
-                    end
+                end else begin
+                    beat_count <= beat_count + 16'd1;
                 end
-{wait_body}
-            endcase
+            end
 
             // Emission runs independently of the feed FSM: the head frame
             // drains while later frames feed.
@@ -2039,7 +1989,7 @@ module {module_name}(
             row_done[hd] = 1'b1;
             for (hp = 0; hp < {k_spatial}; hp = hp + 1)
                 for (hc = 0; hc < {grid_cols}; hc = hc + 1)
-                    if (done_count[(hp*{grid_rows} + hd)*{grid_cols} + hc] <= frames_emitted)
+                    if (done_count[(hp*{grid_rows} + hd)*{grid_cols} + hc] + done_mat_mul[(hp*{grid_rows} + hd)*{grid_cols} + hc] <= frames_emitted)
                         row_done[hd] = 1'b0;
             if (row_done[hd]) any_row_done = 1'b1;
         end

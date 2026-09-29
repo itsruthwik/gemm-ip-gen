@@ -495,7 +495,7 @@ def test_generate_catapult_pkg_fold_axis_n_rom_read_offsets_by_group(scratch_dir
     assert "_grp" not in hdr_k
 
 
-@pytest.mark.parametrize("axis,reuse_factor,run_steps", [("k", 2, 59), ("n", 2, 52)])
+@pytest.mark.parametrize("axis,reuse_factor,run_steps", [("k", 2, 57), ("n", 2, 49)])
 def test_logical_row_drain_aborts_masked_structural_tail(scratch_dir, axis, reuse_factor, run_steps):
     """K/N folding must expose M rows, then pulse pe_reset to retire an 8-row
     physical burst. This checks generated structural control; the hardblock
