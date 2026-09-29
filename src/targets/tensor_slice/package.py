@@ -146,8 +146,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     input_beats = _geometry.feed_beats(m, n, passes)
     total_beats = passes * input_beats
     first_out = latency_cycles(m, k, n, grid_rows, grid_cols, k_spatial=ks)
-    # Frame slots for the pipelined sim core: feed of frame t+1 may overlap
-    # compute/drain of frame t (min frame period = total_beats calls).
+    # Frame slots for the pipelined sim core: a frame may start while the
+    # previous one is still computing/draining (min frame period = total_beats calls).
     #
     # op-contract note: this C
     # core has no op/pe_reset/shadow state -- it is a grid-level `gemm.run()`
@@ -739,8 +739,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     // Each frame is {total_beats} in_valid beats (period {period}, gapless:
     // the core has no preload stage); bias is a
     // compile-time constant baked into the core (decision 4). Every step polls
-    // out_valid, so rows are captured as they emerge — frame t+1 feeds while
-    // frame t drains in the core's FRAME_SLOTS.
+    // out_valid, so rows are captured as they emerge, including while later
+    // beats of the same call are still being fed.  (Under synthesis the stream
+    // entries use the free-running body instead, where frames overlap across calls.)
     #pragma hls_pipeline_init_interval 1
     RUN: for (int step = 0; step < {total_steps}; step++) {{
         bool in_feed = (step < {feed_total});

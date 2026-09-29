@@ -420,10 +420,12 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
         a_bytes = 8 * k_spatial
         b_bytes = 8 * k_spatial
     # Bias is compile-time now (decision 4): no bias_cols port/width at all.
-    c_bytes = grid_cols * out_width // 8
-    # The combined-fold core has no preload stage and, with K in two or more
-    # passes, takes gapless frames; one-pass frames and the single-axis cores
-    # keep one in_valid=0 beat per frame.
+    # 8 output lanes per column tile, out_width bits each (the c_row port width).
+    c_bytes = grid_cols * 8 * out_width // 8
+    # No core has a preload stage (preload_valid is an unused port). With K in
+    # two or more passes the combined-fold TB feeds gapless frames; the other
+    # TBs still put one in_valid=0 beat (with the unused preload_valid pulsed)
+    # before each frame, which the cores accept but do not require.
     tb_preload = "" if (combined_fold and passes >= 2) else """\
             // Preload (bias is compile-time now, baked into the core)
             preload_valid <= 1;
@@ -510,10 +512,10 @@ def _gen_catapult_tb(m, k, n, module_name, base_seed, all_a_stim, all_b_stim, al
 
             // True back-to-back cadence: the structural wrapper pipelines
             // frames (feed of frame t+1 overlaps compute/drain of frame t), so
-            // the next vector follows immediately — after its one preload step
-            // on the single-axis cores (frame II TOTAL_INPUT_BEATS+1), with no
-            // gap at all on the combined-fold core (frame II TOTAL_INPUT_BEATS:
-            // in_valid is re-asserted before the next clock edge).
+            // the next vector follows immediately -- after one idle step on
+            // the TBs that emit it (frame II TOTAL_INPUT_BEATS+1), with no gap
+            // at all on the gapless combined-fold TB (frame II
+            // TOTAL_INPUT_BEATS: in_valid is re-asserted before the next edge).
         end
 
         // Wait for all out_last events

@@ -23,6 +23,12 @@ against the N weight columns, producing M result rows. Entry points:
 - `{name}_gemm_ip_array(a_rows[], weight_cols[], biases[], results[])` — array
   in/out (the einsum / attention interface).
 
+The two stream entries have a second form. Under `__SYNTHESIS__ &&
+BLACKBOX_FLOW` they are free-running single-cycle design blocks (see
+*Free-running stream entries* below); the loop described in the rest of this
+note is the csim (`#else`) body of those entries and the only body of the
+array entry, both of which process one frame per call.
+
 ## Function anatomy
 
 ```cpp
@@ -42,20 +48,22 @@ RUN: for (step = 0; step < total_steps; step++) { ... }  // the frame schedule
 ```
 
 ```text
-period      = total_beats + 1
-total_steps = (n_frames - 1) * period + first_out + M + 6
+period      = total_beats
+total_steps = (n_frames - 1) * period + first_out + M + 4
 ```
 
 `first_out` is the mode-aware first output offset (full-K-spatial packages get
-the shorter single-pass value). The `+6` is the port-lag tail (3 calls
-worst-case RTL lag + 2 spare + 1 for the preload beat). The tail is sized on
+the shorter single-pass value). The `+4` is the port-lag tail (3 calls
+worst-case RTL lag + 1 spare). There is no preload beat: a frame is exactly
+`total_beats` `in_valid` calls and the next frame's first beat follows its
+last directly. The tail is sized on
 the logical row count `M`, not the physical tile burst (`grid_rows * 8`): the
 structural core's op1 signal stops the drain at the logical M'th row, so the
 remaining physical rows never need to be walked by the loop. A combined
 K/N-fold package adds one extra `period` of slack (`_struct_tail`) on top of
 this budget, to guarantee the loop outlives the structural core's registered
 handshake latency on the last frame.
-Generation fails hard if the single-frame budget `first_out + M + 6` cannot
+Generation fails hard if the single-frame budget `first_out + M + 4` cannot
 cover `total_beats + 2` — i.e. if the loop would be shorter than the feed.
 
 ## What one RUN iteration contains
@@ -68,14 +76,14 @@ active:
 ```cpp
 bool in_feed     = step < feed_total;              // feed_total = n_frames * period
 int  p           = in_feed ? step % period : period;
-bool feeding_now = in_feed && p >= 1 && p <= total_beats;
-int  pf = p - 1;
+bool feeding_now = in_feed && p < total_beats;
+int  pf = p;
 int  kc = pf / input_beats;        // K pass index (0..passes-1)
 int  t  = pf % input_beats;        // row/col beat within the pass
 ```
 
-`p == 0` is the frame's leading preload/idle beat; `p == 1..total_beats` are
-its data beats. With `n_frames == 1` the whole feed is one frame, so
+`p == 0..total_beats-1` are the frame's data beats (there is no leading
+preload/idle beat). With `n_frames == 1` the whole feed is one frame, so
 `feed_total = period` and every step past it is an idle drain call.
 
 - *Chunked packages* (`k_spatial == 1`, `passes == k_chunks`): the feed makes
@@ -101,21 +109,17 @@ Outside the feed window the words are zero and this section is inert.
 
 ```cpp
 ac_int<1,false> feed_valid    = feeding_now ? 1 : 0;
-ac_int<1,false> frame_preload = (in_feed && p == 0) ? 1 : 0;
+ac_int<1,false> frame_preload = 0;
 gemm.run(a_rows, b_cols, bias_packed, frame_preload, feed_valid, c_row, v, l);
 ```
 
-The `p == 0` beat is the frame delimiter the core keys on: it is the
-non-`in_valid` call that drops the core's `feeding` flag so the next frame
-allocates a fresh slot. Beats `p == 1..total_beats` are the `in_valid` data
-beats (the core's frame clock is 0 at the first of them). Every step past the
-feed region is an idle call that advances the core's clock.
-
-`frame_preload` must stay a *live* signal. The behavioral core ignores it
-(there is no bias port; the bias is baked into the core), but if it folds to a compile-time
-constant, VTR proves the structural core's `S_IDLE -> S_PRELOAD -> S_RUN` arm
-unreachable, concludes the tensor_slice result path is dead, and prunes every
-slice. Pulsing it on the frame's mandatory idle beat costs nothing.
+The cores have no preload stage: a frame starts on its first `in_valid` beat
+(chunk/pass 0, beat 0) and the core's frame clock is 0 there. Consecutive
+frames may follow each other with no idle call, but a frame's own beats must be
+contiguous (no idle cycle inside a frame; a gap between frames is fine, and an
+`en` freeze at any point is safe). `preload_valid` (`frame_preload`) is an
+unused port kept only so the wrappers still connect; it is tied to 0. Every
+step past the feed region is an idle call that advances the core's clock.
 
 **3. Output capture** — polled on **every** iteration:
 
@@ -143,16 +147,16 @@ and the baked bias both live in the core (see `rtl_contract.md`,
 ## Cycle budget
 
 Frame timeline in run-call indices, for the frame starting at call
-`f = (frame_index) * period`: call `f` is the preload beat, call `f+1` the
-first data beat (core clock 0), so result row `r` appears at call
-`f + first_out + 2 + r` from the core model, and the RTL's registered output
-stages may add up to 3 calls of lag. The bound
+`f = (frame_index) * period`: call `f` is the first data beat (core clock 0),
+so result row `r` appears at about call `f + first_out + r` from the core
+model, and the RTL's registered output stages may add up to 3 calls of lag.
+The bound
 
 ```
 total_steps = (n_frames - 1) * period   start of the last frame
-            + (first_out + M + 1)       its last logical row, core schedule
+            + (first_out + M)           its last logical row, core schedule
             + 3                         worst RTL port lag
-            + 2                         spare
+            + 1                         spare
 ```
 
 guarantees every logical row lands inside the loop's capture window; generation
@@ -168,23 +172,23 @@ zero-trip.
 ## Timing diagram — 8×8×8
 
 `total_beats = 8`, `first_out = 16`, `M = 8`, `n_frames = 1`, so
-`total_steps = 30`. One column =
-one RUN iteration = one core cycle:
+`total_steps = 28`. One column = one RUN iteration = one core cycle (row
+positions are the behavioral core's):
 
 ```
-RUN step      :  0 | 1  2  3  4  5  6  7  8 | 9 ......... 17 |18 19 20 21 22 23 24 25 |26 27 28 29
-phase         :  P |◄———————— FEED ————————►|◄—— wave wait ——►|◄———— rows emerge ————►|◄— spare —►
-              :    |                        |                |                        |
-preload_valid :  1 | 0  0  0  0  0  0  0  0 | 0           0  | 0  0  0  0  0  0  0  0 | 0  0  0  0
-in_valid      :  0 | 1  1  1  1  1  1  1  1 | 0           0  | 0  0  0  0  0  0  0  0 | 0  0  0  0
-a_rows        :  - |A0 A1 A2 A3 A4 A5 A6 A7 | -           -  | -  -  -  -  -  -  -  - | -  -  -  -
-b_cols (wgts) :  - |W0 W1 W2 W3 W4 W5 W6 W7 | -           -  | -  -  -  -  -  -  -  - | -  -  -  -
-              :    |                        |                |                        |
-core clock cc :  - | 0  1  2  3  4  5  6  7 | 8 ......... 16 |17 18 19 20 21 22 23 24 |25 26 27 28
-v (out_valid) :  0 | 0  0  0  0  0  0  0  0 | 0           0  | 1  1  1  1  1  1  1  1 | 0  0  0  0
-c_row         :  - | -  -  -  -  -  -  -  - | -           -  |R0 R1 R2 R3 R4 R5 R6 R7 | -  -  -  -
-res_stream    :    |                        |                |r0 r1 r2 r3 r4 r5 r6 r7 |
-captured      :  0 | 0  0  0  0  0  0  0  0 | 0           0  | 1  2  3  4  5  6  7  8 | 8  8  8  8
+RUN step      : 0  1  2  3  4  5  6  7 | 8 ......... 15 |16 17 18 19 20 21 22 23 |24 25 26 27
+phase         :◄———————— FEED ————————►|◄—— wave wait ——►|◄———— rows emerge ————►|◄— spare —►
+              :                        |                 |                        |
+preload_valid : 0  0  0  0  0  0  0  0 | 0           0   | 0  0  0  0  0  0  0  0 | 0  0  0  0
+in_valid      : 1  1  1  1  1  1  1  1 | 0           0   | 0  0  0  0  0  0  0  0 | 0  0  0  0
+a_rows        :A0 A1 A2 A3 A4 A5 A6 A7 | -           -   | -  -  -  -  -  -  -  - | -  -  -  -
+b_cols (wgts) :W0 W1 W2 W3 W4 W5 W6 W7 | -           -   | -  -  -  -  -  -  -  - | -  -  -  -
+              :                        |                 |                        |
+core clock cc : 0  1  2  3  4  5  6  7 | 8 ......... 15  |16 17 18 19 20 21 22 23 |24 25 26 27
+v (out_valid) : 0  0  0  0  0  0  0  0 | 0           0   | 1  1  1  1  1  1  1  1 | 0  0  0  0
+c_row         : -  -  -  -  -  -  -  - | -           -   |R0 R1 R2 R3 R4 R5 R6 R7 | -  -  -  -
+res_stream    :                        |                 |r0 r1 r2 r3 r4 r5 r6 r7 |
+captured      : 0  0  0  0  0  0  0  0 | 0           0   | 1  2  3  4  5  6  7  8 | 8  8  8  8
 ```
 
 In RTL cosimulation the `v`/`c_row` group may slip up to 3 columns right; the
@@ -193,42 +197,80 @@ spare columns absorb it.
 ## Timing diagram — conv2d full-K (16×72×8)
 
 `total_beats = 16` (single full-K pass), `first_out = 80`, `M = 16`, so
-`total_steps = 102` — phase view:
+`total_steps = 100` — phase view:
 
 ```
-step:   0 |1 ............... 16 |17 ......................... 81 |82 ........ 97 |98 ... 101
-        P |◄————— FEED ———————►|◄—— wave (72+8−16 = 64 idle) ———►|◄— 16 rows ——►|◄— spare —►
-                 in_valid=1                 in_valid=0                 v=1
+step:   0 ............... 15 |16 ......................... 79 |80 ........ 95 |96 ... 99
+        ◄————— FEED ———————►|◄—— wave (72+8−16 = 64 idle) ———►|◄— 16 rows ——►|◄— spare —►
+             in_valid=1                 in_valid=0                 v=1
 ```
 
 The chunked package of the same shape feeds `9 × 16 = 144` beats, with rows at
-steps 146..161 and `total_steps = 166`.
+steps 144..159 and `total_steps = 164`.
 
 ## Frame protocol invariants
 
 The core relies on exactly the protocol this loop produces:
 
-- every frame begins with one preload/idle call (`preload_valid=1`,
-  `in_valid=0`) at `p == 0`;
-- the frame's data beats are contiguous `in_valid=1` calls — any
-  non-`in_valid` call ends the frame's feed;
+- a frame begins on its first `in_valid` beat; there is no preload/idle call
+  (`preload_valid` is tied to 0 and unused);
+- the frame's `total_beats` data beats are contiguous `in_valid=1` calls —
+  no idle cycle inside a frame. Idle cycles between frames are allowed, and
+  the next frame may start on the very next call;
 - `first_out >= total_beats` by construction, so rows never emerge before the
   feed completes;
-- the M-row emission window of a frame is shorter than the minimum frame
-  period (`M <= total_beats < total_beats + 1`), so windows of consecutive
-  frames never overlap.
+- the M-row emission window of a frame is no longer than the frame period
+  (`M <= total_beats`), so windows of consecutive frames never overlap.
 
 The core itself pipelines frames (frame-slot scheduler, minimum frame period
-`total_beats + 1` calls — see *Frame Pipelining* in `wrapper_timing_model.md`).
+`total_beats` calls — see *Frame Pipelining* in `wrapper_timing_model.md`).
 This loop always overlaps a frame's feed with its own compute/drain window.
-Overlap *across* frames happens two ways:
+Overlap *across* frames happens three ways:
 
 - `n_frames > 1` packages drive it directly from this loop — the frames are
   contiguous at `period` spacing, so frame `t+1` feeds while frame `t` drains.
   These are **simulation** packages for measuring back-to-back throughput.
-- `n_frames == 1` (the real hls4ml flow) is one frame per wrapper call, so
-  cross-frame overlap depends on a caller issuing multiple frames through one
-  core (multi-frame conv tiling, einsum head loops).
+- `n_frames == 1` csim / array entries are one frame per wrapper call, so
+  cross-frame overlap there depends on a caller issuing multiple frames
+  through one core (multi-frame conv tiling, einsum head loops).
+- The synthesized stream entries are free-running blocks (next section), so
+  consecutive hls4ml frames overlap at the feed period without any caller
+  cooperation.
+
+## Free-running stream entries
+
+Under `__SYNTHESIS__ && BLACKBOX_FLOW`, the stream and const-weight stream
+entries are single-cycle `hls_design` blocks: one wrapper clock per call, so
+successive frames overlap and the frame interval is the feed length
+(`m_passes * n_passes * total_beats`) rather than feed + drain + call
+overhead.
+
+- **A-row queue.** The next group's A rows wait in a fixed-slot shift queue fed
+  from one non-blocking `nb_read` site. The oldest row is always the top slot
+  (a constant head), a pass-0 beat pops it and shifts the slots up, and
+  otherwise the slots below the highest empty one close the gap. A
+  run-time-indexed latch instead would build wide write decoders and read
+  muxes that grew wide conv layers by about half and cost Fmax.
+- **Group start.** The core has no backpressure and needs every group's beats
+  contiguous, so a group starts only once its core rows are all held. Groups
+  (`m_passes * n_passes` per frame, mg-major) then run back to back with no
+  bubble whenever the stream keeps up.
+- **No blocking reads.** A blocking read (or `available()` wait) stalls the
+  whole block, core drain included, whenever the stream is empty, which would
+  hold the previous frame's outputs until the next frame's first row arrives.
+- **Runtime B.** The runtime-B latch holds all `logical_n` columns for the whole
+  frame (every M-group re-reads them) and is refilled during the last M-group.
+- **Outputs.** Rows are written one per `out_valid` pulse. Under fold-N the
+  slices of earlier N-groups wait in a small `c_buf` and the last N-group's
+  pulse completes and writes each full row. Fold-N also registers
+  `out_valid`/`c_row` before `c_buf` to take the core's row-done logic off the
+  capture path; other configs keep the direct capture, because Catapult turned
+  the registered row counter into a free-running one and lost phase with padded
+  M groups.
+
+Catapult's `cycle.rpt` reports these blocks per call (latency 2, II 1), so it
+does not give the frame interval. Measure it from the cosim end time at two
+frame counts and divide the difference by the frame-count difference.
 
 ## Fold-M multi-frame schedule (FoldAxis="m")
 
@@ -255,10 +297,9 @@ differences are what `M` means and what the loop reads/captures:
   only the last frame's tail is padding, that is exactly the real rows.
 - No replay buffer, no C buffer, no ROM reshaping: K is a single pass (no
   replay), each frame's rows are complete and in order at the end of its own
-  pass (no cross-frame buffering), and the ROM rewinds on every frame's
-  leading idle beat (`beat_ctr`/`rom_base` reset on `!in_valid`), so it
-  re-reads the same `N` (or `K_CHUNKS * N`) entries for every frame — no
-  group-scoped addressing needed.
+  pass (no cross-frame buffering), and the ROM address and A-replay counters
+  wrap at the frame's last beat, so the ROM re-reads the same `N` (or
+  `K_CHUNKS * N`) entries for every frame — no group-scoped addressing needed.
 - RF=1 (`m_passes == 1`) is a single frame: the loop's fold-M-only feed/
   capture text collapses to the ordinary single-frame path with `logical_m ==
   M_g`, matching today's (`FoldAxis="k"`) single-frame hardware.

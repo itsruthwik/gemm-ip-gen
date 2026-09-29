@@ -381,10 +381,10 @@ def vm(val):
 
 # The slice drains one K row through its boundary staging shift register in 8
 # cycles, so consecutive ``start_mat_mul`` pulses must be at least 8 cycles
-# apart.  A back-to-back frame boundary (feed period = total_beats + 1) must
+# apart.  A back-to-back frame boundary (feed period = total_beats) must
 # not present the next frame's starts early either, so *every* K pass is
 # zero-padded up to this minimum -- including single-pass shapes with
-# ``max(m, n) < 8`` (their frame period then floors at 9).
+# ``max(m, n) < 8`` (their frame period then floors at 8).
 MIN_FEED_GAP_BEATS = 8
 
 
@@ -403,7 +403,7 @@ def feed_beats(m, n, passes):
     must therefore start at least ``8*grid_cols`` cycles after the current one
     (capture of cell (i,0) on column 0 at F+i vs. row take at
     loc_max+16+i), otherwise the next frame's captures clobber rows the
-    wrapper has not drained yet.  Frame spacing is ``passes*feed_beats+1``,
+    wrapper has not drained yet.  Frame spacing is ``passes*feed_beats``,
     so padding the per-pass feed to the column tile multiple guarantees it.
     """
     beats = max(int(m), int(n))
@@ -417,7 +417,7 @@ def feed_beats(m, n, passes):
 def total_cycles(m, k, n, P=3, feed_mode="chained"):
     """Conservative total cycle count for the grid counter.
 
-    Row/col: preload(1) + collect(max(M,N)) + transition(2) +
+    Row/col: 1 (kept as margin; the cores have no preload stage) + collect(max(M,N)) + transition(2) +
     feed(max_loc_delay + max(M,N)) + compute + output_align + margin.
     """
     gr = (m + 7) // 8

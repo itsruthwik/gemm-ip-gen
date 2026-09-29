@@ -68,8 +68,11 @@ def _bias_lane(rom_name, idx_expr, width=16):
 def _fold_n_bias_group_decl(n_passes, reg_name="bias_grp_ctr"):
     """Independent fold-N group counter for the bias ROM (synth branches).
 
-    Mirrors ``_weight_rom_block``'s ``grp_ctr`` (advances once per frame
-    boundary, on the idle beat right after a frame's feed beats), but is
+    Legacy helper: no generator calls it any more (the emit side tracks its
+    group with the pop-advanced ``out_grp`` instead).  Mirrors the idle-beat
+    ``grp_ctr`` of ``_weight_rom_block`` (advances once per frame boundary, on
+    the idle beat right after a frame's feed beats, which gapless frames do not
+    have), but is
     NOT tied to weight-stationarity -- fold-N + bias must work with an
     external b_cols port too, where no weight ROM/grp_ctr exists at all.
 
@@ -78,7 +81,7 @@ def _fold_n_bias_group_decl(n_passes, reg_name="bias_grp_ctr"):
     frame's beats stop (well before that same frame's own K-contraction
     pipeline latency + drain complete). It is NOT the right index to read
     the bias ROM with at EMIT time for THAT frame -- callers must latch a
-    frozen per-frame copy (e.g. on ``preload_d``/``slice_start``, before the
+    frozen per-frame copy (e.g. at the frame's first beat, before the
     new frame's own feed can retire and advance this counter again) and use
     the frozen copy in the drain/stage-2 lookup instead of this live one.
     """
@@ -732,10 +735,9 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     # lane, narrowing to out_width and adding the bias from the compile-time
     # bias_rom (or a literal 0 when has_bias is False -- folds the add away).
     if _fold_n_bias:
-        # Frozen per-frame group (see _fold_n_bias_group_decl): latched from
-        # the live counter at this frame's preload, held through its own
-        # drain -- NOT the live counter itself (which may already have
-        # advanced to the next frame's group by the time this frame emits).
+        # Emit-side group (out_grp): advanced only when the emitting frame
+        # pops -- NOT the feed-side counter (which may already have advanced
+        # to the next frame's group by the time this frame emits).
         _bias_expr_synth = (
             lambda c, lane: _bias_lane(bias_rom_name, f"out_grp * {n} + {c * 8 + lane}"))
     elif has_bias:

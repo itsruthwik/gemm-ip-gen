@@ -69,6 +69,11 @@ The wrapper processes one GEMM frame per call: M rows of A against the N weight
 columns, producing M result rows. (`n_frames > 1` packages feed several frames
 in one call — simulation only, see `wrapper_timing_model.md`.)
 
+Under synthesis (`__SYNTHESIS__ && BLACKBOX_FLOW`) the stream entries are
+free-running single-cycle blocks, so consecutive frames overlap at the feed
+period (see `wrapper_run_loop.md`); the csim path and the array entry keep the
+one-frame-per-call loop.
+
 - `a_stream` carries `M` beats, one K-wide activation/im2col row per beat.
   Each logical row is read from the source exactly **once**.
 - `weight_cols` holds `N` K-wide transposed weight columns.
@@ -110,7 +115,7 @@ phases:
    core is a pure integer matmul; the real bias is applied at capture time.
 2. `RUN` / `RUN_ARRAY`: II=1 pipelined loop, one iteration per core cycle. Each
    iteration decodes its position within the frame (`p = step % period`), packs
-   the A/B operand words when `1 <= p <= total_beats`, issues exactly one
+   the A/B operand words when `p < total_beats`, issues exactly one
    `gemm.run()` call, and polls `out_valid`.
 3. Output capture (inside `RUN`): on each `out_valid`, the raw 16-bit integer
    lanes are rescaled by `2^-(frac_a + frac_b)`, the full-precision bias is

@@ -144,16 +144,14 @@ separately.
 zero-pads any tile columns past the real N). The existing `rom_addr`
 register already steps to the next block's base on every frame's wrap beat
 (`rom_addr + 1 == base + N_g`, same mechanism the K-multipass ROM uses
-between K passes); fold-N adds a `grp_ctr` register, only emitted when
-`n_passes > 1`, that gates the idle-beat rewind: `rom_addr` only rewinds to 0
-once every group has been visited (`grp_ctr` reaches `n_passes - 1`),
-otherwise it holds the wrap's next-base value and `grp_ctr` advances. A
-`grp_was_feeding` register distinguishes a REAL frame boundary (the idle beat
-right after a frame fed real beats) from any OTHER idle cycle (reset settle
-beats, or a testbench's trailing wait) -- only a real boundary may advance or
-wrap the group counter, since consecutive idle cycles are common outside a
-frame's feed window and must not double-advance it. With `n_passes == 1` none
-of this is emitted, so the ROM block is byte-for-byte today's.
+between K passes). Frames are gapless (no idle beat between them), so the ROM
+entries are laid out in feed order and `rom_addr` simply wraps to 0 past the
+last entry, on the last beat of the last group's frame; the wrap itself is the
+frame boundary, so no group counter stepped by idle beats is needed (it would
+drift from the frame sequence). An idle cycle only rewinds `beat_ctr` and holds
+`rom_addr`, so reset settle beats and a testbench's trailing wait cannot
+disturb the address. The A-row replay counters wrap the same way at the
+frame's last beat.
 
 The two-operand (external `b_cols`) path needs no RTL change: the wrapper
 already re-inserts the tile offset by beat index, so fold-N just restricts
@@ -164,9 +162,10 @@ and this file's fold-M section above for the row-fold analogue.
 
 ## Synth Protocol
 
-1. The wrapper pulses `preload_valid` for one cycle at the head of each frame.
-   The bias word is zero — see *Bias* below — so this pulse exists to keep the
-   `S_IDLE -> S_PRELOAD -> S_RUN` arm live, not to load coefficients.
+1. There is no preload stage: a frame starts on its first `in_valid` beat, and
+   frames may follow each other with no idle cycle (none is allowed inside a
+   frame). `preload_valid` is an unused port kept so wrappers still connect.
+   The bias is compile-time — see *Bias* below.
 2. For each K chunk:
    - pulse `start_mat_mul` on the first A/B beat of that chunk
    - drive `validity_mask_a_cols_b_rows` for that chunk
@@ -224,8 +223,7 @@ array, because parmys would otherwise infer an unclocked memory and vpr would
 abort. Under fold-N the wire holds `n_passes * core_n` lanes and is indexed by
 the emitting frame's column group, latched when the frame is allocated (the
 live feed-side group counter has already advanced by emit time). There is no
-bias port. The preload phase remains in the protocol only to keep the
-structural core's `S_PRELOAD` arm live.
+bias port, and there is no preload phase.
 
 The hls4ml-facing drain is a pure unpack: it slices `out_width` bits per
 column and reinterprets them as the result type's mantissa.

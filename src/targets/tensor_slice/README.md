@@ -80,19 +80,31 @@ The behavioral grid model uses a parameterized formula:
 ```
 beh = k_chunks × max(M,N) + max(0, K+N − k_chunks × max(M,N)) + M  (+1 sync)
 wrap = beh + 3  (Catapult wrapper overhead)
-II   = k_chunks × max(M,N) + 1  (back-to-back, shadow FIFO)
+II   = k_chunks × max(M,N)  (back-to-back, shadow FIFO)
 ```
 
-Validated results (RTL sim):
+The cores have no preload stage: a frame starts on its first `in_valid` beat,
+frames may follow each other with no idle cycle between them (but none inside a
+frame), and the feed period is the input beats per frame. `preload_valid` is an
+unused port kept so wrappers still connect. Row release uses `done_count` plus
+`done_mat_mul`, so output latency is one cycle shorter than it was with the
+preload beat. In the synthesized flow the stream and const-weight stream
+entries are free-running single-cycle blocks, so the frame interval of the IP
+is this feed period (see `docs/wrapper_run_loop.md`); the csim path and the
+array entry keep one frame per call.
+
+Validated results (RTL sim; `beh`/`seq II` predate the one-cycle latency
+reduction, `b2b II` is the feed period, using the padded `feed_beats` per pass
+for 9×17×10):
 
 | Shape    | beh | seq II | b2b II |
 |----------|-----|--------|--------|
-| 8×8×8   |  25 |     29 |      9 |
-| 16×8×8  |  33 |     37 |     17 |
-| 16×8×16 |  41 |     45 |     17 |
-| 8×16×8  |  33 |     37 |     17 |
-| 16×16×16|  49 |     53 |     33 |
-| 9×17×10 |  40 |     44 |     31 |
+| 8×8×8   |  25 |     29 |      8 |
+| 16×8×8  |  33 |     37 |     16 |
+| 16×8×16 |  41 |     45 |     16 |
+| 8×16×8  |  33 |     37 |     16 |
+| 16×16×16|  49 |     53 |     32 |
+| 9×17×10 |  40 |     44 |     48 |
 
 ## ReuseFactor
 
