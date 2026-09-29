@@ -862,6 +862,10 @@ module {module_name}(
     reg [15:0] frames_fed;
     reg [15:0] frames_emitted;
     wire [{grid_rows*grid_cols-1}:0] done_mat_mul;
+    // The row-release test is (done_count + done_mat_mul > frames_emitted). Both
+    // outcomes are computed from registers only and done_mat_mul (a tensor_slice
+    // output with a long route) just selects between them, keeping the
+    // adder/compare off the done_mat_mul path.
     reg [15:0] done_count [0:{grid_rows*grid_cols-1}];
     reg        row_done [0:{grid_rows-1}];
     reg        any_row_done;
@@ -871,7 +875,8 @@ module {module_name}(
         for (hd = 0; hd < {grid_rows}; hd = hd + 1) begin
             row_done[hd] = 1'b1;
             for (hc = 0; hc < {grid_cols}; hc = hc + 1)
-                if (done_count[hd*{grid_cols} + hc] + done_mat_mul[hd*{grid_cols} + hc] <= frames_emitted)
+                if (done_mat_mul[hd*{grid_cols} + hc] ? (done_count[hd*{grid_cols} + hc] + 16'd1 <= frames_emitted)
+                                                 : (done_count[hd*{grid_cols} + hc] <= frames_emitted))
                     row_done[hd] = 1'b0;
             if (row_done[hd]) any_row_done = 1'b1;
         end
@@ -1475,6 +1480,8 @@ module {module_name}(
     reg [15:0] frames_fed;
     reg [15:0] frames_emitted;
     wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
+    // Row release is (done_count + done_mat_mul > frames_emitted); both outcomes come
+    // from registers and done_mat_mul only selects, keeping the adder off its route.
     reg [15:0] done_count [0:{k_spatial * grid_rows * grid_cols - 1}];
     reg        row_done [0:{grid_rows-1}];
     reg        any_row_done;
@@ -1485,7 +1492,8 @@ module {module_name}(
             row_done[hd] = 1'b1;
             for (hp = 0; hp < {k_spatial}; hp = hp + 1)
                 for (hc = 0; hc < {grid_cols}; hc = hc + 1)
-                    if (done_count[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] + done_mat_mul[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] <= frames_emitted)
+                    if (done_mat_mul[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] ? (done_count[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] + 16'd1 <= frames_emitted)
+                                                 : (done_count[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] <= frames_emitted))
                         row_done[hd] = 1'b0;
             if (row_done[hd]) any_row_done = 1'b1;
         end
@@ -1981,6 +1989,8 @@ module {module_name}(
     // frames_emitted, so each tile-row is released as soon as ITS wave is
     // complete -- emission never waits on the feed FSM. Same shape as the
     // chunked emitter.
+    // Row release is (done_count + done_mat_mul > frames_emitted); both outcomes come
+    // from registers and done_mat_mul only selects, keeping the adder off its route.
     reg [15:0] done_count [0:{k_spatial * grid_rows * grid_cols - 1}];
     reg        row_done [0:{grid_rows - 1}];
     reg        any_row_done;
@@ -1991,7 +2001,8 @@ module {module_name}(
             row_done[hd] = 1'b1;
             for (hp = 0; hp < {k_spatial}; hp = hp + 1)
                 for (hc = 0; hc < {grid_cols}; hc = hc + 1)
-                    if (done_count[(hp*{grid_rows} + hd)*{grid_cols} + hc] + done_mat_mul[(hp*{grid_rows} + hd)*{grid_cols} + hc] <= frames_emitted)
+                    if (done_mat_mul[(hp*{grid_rows} + hd)*{grid_cols} + hc] ? (done_count[(hp*{grid_rows} + hd)*{grid_cols} + hc] + 16'd1 <= frames_emitted)
+                                                 : (done_count[(hp*{grid_rows} + hd)*{grid_cols} + hc] <= frames_emitted))
                         row_done[hd] = 1'b0;
             if (row_done[hd]) any_row_done = 1'b1;
         end
