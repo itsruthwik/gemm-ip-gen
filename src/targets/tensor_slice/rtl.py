@@ -206,7 +206,8 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1, passes=1,
 
     ``gapless``: frames follow each other with no in_valid=0 beat between them
     (combined-fold feed), so the wrap on a frame's LAST beat does what the idle
-    beat otherwise does -- rewind to pass 0 and step the N-group.
+    beat otherwise does -- rewind to pass 0 and step the N-group. An idle
+    beat (in_valid low) holds every counter: mid-frame it only pauses the core.
     """
     hexw = (b_width + 3) // 4
     mask = (1 << b_width) - 1
@@ -268,22 +269,11 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1, passes=1,
             pass_ctr <= 16'd0;
             grp_ctr <= 16'd0;
             grp_was_feeding <= 1'b0;
-        end else if (en) begin
-            if (!in_valid) begin
-                beat_ctr <= 16'd0;
-                pass_ctr <= 16'd0;
-                if (grp_was_feeding) begin
-                    if (grp_ctr + 16'd1 >= 16'd{n_passes}) begin
-                        rom_addr <= 16'd0;
-                        grp_ctr <= 16'd0;
-                    end else begin
-                        // Next group's pass-0 base: (0*{n_passes} + (ng+1))*{n}.
-                        rom_addr <= (grp_ctr + 16'd1) * 16'd{n};
-                        grp_ctr <= grp_ctr + 16'd1;
-                    end
-                end
-                grp_was_feeding <= 1'b0;
-            end else if (beat_ctr < 16'd{input_beats - 1}) begin
+        // Counters advance on presented beats only and HOLD on an idle beat: an idle
+        // beat mid-frame just pauses the core, and between frames the wrap on the last
+        // beat has already left every counter at the next frame's start.
+        end else if (en && in_valid) begin
+            if (beat_ctr < 16'd{input_beats - 1}) begin
                 beat_ctr <= beat_ctr + 16'd1;
                 // Next beat, same K-pass: (kc*{n_passes} + ng)*{n} + (t+1).
                 if (beat_ctr + 16'd1 < 16'd{n})
@@ -292,8 +282,8 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1, passes=1,
             end else begin
                 // Pass boundary: beat 0 of the next K-pass, same group:
                 // ((kc+1)*{n_passes} + ng)*{n}. (On the frame's final pass this
-                // lands one pass past the group; the idle beat that always
-                // follows overrides it before any in_valid beat consumes it.)
+                // lands one pass past the group; the frame-end branch below
+                // overrides it before the next frame's first beat.)
                 beat_ctr <= 16'd0;
                 pass_ctr <= pass_ctr + 16'd1;
                 rom_addr <= ((pass_ctr + 16'd1) * 16'd{n_passes} + grp_ctr) * 16'd{n};
@@ -339,8 +329,9 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1, passes=1,
         # The wrap on a frame's last beat already lands rom_addr on the next
         # frame's first entry (next group's base, or 0 after the last one), and
         # frames may follow each other with no idle beat, so a group counter
-        # stepped by idle beats would drift from the frame sequence. An idle
-        # beat therefore only rewinds beat_ctr and holds rom_addr.
+        # stepped by idle beats would drift from the frame sequence. Idle beats
+        # (between frames, or mid-frame while the core pauses) hold every
+        # counter, which advance on accepted beats only.
         grp_decl = grp_reset = grp_feeding = grp_idle = ""
     # Gapless: entries are laid out in feed order (pass-major, or group-major
     # when only N folds), so the wrap past the last entry is the rewind.
@@ -367,10 +358,11 @@ def _weight_rom_block(b_width, weight_rom, n, input_beats, n_passes=1, passes=1,
         if (rst) begin
             beat_ctr <= 16'd0;
             rom_addr <= 16'd0;{grp_reset}
-        end else if (en) begin
-            if (!in_valid) begin
-                beat_ctr <= 16'd0;{grp_idle_nl}
-            end else if (beat_ctr < 16'd{input_beats - 1}) begin
+        // Counters advance on presented beats only and HOLD on an idle beat (an idle
+        // beat mid-frame just pauses the core; the wrap on a frame's last beat already
+        // leaves the counters at the next frame's start).
+        end else if (en && in_valid) begin
+            if (beat_ctr < 16'd{input_beats - 1}) begin
                 beat_ctr <= beat_ctr + 16'd1;
                 if (beat_ctr + 16'd1 < 16'd{n}) rom_addr <= rom_addr + 16'd1;{grp_feeding}
             end else begin
@@ -504,11 +496,8 @@ def _a_replay_block(a_width, passes, n_passes, m, input_beats, k=None, gapless=F
         if (rst) begin
             replay_beat <= 16'd0;
             replay_pass <= 16'd0;{addr_reset}{grp_reset}
-        end else if (en) begin
-            if (!in_valid) begin
-                replay_beat <= 16'd0;
-                replay_pass <= 16'd0;{addr_hold}{grp_idle}
-            end else if (replay_beat < 16'd{input_beats - 1}) begin
+        end else if (en && in_valid) begin
+            if (replay_beat < 16'd{input_beats - 1}) begin
                 replay_beat <= replay_beat + 16'd1;{addr_step}{grp_feeding}
             end else begin
                 replay_beat <= 16'd0;{addr_hold}{grp_feeding}{pass_wrap}
@@ -669,7 +658,7 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
         // carries no other function -- the VTR hard-block model has no parameters)
         (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8_atlas slice_r{r}_c{c} (
             .clk(clk), .reset(slice_reset), .pe_reset(1'b0),
-            .en(en),
+            .en(en_core),
             .start_mat_mul(slice_start),
             .done_mat_mul(done_mat_mul[{r*grid_cols+c}]),
             .a_data(a_data_{r}_{c}),
@@ -912,6 +901,21 @@ module {module_name}(
     wire final_chunk = (chunk_idx == K_CHUNKS - 1);
     wire [7:0] current_k_mask = final_chunk ? {vm(last_k_mask)} : 8'hFF;
 
+    // Idle-beat pause: a beat that is not in_valid while a frame is open (first
+    // beat taken, last beat not yet) freezes the slices and the drain-side state
+    // for one cycle, exactly like an `en` freeze, so the frame sees a gapless
+    // beat stream. The input registers keep loading on `en` (the idle beat is
+    // simply dropped). Idle beats between frames never pause: the drain
+    // continues. out_valid is cleared on a pause so a row is never repeated.
+    reg frame_open;
+    wire frame_last_beat = final_chunk && (beat_count + 16'd1 == INPUT_BEATS);
+    wire pause = frame_open && !in_valid_q;
+    wire en_core = en && !pause;
+    always @(posedge clk) begin
+        if (rst) frame_open <= 1'b0;
+        else if (en && in_beat_active) frame_open <= !frame_last_beat;
+    end
+
     // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
     // done_count[s] tracks them; row_done[r] says every slice of tile-row r
     // has counted a done past frames_emitted, so each tile-row is released
@@ -974,6 +978,7 @@ module {module_name}(
         end else if (en) begin
             out_valid <= 1'b0;
             out_last <= 1'b0;
+            if (!pause) begin
             for (hd = 0; hd < {grid_rows*grid_cols}; hd = hd + 1)
                 if (done_mat_mul[hd])
                     done_count[hd] <= done_count[hd] + 16'd1;
@@ -1008,6 +1013,7 @@ module {module_name}(
 {(f"                    if (out_grp + 16'd1 >= 16'd{n_passes}) out_grp <= 16'd0;") if _fold_n_bias else ""}
 {"                    else out_grp <= out_grp + 16'd1;" if _fold_n_bias else ""}
                 end
+            end
             end
         end
     end
@@ -1268,7 +1274,7 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
         // carries no other function -- the VTR hard-block model has no parameters)
         (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8_atlas slice_p{p}_r{r}_c{c} (
             .clk(clk), .reset(slice_reset), .pe_reset(1'b0),
-            .en(en),
+            .en(en_core),
             .start_mat_mul(slice_start && part{p}_active),
             .done_mat_mul(done_mat_mul[{idx}]),
             .a_data((part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
@@ -1323,7 +1329,7 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
         // carries no other function -- the VTR hard-block model has no parameters)
         (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8_atlas slice_p{p}_r{r}_c{c} (
             .clk(clk), .reset(slice_reset), .pe_reset(1'b0),
-            .en(en),
+            .en(en_core),
             .start_mat_mul(slice_start && part{p}_active),
             .done_mat_mul(done_mat_mul[{idx}]),
             .a_data((part{p}_active && ({c} == 0){a_route}) ? {a_expr} : 64'b0),
@@ -1422,14 +1428,15 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
                             beat_count <= 16'd0;"""
         frame_first_cond = "(beat_count == 16'd0)"
         op2_expr = "slice_start"
+        frame_last_ksp = "(beat_count + 16'd1 == INPUT_BEATS)"
     else:
         # chunk_idx doubles as the pass counter here: it advances once per
         # pass (not once per chunk), and the loop exits after `passes` passes.
         # Non-final passes advance IN PLACE at the end of their beat window:
         # the host run loop (docs/wrapper_run_loop.md) feeds every pass's
-        # beats contiguously -- any non-in_valid call ends the frame -- so
-        # waiting for all_slices_done between passes would strand the later
-        # passes' beats (the iverilog golden TB feeds contiguously too).
+        # beats back to back (an idle beat inside the frame only pauses the
+        # core), so waiting for all_slices_done between passes would strand
+        # the later passes' beats.
         # The feed FSM never waits for the grid; the emission block drains the
         # committed (final-pass) wave.
         run_end_body = f"""\
@@ -1437,6 +1444,7 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
                             chunk_idx <= (chunk_idx + 16'd1 == 16'd{passes}) ? 16'd0 : chunk_idx + 16'd1;"""
         frame_first_cond = "(beat_count == 16'd0) && (chunk_idx == 16'd0)"
         op2_expr = f"slice_start && (chunk_idx + 16'd1 == 16'd{passes})"
+        frame_last_ksp = f"(chunk_idx + 16'd1 == 16'd{passes}) && (beat_count + 16'd1 == INPUT_BEATS)"
 
     return f"""\
 // Auto-generated by rtl.py
@@ -1523,6 +1531,21 @@ module {module_name}(
     wire slice_reset = rst;
     wire in_beat_active = in_valid_q && (beat_count < INPUT_BEATS);
     wire slice_start = in_beat_active && (beat_count == 16'd0);
+    // Idle-beat pause: a beat that is not in_valid while a frame is open (first
+    // beat taken, last beat not yet) freezes the slices and the drain-side state
+    // for one cycle, exactly like an `en` freeze, so the frame sees a gapless
+    // beat stream. The input registers keep loading on `en` (the idle beat is
+    // simply dropped). Idle beats between frames never pause: the drain
+    // continues. out_valid is cleared on a pause so a row is never repeated.
+    reg frame_open;
+    wire frame_last_beat = {frame_last_ksp};
+    wire pause = frame_open && !in_valid_q;
+    wire en_core = en && !pause;
+    always @(posedge clk) begin
+        if (rst) frame_open <= 1'b0;
+        else if (en && in_beat_active) frame_open <= !frame_last_beat;
+    end
+
     // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
     // done_count[s] tracks them; row_done[r] releases each tile-row as soon
     // as its own slices complete the head frame (not when all rows finish),
@@ -1584,13 +1607,15 @@ module {module_name}(
         end else if (en) begin
             out_valid <= 1'b0;
             out_last <= 1'b0;
+            if (!pause) begin
             for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1)
                 if (done_mat_mul[hd])
                     done_count[hd] <= done_count[hd] + 16'd1;
 {_bias_grp_body}
-            // A frame is one contiguous run of in_valid beats and the next
-            // frame's first beat may follow its last directly: there is no
-            // preload stage, so frames_fed is bumped on the first beat and the
+            // A frame is total_beats accepted in_valid beats (idle beats inside
+            // it pause the core) and the next frame's first beat may follow its
+            // last directly: there is no preload
+            // stage, so frames_fed is bumped on the first beat and the
             // beat/pass counters wrap at the frame's last beat.
             if (in_beat_active) begin
                 if ({frame_first_cond})
@@ -1615,6 +1640,7 @@ module {module_name}(
 {(f"                    if (out_grp + 16'd1 >= 16'd{n_passes}) out_grp <= 16'd0;") if _fold_n_bias else ""}
 {"                    else out_grp <= out_grp + 16'd1;" if _fold_n_bias else ""}
                 end
+            end
             end
         end
     end
@@ -1746,7 +1772,7 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
         // shift_amount pin (= S1 value)
         (* black_box = "true" *) (* keep = "true" *) tensor_slice_int8_atlas slice_p{p}_r{r}_c{c} (
             .clk(clk), .reset(slice_reset), .pe_reset(1'b0),
-            .en(en),
+            .en(en_core),
             .start_mat_mul(slice_start),
             .done_mat_mul(done_mat_mul[{idx}]),
             .a_data(({c} == 0){a_route} ? {a_expr} : 64'b0),
@@ -1983,6 +2009,21 @@ module {module_name}(
     wire slice_start = in_beat_active && (beat_count == 16'd0);
     wire final_chunk = (chunk_idx == 16'd{passes - 1});
     wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
+    // Idle-beat pause: a beat that is not in_valid while a frame is open (first
+    // beat taken, last beat not yet) freezes the slices and the drain-side state
+    // for one cycle, exactly like an `en` freeze, so the frame sees a gapless
+    // beat stream. The input registers keep loading on `en` (the idle beat is
+    // simply dropped). Idle beats between frames never pause: the drain
+    // continues. out_valid is cleared on a pause so a row is never repeated.
+    reg frame_open;
+    wire frame_last_beat = final_chunk && (beat_count + 16'd1 == INPUT_BEATS);
+    wire pause = frame_open && !in_valid_q;
+    wire en_core = en && !pause;
+    always @(posedge clk) begin
+        if (rst) frame_open <= 1'b0;
+        else if (en && in_beat_active) frame_open <= !frame_last_beat;
+    end
+
     // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
     // done_count[s] counts them; row_done[r] says every slice of tile-row r
     // (across every K-spatial partition) has counted a done past
@@ -2069,6 +2110,7 @@ module {module_name}(
         end else if (en) begin
             out_valid <= 1'b0;
             out_last <= 1'b0;
+            if (!pause) begin
             for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1)
                 if (done_mat_mul[hd])
                     done_count[hd] <= done_count[hd] + 16'd1;
@@ -2106,6 +2148,7 @@ module {module_name}(
                     drain_frame <= (drain_frame + 16'd1 == 16'd{total_frames}) ?
                         16'd0 : drain_frame + 16'd1;
                 end
+            end
             end
         end
     end

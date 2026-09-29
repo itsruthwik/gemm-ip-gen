@@ -84,8 +84,9 @@ II   = k_chunks × max(M,N)  (back-to-back, shadow FIFO)
 ```
 
 The cores have no preload stage: a frame starts on its first `in_valid` beat,
-frames may follow each other with no idle cycle between them (but none inside a
-frame), and the feed period is the input beats per frame. `preload_valid` is an
+frames may follow each other with no idle cycle between them, an idle beat
+inside a frame pauses the whole core (see `docs/rtl_contract.md`), and the feed
+period is the input beats per frame. `preload_valid` is an
 unused port kept so wrappers still connect. Row release uses `done_count` plus
 `done_mat_mul`, so output latency is one cycle shorter than it was with the
 preload beat. In the synthesized flow the stream and const-weight stream

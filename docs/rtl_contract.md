@@ -144,14 +144,14 @@ separately.
 zero-pads any tile columns past the real N). The existing `rom_addr`
 register already steps to the next block's base on every frame's wrap beat
 (`rom_addr + 1 == base + N_g`, same mechanism the K-multipass ROM uses
-between K passes). Frames are gapless (no idle beat between them), so the ROM
+between K passes). Frames may be gapless (no idle beat between them), so the ROM
 entries are laid out in feed order and `rom_addr` simply wraps to 0 past the
 last entry, on the last beat of the last group's frame; the wrap itself is the
 frame boundary, so no group counter stepped by idle beats is needed (it would
-drift from the frame sequence). An idle cycle only rewinds `beat_ctr` and holds
-`rom_addr`, so reset settle beats and a testbench's trailing wait cannot
-disturb the address. The A-row replay counters wrap the same way at the
-frame's last beat.
+drift from the frame sequence). Idle cycles hold `beat_ctr` and `rom_addr`
+(they advance on accepted beats only), so reset settle beats, a paused frame
+and a testbench's trailing wait cannot disturb the address. The A-row replay
+counters wrap the same way at the frame's last beat.
 
 The two-operand (external `b_cols`) path needs no RTL change: the wrapper
 already re-inserts the tile offset by beat index, so fold-N just restricts
@@ -163,8 +163,8 @@ and this file's fold-M section above for the row-fold analogue.
 ## Synth Protocol
 
 1. There is no preload stage: a frame starts on its first `in_valid` beat, and
-   frames may follow each other with no idle cycle (none is allowed inside a
-   frame). `preload_valid` is an unused port kept so wrappers still connect.
+   frames may follow each other with no idle cycle. An idle beat inside a frame
+   pauses the core (see *Idle-beat pause* below). `preload_valid` is an unused port kept so wrappers still connect.
    The bias is compile-time — see *Bias* below.
 2. For each K chunk:
    - pulse `start_mat_mul` on the first A/B beat of that chunk
@@ -177,6 +177,21 @@ and this file's fold-M section above for the row-fold analogue.
 3. Intermediate outputs from non-final K chunks are ignored.
 4. After the final K chunk, the output collector releases one tile-row at a
    time and concatenates its column tiles into full output rows.
+
+### Idle-beat pause
+
+The core tolerates idle beats inside a frame. `frame_open` is set on a frame's
+first accepted beat and cleared on its last; `pause = frame_open && !in_valid_q`.
+The slices and all core sequential state run on `en && !pause`, so a pause
+freezes the core as a unit, exactly like a core-level `en` freeze. `out_valid`
+and `out_last` are held low while paused so no output row repeats. Idle beats
+between frames do not pause, so the previous frame's drain continues. The
+weight-ROM and A-replay counters advance on accepted beats only. With no gaps
+the feed period (input beats per frame) and the latency are unchanged.
+
+Trade-off: a pause also freezes the previous frame's drain (there is one `en`
+per slice), so a bursty upstream such as im2col can cost a few cycles of
+frame interval. A small read-ahead was measured not to help.
 
 ## Requantization and Bias
 

@@ -115,9 +115,10 @@ gemm.run(a_rows, b_cols, bias_packed, frame_preload, feed_valid, c_row, v, l);
 
 The cores have no preload stage: a frame starts on its first `in_valid` beat
 (chunk/pass 0, beat 0) and the core's frame clock is 0 there. Consecutive
-frames may follow each other with no idle call, but a frame's own beats must be
-contiguous (no idle cycle inside a frame; a gap between frames is fine, and an
-`en` freeze at any point is safe). `preload_valid` (`frame_preload`) is an
+frames may follow each other with no idle call. This loop feeds a frame's beats
+back to back, but the core tolerates an idle beat inside a frame (it pauses as a
+unit, see *Idle-beat pause* in `rtl_contract.md`); a gap between frames is fine
+and an `en` freeze at any point is safe. `preload_valid` (`frame_preload`) is an
 unused port kept only so the wrappers still connect; it is tied to 0. Every
 step past the feed region is an idle call that advances the core's clock.
 
@@ -214,8 +215,9 @@ The core relies on exactly the protocol this loop produces:
 
 - a frame begins on its first `in_valid` beat; there is no preload/idle call
   (`preload_valid` is tied to 0 and unused);
-- the frame's `total_beats` data beats are contiguous `in_valid=1` calls —
-  no idle cycle inside a frame. Idle cycles between frames are allowed, and
+- the frame's `total_beats` data beats are `in_valid=1` calls, back to back in
+  this loop; an idle cycle inside a frame pauses the core rather than breaking
+  the frame. Idle cycles between frames are allowed (the drain continues), and
   the next frame may start on the very next call;
 - `first_out >= total_beats` by construction, so rows never emerge before the
   feed completes;
@@ -245,21 +247,25 @@ successive frames overlap and the frame interval is the feed length
 (`m_passes * n_passes * total_beats`) rather than feed + drain + call
 overhead.
 
-- **A-row queue.** The next group's A rows wait in a fixed-slot shift queue fed
-  from one non-blocking `nb_read` site. The oldest row is always the top slot
-  (a constant head), a pass-0 beat pops it and shifts the slots up, and
-  otherwise the slots below the highest empty one close the gap. A
-  run-time-indexed latch instead would build wide write decoders and read
-  muxes that grew wide conv layers by about half and cost Fmax.
-- **Group start.** The core has no backpressure and needs every group's beats
-  contiguous, so a group starts only once its core rows are all held. Groups
-  (`m_passes * n_passes` per frame, mg-major) then run back to back with no
-  bubble whenever the stream keeps up.
+- **A-row reads.** There is no A-row buffer. Each call makes one non-blocking
+  `nb_read` of the A stream only on a beat that needs a fresh row (pass 0,
+  `t < m`, first N-group, and `t < last_rows` on a padded last M-group). If the
+  row has not arrived the call presents an idle beat, the core pauses, and the
+  next call retries. Later K passes and padding beats feed without reading. The
+  register cost is constant per layer rather than `core_m * K` bytes.
+- **Group start.** A group starts on the call after the previous one ends and
+  does not wait for its rows: the core pauses on idle beats inside a frame (see
+  *Idle-beat pause* in `rtl_contract.md`). Groups (`m_passes * n_passes` per
+  frame, mg-major) run back to back with no bubble whenever the stream keeps up.
 - **No blocking reads.** A blocking read (or `available()` wait) stalls the
   whole block, core drain included, whenever the stream is empty, which would
   hold the previous frame's outputs until the next frame's first row arrives.
+  (A pause does freeze the drain too, since there is one `en` per slice, so a
+  bursty upstream such as im2col can cost a few cycles of interval; a small
+  read-ahead was measured not to help.)
 - **Runtime B.** The runtime-B latch holds all `logical_n` columns for the whole
-  frame (every M-group re-reads them) and is refilled during the last M-group.
+  frame (every M-group re-reads them) and is refilled during the last M-group;
+  the column release counts fed beats only.
 - **Outputs.** Rows are written one per `out_valid` pulse. Under fold-N the
   slices of earlier N-groups wait in a small `c_buf` and the last N-group's
   pulse completes and writes each full row. Fold-N also registers

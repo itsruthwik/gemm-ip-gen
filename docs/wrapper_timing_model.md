@@ -29,8 +29,8 @@ recovery path.
 
 The feed path is row/col streaming with K-chunks, organised as `n_frames`
 back-to-back frames of period `total_beats`. Each frame is `total_beats`
-contiguous data beats; there is no preload/idle beat, and the next frame's
-first beat may follow immediately:
+data beats; there is no preload/idle beat, and the next frame's first beat may
+follow immediately (an idle beat inside a frame just pauses the core):
 
 ```text
 k_chunks    = ceil(K / 8)
@@ -239,10 +239,12 @@ feed_total  = n_frames * period
 total_steps = (n_frames - 1) * period + first_out + M + 4
 ```
 
-Each frame is `total_beats` contiguous `in_valid=1` beats; the next frame may
-start on the very next call. There must be no idle cycle inside a frame
-(between frames is fine; an `en` freeze anywhere is safe). The weight-ROM
-address and A-replay counters wrap at the frame's last beat, and row release
+Each frame is `total_beats` accepted `in_valid=1` beats; the next frame may
+start on the very next call. An idle beat inside a frame is tolerated: the core
+pauses (see `rtl_contract.md`), so the period only grows by the idle beats
+(unchanged when there are none). Idle beats between frames do not pause and
+the drain continues. The weight-ROM address and A-replay counters advance on
+accepted beats only and wrap at the frame's last beat, and row release
 uses `done_count` plus `done_mat_mul`, which makes the output latency one
 cycle shorter than with the old preload beat. Steady-state **frame II =
 total_beats**, while each frame's first-in→last-out latency stays about
@@ -259,7 +261,7 @@ Under `__SYNTHESIS__ && BLACKBOX_FLOW` the stream and const-weight stream
 entries are free-running single-cycle design blocks, so the frame interval of
 the synthesized IP is the feed period (`m_passes * n_passes * total_beats`),
 not feed + drain + call overhead. See *Free-running stream entries* in
-`wrapper_run_loop.md` for the A-row queue and output rules. The csim
+`wrapper_run_loop.md` for the A-row read and output rules. The csim
 (`#else`) path and the array entry keep the one-frame-per-call loop above.
 Catapult's `cycle.rpt` reports these blocks per call (latency 2, II 1), so
 measure the frame interval from the cosim end time at two frame counts.

@@ -772,17 +772,15 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # ---- Free-running stream entries (synthesis only) -------------------------------
     # The IO stream entries become single-cycle `hls_design block`s: one wrapper clock
     # per call, so frames overlap and the interval is the feed length (groups x
-    # total_beats) instead of feed + drain. The core has no backpressure and needs
-    # every group's beats contiguous, so operands are held before a group starts. A
-    # blocking read or available() on the A stream is not an option: Catapult stalls the
-    # whole block (core drain included) whenever the stream is empty, which delays the
-    # previous frame's outputs until the next frame's first row arrives. Instead A rows
-    # sit in a queue of fixed slots (raw int8 rows, not the grid-padded packed word): the
-    # oldest row is always the top slot, a pass-0 beat pops it and shifts every slot up,
-    # and otherwise slots below the highest empty one close the gap. New rows always enter
-    # slot 0 through the single non-blocking read site, so there is no indexed read or
-    # write mux. A group starts once its core rows fill the top slots, so back-to-back
-    # groups have no bubble whenever the stream keeps up.
+    # total_beats) instead of feed + drain. The core pauses on an idle beat inside a group
+    # (in_valid low mid-frame freezes it), so a group may start before its A rows arrive:
+    # each call makes one non-blocking read of the A stream when the current beat carries
+    # a fresh row, feeds the beat if the row arrived, and otherwise presents an idle beat
+    # and retries next call. A blocking read or available() on the A stream is not an
+    # option: Catapult stalls the whole block (core drain included) whenever the stream is
+    # empty, which delays the previous frame's outputs until the next frame's first row
+    # arrives. Beats that need no fresh row (later K passes, which the core replays, and
+    # padding beats t >= m) are fed without reading.
     # Folded axes: one hls4ml frame is m_passes x n_passes groups (mg-major, ng-minor).
     # A is popped only on the ng == 0 group (the core replays it for later N-groups),
     # rows past logical_m are never fed. Runtime B columns are latched in an indexed
@@ -807,17 +805,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         ng_e = "ng" if fold_ng else "0"
         mg_e = "mg" if fold_mg else "0"
         at_first = f"{mg_e} == 0 && {ng_e} == 0"
-        # A rows a group needs queued before it starts: a padded last M-group is shorter.
-        def _top(nn):
-            return f"(a_vm.template slc<{nn}>({m - nn}) == {(1 << nn) - 1})"
-        if not fold_mg:
-            top_ok = _top(last_rows)
-        elif last_rows != m:
-            top_ok = f"({mg_e} == {last_mg} ? {_top(last_rows)} : {_top(m)})"
-        else:
-            top_ok = _top(m)
-        b_decl = (f"\n    static ac_int<{8 * k}, false> b_lat[{logical_n}];"
-                  f"\n    static ac_int<{cnt_w}, false> b_cnt = 0;") if runtime_b else ""
+        b_decl = (f"static ac_int<{8 * k}, false> b_lat[{logical_n}];"
+                  f"\n    static ac_int<{cnt_w}, false> b_cnt = 0;\n    ") if runtime_b else ""
         b_word_decl = f"\n    ac_int<{b_bits}, false> b_cols = 0;" if runtime_b else ""
         b_feed = f"\n    {fr_bcols_pack}" if runtime_b else ""
         b_arg = "b_cols, " if runtime_b else ""
@@ -834,11 +823,13 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
             b_gather = f"""
     // Column j is free once its last-pass beat in the last M-group has been fed (the
     // pack above already read the old value this call), or while the next frame waits.
+    // An idle call feeds no beat, so beat t itself is not yet consumed then.
     int b_avail = 0;
     if (!active && {at_first}) {{
         b_avail = {logical_n};
     }} else if ({mg_e} == {last_mg}) {{
-        b_avail = ng * {n} + ((active && kc == {passes - 1}) ? (t < {n} ? t + 1 : {n}) : 0);
+        int t_used = fed ? t + 1 : t;
+        b_avail = ng * {n} + ((active && kc == {passes - 1}) ? (t_used < {n} ? t_used : {n}) : 0);
     }}
     if (b_cnt < {logical_n} && b_cnt < b_avail) {{
         b_beat_T b_beat;
@@ -855,8 +846,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         elif runtime_b:
             b_gather = f"""
     // B column j is free once its last-pass beat (t >= j) has been fed; the
-    // pack above already read the old value this call.
-    if (b_cnt < {n} && (!active || (kc == {passes - 1} && t >= b_cnt.to_int()))) {{
+    // pack above already read the old value this call. An idle call feeds no
+    // beat, so beat t itself is not yet consumed then.
+    if (b_cnt < {n} && (!active || (kc == {passes - 1} && (fed ? t + 1 : t) > b_cnt.to_int()))) {{
         b_beat_T b_beat;
         if (b_stream.nb_read(b_beat)) {{
             ac_int<{8 * k}, false> raw = 0;
@@ -874,17 +866,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                     + (f"\n    static ac_int<{_bw(last_mg)}, false> fr_mg = 0;" if fold_mg else ""))
         grp_local = (f"\n    int mg = {'fr_mg.to_int()' if fold_mg else '0'};"
                      f"\n    int ng = {'fr_ng.to_int()' if fold_ng else '0'};")
-        # A is fed on the first N-group of each M-group only.
-        a_ok = f"({ng_e} != 0 || {top_ok})" if fold_ng else top_ok
+        # A is read on the first N-group of each M-group only.
         a_rows_cond = f"active && kc == 0 && t < {m}"
         if fold_ng:
             a_rows_cond += " && ng == 0"
         if fold_mg and last_rows != m:
             a_rows_cond += f" && (mg != {last_mg} || t < {last_rows})"
-        a_shift_lines = "\n".join(
-            f"    if (a_pop || a_v0.template slc<{m - i}>({i}) != {(1 << (m - i)) - 1}) {{\n"
-            f"        a_sh[{i}] = a_sh[{i - 1}];\n        a_vm[{i}] = a_v0[{i - 1}];\n    }}"
-            for i in range(m - 1, 0, -1))
         grp_advance = ""
         if fold_mg:
             grp_advance = f"fr_mg = (mg == {last_mg}) ? 0 : mg + 1;"
@@ -979,15 +966,13 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         o_adv = f"\n        {o_adv}" if o_adv else ""
         return f"""\
     // One wrapper clock per call; state persists across calls. A group is
-    // {total_beats} contiguous in_valid beats ({passes} pass(es) x {input_beats} beats); the
-    // next group may start on the following call. Operands are latched with
-    // non-blocking reads, and a group starts only once its operands are held.
-    static ac_int<{8 * k}, false> a_sh[{m}];
-    static ac_int<{m}, false> a_vm = 0;{b_decl}
-    static ac_int<{_bw(passes)}, false> fr_kc = 0;
+    // {total_beats} contiguous beats ({passes} pass(es) x {input_beats} beats); the
+    // next group may start on the following call. A beat that needs a fresh A row and
+    // finds the stream empty is presented as an idle beat (the core pauses) and retried.
+    {b_decl}static ac_int<{_bw(passes)}, false> fr_kc = 0;
     static ac_int<{_bw(input_beats)}, false> fr_t = 0;{grp_decl}
     static bool active = false;{o_decl}{grp_local}
-    if (!active && {a_ok}{b_ready}) {{
+    if (!active{b_ready}) {{
         active = true;
         fr_kc = 0;
         fr_t = 0;{b_reset}
@@ -996,40 +981,29 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     int t = fr_t.to_int();
     ac_int<{a_port_bits}, false> a_rows = 0;{b_word_decl}
     // Every K-pass slice of A row t goes out on its pass-0 beat; the core keeps the later ones.
-    bool a_pop = {a_rows_cond};
-    if (a_pop) {{
-        ac_int<{8 * k}, false> a_raw = a_sh[{m - 1}];{_a_pack_block("a_rows", "0", "ROW_PACK_DIRECT", elem="static_cast<ac_int<8, true> >(a_raw.template slc<8>(kk * 8))")}{_a_pack_later_passes("a_rows", "PACK_REPLAY", elem="static_cast<ac_int<8, true> >(a_raw.template slc<8>(kk * 8))")}
-    }}{b_feed}
-    ac_int<{c_bits}, false> c_row;
-    ac_int<1, false> v, l;
-    ac_int<1, false> feed_valid = active ? 1 : 0;
-    // preload_valid is an unused port (the core has no preload stage).
-    ac_int<1, false> frame_preload = 0;
-    gemm.run(a_rows, {b_arg}frame_preload, feed_valid, c_row, v, l);
-    // Row queue update. a_vm[i] marks slot i as holding a row; the pre-update mask is used
-    // throughout so every slot sees the state of the previous call.
-    const ac_int<{m}, false> a_v0 = a_vm;
-    bool a_room = a_pop || a_v0 != {(1 << m) - 1};
-    ac_int<{8 * k}, false> a_new = 0;
+    bool a_need = {a_rows_cond};
+    ac_int<{8 * k}, false> a_raw = 0;
     bool a_got = false;
-    if (a_room) {{
+    if (a_need) {{
         a_beat_T a_beat;
         if (a_stream.nb_read(a_beat)) {{
             #pragma hls_unroll
             A_LATCH: for (int i = 0; i < {k}; i++) {{
-                a_new.set_slc(i * 8, {name}_to_gemm_int8(a_beat[i]));
+                a_raw.set_slc(i * 8, {name}_to_gemm_int8(a_beat[i]));
             }}
             a_got = true;
         }}
     }}
-{a_shift_lines}
-    if (a_room) {{
-        if (a_got) {{
-            a_sh[0] = a_new;
-        }}
-        a_vm[0] = a_got;
-    }}{b_gather}
-    if (active) {{
+    bool fed = active && (!a_need || a_got);
+    if (a_got) {{{_a_pack_block("a_rows", "0", "ROW_PACK_DIRECT", elem="static_cast<ac_int<8, true> >(a_raw.template slc<8>(kk * 8))")}{_a_pack_later_passes("a_rows", "PACK_REPLAY", elem="static_cast<ac_int<8, true> >(a_raw.template slc<8>(kk * 8))")}
+    }}{b_feed}
+    ac_int<{c_bits}, false> c_row;
+    ac_int<1, false> v, l;
+    ac_int<1, false> feed_valid = fed ? 1 : 0;
+    // preload_valid is an unused port (the core has no preload stage).
+    ac_int<1, false> frame_preload = 0;
+    gemm.run(a_rows, {b_arg}frame_preload, feed_valid, c_row, v, l);{b_gather}
+    if (fed) {{
         if (t == {input_beats - 1}) {{
             fr_t = 0;
             if (kc == {passes - 1}) {{
