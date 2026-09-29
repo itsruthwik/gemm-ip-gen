@@ -156,6 +156,87 @@ def _stage2_function(s2, out_width, func_name="stage2"):
     )
 
 
+def _s16_literal(v):
+    """Signed 16-bit Verilog literal for *v*, wrapped into [-32768, 32767]."""
+    v = ((int(v) + 32768) & 0xFFFF) - 32768
+    return f"16'sd{v}" if v >= 0 else f"-16'sd{-v}"
+
+
+def _sum_tree16(terms):
+    """Balanced binary adder tree over 16-bit signed *terms* (log2 depth, any
+    count). Addition is associative modulo 2^16 and the consumer is a 16-bit
+    reg, so every intermediate wraps exactly as the left-assoc chain did; the
+    tree only shortens the carry-chain depth from N-1 adders to ceil(log2 N).
+    """
+    level = list(terms)
+    while len(level) > 1:
+        nxt = [f"({level[i]} + {level[i + 1]})" for i in range(0, len(level) - 1, 2)]
+        if len(level) % 2:
+            nxt.append(level[-1])
+        level = nxt
+    return level[0]
+
+
+def _stage2_fold_const(bias, s2, out_width):
+    """Per-lane constant for the folded stage 2, or None when it can't fold.
+
+    stage2 keeps bits [s2+out_width-1:s2] of ``sext32(sum+bias) + half``. When
+    s2 + out_width <= 16 those bits depend only on the low 16 bits of the sum,
+    so ``bias + half`` collapses into ONE 16-bit constant (mod 2^16) and the
+    32-bit half-add disappears. Otherwise the kept bits reach above bit 15 and
+    the sign extension matters, so the caller keeps the separate 32-bit round.
+    """
+    s2 = int(s2) if s2 else 0
+    if s2 + int(out_width) > 16:
+        return None
+    half = (1 << (s2 - 1)) if s2 > 0 else 0
+    return (int(bias) + half) & 0xFFFF
+
+
+def _stage2_folded_function(s2, out_width, func_name="stage2f"):
+    """Stage 2 with bias and rounding pre-folded into one 16-bit constant
+    (see _stage2_fold_const); only valid when s2 + out_width <= 16."""
+    s2 = int(s2) if s2 else 0
+    return (
+        f"    function signed [{out_width - 1}:0] {func_name};\n"
+        "        input signed [15:0] sum_partials;\n"
+        "        input signed [15:0] fold_const;\n"
+        "        reg signed [15:0] t;\n"
+        "        begin\n"
+        "            t = sum_partials + fold_const;\n"
+        f"            {func_name} = t[{s2 + out_width - 1}:{s2}];\n"
+        "        end\n"
+        "    endfunction\n"
+    )
+
+
+def _stage2_tree_stmts(term_exprs, out_ref, bias_expr, bias_const, s2, out_width):
+    """Verilog statements for one lane: balanced K-partition sum (with the bias
+    as one more tree term) and stage 2, bit-identical to the chain
+    ``stage2(p0 + p1 + ...,  bias)``.
+
+    *bias_const* is the compile-time per-lane bias (int, or None when the bias
+    is a runtime lookup such as fold-N's group-indexed one, passed as
+    *bias_expr*). With a constant bias and s2 + out_width <= 16 the rounding
+    half folds into the same constant; otherwise stage2() keeps its 32-bit
+    half-add with a zero bias.
+    """
+    if bias_const is None:
+        leaves = list(term_exprs) + [bias_expr]
+        tail = "stage2(accum16, 16'sd0)"
+    else:
+        folded = _stage2_fold_const(bias_const, s2, out_width)
+        if folded is not None:
+            leaves = list(term_exprs) + ([_s16_literal(folded)] if folded else [])
+            lo = int(s2) if s2 else 0
+            tail = f"accum16[{lo + out_width - 1}:{lo}]"
+        else:
+            leaves = list(term_exprs) + ([_s16_literal(bias_const)] if bias_const else [])
+            tail = "stage2(accum16, 16'sd0)"
+    return [f"            accum16 = {_sum_tree16(leaves)};",
+            f"            {out_ref} = {tail};"]
+
+
 def _require_symmetric_quant(a_zero_point=0, b_zero_point=0,
                              a_zero_point_correct=None, b_zero_point_correct=None,
                              who="tensor_slice"):
@@ -573,7 +654,12 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     # running-sum correction exists.
     has_bias = bias_codes is not None
     bias_rom_block = _bias_rom_block(bias_codes, bias_rom_name) if (has_bias and emit_bias_rom) else ""
-    _fold_n_bias = bool(has_bias and n_passes and int(n_passes) > 1)
+    # The combined core hoists its ROMs and calls this emitter with n_passes
+    # left at 1, but its bias still differs per N-group: the group count arrives
+    # as a_replay_n_passes, and without it group 0's bias would be folded in as
+    # a constant for every group.
+    _bias_groups = int(n_passes if a_replay_n_passes is None else a_replay_n_passes)
+    _fold_n_bias = bool(has_bias and _bias_groups > 1)
     # Multi-frame overlap: the emitted frame is always the OLDEST un-emitted
     # frame, so its fold-N bias group is tracked by a pop-advanced counter
     # (out_grp) instead of the old "latch the live fed-group at frame start"
@@ -748,6 +834,20 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     def _col_zp_corr_term(c, lane):
         return ""
 
+    # Non-fold-N bias is a compile-time constant per lane: fold it and the
+    # rounding half into one 16-bit constant (one adder instead of three) when
+    # the kept bits stay within the low 16 (see _stage2_fold_const).
+    _chunked_fold_ok = (not _fold_n_bias) and (int(s2 or 0) + out_width <= 16)
+
+    def _chunked_lane_expr(r, c, lane):
+        x = f"$signed(c_data_{r}_{c}[{lane}*16 +: 16])"
+        if _chunked_fold_ok:
+            idx = c * 8 + lane
+            b = int(bias_codes[idx]) if (has_bias and idx < len(bias_codes)) else 0
+            return f"stage2f({x}, {_s16_literal(_stage2_fold_const(b, s2, out_width))})"
+        return (f"stage2({x}, "
+                f"{_bias_expr_synth(c, lane)}{_col_zp_corr_term(c, lane)}{row_zp_corr_term})")
+
     row_avail_decl = []
     row_data_decl = []
     for r in range(grid_rows):
@@ -755,9 +855,7 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
         tiles = []
         for c in range(grid_cols):
             lanes = ", ".join(
-                f"stage2($signed(c_data_{r}_{c}[{lane}*16 +: 16]), "
-                f"{_bias_expr_synth(c, lane)}{_col_zp_corr_term(c, lane)}{row_zp_corr_term})"
-                for lane in range(7, -1, -1)
+                _chunked_lane_expr(r, c, lane) for lane in range(7, -1, -1)
             )
             tiles.append("{" + lanes + "}")
         concat = "{" + ", ".join(reversed(tiles)) + "}"
@@ -806,6 +904,8 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
         w_rom_block = ""
 
     stage2_fn = _stage2_function(s2, out_width)
+    if _chunked_fold_ok:
+        stage2_fn += _stage2_folded_function(s2, out_width)
 
     return f"""\
 // Auto-generated by rtl.py
@@ -844,18 +944,25 @@ module {module_name}(
 {_zp_col_decl}{_zp_row_decl}{row_zp_corr_decl}
     // Continuous multi-frame bookkeeping (rev-3 overlapped frames).
     // frames_fed counts frames whose first beat has been taken; frames_emitted
-    // counts frames whose LOGICAL_OUT_ROWS rows have been taken. done_count[s] counts the
+    // counts frames whose LOGICAL_OUT_ROWS rows have been taken. done_pending[s] tracks the
     // committed-wave done pulses per slice; the head (oldest un-emitted)
     // frame's wave is complete when every slice has counted past
     // frames_emitted, so emission never waits on the feed FSM.
     reg [15:0] frames_fed;
     reg [15:0] frames_emitted;
     wire [{grid_rows*grid_cols-1}:0] done_mat_mul;
-    // The row-release test is (done_count + done_mat_mul > frames_emitted). Both
-    // outcomes are computed from registers only and done_mat_mul (a tensor_slice
-    // output with a long route) just selects between them, keeping the
-    // adder/compare off the done_mat_mul path.
-    reg [15:0] done_count [0:{grid_rows*grid_cols-1}];
+    // done_pending[s] = done_count[s] - frames_emitted, kept incrementally: +1 per
+    // counted done_mat_mul pulse, -1 per emitted frame. It is never negative (a
+    // frame is only emitted once every slice of its tile-row has counted it), so
+    // the row-release test (done_count + done_mat_mul > frames_emitted) reduces to
+    // (done_pending != 0 || done_mat_mul) with no adder or 16-bit compare on the
+    // path. Each slice holds at most eight waves in flight, and a wave is done
+    // but un-emitted only while it is in flight, so the count stays <= 8; four
+    // bits leave margin. done_mat_mul (a long route) only gates the result.
+    reg [3:0]  done_pending [0:{grid_rows*grid_cols-1}];
+    // done_nz[s] == (done_pending[s] != 0), registered so the row-release test
+    // starts from a flop instead of a 4-bit compare.
+    reg        done_nz [0:{grid_rows*grid_cols-1}];
     reg        row_done [0:{grid_rows-1}];
     reg        any_row_done;
     integer    hd, hc;
@@ -864,8 +971,7 @@ module {module_name}(
         for (hd = 0; hd < {grid_rows}; hd = hd + 1) begin
             row_done[hd] = 1'b1;
             for (hc = 0; hc < {grid_cols}; hc = hc + 1)
-                if (done_mat_mul[hd*{grid_cols} + hc] ? (done_count[hd*{grid_cols} + hc] + 16'd1 <= frames_emitted)
-                                                 : (done_count[hd*{grid_cols} + hc] <= frames_emitted))
+                if (!done_nz[hd*{grid_cols} + hc] && !done_mat_mul[hd*{grid_cols} + hc])
                     row_done[hd] = 1'b0;
             if (row_done[hd]) any_row_done = 1'b1;
         end
@@ -917,11 +1023,13 @@ module {module_name}(
     end
 
     // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
-    // done_count[s] tracks them; row_done[r] says every slice of tile-row r
-    // has counted a done past frames_emitted, so each tile-row is released
+    // done_pending[s] counts the ones not yet emitted; row_done[r] says every slice
+    // of tile-row r has a done past frames_emitted, so each tile-row is released
     // as soon as ITS wave is complete (not when all rows are). Emission is
     // independent of the feed FSM, so frame t+1 feeds while frame t drains.
     wire emit_active = any_row_done && (frames_fed > frames_emitted);
+    // Frame-emitted event; mirrors the frames_emitted increment below.
+    wire frame_emit_now = emit_active && row_take && (out_row_count + 16'd1 == LOGICAL_OUT_ROWS);
     wire [15:0] cur_row_tile = out_row_count >> 3;
     // op[1] drain_stop source: the logical M'th row of the CURRENT tile-row's
     // burst has just been taken -- the rest of that physical 8-row burst is
@@ -969,8 +1077,10 @@ module {module_name}(
             out_row_count <= 16'd0;
             frames_fed <= 16'd0;
             frames_emitted <= 16'd0;
-            for (hd = 0; hd < {grid_rows*grid_cols}; hd = hd + 1)
-                done_count[hd] <= 16'd0;
+            for (hd = 0; hd < {grid_rows*grid_cols}; hd = hd + 1) begin
+                done_pending[hd] <= 4'd0;
+                done_nz[hd] <= 1'b0;
+            end
             c_row <= {c_width}'d0;
             out_valid <= 1'b0;
             out_last <= 1'b0;
@@ -979,9 +1089,17 @@ module {module_name}(
             out_valid <= 1'b0;
             out_last <= 1'b0;
             if (!pause) begin
-            for (hd = 0; hd < {grid_rows*grid_cols}; hd = hd + 1)
-                if (done_mat_mul[hd])
-                    done_count[hd] <= done_count[hd] + 16'd1;
+            // inc/dec come from registers only; done_mat_mul and frame_emit_now
+            // (long routes) just select among them. Both together cancel.
+            for (hd = 0; hd < {grid_rows*grid_cols}; hd = hd + 1) begin
+                if (done_mat_mul[hd] && !frame_emit_now) begin
+                    done_pending[hd] <= done_pending[hd] + 4'd1;
+                    done_nz[hd] <= 1'b1;
+                end else if (!done_mat_mul[hd] && frame_emit_now) begin
+                    done_pending[hd] <= done_pending[hd] - 4'd1;
+                    done_nz[hd] <= (done_pending[hd] != 4'd1);
+                end
+            end
 
             // A frame is K_CHUNKS * INPUT_BEATS consecutive in_valid beats and
             // the next frame's first beat may follow its last directly: there
@@ -1010,7 +1128,7 @@ module {module_name}(
                 if (out_row_count + 16'd1 == LOGICAL_OUT_ROWS) begin
                     out_row_count <= 16'd0;
                     frames_emitted <= frames_emitted + 16'd1;
-{(f"                    if (out_grp + 16'd1 >= 16'd{n_passes}) out_grp <= 16'd0;") if _fold_n_bias else ""}
+{(f"                    if (out_grp + 16'd1 >= 16'd{_bias_groups}) out_grp <= 16'd0;") if _fold_n_bias else ""}
 {"                    else out_grp <= out_grp + 16'd1;" if _fold_n_bias else ""}
                 end
             end
@@ -1386,27 +1504,27 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
         for c in range(grid_cols):
             for lane in range(8):
                 # Stage 2 (shared with every other emitter -- see
-                # _stage2_function): sum the K-partition 16-bit partials in
-                # 16-bit WRAPPING arithmetic (the `accum16` reg truncates the
-                # sum to 16 bits on assignment), then let stage2() add the
-                # bias and round/wrap to out_width. Slice outputs (and hence
-                # the partials) stay 16-bit; no saturation anywhere.
-                terms = " + ".join(
-                    f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*16 +: 16])" for p in range(k_spatial)
-                )
-                row_mux_cases.append(f"            accum16 = {terms};")
+                # _stage2_function): sum the K-partition 16-bit partials (plus
+                # the bias, and the rounding half when it folds) in a balanced
+                # 16-bit WRAPPING tree (the `accum16` reg truncates every level
+                # exactly), then round/wrap to out_width. Slice outputs (and
+                # hence the partials) stay 16-bit; no saturation anywhere.
+                terms = [f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*16 +: 16])"
+                         for p in range(k_spatial)]
+                _bias_const = None
                 if _fold_n_bias:
                     # Frozen per-frame group (see _fold_n_bias_group_decl),
                     # not the live counter -- it may already have advanced.
                     _bias_e = f"{_bias_lane(bias_rom_name, f'out_grp * {n} + {c * 8 + lane}')}"
                 elif has_bias:
-                    _bias_e = f"{_bias_lane(bias_rom_name, str(c * 8 + lane))}"
+                    _bias_const = int(bias_codes[c * 8 + lane]) if c * 8 + lane < len(bias_codes) else 0
+                    _bias_e = None
                 else:
-                    _bias_e = "16'sd0"
-                row_mux_cases.append(
-                    f"            row_mux[{c}*{8*out_width} + {lane}*{out_width} +: {out_width}] = "
-                    f"stage2(accum16, {_bias_e});"
-                )
+                    _bias_const = 0
+                    _bias_e = None
+                row_mux_cases.extend(_stage2_tree_stmts(
+                    terms, f"row_mux[{c}*{8*out_width} + {lane}*{out_width} +: {out_width}]",
+                    _bias_e, _bias_const, s2, out_width))
         row_mux_cases.append("        end")
     any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
     op0_lines = "\n".join(
@@ -1488,9 +1606,18 @@ module {module_name}(
     reg [15:0] frames_fed;
     reg [15:0] frames_emitted;
     wire [{k_spatial * grid_rows * grid_cols - 1}:0] done_mat_mul;
-    // Row release is (done_count + done_mat_mul > frames_emitted); both outcomes come
-    // from registers and done_mat_mul only selects, keeping the adder off its route.
-    reg [15:0] done_count [0:{k_spatial * grid_rows * grid_cols - 1}];
+    // done_pending[s] = done_count[s] - frames_emitted, kept incrementally: +1 per
+    // counted done_mat_mul pulse, -1 per emitted frame. It is never negative (a
+    // frame is only emitted once every slice of its tile-row has counted it), so
+    // the row-release test (done_count + done_mat_mul > frames_emitted) reduces to
+    // (done_pending != 0 || done_mat_mul) with no adder or 16-bit compare on the
+    // path. Each slice holds at most eight waves in flight, and a wave is done
+    // but un-emitted only while it is in flight, so the count stays <= 8; four
+    // bits leave margin. done_mat_mul (a long route) only gates the result.
+    reg [3:0]  done_pending [0:{k_spatial * grid_rows * grid_cols - 1}];
+    // done_nz[s] == (done_pending[s] != 0), registered so the row-release test
+    // starts from a flop instead of a 4-bit compare.
+    reg        done_nz [0:{k_spatial * grid_rows * grid_cols - 1}];
     reg        row_done [0:{grid_rows-1}];
     reg        any_row_done;
     integer    hp, hd, hc;
@@ -1500,8 +1627,7 @@ module {module_name}(
             row_done[hd] = 1'b1;
             for (hp = 0; hp < {k_spatial}; hp = hp + 1)
                 for (hc = 0; hc < {grid_cols}; hc = hc + 1)
-                    if (done_mat_mul[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] ? (done_count[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] + 16'd1 <= frames_emitted)
-                                                 : (done_count[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] <= frames_emitted))
+                    if (!done_nz[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc] && !done_mat_mul[hp*{grid_rows*grid_cols} + hd*{grid_cols} + hc])
                         row_done[hd] = 1'b0;
             if (row_done[hd]) any_row_done = 1'b1;
         end
@@ -1547,7 +1673,7 @@ module {module_name}(
     end
 
     // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
-    // done_count[s] tracks them; row_done[r] releases each tile-row as soon
+    // done_pending[s] counts the unemitted ones; row_done[r] releases each tile-row as soon
     // as its own slices complete the head frame (not when all rows finish),
     // so emission is independent of the feed FSM and frames overlap.
     wire emit_active = any_row_done && (frames_fed > frames_emitted);
@@ -1557,6 +1683,8 @@ module {module_name}(
 {chr(10).join(row_avail)}
 
     wire any_avail = {any_avail_expr};
+    // Frame-emitted event; mirrors the frames_emitted increment below.
+    wire frame_emit_now = emit_active && any_avail && (out_row_count + 16'd1 == LOGICAL_OUT_ROWS);
 
     // op[1] drain_stop source: the logical M'th row of the current tile-row's
     // burst has just been taken -- the remaining physical rows are padding
@@ -1601,16 +1729,26 @@ module {module_name}(
             out_last <= 1'b0;
             frames_fed <= 16'd0;
             frames_emitted <= 16'd0;
-            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1)
-                done_count[hd] <= 16'd0;
+            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1) begin
+                done_pending[hd] <= 4'd0;
+                done_nz[hd] <= 1'b0;
+            end
 {"            out_grp <= 16'd0;" if _fold_n_bias else ""}
         end else if (en) begin
             out_valid <= 1'b0;
             out_last <= 1'b0;
             if (!pause) begin
-            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1)
-                if (done_mat_mul[hd])
-                    done_count[hd] <= done_count[hd] + 16'd1;
+            // inc/dec come from registers only; done_mat_mul and frame_emit_now
+            // (long routes) just select among them. Both together cancel.
+            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1) begin
+                if (done_mat_mul[hd] && !frame_emit_now) begin
+                    done_pending[hd] <= done_pending[hd] + 4'd1;
+                    done_nz[hd] <= 1'b1;
+                end else if (!done_mat_mul[hd] && frame_emit_now) begin
+                    done_pending[hd] <= done_pending[hd] - 4'd1;
+                    done_nz[hd] <= (done_pending[hd] != 4'd1);
+                end
+            end
 {_bias_grp_body}
             // A frame is total_beats accepted in_valid beats (idle beats inside
             // it pause the core) and the next frame's first beat may follow its
@@ -1835,23 +1973,23 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
         row_mux_cases.append(f"        if ({_row_cond}) begin")
         for c in range(grid_cols):
             for lane in range(8):
-                terms = " + ".join(
-                    f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*16 +: 16])" for p in range(k_spatial)
-                )
-                row_mux_cases.append(f"            accum16 = {terms};")
+                terms = [f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*16 +: 16])"
+                         for p in range(k_spatial)]
                 if has_bias:
                     # Bias depends only on n_group (ng), never on mg or k_pass.
                     # Read the DRAIN engine's own n_group (drain_ng, from the
                     # independent drain_frame counter) -- the feed engine may
                     # already be several groups ahead by the time this group's
-                    # rows drain.
+                    # rows drain. The group-indexed lookup is a runtime value,
+                    # so it joins the sum tree as a leaf (half stays in stage2).
                     _bias_e = f"{_bias_lane(bias_rom_name, f'drain_ng * {n} + {c * 8 + lane}')}"
+                    row_mux_cases.extend(_stage2_tree_stmts(
+                        terms, f"row_mux[{c}*{8*out_width} + {lane}*{out_width} +: {out_width}]",
+                        _bias_e, None, s2, out_width))
                 else:
-                    _bias_e = "16'sd0"
-                row_mux_cases.append(
-                    f"            row_mux[{c}*{8*out_width} + {lane}*{out_width} +: {out_width}] = "
-                    f"stage2(accum16, {_bias_e});"
-                )
+                    row_mux_cases.extend(_stage2_tree_stmts(
+                        terms, f"row_mux[{c}*{8*out_width} + {lane}*{out_width} +: {out_width}]",
+                        None, 0, s2, out_width))
         row_mux_cases.append("            row_take = 1'b1;")
         row_mux_cases.append("        end")
     any_avail_expr = " | ".join(f"row_avail_{r}" for r in range(grid_rows))
@@ -2025,14 +2163,23 @@ module {module_name}(
     end
 
     // Rev-3: done_mat_mul is a per-committed-wave 1-cycle pulse per slice.
-    // done_count[s] counts them; row_done[r] says every slice of tile-row r
-    // (across every K-spatial partition) has counted a done past
+    // done_pending[s] counts the unemitted ones; row_done[r] says every slice of
+    // tile-row r (across every K-spatial partition) has a done past
     // frames_emitted, so each tile-row is released as soon as ITS wave is
     // complete -- emission never waits on the feed FSM. Same shape as the
     // chunked emitter.
-    // Row release is (done_count + done_mat_mul > frames_emitted); both outcomes come
-    // from registers and done_mat_mul only selects, keeping the adder off its route.
-    reg [15:0] done_count [0:{k_spatial * grid_rows * grid_cols - 1}];
+    // done_pending[s] = done_count[s] - frames_emitted, kept incrementally: +1 per
+    // counted done_mat_mul pulse, -1 per emitted frame. It is never negative (a
+    // frame is only emitted once every slice of its tile-row has counted it), so
+    // the row-release test (done_count + done_mat_mul > frames_emitted) reduces to
+    // (done_pending != 0 || done_mat_mul) with no adder or 16-bit compare on the
+    // path. Each slice holds at most eight waves in flight, and a wave is done
+    // but un-emitted only while it is in flight, so the count stays <= 8; four
+    // bits leave margin. done_mat_mul (a long route) only gates the result.
+    reg [3:0]  done_pending [0:{k_spatial * grid_rows * grid_cols - 1}];
+    // done_nz[s] == (done_pending[s] != 0), registered so the row-release test
+    // starts from a flop instead of a 4-bit compare.
+    reg        done_nz [0:{k_spatial * grid_rows * grid_cols - 1}];
     reg        row_done [0:{grid_rows - 1}];
     reg        any_row_done;
     integer    hp, hd, hc;
@@ -2042,8 +2189,7 @@ module {module_name}(
             row_done[hd] = 1'b1;
             for (hp = 0; hp < {k_spatial}; hp = hp + 1)
                 for (hc = 0; hc < {grid_cols}; hc = hc + 1)
-                    if (done_mat_mul[(hp*{grid_rows} + hd)*{grid_cols} + hc] ? (done_count[(hp*{grid_rows} + hd)*{grid_cols} + hc] + 16'd1 <= frames_emitted)
-                                                 : (done_count[(hp*{grid_rows} + hd)*{grid_cols} + hc] <= frames_emitted))
+                    if (!done_nz[(hp*{grid_rows} + hd)*{grid_cols} + hc] && !done_mat_mul[(hp*{grid_rows} + hd)*{grid_cols} + hc])
                         row_done[hd] = 1'b0;
             if (row_done[hd]) any_row_done = 1'b1;
         end
@@ -2055,6 +2201,8 @@ module {module_name}(
 
     wire any_avail = {any_avail_expr};
     wire emit_active = any_row_done && (frames_fed > frames_emitted);
+    // Frame-emitted event; mirrors the frames_emitted increment below.
+    wire frame_emit_now = emit_active && row_take && (out_row_count + 16'd1 == drain_rows);
 
     // op[1] drain_stop source: the emitting frame's last logical row has just
     // been taken AND that frame has a ragged tail to truncate (an 8-aligned
@@ -2087,7 +2235,7 @@ module {module_name}(
     // feed_frame after the final K pass -- with NO wait on compute, so the next
     // group's beats are accepted while the current group is still computing
     // (the module's wave slots pipeline them). Owns beat_count/chunk_idx/
-    // feed_frame/frames_fed/done_count/rom_addr and the independent emission of
+    // feed_frame/frames_fed/done_pending/rom_addr and the independent emission of
     // the head frame's rows (row_done/frames_emitted/drain_frame/out_row_count).
     always @(posedge clk) begin
         if (rst) begin
@@ -2101,8 +2249,10 @@ module {module_name}(
             // row_take is combinational only (driven in the row_mux always @(*)
             // block); it must not be written from this clocked block or the two
             // drivers race and the drain desyncs from the slices' own ptr.
-            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1)
-                done_count[hd] <= 16'd0;
+            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1) begin
+                done_pending[hd] <= 4'd0;
+                done_nz[hd] <= 1'b0;
+            end
             c_row <= {c_width}'d0;
             out_valid <= 1'b0;
             out_last <= 1'b0;
@@ -2111,9 +2261,17 @@ module {module_name}(
             out_valid <= 1'b0;
             out_last <= 1'b0;
             if (!pause) begin
-            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1)
-                if (done_mat_mul[hd])
-                    done_count[hd] <= done_count[hd] + 16'd1;
+            // inc/dec come from registers only; done_mat_mul and frame_emit_now
+            // (long routes) just select among them. Both together cancel.
+            for (hd = 0; hd < {k_spatial * grid_rows * grid_cols}; hd = hd + 1) begin
+                if (done_mat_mul[hd] && !frame_emit_now) begin
+                    done_pending[hd] <= done_pending[hd] + 4'd1;
+                    done_nz[hd] <= 1'b1;
+                end else if (!done_mat_mul[hd] && frame_emit_now) begin
+                    done_pending[hd] <= done_pending[hd] - 4'd1;
+                    done_nz[hd] <= (done_pending[hd] != 4'd1);
+                end
+            end
 
             // A frame is K_PASSES * INPUT_BEATS consecutive in_valid beats and the
             // next frame's first beat may follow its last directly: no preload

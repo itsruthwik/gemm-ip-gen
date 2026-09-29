@@ -729,6 +729,21 @@ def run(cases=None, seeds=None, keep=False):
         failures.append(tag)
         requant_failures.append(tag)
 
+    # Same, on the chunked K_SPATIAL=1 core (single K chunk): that emitter is
+    # called with n_passes=1 (its ROMs are hoisted), and once folded group 0's
+    # bias into constants for every group, so group 1's outputs were off.
+    fn2 = resolve_fold_n(32, 2)
+    core_n2 = fn2["cg"] * 8
+    bias_k1 = [((-1) ** c) * ((g + 1) * 1000 + c)
+               for g in range(fn2["n_passes"]) for c in range(core_n2)]
+    ok, log = run_case(8, 8, 32, seed=3, rf=2, fold_axis="n", bias_codes=bias_k1, s2=3)
+    tag = f"requant:foldn_nonuniform_bias_kspatial1 8x8x32 rf=2 n_passes={fn2['n_passes']}"
+    print(f"{'PASS' if ok else 'FAIL'} {tag}")
+    if not ok:
+        print(log)
+        failures.append(tag)
+        requant_failures.append(tag)
+
     # Real Catapult gemm_ip_stream_buffered_b protocol regression (gemm_mha_aV_h0
     # av_pkg_tb shape: m=4/k=4/n=8, symmetric operands, back-to-back frames).
     # Symmetric-only quantization scope: the back-to-back frame cadence is
