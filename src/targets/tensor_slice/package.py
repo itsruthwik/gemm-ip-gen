@@ -428,6 +428,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         stream_bcols_decl = ""
         # Weight-stationary: the IP holds B, so the feed packs no B beat at all.
         stream_bcols_pack = ""
+        fr_bcols_pack = ""
         # Array feed loop, const_weights: no b_cols decl / pack / run-arg (weights in ROM).
         array_bcols_decl = ""
         array_bcols_run_arg = ""
@@ -443,9 +444,10 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # stream), so B never needs a replay buffer: every pass simply
         # re-slices the same full-K row/column it already has in hand. ``kc``
         # is the pass index (== the K chunk index when k_spatial == 1).
-        if ks > 1 or _combined_fold:
-            stream_bcols_pack = f"""if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[{b_col_idx}];
+        def _stream_bcols_pack_text(guard, load, elem):
+            if ks > 1 or _combined_fold:
+                return f"""if ({guard}) {{
+            {load}
             #pragma hls_unroll
             COL_PACK_KC: for (int kc_local = 0; kc_local < {ks}; kc_local++) {{
                 #pragma hls_unroll
@@ -453,14 +455,13 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                     int kk = (kc * {ks} + kc_local) * 8 + kl;
                     if (kk < {k}) {{
                         b_cols.set_slc(kc_local * 64 + kl * 8,
-                                       {name}_to_gemm_int8(b_beat[kk]));
+                                       {elem});
                     }}
                 }}
             }}
         }}"""
-        else:
-            stream_bcols_pack = f"""if (feeding_now && t < {n}) {{
-            b_beat_T b_beat = weight_cols[{b_col_idx}];
+            return f"""if ({guard}) {{
+            {load}
             #pragma hls_unroll
             COL_PACK: for (int kl = 0; kl < 8; kl++) {{
                 int kk = kc * 8 + kl;
@@ -469,11 +470,20 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                 COL_TILE_CHUNK: for (int ct = 0; ct < {grid_cols}; ct++) {{
                     if (col_tile == ct && kk < {k}) {{
                         b_cols.set_slc(ct * 64 + kl * 8,
-                                       {name}_to_gemm_int8(b_beat[kk]));
+                                       {elem});
                     }}
                 }}
             }}
         }}"""
+        stream_bcols_pack = _stream_bcols_pack_text(
+            f"feeding_now && t < {n}", f"b_beat_T b_beat = weight_cols[{b_col_idx}];",
+            f"{name}_to_gemm_int8(b_beat[kk])")
+        # Free-running runtime-B entry: the same pack, sourced from the latched raw column.
+        # Under fold-N the latch holds every group's columns; columns past logical_n are zero.
+        fr_bcols_pack = _stream_bcols_pack_text(
+            f"active && t < {n}" + (f" && ng * {n} + t < {logical_n}" if int(n_passes) > 1 else ""),
+            f"ac_int<{8 * k}, false> b_raw = b_lat[{'ng * %d + t' % n if int(n_passes) > 1 else 't'}];",
+            "static_cast<ac_int<8, true> >(b_raw.template slc<8>(kk * 8))")
         # Array feed loop, two-stream: pack the external weight_cols beat into b_cols_packed.
         array_bcols_decl = f"\n        ac_int<{b_bits}, false> b_cols_packed = 0;"
         array_bcols_run_arg = "b_cols_packed, "
@@ -578,7 +588,10 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # keeps today's single-chunk, row-tile-addressed pack (offset by row_tile);
     # ks > 1 packs ``ks`` K chunks into one narrow word (offset by kc_local),
     # generalizing the old full-K-only pack across every pass.
-    def _a_pack_block(dest, pass_expr, label, base=""):
+    def _a_pack_block(dest, pass_expr, label, base="", elem=None):
+        # ``elem`` overrides the per-element source (default: the A beat's int8
+        # cast); the free-running entries pack from a raw latched row instead.
+        elem = elem or f"{name}_to_gemm_int8(a_beat[kk])"
         if ks > 1 or _combined_fold:
             return f"""
                 #pragma hls_unroll
@@ -588,7 +601,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                         int kk = (({pass_expr}) * {ks} + kc_local) * 8 + kl;
                         if (kk < {k}) {{
                             {dest}.set_slc({base}kc_local * 64 + kl * 8,
-                                           {name}_to_gemm_int8(a_beat[kk]));
+                                           {elem});
                         }}
                     }}
                 }}"""
@@ -604,7 +617,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
                     {label}_KL: for (int kl = 0; kl < 8; kl++) {{
                         int kk = ({pass_expr}) * 8 + kl;
                         if (kk < {k}) {{
-                            {label}_chunk.set_slc(kl * 8, {name}_to_gemm_int8(a_beat[kk]));
+                            {label}_chunk.set_slc(kl * 8, {elem});
                         }}
                     }}
                     int row_tile = t / 8;
@@ -617,12 +630,12 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
 
     # Every K-pass slice of the row just read goes out on this beat; the core
     # keeps the later ones.
-    def _a_pack_later_passes(dest, label):
+    def _a_pack_later_passes(dest, label, elem=None):
         if passes < 2:
             return ""
         return f"""
                 #pragma hls_unroll
-                {label}: for (int pack_kc = 1; pack_kc < {passes}; pack_kc++) {{{_a_pack_block(dest, "pack_kc", label + "_ROW", base=f"pack_kc * {a_bits} + ")}
+                {label}: for (int pack_kc = 1; pack_kc < {passes}; pack_kc++) {{{_a_pack_block(dest, "pack_kc", label + "_ROW", base=f"pack_kc * {a_bits} + ", elem=elem)}
                 }}"""
 
     a_replay_decl = ""
@@ -753,6 +766,283 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         gemm.run(a_rows, {bcols_run_arg}frame_preload, feed_valid, c_row, v, l);
 {_stream_capture_use}
     }}
+"""
+
+    # ---- Free-running stream entries (synthesis only) -------------------------------
+    # The IO stream entries become single-cycle `hls_design block`s: one wrapper clock
+    # per call, so frames overlap and the interval is the feed length (groups x
+    # total_beats) instead of feed + drain. The core has no backpressure and needs
+    # every group's beats contiguous, so operands are latched (raw int8 rows/columns,
+    # not the grid-padded packed word) before a group starts; the packed feed words are
+    # built from the latch at each beat. While a group feeds, the operands of the next
+    # group that needs fresh data are gathered into the slots the current group no longer
+    # needs (A row i after its pass-0 beat, B column j after its last-pass beat), so
+    # back-to-back groups start with no bubble whenever the streams keep up.
+    # Folded axes: one hls4ml frame is m_passes x n_passes groups (mg-major, ng-minor).
+    # The A latch holds the current M-group's core rows and is refilled once per M-group
+    # (A is fed only on the ng == 0 group; the core replays it for later N-groups), rows
+    # past logical_m are never fed. A runtime B latch holds all logical_n columns for the
+    # whole frame (every M-group re-reads them) and is refilled during the last M-group.
+    # Output rows are written one per out_valid pulse, never deferred: fold-N slices from
+    # the earlier N-groups of an M-group wait in c_buf and the last N-group's pulse
+    # completes and writes each full row. out_valid is a one-cycle pulse. The csim
+    # (`#else`) path is unchanged: one frame per call.
+    if input_beats < max(m, n):
+        raise RuntimeError(f"{name}: feed pass ({input_beats} beats) shorter than m={m}/n={n}.")
+
+    def _bw(v):
+        return max(1, int(v).bit_length())
+
+    def _fr_stream_body(runtime_b):
+        fold_ng = int(n_passes) > 1
+        fold_mg = int(m_passes) > 1
+        last_mg = int(m_passes) - 1
+        last_rows = logical_m - last_mg * m   # core rows fed in the last M-group
+        cnt_w = _bw(max(m, logical_n))
+        ng_e = "ng" if fold_ng else "0"
+        mg_e = "mg" if fold_mg else "0"
+        at_first = f"{mg_e} == 0 && {ng_e} == 0"
+        # A-row target of the M-group being gathered: a padded last M-group is shorter.
+        a_tgt_reg = last_rows != m
+        a_tgt = "a_tgt.to_int()" if a_tgt_reg else str(m)
+        a_tgt_decl = (f"\n    static ac_int<{cnt_w}, false> a_tgt = {last_rows if not fold_mg else m};"
+                      if a_tgt_reg else "")
+        if a_tgt_reg:
+            a_tgt_next = (f"\n            a_tgt = ({mg_e} + 1 == {last_mg}) ? {last_rows} : {m};")
+        else:
+            a_tgt_next = ""
+        b_decl = (f"\n    static ac_int<{8 * k}, false> b_lat[{logical_n}];"
+                  f"\n    static ac_int<{cnt_w}, false> b_cnt = 0;") if runtime_b else ""
+        b_word_decl = f"\n    ac_int<{b_bits}, false> b_cols = 0;" if runtime_b else ""
+        b_feed = f"\n    {fr_bcols_pack}" if runtime_b else ""
+        b_arg = "b_cols, " if runtime_b else ""
+        if runtime_b and (fold_mg or fold_ng):
+            # The frame's first group needs every column; later groups reuse them.
+            b_ready = f" && (!({at_first}) || b_cnt == {logical_n})"
+        else:
+            b_ready = f" && b_cnt == {logical_n}" if runtime_b else ""
+        # The next frame's columns are gathered during the last M-group, which is each
+        # column's final use; the counter restarts when that group's first N-group starts.
+        b_reset = (f"\n        if ({mg_e} == {last_mg} && {ng_e} == 0) {{\n            b_cnt = 0;\n        }}"
+                   if runtime_b else "")
+        if runtime_b and (fold_mg or fold_ng):
+            b_gather = f"""
+    // Column j is free once its last-pass beat in the last M-group has been fed (the
+    // pack above already read the old value this call), or while the next frame waits.
+    int b_avail = 0;
+    if (!active && {at_first}) {{
+        b_avail = {logical_n};
+    }} else if ({mg_e} == {last_mg}) {{
+        b_avail = ng * {n} + ((active && kc == {passes - 1}) ? (t < {n} ? t + 1 : {n}) : 0);
+    }}
+    if (b_cnt < {logical_n} && b_cnt < b_avail) {{
+        b_beat_T b_beat;
+        if (b_stream.nb_read(b_beat)) {{
+            ac_int<{8 * k}, false> raw = 0;
+            #pragma hls_unroll
+            B_LATCH: for (int i = 0; i < {k}; i++) {{
+                raw.set_slc(i * 8, {name}_to_gemm_int8(b_beat[i]));
+            }}
+            b_lat[b_cnt] = raw;
+            b_cnt++;
+        }}
+    }}"""
+        elif runtime_b:
+            b_gather = f"""
+    // B column j is free once its last-pass beat (t >= j) has been fed; the
+    // pack above already read the old value this call.
+    if (b_cnt < {n} && (!active || (kc == {passes - 1} && t >= b_cnt.to_int()))) {{
+        b_beat_T b_beat;
+        if (b_stream.nb_read(b_beat)) {{
+            ac_int<{8 * k}, false> raw = 0;
+            #pragma hls_unroll
+            B_LATCH: for (int i = 0; i < {k}; i++) {{
+                raw.set_slc(i * 8, {name}_to_gemm_int8(b_beat[i]));
+            }}
+            b_lat[b_cnt] = raw;
+            b_cnt++;
+        }}
+    }}"""
+        else:
+            b_gather = ""
+        grp_decl = ((f"\n    static ac_int<{_bw(n_passes - 1)}, false> fr_ng = 0;" if fold_ng else "")
+                    + (f"\n    static ac_int<{_bw(last_mg)}, false> fr_mg = 0;" if fold_mg else ""))
+        grp_local = (f"\n    int mg = {'fr_mg.to_int()' if fold_mg else '0'};"
+                     f"\n    int ng = {'fr_ng.to_int()' if fold_ng else '0'};")
+        # A is fed on the first N-group of each M-group only; the start of that group also
+        # restarts the gather for the next M-group.
+        a_ok = f"({ng_e} != 0 || a_cnt == {a_tgt})" if fold_ng else f"a_cnt == {a_tgt}"
+        a_restart = f"a_cnt = 0;{a_tgt_next}"
+        if fold_ng:
+            a_restart = f"if (ng == 0) {{\n            {a_restart}\n        }}"
+        a_rows_cond = f"active && kc == 0 && t < {m}"
+        if fold_ng:
+            a_rows_cond += " && ng == 0"
+        if fold_mg and last_rows != m:
+            a_rows_cond += f" && (mg != {last_mg} || t < {last_rows})"
+        # Row a_cnt is free unless the current group is still feeding A and has not
+        # yet read it (later N-groups and the idle gap after the first one never read A).
+        a_free = "!active || kc != 0 || t > a_cnt.to_int()"
+        if fold_ng:
+            a_free = "ng != 0 || " + a_free
+        grp_advance = ""
+        if fold_mg:
+            grp_advance = f"fr_mg = (mg == {last_mg}) ? 0 : mg + 1;"
+        if fold_ng:
+            adv_m = f"\n                    {grp_advance}" if grp_advance else ""
+            grp_advance = f"""if (ng == {n_passes - 1}) {{
+                    fr_ng = 0;{adv_m}
+                }} else {{
+                    fr_ng = ng + 1;
+                }}"""
+        grp_advance = f"\n                {grp_advance}" if grp_advance else ""
+        # Output: one write per out_valid pulse. Per-pulse position counters (row within
+        # the group, N-group, M-group) run on their own since outputs lag the feed.
+        ow = out_width
+        need_omg = fold_mg and last_rows != m
+        o_decl = ""
+        if fold_ng or fold_mg:
+            o_decl += f"\n    static ac_int<{_bw(m - 1)}, false> o_row = 0;"
+        if fold_ng:
+            o_decl += f"\n    static ac_int<{_bw(n_passes - 1)}, false> o_ng = 0;"
+            o_decl += f"\n    static ac_int<{(n_passes - 1) * n * ow}, false> c_buf[{m}];"
+        if need_omg:
+            o_decl += f"\n    static ac_int<{_bw(last_mg)}, false> o_mg = 0;"
+        keep = f"(o_mg.to_int() != {last_mg} || o_row.to_int() < {last_rows})" if need_omg else "true"
+        omg_adv = (f"if (o_mg == {last_mg}) {{ o_mg = 0; }} else {{ o_mg = o_mg + 1; }}"
+                   if need_omg else "")
+        if fold_ng:
+            o_adv = f"""if (o_row == {m - 1}) {{
+            o_row = 0;
+            if (o_ng == {n_passes - 1}) {{
+                o_ng = 0;
+                {omg_adv}
+            }} else {{
+                o_ng = o_ng + 1;
+            }}
+        }} else {{
+            o_row = o_row + 1;
+        }}"""
+        elif fold_mg:
+            o_adv = f"""if (o_row == {m - 1}) {{
+            o_row = 0;
+            {omg_adv}
+        }} else {{
+            o_row = o_row + 1;
+        }}"""
+        else:
+            o_adv = ""
+        if fold_ng:
+            o_store = f"""
+        if (o_ng != {n_passes - 1}) {{
+            // Earlier N-group slice of this row: keep it until the last N-group's pulse.
+            #pragma hls_unroll
+            C_ROW: for (int r = 0; r < {m}; r++) {{
+                #pragma hls_unroll
+                C_GRP: for (int gc = 0; gc < {n_passes - 1}; gc++) {{
+                    if (o_row == r && o_ng == gc) {{
+                        c_buf[r].set_slc(gc * {n * ow}, c_row.template slc<{n * ow}>(0));
+                    }}
+                }}
+            }}
+        }} else if ({keep}) {{
+            ac_int<{(n_passes - 1) * n * ow}, false> held = c_buf[o_row.to_int()];
+            res_T out_pack;
+            #pragma hls_unroll
+            for (int col = 0; col < {logical_n}; col++) {{
+                ac_int<{ow}, true> raw_val = (col < {(n_passes - 1) * n})
+                    ? ac_int<{ow}, true>(held.template slc<{ow}>(col * {ow}))
+                    : ac_int<{ow}, true>(c_row.template slc<{ow}>((col - {(n_passes - 1) * n}) * {ow}));
+                typename res_T::value_type out_val;
+                out_val.set_slc(0, raw_val);
+                out_pack[col] = out_val;
+            }}
+            res_stream.write(out_pack);
+        }}"""
+        else:
+            o_store = f"""
+        if ({keep}) {{
+            res_T out_pack;
+            #pragma hls_unroll
+            for (int col = 0; col < {n}; col++) {{
+                int col_tile = col / 8;
+                int col_local = col % 8;
+                // Pure unpack (decision 8) -- see _capture_body's comment.
+                ac_int<{ow}, true> raw_val =
+                    c_row.template slc<{ow}>(col_tile * {8 * ow} + col_local * {ow});
+                typename res_T::value_type out_val;
+                out_val.set_slc(0, raw_val);
+                out_pack[col] = out_val;
+            }}
+            res_stream.write(out_pack);
+        }}"""
+        o_adv = f"\n        {o_adv}" if o_adv else ""
+        return f"""\
+    // One wrapper clock per call; state persists across calls. A group is
+    // {total_beats} contiguous in_valid beats ({passes} pass(es) x {input_beats} beats); the
+    // next group may start on the following call. Operands are latched with
+    // non-blocking reads, and a group starts only once its operands are held.
+    static ac_int<{8 * k}, false> a_lat[{m}];{b_decl}
+    static ac_int<{cnt_w}, false> a_cnt = 0;{a_tgt_decl}
+    static ac_int<{_bw(passes)}, false> fr_kc = 0;
+    static ac_int<{_bw(input_beats)}, false> fr_t = 0;{grp_decl}
+    static bool active = false;{o_decl}{grp_local}
+    if (!active && {a_ok}{b_ready}) {{
+        active = true;
+        fr_kc = 0;
+        fr_t = 0;
+        {a_restart}{b_reset}
+    }}
+    int kc = fr_kc.to_int();
+    int t = fr_t.to_int();
+    ac_int<{a_port_bits}, false> a_rows = 0;{b_word_decl}
+    // Every K-pass slice of A row t goes out on its pass-0 beat; the core keeps the later ones.
+    if ({a_rows_cond}) {{
+        ac_int<{8 * k}, false> a_raw = a_lat[t];{_a_pack_block("a_rows", "0", "ROW_PACK_DIRECT", elem="static_cast<ac_int<8, true> >(a_raw.template slc<8>(kk * 8))")}{_a_pack_later_passes("a_rows", "PACK_REPLAY", elem="static_cast<ac_int<8, true> >(a_raw.template slc<8>(kk * 8))")}
+    }}{b_feed}
+    ac_int<{c_bits}, false> c_row;
+    ac_int<1, false> v, l;
+    ac_int<1, false> feed_valid = active ? 1 : 0;
+    // preload_valid is an unused port (the core has no preload stage).
+    ac_int<1, false> frame_preload = 0;
+    gemm.run(a_rows, {b_arg}frame_preload, feed_valid, c_row, v, l);
+    // A row i is free once its pass-0 beat has been fed.
+    if (a_cnt < {a_tgt} && ({a_free})) {{
+        a_beat_T a_beat;
+        if (a_stream.nb_read(a_beat)) {{
+            ac_int<{8 * k}, false> raw = 0;
+            #pragma hls_unroll
+            A_LATCH: for (int i = 0; i < {k}; i++) {{
+                raw.set_slc(i * 8, {name}_to_gemm_int8(a_beat[i]));
+            }}
+            a_lat[a_cnt] = raw;
+            a_cnt++;
+        }}
+    }}{b_gather}
+    if (active) {{
+        if (t == {input_beats - 1}) {{
+            fr_t = 0;
+            if (kc == {passes - 1}) {{
+                active = false;
+                fr_kc = 0;{grp_advance}
+            }} else {{
+                fr_kc = kc + 1;
+            }}
+        }} else {{
+            fr_t = t + 1;
+        }}
+    }}
+    // Core has no backpressure and out_valid is a pulse: handle it on every call.
+    if (v) {{{o_store}{o_adv}
+    }}
+"""
+
+    fr_block_pragma = """\
+#if defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW)
+// Free-running entry: its own single-cycle block, one wrapper clock per call, frames overlap.
+#pragma hls_design block
+#pragma hls_pipeline_init_interval 1
+#endif
 """
 
     # Merged feed+drain array loop, parameterised over weight-stationarity the same way
@@ -917,6 +1207,44 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         .replace("        %SINK_ROW%\n", "")
     ) if fold_n else ""
 
+    stream_body = f"""\
+    int captured = 0;   // total out_valid pulses seen (incl. padding rows)
+    int written = 0;    // real result rows written to res_stream
+{_c_buf_decl}
+{stream_feed_loop}
+{_emit_stream}"""
+    rb_fr_prefix = f"""\
+    static_assert(CONFIG_T::gemm_m == {logical_m}, "Generated GEMM wrapper requires matching gemm_m.");
+    static_assert(CONFIG_T::gemm_n == {logical_n}, "Generated GEMM wrapper requires matching gemm_n.");
+    static_assert(a_beat_T::size == CONFIG_T::gemm_k,
+                  "a_beat_T must carry one A-row K-width beat.");
+    static_assert(b_beat_T::size == CONFIG_T::gemm_k,
+                  "b_beat_T must carry one B-col K-width beat.");
+    static_assert(res_T::size == CONFIG_T::gemm_n,
+                  "res_T must carry one full GEMM result row.");
+
+    static {name}_ccore gemm;
+"""
+    rb_stream_body = f"""\
+    b_beat_T weight_cols[{logical_n}];
+    #pragma hls_pipeline_init_interval 1
+    READ_B_COLS: for (int col = 0; col < {logical_n}; col++) {{
+        weight_cols[col] = b_stream.read();
+    }}
+    {name}_gemm_ip_stream_buffered_b<a_beat_T, b_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T, false>(
+        a_stream, weight_cols, nullptr, res_stream);
+"""
+
+    def _fr_wrap(fr_body, csim_body):
+        # Free-running body under synthesis; the csim body (one frame per call) otherwise.
+        if not fr_body:
+            return csim_body
+        return f"""\
+#if defined(__SYNTHESIS__) && defined(BLACKBOX_FLOW)
+{fr_body}#else
+{csim_body}#endif
+"""
+
     if weights_in_core:
         # Weight-stationary: the self-contained const_weights STREAM entry plus the
         # const_weights ARRAY entry (io_parallel). Neither references an external b_cols;
@@ -926,7 +1254,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
 // binds gemm.run to the const_weights RTL core (weights in the wrapper ROM); csim
 // uses the ccore's internal B_ROM (same .dat-sourced beats). No frontend weight
 // accessor is involved.
-template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T, bool HAS_BIAS = true>
+{fr_block_pragma}template <class a_beat_T, class bias_T, class res_T, typename CONFIG_T, bool HAS_BIAS = true>
 void {name}_gemm_ip_stream_const_weights(
     ac_channel<a_beat_T> &a_stream,
     bias_T *biases,
@@ -940,11 +1268,7 @@ void {name}_gemm_ip_stream_const_weights(
                   "res_T must carry one full GEMM result row.");
 
     static {name}_ccore gemm;
-    int captured = 0;   // total out_valid pulses seen (incl. padding rows)
-    int written = 0;    // real result rows written to res_stream
-{_c_buf_decl}
-{stream_feed_loop}
-{_emit_stream}}}
+{_fr_wrap(_fr_stream_body(False), stream_body)}}}
 
 // Weight-stationary ARRAY entry (io_parallel): array in / array out, weights in
 // the core. Direct feed — A rows go straight into gemm.run() (no b_cols, weights
@@ -1004,20 +1328,13 @@ void {name}_gemm_ip_stream_buffered_b(
 // Two-operand entry: no bias port -- a two-operand GEMM never owns one, so the
 // shared buffered-B worker above is instantiated with HAS_BIAS=false (biases=nullptr),
 // folding away the drain add and leaving no bias array anywhere in this instantiation.
-template <class a_beat_T, class b_beat_T, class res_T, typename CONFIG_T>
+{fr_block_pragma}template <class a_beat_T, class b_beat_T, class res_T, typename CONFIG_T>
 void {name}_gemm_ip_stream(
     ac_channel<a_beat_T> &a_stream,
     ac_channel<b_beat_T> &b_stream,
     ac_channel<res_T> &res_stream
 ) {{
-    b_beat_T weight_cols[{logical_n}];
-    #pragma hls_pipeline_init_interval 1
-    READ_B_COLS: for (int col = 0; col < {logical_n}; col++) {{
-        weight_cols[col] = b_stream.read();
-    }}
-    {name}_gemm_ip_stream_buffered_b<a_beat_T, b_beat_T, typename CONFIG_T::bias_t, res_T, CONFIG_T, false>(
-        a_stream, weight_cols, nullptr, res_stream);
-}}
+{_fr_wrap(rb_fr_prefix + _fr_stream_body(True), rb_stream_body)}}}
 
 // Two-operand entry: no bias port -- a two-operand GEMM never owns one. HAS_BIAS is
 // a local compile-time false (not a template parameter -- nothing else instantiates
