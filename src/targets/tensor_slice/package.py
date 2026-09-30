@@ -806,7 +806,9 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         mg_e = "mg" if fold_mg else "0"
         at_first = f"{mg_e} == 0 && {ng_e} == 0"
         b_decl = (f"static ac_int<{8 * k}, false> b_lat[{logical_n}];"
-                  f"\n    static ac_int<{cnt_w}, false> b_cnt = 0;\n    ") if runtime_b else ""
+                  f"\n    static ac_int<{cnt_w}, false> b_cnt = 0;"
+                  f"\n    static ac_int<{cnt_w + 1}, false> b_free = 0;"
+                  f"\n    int b_free_e = b_free.to_int();\n    ") if runtime_b else ""
         b_word_decl = f"\n    ac_int<{b_bits}, false> b_cols = 0;" if runtime_b else ""
         b_feed = f"\n    {fr_bcols_pack}" if runtime_b else ""
         b_arg = "b_cols, " if runtime_b else ""
@@ -817,38 +819,39 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
             b_ready = f" && b_cnt == {logical_n}" if runtime_b else ""
         # The next frame's columns are gathered during the last M-group, which is each
         # column's final use; the counter restarts when that group's first N-group starts.
-        b_reset = (f"\n        if ({mg_e} == {last_mg} && {ng_e} == 0) {{\n            b_cnt = 0;\n        }}"
+        b_reset = (f"\n        if ({mg_e} == {last_mg} && {ng_e} == 0) {{\n            b_cnt = 0;\n            b_free_e = 0;  // the new frame has consumed nothing yet\n        }}"
                    if runtime_b else "")
+        # B reads are gated by b_free, a register written at the end of the previous
+        # call from that call's feed progress. A gate that used this call's `fed` would
+        # make the B read depend on the A read's result in the same call, and an I/O op
+        # predicated on another I/O op's result forces an extra cycle (breaking II=1).
+        # The price is that a column is released one call after its last use.
+        b_gate = f"b_cnt < {logical_n if (fold_mg or fold_ng) else n} && b_cnt < b_free_e"
         if runtime_b and (fold_mg or fold_ng):
-            b_gather = f"""
-    // Column j is free once its last-pass beat in the last M-group has been fed (the
-    // pack above already read the old value this call), or while the next frame waits.
-    // An idle call feeds no beat, so beat t itself is not yet consumed then.
+            b_avail_expr = f"""
+    // Column j is free once its last-pass beat in the last M-group has been fed, or
+    // while the next frame waits. An idle call feeds no beat, so beat t itself is not
+    // yet consumed then.
     int b_avail = 0;
     if (!active && {at_first}) {{
         b_avail = {logical_n};
     }} else if ({mg_e} == {last_mg}) {{
         int t_used = fed ? t + 1 : t;
         b_avail = ng * {n} + ((active && kc == {passes - 1}) ? (t_used < {n} ? t_used : {n}) : 0);
-    }}
-    if (b_cnt < {logical_n} && b_cnt < b_avail) {{
-        b_beat_T b_beat;
-        if (b_stream.nb_read(b_beat)) {{
-            ac_int<{8 * k}, false> raw = 0;
-            #pragma hls_unroll
-            B_LATCH: for (int i = 0; i < {k}; i++) {{
-                raw.set_slc(i * 8, {name}_to_gemm_int8(b_beat[i]));
-            }}
-            b_lat[b_cnt] = raw;
-            b_cnt++;
-        }}
     }}"""
         elif runtime_b:
-            b_gather = f"""
-    // B column j is free once its last-pass beat (t >= j) has been fed; the
-    // pack above already read the old value this call. An idle call feeds no
-    // beat, so beat t itself is not yet consumed then.
-    if (b_cnt < {n} && (!active || (kc == {passes - 1} && (fed ? t + 1 : t) > b_cnt.to_int()))) {{
+            b_avail_expr = f"""
+    // B column j is free once its last-pass beat (t >= j) has been fed. An idle call
+    // feeds no beat, so beat t itself is not yet consumed then.
+    int b_avail = 0;
+    if (!active) {{
+        b_avail = {n};
+    }} else if (kc == {passes - 1}) {{
+        b_avail = fed ? t + 1 : t;
+    }}"""
+        if runtime_b:
+            b_gather = f"""{b_avail_expr}
+    if ({b_gate}) {{
         b_beat_T b_beat;
         if (b_stream.nb_read(b_beat)) {{
             ac_int<{8 * k}, false> raw = 0;
@@ -859,7 +862,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
             b_lat[b_cnt] = raw;
             b_cnt++;
         }}
-    }}"""
+    }}
+    b_free = (b_avail < {logical_n}) ? b_avail : {logical_n};"""
         else:
             b_gather = ""
         grp_decl = ((f"\n    static ac_int<{_bw(n_passes - 1)}, false> fr_ng = 0;" if fold_ng else "")
