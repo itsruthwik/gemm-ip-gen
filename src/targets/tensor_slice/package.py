@@ -807,63 +807,94 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         at_first = f"{mg_e} == 0 && {ng_e} == 0"
         b_decl = (f"static ac_int<{8 * k}, false> b_lat[{logical_n}];"
                   f"\n    static ac_int<{cnt_w}, false> b_cnt = 0;"
-                  f"\n    static ac_int<{cnt_w + 1}, false> b_free = 0;"
-                  f"\n    int b_free_e = b_free.to_int();\n    ") if runtime_b else ""
+                  f"\n    static bool b_full = false;"
+                  f"\n    static bool b_rst = false;"
+                  f"\n    static bool bq_act = false;"
+                  f"\n    static bool bq_fed = false;"
+                  f"\n    static ac_int<{_bw(input_beats)}, false> bq_t = 0;"
+                  f"\n    static ac_int<{_bw(passes)}, false> bq_kc = 0;"
+                  f"\n    static ac_int<{_bw(max(int(n_passes) - 1, 1))}, false> bq_ng = 0;"
+                  f"\n    static ac_int<{_bw(max(last_mg, 1))}, false> bq_mg = 0;\n    ") if runtime_b else ""
         b_word_decl = f"\n    ac_int<{b_bits}, false> b_cols = 0;" if runtime_b else ""
         b_feed = f"\n    {fr_bcols_pack}" if runtime_b else ""
         b_arg = "b_cols, " if runtime_b else ""
         if runtime_b and (fold_mg or fold_ng):
             # The frame's first group needs every column; later groups reuse them.
-            b_ready = f" && (!({at_first}) || b_cnt == {logical_n})"
+            b_ready = f" && (!({at_first}) || b_full)"
         else:
-            b_ready = f" && b_cnt == {logical_n}" if runtime_b else ""
+            b_ready = " && b_full" if runtime_b else ""
         # The next frame's columns are gathered during the last M-group, which is each
-        # column's final use; the counter restarts when that group's first N-group starts.
-        b_reset = (f"\n        if ({mg_e} == {last_mg} && {ng_e} == 0) {{\n            b_cnt = 0;\n            b_free_e = 0;  // the new frame has consumed nothing yet\n        }}"
+        # column's final use. The start test sees only the registered b_full flag (the
+        # read that completes the latch sets it), never a same-call count compare, so the
+        # start decision does not sit behind the B read. When that group's first N-group
+        # starts, the latch is consumed: b_full drops and b_rst is raised; the next call
+        # restarts b_cnt (and blocks the B read for that call) instead of the activation
+        # call doing it, which keeps the activation path off the stream-read results.
+        b_reset = (f"\n        if ({mg_e} == {last_mg} && {ng_e} == 0) {{\n            b_full = false;\n            b_rst = true;\n        }}"
                    if runtime_b else "")
-        # B reads are gated by b_free, a register written at the end of the previous
-        # call from that call's feed progress. A gate that used this call's `fed` would
+        # B reads are gated by the release derived from the previous call's feed
+        # progress. A gate that used this call's `fed` would
         # make the B read depend on the A read's result in the same call, and an I/O op
         # predicated on another I/O op's result forces an extra cycle (breaking II=1).
         # The price is that a column is released one call after its last use.
-        b_gate = f"b_cnt < {logical_n if (fold_mg or fold_ng) else n} && b_cnt < b_free_e"
+        # The release is computed from registered copies of the previous call's beat
+        # (bq_*: fed, t, kc, ng, mg), not from this call's `fed`, so the whole B read
+        # predicate is a function of registers only. Doing the derivation here, rather
+        # than through a further release register, keeps the release at one call of lag.
+        b_gate = f"!b_rst && b_cnt < {logical_n if (fold_mg or fold_ng) else n} && b_cnt < b_avail"
+        bq_mg_e = "bq_mg.to_int()" if fold_mg else "0"
+        bq_ng_e = "bq_ng.to_int()" if fold_ng else "0"
+        bq_first = f"{bq_mg_e} == 0 && {bq_ng_e} == 0"
         if runtime_b and (fold_mg or fold_ng):
             b_avail_expr = f"""
     // Column j is free once its last-pass beat in the last M-group has been fed, or
     // while the next frame waits. An idle call feeds no beat, so beat t itself is not
     // yet consumed then.
     int b_avail = 0;
-    if (!active && {at_first}) {{
+    if (!bq_act && {bq_first}) {{
         b_avail = {logical_n};
-    }} else if ({mg_e} == {last_mg}) {{
-        int t_used = fed ? t + 1 : t;
-        b_avail = ng * {n} + ((active && kc == {passes - 1}) ? (t_used < {n} ? t_used : {n}) : 0);
+    }} else if ({bq_mg_e} == {last_mg}) {{
+        int t_used = bq_fed ? bq_t.to_int() + 1 : bq_t.to_int();
+        b_avail = {bq_ng_e} * {n} + ((bq_act && bq_kc == {passes - 1}) ? (t_used < {n} ? t_used : {n}) : 0);
     }}"""
         elif runtime_b:
             b_avail_expr = f"""
     // B column j is free once its last-pass beat (t >= j) has been fed. An idle call
     // feeds no beat, so beat t itself is not yet consumed then.
     int b_avail = 0;
-    if (!active) {{
+    if (!bq_act) {{
         b_avail = {n};
-    }} else if (kc == {passes - 1}) {{
-        b_avail = fed ? t + 1 : t;
+    }} else if (bq_kc == {passes - 1}) {{
+        b_avail = bq_fed ? bq_t.to_int() + 1 : bq_t.to_int();
     }}"""
         if runtime_b:
             b_gather = f"""{b_avail_expr}
+    bool b_got = false;
     if ({b_gate}) {{
         b_beat_T b_beat;
         if (b_stream.nb_read(b_beat)) {{
+            b_got = true;
             ac_int<{8 * k}, false> raw = 0;
             #pragma hls_unroll
             B_LATCH: for (int i = 0; i < {k}; i++) {{
                 raw.set_slc(i * 8, {name}_to_gemm_int8(b_beat[i]));
             }}
             b_lat[b_cnt] = raw;
-            b_cnt++;
         }}
     }}
-    b_free = (b_avail < {logical_n}) ? b_avail : {logical_n};"""
+    if (b_rst) {{
+        b_cnt = 0;
+        b_rst = false;
+    }} else if (b_got) {{
+        if (b_cnt == {(logical_n if (fold_mg or fold_ng) else n) - 1}) {{
+            b_full = true;
+        }}
+        b_cnt++;
+    }}
+    bq_act = active;
+    bq_fed = fed;
+    bq_t = t;
+    bq_kc = kc;{"" if not fold_ng else chr(10) + "    bq_ng = ng;"}{"" if not fold_mg else chr(10) + "    bq_mg = mg;"}"""
         else:
             b_gather = ""
         grp_decl = ((f"\n    static ac_int<{_bw(n_passes - 1)}, false> fr_ng = 0;" if fold_ng else "")
