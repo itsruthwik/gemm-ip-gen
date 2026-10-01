@@ -7,7 +7,7 @@ Drives the Catapult ``{core}`` with ``clk/rst/en``, ``a_rows/b_cols``,
 
 Stimulus: random INT8 matrices A, B are generated in Python, multiplied with
 exact accumulation, put through the two-stage requant (stage-1 shift and wrap
-to 16, bias add, stage-2 shift and wrap to the result width, no saturation),
+to 32, bias add, stage-2 shift and wrap to the result width, no saturation),
 and embedded as Verilog literals for self-checking.
 """
 import argparse
@@ -172,17 +172,17 @@ def pack_b_full_k_spatial_narrow(B, col_idx, n, k):
 
 
 def pack_bias(bias_codes, grid_cols, n):
-    """Pack the per-column bias CODES (already at the 16-bit stage-2
+    """Pack the per-column bias CODES (already at the 32-bit stage-2
     intermediate scale -- decision 4 in the tensor-slice-bias-in-rtl plan)
-    into a single integer: one 16-bit signed lane per column, same per-tile
-    layout as ``c_row`` (128 bits/tile) regardless of the output lane width.
+    into a single integer: one 32-bit signed lane per column, same per-tile
+    layout as ``c_row`` (256 bits/tile) regardless of the output lane width.
     """
     val = 0
     for c in range(grid_cols):
         for col in range(8):
             actual_col = c * 8 + col
-            code = int(bias_codes[actual_col]) & 0xFFFF if actual_col < n else 0
-            val |= code << ((c * 8 + col) * 16)
+            code = int(bias_codes[actual_col]) & 0xFFFFFFFF if actual_col < n else 0
+            val |= code << ((c * 8 + col) * 32)
     return val
 
 
@@ -238,8 +238,8 @@ def two_stage_reference(A, B, bias_codes, s1=0, s2=0, out_width=8):
     """Reference matching stage1()/stage2() in rtl.py bit-for-bit: exact full-K
     sum (the sim branch folds in-slice and cross-chunk accumulation together --
     phase 1 does not structurally partition K, see the plan's "Sim vs synth
-    branches" note), stage 1 (round-half-up shift by s1, wrap to 16), bias add
-    (16-bit wrap), stage 2 (round-half-up shift by s2, wrap to out_width). No
+    branches" note), stage 1 (round-half-up shift by s1, wrap to 32), bias add
+    (32-bit wrap), stage 2 (round-half-up shift by s2, wrap to out_width). No
     saturation anywhere. Returns an (m, n) int array of signed out_width codes.
     """
     m, k = A.shape
@@ -248,9 +248,9 @@ def two_stage_reference(A, B, bias_codes, s1=0, s2=0, out_width=8):
     out = np.zeros((m, n), dtype=np.int64)
     for row in range(m):
         for col in range(n):
-            p1 = _wrap_signed(_round_shift(int(raw[row, col]), s1), 16)
+            p1 = _wrap_signed(_round_shift(int(raw[row, col]), s1), 32)
             bias = int(bias_codes[col]) if bias_codes is not None else 0
-            biased = _wrap_signed(p1 + bias, 16)
+            biased = _wrap_signed(p1 + bias, 32)
             p2 = _round_shift(biased, s2)
             out[row, col] = _wrap_signed(p2, out_width)
     return out

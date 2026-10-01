@@ -24,20 +24,20 @@ tail_mask_hex, vm, _total_cycles = _geometry.tail_mask_hex, _geometry.vm, _geome
 # The slice's raw K
 # contraction is requantised in exactly two stages, both round-half-up + wrap
 # (never saturate):
-#   stage 1 (in-slice, S1): round-half-up shift by S1, wrap to 16 bits. S1 is a
+#   stage 1 (in-slice, S1): round-half-up shift by S1, wrap to 32 bits. S1 is a
 #     Verilog module PARAMETER on the tensor_slice_int8_atlas black box, not a port;
 #     the sim behavioural model applies it once to the exact full sum (see the
 #     "Sim vs synth branches" note in the plan -- phase 2 moves this per-K-
 #     partition).
-#   stage 2 (in the wrapper, S2): sum the 16-bit partials in 16-bit WRAPPING
-#     arithmetic, add the bias (16-bit signed, baked at the intermediate scale
+#   stage 2 (in the wrapper, S2): sum the 32-bit partials in 32-bit WRAPPING
+#     arithmetic, add the bias (32-bit signed, baked at the intermediate scale
 #     gemm_frac - S1), round-half-up shift by S2, wrap to out_width.
 # Stage 2 is emitted as ONE Verilog function shared by every call site (chunked
 # and K-spatial, sim and synth): only the two arguments (the wrapping partial
 # sum and the bias value) differ per call site, never the function body.
 
 
-def _bias_rom_block(bias_codes, rom_name="bias_rom", width=16):
+def _bias_rom_block(bias_codes, rom_name="bias_rom", width=32):
     """Compile-time bias constant (decision 4): one *width*-bit signed lane per
     output column, rendered from the SAME codes list the C behavioral core
     bakes as a static array (``gemm_ip.biasrom``).
@@ -60,7 +60,7 @@ def _bias_rom_block(bias_codes, rom_name="bias_rom", width=16):
             f"    wire [{n * width - 1}:0] {rom_name} = {{\n        {body}\n    }};\n")
 
 
-def _bias_lane(rom_name, idx_expr, width=16):
+def _bias_lane(rom_name, idx_expr, width=32):
     """Signed *width*-bit part-select of the flat bias wire at column *idx_expr*."""
     return f"$signed({rom_name}[({idx_expr}) * {width} +: {width}])"
 
@@ -109,8 +109,8 @@ def _fold_n_bias_group_decl(n_passes, reg_name="bias_grp_ctr"):
 
 def _stage1_function(s1, func_name="stage1"):
     """Sim-branch stage 1: round-half-up shift the exact 32-bit sum by *s1*
-    bits, then wrap to 16. ``s1 == 0`` is a true pass-through (low 16 bits of
-    the raw sum, no rounding) -- decision 2 in the plan.
+    bits, then wrap to 32. ``s1 == 0`` is a true pass-through (the raw sum,
+    no rounding) -- decision 2 in the plan.
     """
     if s1 and s1 > 0:
         half = 1 << (s1 - 1)
@@ -120,11 +120,11 @@ def _stage1_function(s1, func_name="stage1"):
     else:
         body = "            r = x;\n"
     return f"""\
-    function signed [15:0] {func_name};
+    function signed [31:0] {func_name};
         input signed [31:0] x;
         reg signed [31:0] r;
         begin
-{body}            {func_name} = r[15:0];
+{body}            {func_name} = r;
         end
     endfunction
 """
@@ -132,39 +132,38 @@ def _stage1_function(s1, func_name="stage1"):
 
 def _stage2_function(s2, out_width, func_name="stage2"):
     """Wrapper-side stage 2, shared verbatim by every emitter: wrap-add the
-    bias to the (already 16-bit-wrapping-summed) partial, round-half-up shift
-    by *s2*, wrap to *out_width*. Both inputs are 16-bit signed; the addition
+    bias to the (already 32-bit-wrapping-summed) partial, round-half-up shift
+    by *s2*, wrap to *out_width*. Both inputs are 32-bit signed; the addition
     ``sum_partials + bias_val`` truncates (Verilog assignment semantics) to
-    the declared 16-bit ``biased`` reg, which is exactly the 16-bit wrap the
+    the declared 32-bit ``biased`` reg, which is exactly the 32-bit wrap the
     plan calls for. ``s2 == 0`` skips the half-LSB round (identity shift).
     """
     half = (1 << (s2 - 1)) if s2 and s2 > 0 else 0
     shift = int(s2) if s2 else 0
-    sext = "{16{biased[15]}}, biased"
     return (
         f"    function signed [{out_width - 1}:0] {func_name};\n"
-        "        input signed [15:0] sum_partials;\n"
-        "        input signed [15:0] bias_val;\n"
-        "        reg signed [15:0] biased;\n"
+        "        input signed [31:0] sum_partials;\n"
+        "        input signed [31:0] bias_val;\n"
+        "        reg signed [31:0] biased;\n"
         "        reg signed [31:0] r;\n"
         "        begin\n"
         "            biased = sum_partials + bias_val;\n"
-        f"            r = ({{{sext}}} + 32'sd{half}) >>> {shift};\n"
+        f"            r = (biased + 32'sd{half}) >>> {shift};\n"
         f"            {func_name} = r[{out_width - 1}:0];\n"
         "        end\n"
         "    endfunction\n"
     )
 
 
-def _s16_literal(v):
-    """Signed 16-bit Verilog literal for *v*, wrapped into [-32768, 32767]."""
-    v = ((int(v) + 32768) & 0xFFFF) - 32768
-    return f"16'sd{v}" if v >= 0 else f"-16'sd{-v}"
+def _s32_literal(v):
+    """Signed 32-bit Verilog literal for *v*, wrapped into [-2^31, 2^31)."""
+    v = ((int(v) + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)
+    return f"32'sd{v}" if v >= 0 else f"-32'sd{-v}"
 
 
-def _sum_tree16(terms):
-    """Balanced binary adder tree over 16-bit signed *terms* (log2 depth, any
-    count). Addition is associative modulo 2^16 and the consumer is a 16-bit
+def _sum_tree32(terms):
+    """Balanced binary adder tree over 32-bit signed *terms* (log2 depth, any
+    count). Addition is associative modulo 2^32 and the consumer is a 32-bit
     reg, so every intermediate wraps exactly as the left-assoc chain did; the
     tree only shortens the carry-chain depth from N-1 adders to ceil(log2 N).
     """
@@ -181,27 +180,27 @@ def _stage2_fold_const(bias, s2, out_width):
     """Per-lane constant for the folded stage 2, or None when it can't fold.
 
     stage2 keeps bits [s2+out_width-1:s2] of ``sext32(sum+bias) + half``. When
-    s2 + out_width <= 16 those bits depend only on the low 16 bits of the sum,
-    so ``bias + half`` collapses into ONE 16-bit constant (mod 2^16) and the
-    32-bit half-add disappears. Otherwise the kept bits reach above bit 15 and
-    the sign extension matters, so the caller keeps the separate 32-bit round.
+    s2 + out_width <= 32 the kept bits sit inside the 32-bit sum, so
+    ``bias + half`` collapses into ONE 32-bit constant (mod 2^32) and the
+    separate half-add disappears. Otherwise the kept bits would reach past
+    bit 31, so the caller keeps the separate round.
     """
     s2 = int(s2) if s2 else 0
-    if s2 + int(out_width) > 16:
+    if s2 + int(out_width) > 32:
         return None
     half = (1 << (s2 - 1)) if s2 > 0 else 0
-    return (int(bias) + half) & 0xFFFF
+    return (int(bias) + half) & 0xFFFFFFFF
 
 
 def _stage2_folded_function(s2, out_width, func_name="stage2f"):
-    """Stage 2 with bias and rounding pre-folded into one 16-bit constant
-    (see _stage2_fold_const); only valid when s2 + out_width <= 16."""
+    """Stage 2 with bias and rounding pre-folded into one 32-bit constant
+    (see _stage2_fold_const); only valid when s2 + out_width <= 32."""
     s2 = int(s2) if s2 else 0
     return (
         f"    function signed [{out_width - 1}:0] {func_name};\n"
-        "        input signed [15:0] sum_partials;\n"
-        "        input signed [15:0] fold_const;\n"
-        "        reg signed [15:0] t;\n"
+        "        input signed [31:0] sum_partials;\n"
+        "        input signed [31:0] fold_const;\n"
+        "        reg signed [31:0] t;\n"
         "        begin\n"
         "            t = sum_partials + fold_const;\n"
         f"            {func_name} = t[{s2 + out_width - 1}:{s2}];\n"
@@ -217,23 +216,23 @@ def _stage2_tree_stmts(term_exprs, out_ref, bias_expr, bias_const, s2, out_width
 
     *bias_const* is the compile-time per-lane bias (int, or None when the bias
     is a runtime lookup such as fold-N's group-indexed one, passed as
-    *bias_expr*). With a constant bias and s2 + out_width <= 16 the rounding
-    half folds into the same constant; otherwise stage2() keeps its 32-bit
+    *bias_expr*). With a constant bias and s2 + out_width <= 32 the rounding
+    half folds into the same constant; otherwise stage2() keeps its separate
     half-add with a zero bias.
     """
     if bias_const is None:
         leaves = list(term_exprs) + [bias_expr]
-        tail = "stage2(accum16, 16'sd0)"
+        tail = "stage2(accum32, 32'sd0)"
     else:
         folded = _stage2_fold_const(bias_const, s2, out_width)
         if folded is not None:
-            leaves = list(term_exprs) + ([_s16_literal(folded)] if folded else [])
+            leaves = list(term_exprs) + ([_s32_literal(folded)] if folded else [])
             lo = int(s2) if s2 else 0
-            tail = f"accum16[{lo + out_width - 1}:{lo}]"
+            tail = f"accum32[{lo + out_width - 1}:{lo}]"
         else:
-            leaves = list(term_exprs) + ([_s16_literal(bias_const)] if bias_const else [])
-            tail = "stage2(accum16, 16'sd0)"
-    return [f"            accum16 = {_sum_tree16(leaves)};",
+            leaves = list(term_exprs) + ([_s32_literal(bias_const)] if bias_const else [])
+            tail = "stage2(accum32, 32'sd0)"
+    return [f"            accum32 = {_sum_tree32(leaves)};",
             f"            {out_ref} = {tail};"]
 
 
@@ -612,7 +611,7 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     across K chunks (no external reduction) -- this is the ``k_spatial == 1``
     branch below, byte-identical to the old standalone ``generate_synth_verilog``.
     K-in-space (``k_spatial > 1``) is ``k_spatial`` INDEPENDENT copies whose
-    16-bit partials are reduced EXTERNALLY in the wrapper -- the branch below,
+    32-bit partials are reduced EXTERNALLY in the wrapper -- the branch below,
     byte-identical to the old standalone ``generate_k_spatial_synth_verilog``
     (itself already byte-identical to the k_spatial==1 branch when
     k_spatial==1, which is why that case delegates here with k_spatial=1
@@ -705,7 +704,7 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
             chain_wires.append(f"    wire [63:0] b_chain_{r}_{c};")
     for r in range(grid_rows):
         for c in range(grid_cols):
-            chain_wires.append(f"    wire [127:0] c_data_{r}_{c};")
+            chain_wires.append(f"    wire [255:0] c_data_{r}_{c};")
             chain_wires.append(f"    wire         c_avail_{r}_{c};")
 
     boundary = []
@@ -818,7 +817,7 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
     elif has_bias:
         _bias_expr_synth = (lambda c, lane: _bias_lane(bias_rom_name, str(c * 8 + lane)))
     else:
-        _bias_expr_synth = (lambda c, lane: "16'sd0")
+        _bias_expr_synth = (lambda c, lane: "32'sd0")
     # Symmetric-only quantization scope: no zero-point running-sum
     # correction exists. All correction fragments below render empty; the
     # stage-2 call sites keep their shape (bias term only).
@@ -835,16 +834,16 @@ def _generate_general_synth_verilog(m, k, n, module_name="gemm_grid_wrapper", k_
         return ""
 
     # Non-fold-N bias is a compile-time constant per lane: fold it and the
-    # rounding half into one 16-bit constant (one adder instead of three) when
+    # rounding half into one 32-bit constant (one adder instead of three) when
     # the kept bits stay within the low 16 (see _stage2_fold_const).
-    _chunked_fold_ok = (not _fold_n_bias) and (int(s2 or 0) + out_width <= 16)
+    _chunked_fold_ok = (not _fold_n_bias) and (int(s2 or 0) + out_width <= 32)
 
     def _chunked_lane_expr(r, c, lane):
-        x = f"$signed(c_data_{r}_{c}[{lane}*16 +: 16])"
+        x = f"$signed(c_data_{r}_{c}[{lane}*32 +: 32])"
         if _chunked_fold_ok:
             idx = c * 8 + lane
             b = int(bias_codes[idx]) if (has_bias and idx < len(bias_codes)) else 0
-            return f"stage2f({x}, {_s16_literal(_stage2_fold_const(b, s2, out_width))})"
+            return f"stage2f({x}, {_s32_literal(_stage2_fold_const(b, s2, out_width))})"
         return (f"stage2({x}, "
                 f"{_bias_expr_synth(c, lane)}{_col_zp_corr_term(c, lane)}{row_zp_corr_term})")
 
@@ -1291,14 +1290,14 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
                                    weight_rom=None, emit_rom=True,
                                    bias_codes=None, emit_bias_rom=True, bias_rom_name="bias_rom"):
     """k_spatial > 1 branch of ``_generate_general_synth_verilog``: K-in-space,
-    ``k_spatial`` INDEPENDENT ``Ms x Ns`` grids whose 16-bit partials are
+    ``k_spatial`` INDEPENDENT ``Ms x Ns`` grids whose 32-bit partials are
     reduced EXTERNALLY in the wrapper (see the unification docstring on
     ``_generate_general_synth_verilog``). Callers never call this directly;
     ``k_spatial == 1`` is dispatched to the other branch by the caller.
 
-    Tensor-slice outputs (and therefore the K-chunk partials) are 16-bit, as in
+    Tensor-slice outputs (and therefore the K-chunk partials) are 32-bit, as in
     the current architecture. Stage 2 (shared with every other emitter) sums the
-    partials in 16-bit wrapping arithmetic, adds the bias, and rounds/wraps to
+    partials in 32-bit wrapping arithmetic, adds the bias, and rounds/wraps to
     out_width -- no saturation anywhere.
 
     The structural body instantiates multiple tensor-slice grids and exposes the
@@ -1472,7 +1471,7 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
     for p in range(k_spatial):
         for r in range(grid_rows):
             for c in range(grid_cols):
-                partial_wires.append(f"    wire [127:0] partial_c_p{p}_r{r}_c{c};")
+                partial_wires.append(f"    wire [255:0] partial_c_p{p}_r{r}_c{c};")
                 partial_wires.append(f"    wire         partial_avail_p{p}_r{r}_c{c};")
     # Per-partition systolic chain: each K-spatial partition p is its own
     # grid_rows x grid_cols grid (A flows left->right, B flows top->bottom
@@ -1504,12 +1503,12 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
         for c in range(grid_cols):
             for lane in range(8):
                 # Stage 2 (shared with every other emitter -- see
-                # _stage2_function): sum the K-partition 16-bit partials (plus
+                # _stage2_function): sum the K-partition 32-bit partials (plus
                 # the bias, and the rounding half when it folds) in a balanced
-                # 16-bit WRAPPING tree (the `accum16` reg truncates every level
+                # 32-bit WRAPPING tree (the `accum32` reg truncates every level
                 # exactly), then round/wrap to out_width. Slice outputs (and
-                # hence the partials) stay 16-bit; no saturation anywhere.
-                terms = [f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*16 +: 16])"
+                # hence the partials) stay 32-bit; no saturation anywhere.
+                terms = [f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*32 +: 32])"
                          for p in range(k_spatial)]
                 _bias_const = None
                 if _fold_n_bias:
@@ -1568,7 +1567,7 @@ def _general_synth_kspatial_branch(m, k, n, module_name="gemm_grid_wrapper", k_s
 // Auto-generated by rtl.py
 // Experimental K-spatial structural tensor-slice synth wrapper
 // Dimensions: M={m}, K={k}, N={n}  |  Grid: {grid_rows}x{grid_cols} slices, K_SPATIAL={k_spatial}
-// WARNING: K-spatial partial outputs are INT16; correctness requires every partition partial sum to fit INT16.
+// WARNING: K-spatial partial outputs are INT32; correctness requires every partition partial sum to fit INT32.
 {part_comments}
 `timescale 1ns/1ps
 
@@ -1594,7 +1593,7 @@ module {module_name}(
     reg [15:0] beat_count;
     reg [15:0] chunk_idx;
     reg [15:0] out_row_count;
-    reg signed [15:0] accum16;
+    reg signed [31:0] accum32;
     reg [{c_width-1}:0] row_mux;
 {_bias_grp_decl}
 {"    reg [15:0] out_grp;" if _fold_n_bias else ""}
@@ -1715,7 +1714,7 @@ module {module_name}(
 {stage2_fn}
     always @(*) begin
         row_mux = {c_width}'d0;
-        accum16 = 16'sd0;
+        accum32 = 32'sd0;
 {chr(10).join(row_mux_cases)}
     end
 
@@ -1935,7 +1934,7 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
     for p in range(k_spatial):
         for r in range(grid_rows):
             for c in range(grid_cols):
-                partial_wires.append(f"    wire [127:0] partial_c_p{p}_r{r}_c{c};")
+                partial_wires.append(f"    wire [255:0] partial_c_p{p}_r{r}_c{c};")
                 partial_wires.append(f"    wire         partial_avail_p{p}_r{r}_c{c};")
     # Per-partition systolic chain: each K-spatial partition p is its own
     # grid_rows x grid_cols grid (A flows left->right, B flows top->bottom
@@ -1973,7 +1972,7 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
         row_mux_cases.append(f"        if ({_row_cond}) begin")
         for c in range(grid_cols):
             for lane in range(8):
-                terms = [f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*16 +: 16])"
+                terms = [f"$signed(partial_c_p{p}_r{r}_c{c}[{lane}*32 +: 32])"
                          for p in range(k_spatial)]
                 if has_bias:
                     # Bias depends only on n_group (ng), never on mg or k_pass.
@@ -2055,7 +2054,7 @@ def _general_synth_combined_fold(m, k, n, module_name="gemm_grid_wrapper", k_spa
 // ADDITIVE combined-fold structural tensor-slice synth wrapper (2b)
 // Per-group core: M={m}, K={k}, N={n}  |  Grid: {grid_rows}x{grid_cols} slices, K_SPATIAL={k_spatial}
 // Groups: M_PASSES={m_passes} x N_PASSES={n_passes} (mg-major, ng-minor), LOGICAL_M={logical_m}, LOGICAL_N={logical_n}
-// WARNING: K-spatial partial outputs are INT16; correctness requires every partition partial sum to fit INT16.
+// WARNING: K-spatial partial outputs are INT32; correctness requires every partition partial sum to fit INT32.
 // Overlapped gapless multi-frame feed: each group's beats are consumed
 // without waiting on compute, and the head frame's rows drain independently.
 {part_comments}
@@ -2101,7 +2100,7 @@ module {module_name}(
     reg [15:0] frames_fed;     // frames whose first beat has been taken
     reg [15:0] frames_emitted; // frames whose rows have fully drained
     reg        row_take;
-    reg signed [15:0] accum16;
+    reg signed [31:0] accum32;
     reg [{c_width-1}:0] row_mux;
 {rom_addr_decl}
 
@@ -2226,7 +2225,7 @@ module {module_name}(
 {stage2_fn}
     always @(*) begin
         row_mux = {c_width}'d0;
-        accum16 = 16'sd0;
+        accum32 = 32'sd0;
         row_take = 1'b0;
 {chr(10).join(row_mux_cases)}
     end
@@ -2366,7 +2365,7 @@ def generate_k_spatial_combined_core_verilog(m, k, n, module_name="gemm_grid_wra
     lines.append("// Auto-generated by rtl.py")
     lines.append(f"// Combined K-spatial core: M={m}, K={k}, N={n}, K_SPATIAL={k_spatial}")
     lines.append("//   structural K-spatial wrapper (single-branch RTL: simulation + HLS synthesis)")
-    lines.append("// WARNING: INT16 partial overflow is possible in K-spatial structural mode.")
+    lines.append("// WARNING: INT32 partial overflow is possible in K-spatial structural mode.")
     lines.append("")
     lines.extend(synth_top.splitlines())
     return "\n".join(lines) + "\n"

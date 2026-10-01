@@ -76,14 +76,14 @@ def _random_weight_matrix(k, n, seed=0):
 
 def _nonuniform_bias(n, scale=0.05):
     """A real-valued, non-zero, non-uniform bias vector, small enough that
-    its baked 16-bit stage-2 intermediate code always fits (see
+    its baked 32-bit stage-2 intermediate code always fits (see
     generate_catapult_pkg's own bias-code-fits check)."""
     return list((np.arange(n) - (n - 1) / 2.0) * scale)
 
 
 # Each case: (case_id, gen kwargs). m/k/n and reuse_factor chosen so the
 # accum_precision default keeps S1 == 0 (see generate_catapult_pkg: S1 is
-# only forced above 0 when accum_precision asks for more than 16 bits of
+# only forced above 0 when accum_precision asks for more than 32 bits of
 # gemm-scale range; none of these cases set accum_precision, so S1 == 0 and
 # the tb's own single-round golden -- which explicitly assumes S1 == 0 --
 # matches the two-stage DUT exactly).

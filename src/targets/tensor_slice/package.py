@@ -134,7 +134,7 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
     # Bias is a COMPILE-TIME constant now (decision 4): no bias_cols port at
     # all. ``bias_codes`` (or None -- the add folds away) is the SAME codes
     # list baked as the Verilog bias ROM (see rtl.py's _bias_rom_block); here
-    # it is baked as a C twin static array, one 16-bit-equivalent signed
+    # it is baked as a C twin static array, one 32-bit-equivalent signed
     # value per column, read at the stage-2 intermediate scale.
     has_bias = bias_codes is not None
     from gemm_ip.biasrom import bias_c_decl as _bias_c_decl
@@ -334,15 +334,15 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
             f"more than the {gemm_shift} the product carries; a left shift is not "
             "supported by the tensor_slice requant.")
     # Two-stage requant: this ccore mirrors the Verilog sim branch's folded model exactly. Stage 1
-    # (round-half-up shift by S1, wrap to 16) is applied PER K-spatial partition
+    # (round-half-up shift by S1, wrap to 32) is applied PER K-spatial partition
     # in-slice -- the RTL computes each of the ``ks`` partitions in its own
-    # 16-bit slice partial and then sums those 16-bit partials (accum16), so the
-    # csim must partition K the same way and wrap each partial to 16 before
+    # 32-bit slice partial and then sums those 32-bit partials (accum32), so the
+    # csim must partition K the same way and wrap each partial to 32 before
     # summing (see the accumulate loop below). For ``ks == 1`` this reduces to a
     # single partition == the exact-full-sum-then-S1 behavior it had before.
-    # Stage 2 (wrap-add the bias at the 16-bit intermediate scale, round-half-up
+    # Stage 2 (wrap-add the bias at the 32-bit intermediate scale, round-half-up
     # shift by S2, wrap to the physical lane) then runs once on the summed
-    # 16-bit accumulator. No saturation anywhere -- decision 5. `requant_shift`
+    # 32-bit accumulator. No saturation anywhere -- decision 5. `requant_shift`
     # here is the TOTAL shift (S1 + S2); S2 is the remainder after S1.
     _s1 = int(s1) if s1 else 0
     _s2 = max(0, requant_shift - _s1)
@@ -352,8 +352,8 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         f"                        ac_int<{out_width}, true> sat_val;\n"
         "                        {\n"
         "                            // Stage 2: wrap-add the bias, round-half-up shift by S2, wrap.\n"
-        "                            ac_int<16, true> _biased = _p1 + bias_el;\n"
-        f"                            ac_int<32, true> _r2 = (ac_int<32, true>) _biased + {_half2};\n"
+        "                            ac_int<32, true> _biased = _p1 + bias_el;\n"
+        f"                            ac_int<33, true> _r2 = (ac_int<33, true>) _biased + {_half2};\n"
         f"                            sat_val = (ac_int<{out_width}, true>) (_r2 >> {_s2});\n"
         "                        }"
     )
@@ -361,11 +361,11 @@ def gen_public_header(name, m, k, n, grid_rows, grid_cols, result_type=None, k_s
         # Frozen per-slot group (slot_bias_grp[s], captured at that frame's
         # allocation) -- NOT the live _bias_grp counter, which may already
         # have advanced to a later frame's group by emit time.
-        bias_el_expr = f"(ac_int<16, true>) {bias_c_array_name}_bias[slot_bias_grp[s] * {n} + actual_col]"
+        bias_el_expr = f"(ac_int<32, true>) {bias_c_array_name}_bias[slot_bias_grp[s] * {n} + actual_col]"
     elif has_bias:
-        bias_el_expr = f"(ac_int<16, true>) {bias_c_array_name}_bias[actual_col]"
+        bias_el_expr = f"(ac_int<32, true>) {bias_c_array_name}_bias[actual_col]"
     else:
-        bias_el_expr = "(ac_int<16, true>) 0"
+        bias_el_expr = "(ac_int<32, true>) 0"
     a_el_expr = (
         f"a_buf[s][(k_chunk / {ks}) * {input_beats} + actual_row]"
         f".slc<8>((k_chunk % {ks}) * 64 + k_lane * 8)"
@@ -1485,16 +1485,16 @@ class {name}_ccore {{
                 for (int ct = 0; ct < {grid_cols}; ct++) {{
                     for (int cl = 0; cl < 8; cl++) {{
                         int actual_col = ct * 8 + cl;
-                        // Per-K-spatial-partition INT16 accumulation, mirroring
+                        // Per-K-spatial-partition INT32 accumulation, mirroring
                         // the RTL: each of the {ks} partitions (partition pp owns
                         // K chunks with chunk % {ks} == pp) accumulates its own
                         // exact product sum, gets stage-1 requantised and wrapped
-                        // to 16 bits in-slice, and only then are the {ks} 16-bit
-                        // partials summed (16-bit wrap, == the RTL's accum16). Bias
+                        // to 32 bits in-slice, and only then are the {ks} 32-bit
+                        // partials summed (32-bit wrap, == the RTL's accum32). Bias
                         // is added post-stage-2 (core_requant_emit below). For
                         // {ks} == 1 this is one partition over the full K == the
                         // former exact-full-sum-then-S1 model.
-                        ac_int<16, true> _p1 = 0;
+                        ac_int<32, true> _p1 = 0;
                         for (int _pp = 0; _pp < {ks}; _pp++) {{
                             ac_int<32, true> acc = 0;
                             if (actual_row < {m} && actual_col < {n}) {{
@@ -1508,12 +1508,12 @@ class {name}_ccore {{
                                 }}
                             }}
                             // Stage 1 (per partition): round-half-up shift the
-                            // partition sum by S1, wrap to 16, accumulate into the
-                            // 16-bit partial sum (wraps -- RTL accum16 is 16-bit).
+                            // partition sum by S1, wrap to 32, accumulate into the
+                            // 32-bit partial sum (wraps -- RTL accum32 is 32-bit).
                             ac_int<33, true> _r1 = (ac_int<33, true>) acc + {_half1};
-                            _p1 += (ac_int<16, true>) (_r1 >> {_s1});
+                            _p1 += (ac_int<32, true>) (_r1 >> {_s1});
                         }}
-                        ac_int<16, true> bias_el = {bias_el_expr};
+                        ac_int<32, true> bias_el = {bias_el_expr};
 {core_requant_emit}
                         row_out.set_slc(ct * {8 * out_width} + cl * {out_width}, sat_val);
                     }}
@@ -1773,21 +1773,21 @@ def gen_tb(name, m, k, n, interface="stream", n_frames=1,
     _s2 = int(s2)
     _half1 = (1 << (_s1 - 1)) if _s1 else 0
     _half2 = (1 << (_s2 - 1)) if _s2 else 0
-    _st1 = (f"(ac_int<16, true>)((part[p] + {_half1}) >> {_s1})" if _s1
-            else "(ac_int<16, true>)(part[p])")
-    _st2 = (f"(ac_int<{out_width}, true>)((biased.to_int() + {_half2}) >> {_s2})"
+    _st1 = (f"(ac_int<32, true>)(((long long) part[p] + {_half1}) >> {_s1})" if _s1
+            else "(ac_int<32, true>)(part[p])")
+    _st2 = (f"(ac_int<{out_width}, true>)((biased.to_int64() + {_half2}) >> {_s2})"
             if _s2 else f"(ac_int<{out_width}, true>)(biased.to_int())")
     # Per-K-partition two-stage reference, matching the structural RTL bit-for-bit:
     # chunk c = kk/8 belongs to partition c % k_spatial (chunk = pass*k_spatial + p),
-    # each partition is stage-1 round-half-up shifted and wrapped to 16, the 16-bit
-    # partials are summed (wrap 16), the bias code is added (wrap 16), then stage 2
+    # each partition is stage-1 round-half-up shifted and wrapped to 32, the 32-bit
+    # partials are summed (wrap 32), the bias code is added (wrap 32), then stage 2
     # round-half-up shifts and wraps to out_width. Reduces to the exact full-K sum +
     # stage1 when k_spatial == 1. (The old single-round-by-total-shift form was only
     # correct at S1 == 0; it mis-scored every S1>0 package and made the smoke TB's
     # own check_row fail csim/cosim even though the IP was correct.)
     check_row = f"""\
 // Per-row golden check: per-K-partition stage 1 (round-half-up shift by S1, wrap
-// to 16), sum the 16-bit partials, add the SAME bias code baked into the core's
+// to 32), sum the 32-bit partials, add the SAME bias code baked into the core's
 // bias ROM, stage 2 (round-half-up shift by S2, wrap to out_width). No saturation.
 static const int _golden_bias_codes[{n}] = {{{_bias_lit}}};
 static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
@@ -1800,10 +1800,10 @@ static void check_row(const res_t &out, ac_int<8, true> a_row[{k}],
         }}
         int psum = 0;
         for (int p = 0; p < {_ks}; p++) {{
-            ac_int<16, true> st = {_st1};
+            ac_int<32, true> st = {_st1};
             psum += st.to_int();
         }}
-        ac_int<16, true> biased = (ac_int<16, true>)(psum + _golden_bias_codes[j]);
+        ac_int<32, true> biased = (ac_int<32, true>)((long long) psum + _golden_bias_codes[j]);
         ac_int<{out_width}, true> expect_code = {_st2};
         if (out[j].to_int() != expect_code.to_int()) {{
             printf("Mismatch frame %d row %d col %d: got %d expected %d\\n",
@@ -2626,14 +2626,14 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             f"fraction bits, more than the {_gemm_shift} the product carries; a "
             "left shift is not supported by the tensor_slice requant.")
     _accum_w = _accum_shift_bits(accum_precision, _gemm_shift)
-    s1 = max(0, _accum_w - 16) if _accum_w else 0
+    s1 = max(0, _accum_w - 32) if _accum_w else 0
     if s1 > _total_shift:
         raise RuntimeError(
             f"{name}: accum_precision needs S1={s1} bits of in-slice pre-rounding, "
             f"more than the total gemm->result shift ({_total_shift}); the output "
-            "needs more than 16 bits of range at the gemm scale.")
+            "needs more than 32 bits of range at the gemm scale.")
     # The slice rounds half-up for any non-zero shift_amount and passes the raw
-    # low 16 bits through at 0, so a single exact requant is reachable two ways:
+    # low 32 bits through at 0, so a single exact requant is reachable two ways:
     #   - S1 == 0: the wrapper (stage 2) does the whole shift in the result type's
     #     own mode, round-half-up for RND, floor for TRN;
     #   - S1 > 0 on an RND result: the whole shift moves into the slice (S1 = T,
@@ -2652,7 +2652,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
               "from the reference by one output LSB.", file=sys.stderr)
     if s1 > 0 and int(k_spatial) > 1:
         print(f"WARNING: {name}: S1={s1} with k_spatial={k_spatial}: every K partition "
-              "is rounded on its own before the 16-bit partials are summed, which may "
+              "is rounded on its own before the 32-bit partials are summed, which may "
               "differ from the reference by one output LSB. Fold K fully in time "
               "(k_spatial 1) for an exact result.", file=sys.stderr)
     s2 = _total_shift - s1
@@ -2663,12 +2663,18 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
     requant_shift = _total_shift
 
     # Bake the bias (decision 4): baked at the intermediate scale (gemm_frac
-    # - S1, the scale stage 2 adds it at), one 16-bit signed code per column,
+    # - S1, the scale stage 2 adds it at), one 32-bit signed code per column,
     # via the SAME shared helper mvau uses (gemm_ip.biasrom), so the C twin
     # and the Verilog ROM render from one codes list.
     from gemm_ip.biasrom import bias_acc_codes as _bias_acc_codes
     _has_bias = bool(has_bias)
     _intermediate_frac = max(0, _gemm_shift - s1)
+    # A bias finer than the intermediate scale cannot be a whole code, and rounding it to
+    # the nearest one flips results that sit near a rounding tie. Floor is exact instead
+    # whenever stage 2 then shifts by >= 1 bit (round-half-up) or truncates: floor(b) plus
+    # the rounding half moves every sum across the same cut that sum + b crosses. With no
+    # stage-2 shift on a rounding result, the code itself must round half up.
+    _bias_rounding = "half_up" if (s2 == 0 and not _trn) else "floor"
     bias_codes = None
     if _has_bias:
         if fold_n:
@@ -2678,24 +2684,26 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
             # base g*core_n, zero-padded tail -- the RTL's out_grp-indexed
             # lookup (frozen per-frame, not the live/already-advanced group
             # counter) selects the right slice at emit time.
-            _real_codes = _bias_acc_codes(bias, _intermediate_frac, n, True)
+            _real_codes = _bias_acc_codes(bias, _intermediate_frac, n, True,
+                                          rounding=_bias_rounding)
             bias_codes = [0] * (n_passes * core_n)
             bias_codes[:n] = _real_codes
         else:
-            bias_codes = _bias_acc_codes(bias, _intermediate_frac, core_n, True)
-        _bad = [c for c in bias_codes if not (-32768 <= c <= 32767)]
+            bias_codes = _bias_acc_codes(bias, _intermediate_frac, core_n, True,
+                                         rounding=_bias_rounding)
+        _bad = [c for c in bias_codes if not (-(1 << 31) <= c < (1 << 31))]
         if _bad:
             raise RuntimeError(
-                f"{name}: bias code(s) {_bad} do not fit the 16-bit stage-2 "
+                f"{name}: bias code(s) {_bad} do not fit the 32-bit stage-2 "
                 f"intermediate scale (2^{_intermediate_frac} fractional bits) -- "
                 "reduce the bias magnitude or accum_precision's fractional bits.")
     if _trn and s2 > 0:
         # Truncating result: floor(x / 2^S2) == round_half_up(x - 2^(S2-1), S2), and
-        # stage 2 already adds a baked 16-bit wrapping constant before its round, so
+        # stage 2 already adds a baked 32-bit wrapping constant before its round, so
         # the half goes into the bias codes (one list feeds the ROM and the C twins).
         _half2 = 1 << (s2 - 1)
         _codes = bias_codes if bias_codes is not None else [0] * (n_passes * core_n if fold_n else core_n)
-        bias_codes = [((int(c) - _half2 + 32768) % 65536) - 32768 for c in _codes]
+        bias_codes = [((int(c) - _half2 + (1 << 31)) % (1 << 32)) - (1 << 31) for c in _codes]
 
     pkg_dir = Path(output_dir) / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
@@ -2748,7 +2756,7 @@ def generate_catapult_pkg(m, k, n, name, output_dir, interface="stream", output_
         print(
             f"WARNING: {name}: ReuseFactor={rf_legalized} partitions K into "
             f"k_spatial={k_spatial} parallel chunks; tensor-slice partial outputs "
-            "are INT16 and partial overflow is possible. Correctness depends on "
+            "are INT32 and partial overflow is possible. Correctness depends on "
             "quantized operand ranges and partition size.",
             file=sys.stderr,
         )

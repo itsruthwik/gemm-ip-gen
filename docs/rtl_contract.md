@@ -88,7 +88,7 @@ offset from the beat index, so the deep input FIFO never stores the
 always-zero grid padding. `k_spatial == 1` keeps the single-chunk grid-padded
 width instead (today's chunked layout).
 
-Intermediate K-spatial partial sums are INT16, so partition-level overflow is
+Intermediate K-spatial partial sums are INT32, so partition-level overflow is
 possible; correctness depends on quantized operand ranges and partition size.
 The generator prints a warning for every package with `k_spatial > 1`.
 
@@ -200,15 +200,15 @@ two stages, and `c_row` carries finished result codes of `out_width` bits per
 column (`c_bits = GRID_COLS * 8 * out_width`).
 
 - **Stage 1, in the slice.** The full K contraction accumulates in 32 bits. The
-  slice's 16-bit output is that sum after a round-half-up shift by `S1` and a
-  wrap to 16 bits. `S1` is an IP parameter set out of band; the generator
+  slice's 32-bit output lane is that sum after a round-half-up shift by `S1`
+  and a wrap to 32 bits. `S1` is an IP parameter set out of band; the generator
   records it as a comment above each instantiation (VTR's hard-block model has
   no parameters, so it is not a Verilog override). `S1 = 0` is a pass-through
   (no rounding) and is the normal case: the generator derives `S1` from the
   layer's `accum_t` as the smallest shift that makes the gemm-scale accumulator
-  fit 16 bits.
-- **Stage 2, in the wrapper.** The 16-bit partials of the K partitions are
-  summed in 16-bit wrapping arithmetic (one term in the chunked path), the
+  fit 32 bits.
+- **Stage 2, in the wrapper.** The 32-bit partials of the K partitions are
+  summed in 32-bit wrapping arithmetic (one term in the chunked path), the
   bias is added at that intermediate scale (`frac_a + frac_b - S1`), then a
   round-half-up shift by `S2` and a wrap to `out_width`. `S1 + S2 =
   frac_a + frac_b - frac_out`. No saturation anywhere.
@@ -231,7 +231,7 @@ get there:
   `k_spatial > 1`, where every K partition is rounded before the partials are
   summed; folding K fully in time avoids it.
 
-The bias is a **compile-time constant**: one 16-bit signed lane per column,
+The bias is a **compile-time constant**: one 32-bit signed lane per column,
 baked into the core as a flat `wire` from the same codes list the C behavioral
 core and mvau use (`gemm_ip/biasrom.py`). It is a flat wire, not a `reg`
 array, because parmys would otherwise infer an unclocked memory and vpr would

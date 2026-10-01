@@ -23,7 +23,7 @@ Control behavior:
 
 - `start_mat_mul` is a 1-cycle launch pulse
 - the slice then runs autonomously
-- `c_data_available` goes high when `c_data_out[63:0]` holds a valid result row
+- `c_data_available` goes high when `c_data_out[255:0]` holds a valid result row
 - `done_mat_mul` pulses when the final row has been emitted
 
 Data behavior:
@@ -31,7 +31,9 @@ Data behavior:
 - `a_data` / `b_data` are the primary top/left boundary inputs
 - `a_data_in` / `b_data_in` are chain inputs from neighboring slices
 - `a_data_out` / `b_data_out` chain onward to neighboring slices
-- `c_data_out[63:0]` contains saturated int8 output values, one row per cycle
+- `c_data_out[255:0]` carries one result row per cycle as eight signed 32-bit
+  lanes (lane `i` at `[i*32 +: 32]`): the 32-bit accumulator after the stage-1
+  round-half-up shift by `shift_amount`, so a zero shift passes the full sum
 
 Masking support:
 

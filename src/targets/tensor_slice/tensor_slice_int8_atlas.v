@@ -19,7 +19,8 @@
 // enable); en==0 freezes the schedule, snapshots, and the array so wrapper
 // and slices stay in lockstep across wait states.
 // Stage-1 shift is a 4-bit field driven directly by the `shift_amount` pin,
-// latched at start.
+// latched at start. Each c_data_out lane is 32 bits, so with a zero shift the
+// row leaves the slice as the full accumulator.
 
 // Hard block: VTR/parmys (yosys) must treat this definition as a black box and
 // map instances to the arch model of the same name. The `blackbox` attribute
@@ -41,7 +42,7 @@ module tensor_slice_int8_atlas (
     output wire [63:0] a_data_out,
     output wire [63:0] b_data_out,
 
-    output wire [127:0] c_data_out,
+    output wire [255:0] c_data_out,
     output wire         c_data_available,
 
     input  wire [7:0]  validity_mask_a_rows,
@@ -417,18 +418,18 @@ module tensor_slice_int8_atlas (
 
     wire emit = (op[0] == 1'b0) && row_ready[ptr] && (!trunc);
 
-    function signed [15:0] stage1(input signed [31:0] x);
-        stage1 = (shift_lat > 0) ? ((x + (32'sd1 << (shift_lat - 1))) >>> shift_lat) : x[15:0];
+    function signed [31:0] stage1(input signed [31:0] x);
+        stage1 = (shift_lat > 0) ? ((x + (32'sd1 << (shift_lat - 1))) >>> shift_lat) : x;
     endfunction
 
-    wire signed [15:0] lane0 = stage1(shadow[ptr][0]);
-    wire signed [15:0] lane1 = stage1(shadow[ptr][1]);
-    wire signed [15:0] lane2 = stage1(shadow[ptr][2]);
-    wire signed [15:0] lane3 = stage1(shadow[ptr][3]);
-    wire signed [15:0] lane4 = stage1(shadow[ptr][4]);
-    wire signed [15:0] lane5 = stage1(shadow[ptr][5]);
-    wire signed [15:0] lane6 = stage1(shadow[ptr][6]);
-    wire signed [15:0] lane7 = stage1(shadow[ptr][7]);
+    wire signed [31:0] lane0 = stage1(shadow[ptr][0]);
+    wire signed [31:0] lane1 = stage1(shadow[ptr][1]);
+    wire signed [31:0] lane2 = stage1(shadow[ptr][2]);
+    wire signed [31:0] lane3 = stage1(shadow[ptr][3]);
+    wire signed [31:0] lane4 = stage1(shadow[ptr][4]);
+    wire signed [31:0] lane5 = stage1(shadow[ptr][5]);
+    wire signed [31:0] lane6 = stage1(shadow[ptr][6]);
+    wire signed [31:0] lane7 = stage1(shadow[ptr][7]);
 
     assign c_data_out = {lane7, lane6, lane5, lane4, lane3, lane2, lane1, lane0};
     assign c_data_available = emit;

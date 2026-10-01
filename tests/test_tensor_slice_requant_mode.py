@@ -16,8 +16,9 @@ _generate_catapult_pkg = _tensor_slice_pkg.generate_catapult_pkg
 
 # frac(a) + frac(b) = 12 everywhere below.
 _IN = dict(input_precision="fixed<8,2>", weight_precision="fixed<8,2>")
-# 8 integer bits at the 12-fraction-bit gemm scale is 20 bits: forces S1 = 4.
-_WIDE_ACCUM = "fixed<20,8,RND,WRAP,0>"
+# 24 integer bits at the 12-fraction-bit gemm scale is 36 bits: forces S1 = 4
+# past the slice's 32-bit output lane.
+_WIDE_ACCUM = "fixed<36,24,RND,WRAP,0>"
 
 
 def generate_catapult_pkg(*args, **kwargs):

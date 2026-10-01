@@ -9,8 +9,21 @@ assuming either target's fixed-point convention.
 """
 
 
-def bias_acc_codes(bias, product_frac, n, has_bias):
+import math
+
+def bias_acc_codes(bias, product_frac, n, has_bias, exact=False, rounding="nearest"):
     """Scale per-column real bias to the accumulator (2^product_frac) domain.
+
+    With ``exact`` a bias that is not an integer at this scale raises instead of being
+    rounded to the nearest code (the caller is expected to have chosen a scale that
+    holds every bias, as mvau does with its accumulator left shift).
+
+    ``rounding`` picks how a bias finer than the scale becomes a code when it is not
+    exact: ``"nearest"`` (Python ``round``, the historical default), ``"floor"`` or
+    ``"half_up"``. ``"floor"`` is exact for a stage that then rounds half-up by a
+    shift of at least one bit (or truncates): adding floor(b) and the rounding half
+    lands every result on the same side of the cut as the exact sum + b would.
+    ``"half_up"`` is the exact code when no shift follows.
 
     ``has_bias`` (the manifest's own field, computed by hls4ml from the real bias
     tensor) is the *only* gate for whether a bias is baked: when True this always
@@ -31,7 +44,21 @@ def bias_acc_codes(bias, product_frac, n, has_bias):
         raise ValueError(
             "has_bias is True but the manifest has no bias values to bake "
             "(cfg['bias'] is missing/empty)")
-    codes = [int(round(float(b) * (1 << product_frac))) for b in bias]
+    codes = []
+    for b in bias:
+        scaled = float(b) * (1 << product_frac)
+        if exact and scaled != round(scaled):
+            raise ValueError(
+                f"bias {b!r} is not an exact integer at scale 2^{product_frac}; rounding it "
+                "would silently change results (raise the accumulator scale instead)")
+        if rounding == "floor":
+            codes.append(math.floor(scaled))
+        elif rounding == "half_up":
+            codes.append(math.floor(scaled + 0.5))
+        elif rounding == "nearest":
+            codes.append(int(round(scaled)))
+        else:
+            raise ValueError(f"unknown bias rounding {rounding!r}")
     if len(codes) != n:
         raise ValueError(f"bias length {len(codes)} != N {n}")
     return codes
