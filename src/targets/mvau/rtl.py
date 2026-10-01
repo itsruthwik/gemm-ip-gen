@@ -64,12 +64,9 @@ def _requant_lanes(t, n_lanes, raw_exprs, const_lists, reg_prefix, nf_cnt_expr="
     sum/(case)/shift + one register per lane) and the list of per-lane register
     names (each ``out_width`` bits wide) to slice into ``p_din``.
     """
-    # acc_lshift lifts the raw sum to a scale that holds the bias exactly (geometry.
-    # acc_lshift_for_bias); the requant shift and the add's width grow with it.
-    lsh = t.get("acc_lshift", 0)
-    accu = t["accu_width"] + lsh
+    accu = t["accu_width"]
     out_width = t["output_width"]
-    shift = _geom.requant_shift(t)
+    shift = t["product_frac"] - t["output_frac"]
     all_consts = [c for lst in (const_lists or []) if lst for c in lst]
     biased_w, const_w = _geom.requant_width(accu, all_consts)
     _wpack.assert_constants_fit(all_consts, const_w)
@@ -108,13 +105,8 @@ def _requant_lanes(t, n_lanes, raw_exprs, const_lists, reg_prefix, nf_cnt_expr="
                 lines.append(f"    wire signed [{const_w - 1}:0] {cname} = {romname}[{nf_cnt_expr}];")
                 const_expr = cname
             bias_term = f" + $signed({const_expr})"
-        reg_names.append(reg)
-        if lsh:
-            # Sign-extend the raw sum to the requant width first, then shift: the shifted
-            # sum keeps its top bits.
-            lines.append(f"    wire signed [{biased_w - 1}:0] {reg}_acc = {sum_expr};")
-            sum_expr = f"{reg}_acc <<< {lsh}"
         biased = f"({sum_expr}){bias_term}"
+        reg_names.append(reg)
         lines.append(f"    wire signed [{biased_w - 1}:0] {reg}_biased = {biased};")
         # The round-half-up constant is already folded into `consts` (see
         # fold_requant_constants), so shifting is now a plain arithmetic shift --
@@ -451,7 +443,7 @@ def _generate_kt_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
         for pe_i in range(pe):
             raw_exprs.append([
                 f"out_tdata_{j * k_tiles + i}[{pe_i * accu} +: {accu}]" for i in range(k_tiles)])
-    shift = _geom.requant_shift(t)
+    shift = t["product_frac"] - t["output_frac"]
     folded = _wpack.fold_requant_constants(bias_codes, shift, N)
     if folded:
         buckets = [_wpack.bias_codes_for_tile(folded, j, ntile_real, t["mh"])
@@ -990,7 +982,7 @@ def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
     # (=NF*PE) local lanes (bias_codes is real-column length; ntile_real derives
     # from it since all n_tiles are equal-width). fold_requant_constants handles
     # bias_codes=None (pure rounding, no real bias) too.
-    shift = _geom.requant_shift(t)
+    shift = t["product_frac"] - t["output_frac"]
     folded = _wpack.fold_requant_constants(bias_codes, shift, N)
     if folded:
         buckets = [_wpack.bias_codes_for_tile(folded, i, ntile_real, t["mh"])

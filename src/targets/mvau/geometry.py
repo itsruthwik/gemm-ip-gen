@@ -346,31 +346,6 @@ def _signed_const_width(v):
     return (v.bit_length() + 1) if v > 0 else ((~v).bit_length() + 1)
 
 
-def acc_lshift_for_bias(bias, product_frac, limit=16):
-    """Left shift that lifts the accumulator from the product scale (2^product_frac)
-    to one where every bias is an exact integer code.
-
-    The dot product carries input_frac + weight_frac fractional bits, but a bias can
-    carry more (an HGQ2 bias quantizer is independent of the operands'). Baking such a
-    bias at the product scale would round it, and that rounding flips the output's
-    round-half-up wherever a result lies within the lost bits of a tie. Shifting the
-    raw sum left by this amount before the bias add keeps the add exact; the requant
-    shift grows by the same amount (see requant_shift). 0 when the bias already fits.
-    """
-    for d in range(limit + 1):
-        scale = float(1 << (product_frac + d))
-        if all(float(b) * scale == round(float(b) * scale) for b in (bias or [])):
-            return d
-    raise ValueError(f"bias is not representable with up to {limit} fractional bits beyond "
-                     f"the product scale (2^{product_frac})")
-
-
-def requant_shift(p):
-    """Right shift from the accumulator scale (product_frac + acc_lshift) to the output's
-    frac. Takes the plan or its tile dict; plans without acc_lshift shift by 0."""
-    return p["product_frac"] + p.get("acc_lshift", 0) - p["output_frac"]
-
-
 def requant_width(accu, consts):
     """Just-wide-enough intermediate width for the requant stage's biased value
     (shared by the C twin and the RTL requant stage so the two never drift, and

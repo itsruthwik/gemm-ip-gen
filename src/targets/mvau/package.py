@@ -665,19 +665,21 @@ def generate_mvau_pkg(shape, name, output_dir, **cfg):
     # the downstream drain -- computed here so both get the same codes.
     _bias = cfg.get("bias")
     _has_bias_default = _bias is not None and any(_bias)
-    _bake_bias = bool(cfg.get("has_bias", _has_bias_default))
-    # A bias finer than the products (input_frac + weight_frac) lifts the accumulator:
-    # the raw sum is shifted left by acc_lshift before the add, so every bias is an exact
-    # code. Set on the plan and its tile before anything renders the requant stage.
-    _lsh = _geom.acc_lshift_for_bias(_bias if _bake_bias else None, plan["product_frac"])
-    plan["acc_lshift"] = plan["tile"]["acc_lshift"] = _lsh
-    bias_codes = _wpack.bias_acc_codes(_bias, plan["product_frac"] + _lsh, plan["n"], _bake_bias,
-                                       exact=True)
+    # A bias finer than the products (input_frac + weight_frac) cannot be a whole code at
+    # their scale. The requant floors sum + code (+ the rounding half), so floor(bias) is
+    # exact whenever it then shifts right or truncates: it crosses the same cut sum + bias
+    # does. With no shift on a rounding result the code itself must round half up, and a
+    # left shift (output finer than the products) cannot hold such a bias at all.
+    _req_shift = plan["product_frac"] - plan["output_frac"]
+    _rounds = not _truncates(cfg.get("output_precision"))
+    bias_codes = _wpack.bias_acc_codes(
+        _bias, plan["product_frac"], plan["n"], bool(cfg.get("has_bias", _has_bias_default)),
+        exact=_req_shift < 0, rounding="half_up" if (_req_shift == 0 and _rounds) else "floor")
     # Truncating (TRN) result: the requant stage only rounds half-up, and
     # floor(x / 2^s) == round_half_up(x - 2^(s-1), s), so the half is folded into the
     # baked bias codes (created for a bias-free layer). One list feeds the RTL ROM,
     # the C twin and the testbench, so all three floor together.
-    _shift = _geom.requant_shift(plan)
+    _shift = plan["product_frac"] - plan["output_frac"]
     if _truncates(cfg.get("output_precision")) and _shift > 0:
         _half = 1 << (_shift - 1)
         bias_codes = [int(c) - _half for c in (bias_codes if bias_codes is not None

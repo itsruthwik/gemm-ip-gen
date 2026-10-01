@@ -335,25 +335,44 @@ def test_has_bias_false_ignores_nonzero_bias_values(tmp_path):
 
 
 def test_has_bias_true_bakes_sublsb_bias(tmp_path):
-    # A bias finer than the 2^8 product scale is not rounded away: the accumulator is
-    # lifted (acc_lshift) until the bias is an exact code, because a dropped bias still
-    # flips round-half-up wherever a result lies within it of a tie.
-    tiny = 1.0 / (1 << 20)
+    # has_bias=True still routes a sub-LSB bias through bias_acc_codes (it bakes
+    # an N-long all-zero codes list rather than treating this as "no bias") --
+    # but adding a zero constant is a value no-op, so the requant width helper
+    # (geometry.requant_width) correctly skips the add/array for it: the
+    # generated result is bit-identical to a true no-bias layer either way, only
+    # without the wasted fabric a forced all-zero add/ROM would cost.
+    tiny = 1.0 / (1 << 20)   # far below the 2^8 accumulator scale -> rounds to 0
     bias = [tiny] * 8
-    pkg = _gen(tmp_path, (2, 8, 8), "gsl", reuse_factor=1, has_bias=True, bias=bias)
+    # Output at the product scale (no requant shift): the code is round-half-up(bias) = 0
+    # and there is no rounding constant to bake either.
+    pkg = _gen(tmp_path, (2, 8, 8), "gsl", reuse_factor=1, has_bias=True, bias=bias,
+               output_precision="fixed<16,8>")
     core = (pkg / "gsl_core.cpp").read_text()
-    assert "gemm_stream_gsl_bias" in core
-    assert "acc << 12" in core
+    assert "gemm_stream_gsl_bias" not in core
 
 
-def test_bias_finer_than_products_lifts_accumulator(tmp_path):
-    # 10-bit bias vs product_frac=8: baked exactly at 2^10, the raw sum shifted up by 2.
-    bias = [((i * 37) % 41 - 20) / 1024.0 for i in range(8)]
-    pkg = _gen(tmp_path, (2, 8, 8), "gfn", reuse_factor=1, has_bias=True, bias=bias)
+def test_bias_finer_than_products_is_floored(tmp_path):
+    # 10-bit bias vs product_frac=8: not a whole code at the product scale. Floored, the
+    # requant (which floors sum + code + the rounding half) still lands where the exact
+    # sum + bias would; the nearest code would miss results near a tie.
+    bias = [3 / 1024, -3 / 1024, 2050 / 1024, 1 / 1024, 0.0, 0.5, -0.25, 7 / 1024]
+    pkg = _gen(tmp_path, (2, 8, 8), "gfn", reuse_factor=1, has_bias=True, bias=bias,
+               output_precision="fixed<8,2>")
     core = (pkg / "gfn_core.cpp").read_text()
-    assert "acc << 2" in core
-    v = (pkg / "gfn_core.v").read_text()
-    assert "<<< 2" in v
+    import math
+    import re
+    m = re.search(r"gemm_stream_gfn_bias\[8\] = \{([^}]*)\}", core)
+    assert m
+    folded = [int(v) for v in m.group(1).split(",")]
+    half = folded[4]                     # bias 0.0: just the rounding constant
+    assert [c - half for c in folded] == [math.floor(b * 256) for b in bias]
+
+
+def test_bias_finer_than_products_with_a_left_shift_raises(tmp_path):
+    # Output finer than the products (requant left shift): the bias code lives at the
+    # product scale, so a finer bias cannot be exact and is refused, not rounded.
+    with pytest.raises(ValueError, match="not an exact integer"):
+        _gen(tmp_path, (2, 8, 8), "gls", reuse_factor=1, has_bias=True, bias=[3 / 1024] * 8)
 
 
 def test_has_bias_true_without_bias_raises(tmp_path):

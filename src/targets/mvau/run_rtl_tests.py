@@ -98,13 +98,17 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_
     N, K, K_pad = plan["n"], plan["k"], plan["k_pad"]
     WW, AW, outW = t["weight_width"], t["activation_width"], t["output_width"]
     signed = bool(t["signed_activations"])
-    # Same accumulator lift as package.py: a bias finer than the products is baked at
-    # 2^(product_frac + acc_lshift) and the raw sum is shifted up to meet it.
-    lsh = _geom.acc_lshift_for_bias(bias, plan["product_frac"])
-    plan["acc_lshift"] = t["acc_lshift"] = lsh
-    shift = _geom.requant_shift(plan)
-    bias_codes = (_pkg._wpack.bias_acc_codes(bias, plan["product_frac"] + lsh, N, True, exact=True)
+    shift = plan["product_frac"] - plan["output_frac"]
+    # Codes baked as package.py does (floor, or round-half-up with no shift); the expected
+    # rows below use the real bias at a scale fine enough to hold it, so a bias finer than
+    # the products is checked against exact arithmetic, not against its own codes.
+    bias_codes = (_pkg._wpack.bias_acc_codes(bias, plan["product_frac"], N, True,
+                                             rounding="half_up" if shift == 0 else "floor")
                  if bias is not None else None)
+    d = 0
+    while bias is not None and any(b * (1 << (plan["product_frac"] + d)) != int(b * (1 << (plan["product_frac"] + d)))
+                                   for b in bias):
+        d += 1
 
     B = _tb.synth_weights(N, K_pad, WW)   # [K_pad][N]; K_pad>=K, extra rows unused (K real)
     NTILE = plan["n_tile"]                # padded per-tile width (>= N; PE must divide it)
@@ -140,10 +144,10 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_
             a_words.append(_tb.pack_beat(X[v], AW))
             row = []
             for o in range(N):
-                acc = sum(B[kk][o] * X[v][kk] for kk in range(K)) << lsh
-                if bias_codes is not None:
-                    acc += bias_codes[o]
-                row.append(_tb.requant_ref(acc, shift, outW))
+                acc = sum(B[kk][o] * X[v][kk] for kk in range(K)) << d
+                if bias is not None:
+                    acc += int(bias[o] * (1 << (plan["product_frac"] + d)))
+                row.append(_tb.requant_ref(acc, shift + d, outW))
             exp_words.append(_tb.pack_beat(row, outW))
 
     ab, pb = K * AW, N * outW
@@ -355,10 +359,10 @@ CASES = {
         output_precision="fixed<8,2>",
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     "w_bias_finer_than_products": lambda work, seed, **kw: _build_ws_case(
-        # Bias with 10 fractional bits vs product_frac=8: baked at the product scale it
-        # would be rounded, flipping round-half-up near ties. The raw sum is shifted left
-        # by acc_lshift=2 instead, so the add stays exact. NF==2 exercises the bias ROM.
+        # Bias with 10 fractional bits vs product_frac=8: rounded to the nearest code it
+        # flips round-half-up near ties; floored it stays exact. NF==2 exercises the ROM.
         work, "w", (2, 8, 8), seed, pe=4, simd=8, bias=_synth_fine_bias(8, seed),
+        output_precision="fixed<8,2>",   # requant right shift (a left shift refuses it)
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
 }
 
