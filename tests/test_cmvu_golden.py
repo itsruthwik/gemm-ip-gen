@@ -251,3 +251,23 @@ def test_exactness_vs_independent_numpy_reference(rnd, with_bias):
         assert np.array_equal(got, want), (
             f"trial {trial}: m={m} k={k} n={n} shift={shift} width={width} "
             f"rnd={rnd} with_bias={with_bias}")
+
+
+@pytest.mark.parametrize("shift,rnd", [(5, True), (5, False), (0, True)])
+def test_bias_finer_than_products_is_exact(shift, rnd):
+    # Bias with 2 fractional bits below the product scale (pf=8): not a whole code, but
+    # the floor-baked code (round-half-up with no shift) keeps the requant exact.
+    from fractions import Fraction
+    pf, W = 8, 16
+    bias = [k / (1 << (pf + 2)) for k in (3, -3, 1, -1, 2050, -2051, 7, 0)]
+    codes, _ = gold.bias_codes(bias, pf, rnd=rnd, requant_shift=shift)
+    rng = np.random.default_rng(11)
+    A = rng.integers(-128, 128, (48, 16))
+    B = rng.integers(-128, 128, (16, 8))
+    got = gold.reference_rows(A, B, codes, shift=shift, result_width=W)
+    raw = A @ B
+    for (r, c), v in np.ndenumerate(raw):
+        x = (Fraction(int(v)) + Fraction(bias[c]) * (1 << pf)) / (1 << shift)
+        q = (x + Fraction(1, 2)).__floor__() if rnd else x.__floor__()
+        q = (q + (1 << (W - 1))) % (1 << W) - (1 << (W - 1))
+        assert got[r, c] == q, (r, c)

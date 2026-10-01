@@ -152,9 +152,10 @@ res_T ${name}_unpack_res_row(ac_int<${RES_BITS}, false> packed) {
 
 _REQUANT_FN = Template("""\
 static inline int ${name}_requant_cpp(int total) {
-    int q = total >> ${shift};
-    q &= (1 << ${W}) - 1;
-    return (q >= (1 << (${W} - 1))) ? (q - (1 << ${W})) : q;
+    // 64-bit so the W = 32 mask and sign test stay defined.
+    long long q = (long long)total >> ${shift};
+    q &= (1LL << ${W}) - 1;
+    return (int)((q >= (1LL << (${W} - 1))) ? (q - (1LL << ${W})) : q);
 }""")
 
 _BLACKBOX_BIND = Template("""\
@@ -275,7 +276,7 @@ ${result_slot_poll_capture}
                 if (a_code >= 128) a_code -= 256;
                 total += a_code * (int)${W_NAME}[i][j];
             }
-            int code = ${name}_requant_cpp(total) & ((1 << ${W}) - 1);
+            long long code = (long long)${name}_requant_cpp(total) & ((1LL << ${W}) - 1);
             packed.set_slc(j * ${W}, ac_int<${W}, false>(code));
         }
         return packed;
@@ -475,7 +476,7 @@ ${result_slot_poll_capture}
                 if (a_code >= 128) a_code -= 256;
                 total += a_code * (int)B_model[i][j];
             }
-            int code = ${name}_requant_cpp(total) & ((1 << ${W}) - 1);
+            long long code = (long long)${name}_requant_cpp(total) & ((1LL << ${W}) - 1);
             packed.set_slc(j * ${W}, ac_int<${W}, false>(code));
         }
         return packed;

@@ -28,11 +28,11 @@ block itself (not the wrapper this target generates around it).
   change what cmvu computes — it only means hls4ml's own (rounded) reference
   can differ from cmvu's by about an output LSB, which is worth a warning,
   not a hard error.
-- **Bias must be exactly representable at the product's fractional
-  precision.** hls4ml adds bias into `accum_t` at that precision; a bias
-  with bits below that LSB can't be baked exactly into the int32
-  accumulator-scale code, so it's rejected at package time instead of
-  silently rounded.
+- **A bias finer than the product's fractional precision is still exact.**
+  It can't be a whole int32 code at that scale, but the requant floors
+  `sum + code`, so baking floor(bias) (plus the RND half) lands every result
+  on the same side of the cut as the exact `sum + bias`; an RND layer with no
+  shift bakes round-half-up(bias) instead. See `golden.bias_codes`.
 
 ## Wrapper boundary and control
 

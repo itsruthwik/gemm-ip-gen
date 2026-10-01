@@ -169,12 +169,12 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
     ks, ns = geo["k_spatial"], geo["n_spatial"]
     kp_n, np_n = geo["k_passes"], geo["n_passes"]
     a_slice_w = _geometry.K_PHYS * _geometry.IN_WIDTH      # 32
-    rw = geo["result_width"]                                # effective W (1..16)
-    # The block's y_out lanes are RESULT_WIDTH (16) bits (sign-extended W-bit
+    rw = geo["result_width"]                                # effective W (1..RESULT_WIDTH)
+    # The block's y_out lanes are RESULT_WIDTH (32) bits (sign-extended W-bit
     # value); bias lanes are BIAS_WIDTH (32), accumulator scale. The wrapper
     # keeps the y path at RESULT_WIDTH and slices each lane to W on the
     # emitted res_row.
-    res_group_w = _geometry.N_PHYS * _geometry.RESULT_WIDTH   # 128
+    res_group_w = _geometry.N_PHYS * _geometry.RESULT_WIDTH   # 256
     bias_group_w = _geometry.N_PHYS * _geometry.BIAS_WIDTH    # 256
     out_lanes = geo["n_chunks_pad"] * _geometry.N_PHYS
     a_bits, res_bits = geo["a_row_bits"], geo["res_row_bits"]
@@ -242,7 +242,8 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
     add(f"    localparam int unsigned GROUP_W   = {res_group_w};")
     add(f"    localparam int unsigned BIAS_W    = {bias_group_w};")
     add(f"    localparam int unsigned OUT_W     = {rw};")
-    add(f"    localparam [3:0]        OUT_W_ENC = 4'd{rw - 1};")
+    ow_bits = max(1, (_geometry.RESULT_WIDTH - 1).bit_length())   # $clog2(RESULT_WIDTH): the block's out_w port
+    add(f"    localparam [{ow_bits - 1}:0]        OUT_W_ENC = {ow_bits}'d{rw - 1};")
     add(f"    localparam int unsigned BUS_W     = {bus_w};")
     add(f"    localparam int unsigned B_VALID   = {b_valid};")
     add(f"    localparam int unsigned B_FIRST   = {b_first};")

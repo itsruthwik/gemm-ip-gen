@@ -140,16 +140,16 @@ def test_tail_lanes():
 def test_stream_widths():
     r = g.resolve_geometry(1, 16, 16, 1, 1)
     assert r["a_row_bits"] == 4 * g.K_PHYS * g.IN_WIDTH      # 128
-    assert r["res_row_bits"] == 2 * g.N_PHYS * g.RESULT_WIDTH  # 256
+    assert r["res_row_bits"] == 2 * g.N_PHYS * g.RESULT_WIDTH  # 512
     assert r["weight_tiles"] == 8
     assert r["weight_tile_bits"] == g.K_PHYS * g.N_PHYS * g.COEF_WIDTH
 
 
 def test_result_width_default_and_effective():
-    # default W is the physical RESULT_WIDTH (16); out_w = W-1
+    # default W is the physical RESULT_WIDTH (32); out_w = W-1
     r = g.resolve_geometry(1, 16, 16, 1, 1)
-    assert r["result_width"] == g.RESULT_WIDTH == 16
-    assert r["out_w"] == 15
+    assert r["result_width"] == g.RESULT_WIDTH == 32
+    assert r["out_w"] == 31
     # a narrower effective width shrinks the emitted res_row only
     r8 = g.resolve_geometry(1, 16, 16, 1, 1, result_width=8)
     assert r8["result_width"] == 8 and r8["out_w"] == 7
@@ -157,7 +157,7 @@ def test_result_width_default_and_effective():
     assert r8["a_row_bits"] == r["a_row_bits"]
 
 
-@pytest.mark.parametrize("bad", [0, -1, 17, 32])
+@pytest.mark.parametrize("bad", [0, -1, 33, 64])
 def test_result_width_out_of_range_is_error(bad):
     with pytest.raises(ValueError, match="result_width"):
         g.resolve_geometry(1, 16, 16, 1, 1, result_width=bad)

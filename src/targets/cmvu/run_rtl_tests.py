@@ -27,25 +27,25 @@ from . import rtl as _rtl
 GEN_DIR = Path(__file__).resolve().parent / "tb" / "generated"
 
 # (m, k, n, kfold, nfold, shift, bias, width, rnd). ``width`` is the effective
-# result width W: the physical max (16) unless the case exercises a narrower
+# result width W: the physical max (32) unless the case exercises a narrower
 # lane (the block slices each RESULT_WIDTH lane down to W). ``rnd`` selects
 # whether a case's bias word carries the round-half-up constant (RND,
 # default -- matches the block's historical default before rounding moved
 # into the bias) or not (TRN, a plain floor with no rounding constant).
 DEFAULT_CASES = [
-    (4, 4, 8, 1, 1, 0, False, 16, True),   # single 4x8 tile
-    (4, 8, 8, 2, 1, 3, True, 16, True),    # temporal K
+    (4, 4, 8, 1, 1, 0, False, 32, True),   # single 4x8 tile
+    (4, 8, 8, 2, 1, 3, True, 32, True),    # temporal K
     (4, 8, 16, 2, 2, 5, True, 8, True),    # temporal K+N, narrow W
-    (4, 16, 16, 4, 2, 2, True, 16, True),  # slot cap (8 resident tiles)
+    (4, 16, 16, 4, 2, 2, True, 32, True),  # slot cap (8 resident tiles)
     (4, 6, 10, 2, 2, 4, True, 12, True),   # non-multiple tails, mid W
-    (4, 8, 8, 1, 1, 3, True, 16, True),    # spatial 2x1
+    (4, 8, 8, 1, 1, 3, True, 32, True),    # spatial 2x1
     (4, 4, 16, 1, 1, 5, False, 8, True),   # spatial 1x2, narrow W
-    (4, 8, 16, 1, 1, 0, True, 16, True),   # spatial 2x2
-    (4, 6, 10, 1, 1, 4, True, 16, True),   # spatial 2x2 + tails
-    (4, 16, 16, 2, 2, 4, True, 16, True),  # mixed spatial+temporal
-    (4, 16, 16, 2, 1, 3, False, 16, True), # mixed, K temporal only
-    (4, 8, 8, 2, 1, 3, True, 16, False),   # TRN: bias present, no round const
-    (4, 8, 16, 1, 1, 0, True, 16, False),  # TRN: spatial 2x2, no round const
+    (4, 8, 16, 1, 1, 0, True, 32, True),   # spatial 2x2
+    (4, 6, 10, 1, 1, 4, True, 32, True),   # spatial 2x2 + tails
+    (4, 16, 16, 2, 2, 4, True, 32, True),  # mixed spatial+temporal
+    (4, 16, 16, 2, 1, 3, False, 32, True), # mixed, K temporal only
+    (4, 8, 8, 2, 1, 3, True, 32, False),   # TRN: bias present, no round const
+    (4, 8, 16, 1, 1, 0, True, 32, False),  # TRN: spatial 2x2, no round const
 ]
 DEFAULT_SEEDS = [1, 7]
 
@@ -56,18 +56,18 @@ DEFAULT_SEEDS = [1, 7]
 # fill/drain residual buffer). Column and row tails (K/N neither a multiple
 # of 4/8) hit each format's self-generated zero-padding.
 RUNTIME_B_CASES = [
-    (8, 16, 8, 2, 1, 3, True, 16, True, "col"),   # mha_small QK: K_PASSES=2 (paired)
-    (8, 8, 16, 2, 1, 0, True, 16, True, "row"),   # mha_small aV: row-major, K_PASSES=2
-    (8, 6, 10, 1, 1, 4, True, 16, True, "col"),   # column tail, K_PASSES=1
-    (8, 6, 10, 1, 1, 4, True, 16, True, "row"),   # row tail, K_PASSES=1
-    (4, 8, 16, 1, 2, 5, True, 16, True, "row"),   # row-major, N_PASSES=2 (residual buffer)
+    (8, 16, 8, 2, 1, 3, True, 32, True, "col"),   # mha_small QK: K_PASSES=2 (paired)
+    (8, 8, 16, 2, 1, 0, True, 32, True, "row"),   # mha_small aV: row-major, K_PASSES=2
+    (8, 6, 10, 1, 1, 4, True, 32, True, "col"),   # column tail, K_PASSES=1
+    (8, 6, 10, 1, 1, 4, True, 32, True, "row"),   # row tail, K_PASSES=1
+    (4, 8, 16, 1, 2, 5, True, 32, True, "row"),   # row-major, N_PASSES=2 (residual buffer)
     # Column-major with more than two K passes: tiles beyond the live pair
     # are staged in the wrapper and drained after each n-group's columns.
-    (8, 24, 12, 3, 1, 3, True, 16, True, "col"),  # K_PASSES=3, 2 cascade blocks
-    (6, 12, 16, 3, 2, 4, True, 16, True, "col"),  # K_PASSES=3, odd group: single live tile
-    (5, 16, 8, 4, 1, 2, True, 16, False, "col"),  # K_PASSES=4, one block
-    (4, 32, 16, 4, 2, 2, True, 16, True, "col"),  # K_PASSES=4 x N_PASSES=2: all 8 slots
-    (3, 32, 10, 8, 1, 5, False, 16, True, "col"), # K_PASSES=8, N tail
+    (8, 24, 12, 3, 1, 3, True, 32, True, "col"),  # K_PASSES=3, 2 cascade blocks
+    (6, 12, 16, 3, 2, 4, True, 32, True, "col"),  # K_PASSES=3, odd group: single live tile
+    (5, 16, 8, 4, 1, 2, True, 32, False, "col"),  # K_PASSES=4, one block
+    (4, 32, 16, 4, 2, 2, True, 32, True, "col"),  # K_PASSES=4 x N_PASSES=2: all 8 slots
+    (3, 32, 10, 8, 1, 5, False, 32, True, "col"), # K_PASSES=8, N tail
 ]
 
 

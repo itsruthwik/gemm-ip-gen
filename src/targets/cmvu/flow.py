@@ -19,11 +19,12 @@ Design locks that live here rather than in the generators:
   RND output is reproduced by folding the rounding constant into the 32-bit
   bias (``golden.bias_codes``). int8 operand codes only. SAT/SAT_SYM output
   overflow and any round mode other than RND/TRN are rejected at package
-  time (see ``_output_rounds``); so is a bias not exactly representable at
-  the product's fractional precision, and an ``accum_precision`` narrower
-  than input-frac + weight-frac.
-* Effective result width ``W`` (1..16) derived from ``output_precision``,
-  defaulting to the physical ``RESULT_WIDTH`` (16) when unset; lanes are always
+  time (see ``_output_rounds``). A bias finer than the product's fractional
+  precision is baked exactly anyway (``golden.bias_codes`` picks floor or
+  round-half-up so the requant lands where the exact sum would); an
+  ``accum_precision`` narrower than input-frac + weight-frac only warns.
+* Effective result width ``W`` (1..32) derived from ``output_precision``,
+  defaulting to the physical ``RESULT_WIDTH`` (32) when unset; lanes are always
   sign-extended, even for unsigned ``output_precision`` -- there is no
   zero-extend path.
 * Every rejection above (and the ones in ``geometry.resolve_geometry`` --
@@ -155,28 +156,10 @@ def _derive_shift(input_precision, weight_precision, output_precision,
     return shift, product_frac
 
 
-def _check_bias_exact(bias, product_frac, name):
-    """Reject a bias that is not exactly representable at ``product_frac``.
-
-    hls4ml adds the bias into ``accum_t`` at the product's fractional
-    precision; a bias with bits below that LSB cannot be baked exactly into
-    the int32 accumulator-scale code cmvu uses.
-    """
-    import numpy as np
-    scale = 1 << int(product_frac)
-    for lane, value in enumerate(np.asarray(bias, dtype=np.float64).reshape(-1)):
-        scaled = float(value) * scale
-        if abs(scaled - round(scaled)) > 1e-6:
-            raise ValueError(
-                f"layer '{name}': bias lane {lane} = {value} is not exactly "
-                f"representable at frac {product_frac} (input frac + weight "
-                f"frac); cmvu bias must have no bits below the accumulator LSB.")
-
-
 def _output_width(precision, name=None):
     """Effective result-lane width W from ``output_precision``.
 
-    Defaults to the physical ``RESULT_WIDTH`` (16) when the precision is
+    Defaults to the physical ``RESULT_WIDTH`` (32) when the precision is
     unset/unparseable; cmvu lanes are at most ``RESULT_WIDTH``, so a wider
     precision is an error rather than a silent truncation.
     """
@@ -280,7 +263,6 @@ class CmvuTarget(Target):
         # a TRN layer with no bias collapses to an all-zero bias word.
         has_bias = bool(cfg.get("has_bias")) and cfg.get("bias") is not None
         if has_bias:
-            _check_bias_exact(cfg["bias"], product_frac, name)
             bias_values = cfg["bias"]
         else:
             import numpy as np

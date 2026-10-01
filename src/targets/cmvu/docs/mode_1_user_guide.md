@@ -6,7 +6,7 @@ The normative micro-architecture specification remains [architecture.md](archite
 
 > **Hardened block, not parameterizable soft IP.** `cmvu_mode1` is a fixed-function block
 > specified, validated, and taken to GDS at the V1 defaults (`k=4, n=8`, int8 inputs/weights,
-> int16 output lanes, `L=6`,
+> int32 output lanes, `L=6`,
 > 8 resident weight tiles). Every runtime-configurable aspect — operand signedness, requant
 > shift, effective output width, tile selection, framing, per-lane bias — is exposed as a **port**. Do not
 > re-parameterize the module to alter its behavior: non-default parameter values are outside
@@ -23,9 +23,9 @@ y[j] = requant(bias[j] + cascade_in[j] + sum(i=0..3, x[i] * W[i][j]))
 - Inputs and weights are int8 lanes; `a_signed` and `b_signed` select signed or unsigned interpretation.
 - There are eight output lanes.
 - Accumulation and cascade values are int32.
-- `y_out` contains eight requantized int16 lanes (128 bits total). Each lane is an effective
-  width `W = out_w + 1` (`1…16`) value, with the high bits sign-extended; `out_w=15` gives the
-  full 16-bit result, `out_w=7` puts the V1 int8 result in the low byte.
+- `y_out` contains eight requantized int32 lanes (256 bits total). Each lane is an effective
+  width `W = out_w + 1` (`1…32`) value, with the high bits sign-extended; `out_w=31` gives the
+  full 32-bit result, `out_w=7` puts the V1 int8 result in the low byte.
 - Default input-to-output latency is six cycles; `y_valid` identifies valid output cycles.
 - The weight memory contains 8 slots by default. Each slot holds one `4×8` tile (256 bits).
 
@@ -132,7 +132,7 @@ For a standalone `4×8` tile with no temporal-K folding:
 6. Sample `y_out` only when `y_valid=1`. With all default register banks present, this is six cycles after
    the corresponding valid input.
 
-Lane `j` is returned in `y_out[j*16 +: 16]` (int16 lane; effective `W = out_w+1` bits sign-extended). `cascade_out[j*32 +: 32]` carries the full-precision int32
+Lane `j` is returned in `y_out[j*32 +: 32]` (int32 lane; effective `W = out_w+1` bits sign-extended). `cascade_out[j*32 +: 32]` carries the full-precision int32
 partial/final sum for spatial chaining and appears one cycle earlier than `y_out` at the default configuration.
 `cascade_out` is valid at that fixed latency after its input and **holds its last accumulated partial on
 later (invalid) cycles**; sample it only in the valid window. When the block is used standalone (not in a
@@ -149,14 +149,14 @@ temporal-K folding uses multiple passes.
 Final outputs apply:
 
 ```text
-arithmetic right shift by shift_amt (floor/TRN) -> wrap to W = out_w+1 bits -> sign-extend to int16
+arithmetic right shift by shift_amt (floor/TRN) -> wrap to W = out_w+1 bits -> sign-extend to int32
 ```
 
 The block has no rounding-mode input; it always truncates. Round-half-up (`RND`) output is produced by
 folding the rounding constant `1 << (shift_amt-1)` into `bias_in` before it reaches the block (accumulator
 scale), so both hls4ml `RND` and `TRN` output modes are served by this one requant path.
 
-`out_w` encodes `W-1` (0..15), uniformly across all lanes: `out_w=15` gives the full int16 result,
+`out_w` encodes `W-1` (0..31), uniformly across all lanes: `out_w=31` gives the full int32 result,
 `out_w=7` gives the old int8 result in the low byte (high bits sign-extended). The effective result is not
 saturated. Because the high `16-W` bits are just the sign fill, an integrator that needs only `W` bits may
 leave those high `y_out` bits unconnected. `cascade_out` remains full int32 and is not requantized.
@@ -188,7 +188,7 @@ or N-inner scheduling contract applies to standalone `cmvu_mode1`. See
 - Do not use a partially loaded or abandoned slot.
 - Switch `tile_sel` only with the activation that should use the new tile.
 - Hold or present signedness, shift, `out_w`, bias, and framing with their corresponding valid input.
-- Drive `out_w = RESULT_WIDTH-1` (15) for full-width int16 output; smaller values sign-extend a
+- Drive `out_w = RESULT_WIDTH-1` (31) for full-width int32 output; smaller values sign-extend a
   narrower effective result into each lane.
 - Observe `y_valid`; do not infer output validity from a fixed software delay alone.
 - Leave unused cascade pins dangling (chain head `cascade_in`, chain tail `cascade_out`); never tie them

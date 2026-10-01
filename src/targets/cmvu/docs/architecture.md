@@ -39,7 +39,7 @@ validated defaults.
 | Adder trees | `n` | 8 |
 | Adder-tree depth | `⌈log₂ k⌉` | 2 (sums 4 terms) |
 | Activation slice | `k × IN_WIDTH` | 32 b |
-| Output `y_out` width | `n × RESULT_WIDTH` | 128 b (int16 lanes, effective `W`-bit sign-extended) |
+| Output `y_out` width | `n × RESULT_WIDTH` | 256 b (int32 lanes, effective `W`-bit sign-extended) |
 | Cascade width | `n × ACC_WIDTH` | 256 b (int32 partials) |
 | Weight tile size | `k × n × COEF_WIDTH` | 256 b |
 | Pipeline latency `L` | see §5 | 6 |
@@ -75,11 +75,11 @@ Integer only in V1.
 | `IN_WIDTH` | 8 | input / activation element width (int8) |
 | `COEF_WIDTH` | 8 | weight / second-operand element width (int8) |
 | `ACC_WIDTH` | 32 | internal accumulate / **cascade** width (int32) |
-| `RESULT_WIDTH` | 16 | physical **result** lane width (int16) — the `y_out` lane width |
+| `RESULT_WIDTH` | 32 | physical **result** lane width (int32, the full accumulator width) — the `y_out` lane width |
 | `SHIFT_WIDTH` | 5 | width of the runtime `shift_amt` (covers shifts 0…`ACC_WIDTH`−1) |
 | `out_w` | runtime | effective result width minus 1: `W = out_w + 1`, `1 ≤ W ≤ RESULT_WIDTH` (uniform across lanes) |
 
-- **`y_out` is `n × RESULT_WIDTH` = 8 × 16 = 128 b** — the final requantized result bus (int16 lanes,
+- **`y_out` is `n × RESULT_WIDTH` = 8 × 32 = 256 b** — the final requantized result bus (int32 lanes,
   each a sign-extended `W`-bit value). The
   full-precision int32 path is the separate **`cascade_out` (`n × ACC_WIDTH` = 256 b)**, used for
   chaining; the two are distinct ports (§7, §8).
@@ -107,7 +107,7 @@ Integer only in V1.
   floor here plus a pre-rounded bias reproduces round-half-up (`RND`) at the output, and a plain bias
   (or none) reproduces `TRN`. One requant path therefore serves both hls4ml output modes exactly.
 - **`y_out` is the final `RESULT_WIDTH`-bit result (effective `W`-bit, sign-extended); full precision goes
-  out `cascade_out`.** Since `y_out` lanes are `RESULT_WIDTH`-wide, a full-int32 partial cannot ride it —
+  out `cascade_out`.** Since `y_out` is shifted and wrapped by the requant, a K partial does not ride it —
   the un-requantized int32 `sum`
   is emitted on **`cascade_out`** (256 b, tapped at `REG_RED`) for chaining. A cascade tail therefore
   reads its neighbour's `cascade_out` and emits the final result on its own `y_out`.
@@ -324,7 +324,7 @@ Fmax/fan-out is not a concern, at the cost of losing the "local wires only" prop
 
 *(Note: with the wider `n = 8`, the int32 **cascade** bus is 256 b — the deliberate cost of the 4×8 grid;
 larger local contraction was traded away because folding (§1) makes low local-contraction cheap. The
-requantized `y_out` bus is 128 b, int16 per lane.)*
+requantized `y_out` bus is 256 b, int32 per lane.)*
 
 ## 8. Control and interface
 
@@ -350,7 +350,7 @@ were removed from `cmvu_mode1` on 2026-09-17; the removed unified block is gone 
 
 This is the interface of **`cmvu_mode1`** (`cmvu_mode1.sv` in the RTL — the shipped block).
 Widths shown are the V1 default
-(`k=4, n=8, M_MEM_TILES=8, SHIFT_WIDTH=5, ACC_WIDTH=32, RESULT_WIDTH=16`); `tile_sel`/`w_tile_sel` are
+(`k=4, n=8, M_MEM_TILES=8, SHIFT_WIDTH=5, ACC_WIDTH=32, RESULT_WIDTH=32`); `tile_sel`/`w_tile_sel` are
 `⌈log₂ M_MEM_TILES⌉` bits, generically (3 b at the V1 default). The underlying `cmvu_w_mem`
 primitive defaults to 64 slots (32/bank, §4); the V1 Mode-1 instantiation uses 8.
 
@@ -370,9 +370,9 @@ primitive defaults to 64 slots (32/bank, §4); the V1 Mode-1 instantiation uses 
 | `w_tile_sel` | in | ⌈log₂ M_MEM_TILES⌉ = 3 at V1 default | **write**-target tile slot for the `b_in`/`w_we` weight-load protocol (independent of `tile_sel`, so a free slot can be preloaded while another is read — §4's caller contract) |
 | `a_signed`, `b_signed` | in | 1 each | runtime per-operand signedness |
 | `shift_amt` | in | `SHIFT_WIDTH` = 5 | runtime per-frame requant right-shift |
-| `out_w` | in | `⌈log₂ RESULT_WIDTH⌉` = 4 | runtime effective result width **minus one** (`W = out_w+1`, 1…16), uniform across all lanes; high `RESULT_WIDTH−W` bits are the sign fill (§2) |
+| `out_w` | in | `⌈log₂ RESULT_WIDTH⌉` = 5 | runtime effective result width **minus one** (`W = out_w+1`, 1…32), uniform across all lanes; high `RESULT_WIDTH−W` bits are the sign fill (§2) |
 | `cascade_in` | in | `n × ACC_WIDTH` = 256 b | partial-`y` from the previous block in a sum-cascade chain (§7), consumed directly, combinationally, at the reduce node |
-| `y_out` | out | `n × RESULT_WIDTH` = 128 b | requantized result, all 8 lanes/cycle (one beat), int16 lanes |
+| `y_out` | out | `n × RESULT_WIDTH` = 256 b | requantized result, all 8 lanes/cycle (one beat), int32 lanes |
 | `cascade_out` | out | `n × ACC_WIDTH` = 256 b | partial-`y` to the next block (tapped at `REG_RED`, latency `L−1`; full int32) |
 | `bias_in` (see note below) | in | `n × BIAS_WIDTH` = 256 b | per-lane signed int32 bias (accumulator scale), sign-extended, added exactly once per output at `acc_first` (§6) |
 | `y_valid`, `done` | out | 1 each | output-valid / per-group-complete |
@@ -440,7 +440,7 @@ not architectural choices.
   wrapper-level broadcast wire, where a composition wrapper provides one — there is no `x_bcast`
   block port, §7), activation
   element `i` occupies bits `[i·IN_WIDTH +: IN_WIDTH]`. On **`y_out`**, result lane `j` occupies
-  `[j·RESULT_WIDTH +: RESULT_WIDTH]` (int16, effective `W`-bit sign-extended, §2). On **`cascade_in`/`cascade_out`**, int32 lane `j` occupies
+  `[j·RESULT_WIDTH +: RESULT_WIDTH]` (int32, effective `W`-bit sign-extended, §2). On **`cascade_in`/`cascade_out`**, int32 lane `j` occupies
   `[j·ACC_WIDTH +: ACC_WIDTH]`.
 - **Weight tile** is packed **row-major (contraction-row `i` major, output-col `j` minor)**: element
   `W[i][j]` is at linear index `i·n + j`, i.e. bits `[(i·n + j)·COEF_WIDTH +: COEF_WIDTH]`.
@@ -492,7 +492,7 @@ The reference RTL resets the register bank, but `acc_first` is mandatory per gro
 `cmvu_mode1_kfirst`, `cmvu_array`, `cmvu_sram`, `cmvu_load_formats`,
 `cmvu_sweep` (10 configs), `cmvu_perf`, `cmvu_edge`, `cmvu_gemv` — with exact arithmetic, exact
 per-bank latency, II laws, and the K-first group cadence checked cycle-by-cycle. `cmvu_edge` also sweeps
-the runtime effective width `out_w` (W = 1/7/8/15/16), checking the wrap-to-`W` + sign-extension
+the runtime effective width `out_w` (W = 1/7/8/15/16, run while lanes were 16 bits), checking the wrap-to-`W` + sign-extension
 invariants and the W=8 ↔ V1 int8 result. A Verilator 5.x build is
 also used as a second-opinion debug simulator (`run_tests.sh`); the `sweep` and `edge` targets are
 additionally cross-checked green under Verilator.
@@ -501,7 +501,7 @@ additionally cross-checked green under Verilator.
 (DC synthesis → Innovus place-and-route → PT signoff → genlibdb, FreePDK45, 4.0 ns target) to
 signoff-clean GDS: setup WNS +0.315 ns, hold WNS +0.065 ns, no violations. See
 `asic-work/cmvu-mode1/README.md` for the full result table and layout renders. (That physical result
-predates the int16 `y_out`/`out_w` change; the flow has not been re-run for it.)
+predates the int16 and int32 `y_out`/`out_w` changes; the flow has not been re-run for it.)
 
 Caller obligations: assert `acc_first` on each group and `acc_last` only on its final valid K pass;
 drive `out_w` with each valid frame (`RESULT_WIDTH−1` for full width);

@@ -167,11 +167,11 @@ def test_package_warns_on_narrow_accum_precision(tmp_path, capsys):
     assert "narrower than the product frac" in capsys.readouterr().err
 
 
-def test_package_rejects_inexact_bias(tmp_path):
-    with pytest.raises(ValueError, match="not exactly representable"):
-        T.package((4, 4, 8),
-                  _cfg(name="bad_bias", has_bias=True, bias=[0.03],
-                       output_dir=str(tmp_path)))
+def test_package_accepts_bias_finer_than_products(tmp_path):
+    # Was rejected; floor-baked codes keep the requant exact (see golden.bias_codes).
+    T.package((4, 4, 8),
+              _cfg(name="fine_bias", has_bias=True, bias=[0.03],
+                   output_dir=str(tmp_path)))
 
 
 def test_package_rejects_shift_out_of_range(tmp_path):
@@ -274,8 +274,8 @@ def test_package_const_weights_still_default(tmp_path):
 def test_output_width_derivation():
     from targets.cmvu.flow import _output_width
     # unset/unparseable -> physical max
-    assert _output_width(None) == 16
-    assert _output_width("garbage") == 16
+    assert _output_width(None) == 32
+    assert _output_width("garbage") == 32
     assert _output_width("fixed<16,6,TRN,WRAP,0>") == 16
     assert _output_width("fixed<8,2>") == 8
     assert _output_width("ac_int<12,true>") == 12
@@ -284,7 +284,7 @@ def test_output_width_derivation():
 def test_output_width_over_cap_is_error():
     from targets.cmvu.flow import _output_width
     with pytest.raises(ValueError, match="result width"):
-        _output_width("fixed<24,8>")
+        _output_width("fixed<40,8>")
 
 
 @pytest.mark.parametrize("prec,w", [("fixed<16,8>", 16), ("fixed<8,2>", 8),
@@ -309,13 +309,12 @@ _UNSUPPORTED_CASES = [
     ("output_sat", dict(output_precision="fixed<8,4,RND,SAT,0>"), None),
     ("output_sat_sym", dict(output_precision="fixed<8,4,RND,SAT_SYM,0>"), None),
     ("output_bad_round", dict(output_precision="fixed<8,4,RND_CONV,WRAP,0>"), None),
-    ("output_width_over_cap", dict(output_precision="fixed<20,12>",
+    ("output_width_over_cap", dict(output_precision="fixed<40,12>",
                                    input_precision="fixed<8,0>",
                                    weight_precision="fixed<8,0>"), None),
     ("shift_out_of_range", dict(input_precision="fixed<24,4>",
                                 weight_precision="fixed<24,4>",
                                 output_precision="fixed<8,0>"), None),
-    ("inexact_bias", dict(has_bias=True, bias=[0.03]), None),
     ("kfold_illegal", dict(kfold=100, input_precision="fixed<8,0>",
                            weight_precision="fixed<8,0>",
                            output_precision="fixed<8,0>"), (4, 32, 64)),

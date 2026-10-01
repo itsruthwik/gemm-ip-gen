@@ -85,10 +85,10 @@ def test_spatial_core_structure():
     assert ".bias_in(bus_r0_c1[B_BIAS_LO + 0 +: BIAS_W])" in core
     assert ".bias_in(bus_r1_c1[B_BIAS_LO + 256 +: BIAS_W])" in core
     assert ".bias_in('0)" in core
-    # effective width: default W = RESULT_WIDTH (16) -> out_w encoded as 15
-    assert "OUT_W     = 16" in core and "OUT_W_ENC = 4'd15" in core
+    # effective width: default W = RESULT_WIDTH (32) -> out_w encoded as 31
+    assert "OUT_W     = 32" in core and "OUT_W_ENC = 5'd31" in core
     assert ".out_w(OUT_W_ENC)" in core
-    assert "res_row[gs*OUT_W +: OUT_W] = res_buf[gs*16 +: OUT_W]" in core
+    assert "res_row[gs*OUT_W +: OUT_W] = res_buf[gs*32 +: OUT_W]" in core
 
 
 def test_single_block_leaves_both_cascade_pins_dangling():

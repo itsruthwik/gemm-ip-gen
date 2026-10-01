@@ -88,7 +88,7 @@ def reference_rows(A, B, bias_codes=None, shift=0, result_width=8):
     given) is one signed int32 code per output lane, at accumulator scale
     with any rounding constant already folded in, added to the raw sum
     before the single (floor) requant (hardware applies it once at
-    ``acc_first``). ``result_width`` is the block's effective width W (1..16).
+    ``acc_first``). ``result_width`` is the block's effective width W (1..RESULT_WIDTH).
     """
     A = np.asarray(A, dtype=np.int64)
     B = np.asarray(B, dtype=np.int64)
@@ -107,9 +107,12 @@ def reference_rows(A, B, bias_codes=None, shift=0, result_width=8):
 def bias_codes(bias, scale_shift, rnd=True, requant_shift=None):
     """Bake per-lane bias values into int32 accumulator-scale codes.
 
-    ``code = round(bias * 2**scale_shift) + round_const`` with
-    round-half-away-from-zero for the bias itself, where ``round_const =
-    1 << (requant_shift-1)`` (else 0) when ``rnd`` is true. ``requant_shift``
+    ``code = q(bias * 2**scale_shift) + round_const`` where ``round_const =
+    1 << (requant_shift-1)`` (else 0) when ``rnd`` is true. ``q`` matters only for a
+    bias finer than the scale, and makes the result exact anyway: it is floor
+    whenever the requant then shifts (the block floors ``sum + code``, and floor(b)
+    plus the rounding half crosses the same cut that ``sum + b`` does) or truncates,
+    and round-half-up for an RND layer with no shift, where the code is the rounding. ``requant_shift``
     defaults to ``scale_shift`` -- the standalone/test-config convention
     where the bias is expressed directly at the block's requant shift (i.e.
     ``scale_shift`` doubles as the product/accumulator frac for these
@@ -131,7 +134,7 @@ def bias_codes(bias, scale_shift, rnd=True, requant_shift=None):
         bias = np.zeros(_geometry.N_PHYS, dtype=np.float64)
     for lane, value in enumerate(np.asarray(bias, dtype=np.float64).reshape(-1)):
         scaled = float(value) * (1 << scale_shift)
-        rounded = int(np.floor(scaled + 0.5)) if scaled >= 0 else int(np.ceil(scaled - 0.5))
+        rounded = int(np.floor(scaled + 0.5)) if (rnd and req_shift == 0) else int(np.floor(scaled))
         rounded += round_const
         wrapped = wrap_int32(rounded)
         if wrapped != rounded:

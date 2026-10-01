@@ -3,7 +3,7 @@
 // Computes, for a k x n physical grid (default k=4, n=8):
 //   y[j] = requant( sum_{i=0..k-1} a[i] * W[i][j]  +  cascade_in[j] )   for j = 0 .. n-1
 //
-// Output lanes are physically RESULT_WIDTH (default 16) bits; the runtime `out_w` selects an
+// Output lanes are physically RESULT_WIDTH (default 32) bits; the runtime `out_w` selects an
 // effective width W = out_w+1 in 1..RESULT_WIDTH, and the requantized W-bit value is
 // sign-extended into the full lane (see the requant block near the end of this file).
 //
@@ -31,7 +31,7 @@ module cmvu_mode1 #(
     parameter int unsigned COEF_WIDTH      = 8,
     parameter int unsigned ACC_WIDTH       = 32,
     parameter int unsigned BIAS_WIDTH      = 32,
-    parameter int unsigned RESULT_WIDTH    = 16,
+    parameter int unsigned RESULT_WIDTH    = 32,
     parameter int unsigned SHIFT_WIDTH     = 5,
     parameter int unsigned K               = 4,
     parameter int unsigned N               = 8,
