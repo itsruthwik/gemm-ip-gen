@@ -85,6 +85,11 @@ def _synth_bias(n, seed):
     return [((i * 3 + seed) % 7 - 3) * 0.25 for i in range(n)]
 
 
+def _synth_fine_bias(n, seed):
+    """Bias values with 10 fractional bits (odd multiples of 2^-10 included)."""
+    return [((i * 37 + seed) % 41 - 20) / 1024.0 for i in range(n)]
+
+
 def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_stall=False,
                    fsm_debug=False,
                    bias=None, **plan_kw):
@@ -93,8 +98,12 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_
     N, K, K_pad = plan["n"], plan["k"], plan["k_pad"]
     WW, AW, outW = t["weight_width"], t["activation_width"], t["output_width"]
     signed = bool(t["signed_activations"])
-    shift = plan["product_frac"] - plan["output_frac"]
-    bias_codes = (_pkg._wpack.bias_acc_codes(bias, plan["product_frac"], N, True)
+    # Same accumulator lift as package.py: a bias finer than the products is baked at
+    # 2^(product_frac + acc_lshift) and the raw sum is shifted up to meet it.
+    lsh = _geom.acc_lshift_for_bias(bias, plan["product_frac"])
+    plan["acc_lshift"] = t["acc_lshift"] = lsh
+    shift = _geom.requant_shift(plan)
+    bias_codes = (_pkg._wpack.bias_acc_codes(bias, plan["product_frac"] + lsh, N, True, exact=True)
                  if bias is not None else None)
 
     B = _tb.synth_weights(N, K_pad, WW)   # [K_pad][N]; K_pad>=K, extra rows unused (K real)
@@ -131,7 +140,7 @@ def _build_ws_case(work, name, shape, seed, backpressure=True, sustained_output_
             a_words.append(_tb.pack_beat(X[v], AW))
             row = []
             for o in range(N):
-                acc = sum(B[kk][o] * X[v][kk] for kk in range(K))
+                acc = sum(B[kk][o] * X[v][kk] for kk in range(K)) << lsh
                 if bias_codes is not None:
                     acc += bias_codes[o]
                 row.append(_tb.requant_ref(acc, shift, outW))
@@ -247,6 +256,16 @@ CASES = {
     "i_2op_col_major_qk_memstream": lambda work, seed, **kw: _build_2op_case(
         work, "i", (16, 12, 16), seed, pe=16, simd=6, mode=1,
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    # SIMD * activation width not a multiple of 8 (4 lanes x 7-bit unsigned = 28 bits,
+    # the attention softmax output feeding aV): the row slices must step by 28 bits, not
+    # by the core's 32-bit byte-aligned beat, or every slice after the first is shifted.
+    "y_2op_nonbyte_slice": lambda work, seed, **kw: _build_2op_case(
+        work, "y", (8, 8, 16), seed, pe=2, simd=4, mode=0,
+        input_precision="ufixed<7,0>", backpressure=kw.get("backpressure", True),
+        fsm_debug=kw.get("fsm_debug", False)),
+    "y2_ws_nonbyte_slice": lambda work, seed, **kw: _build_ws_case(
+        work, "y2", (4, 8, 4), seed, pe=2, simd=4, input_precision="ufixed<7,0>",
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
     # NF>1, mode 0 (row-major): the aV node shape (M, K, N) = (8, 8, 16), one whole
     # B row (N=16 wide) landing on 2 NF groups x 8 SIMD lanes per beat.
     "w_2op_nf2_row_major_av": lambda work, seed, **kw: _build_2op_case(
@@ -334,6 +353,12 @@ CASES = {
         # must carry into the sum correctly (round-half-up, not truncate).
         work, "v", (2, 8, 4), seed, pe=4, simd=4, bias=_synth_bias(4, seed),
         output_precision="fixed<8,2>",
+        backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
+    "w_bias_finer_than_products": lambda work, seed, **kw: _build_ws_case(
+        # Bias with 10 fractional bits vs product_frac=8: baked at the product scale it
+        # would be rounded, flipping round-half-up near ties. The raw sum is shifted left
+        # by acc_lshift=2 instead, so the add stays exact. NF==2 exercises the bias ROM.
+        work, "w", (2, 8, 8), seed, pe=4, simd=8, bias=_synth_fine_bias(8, seed),
         backpressure=kw.get("backpressure", True), fsm_debug=kw.get("fsm_debug", False)),
 }
 

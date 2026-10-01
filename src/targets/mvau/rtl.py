@@ -28,6 +28,15 @@ def _tile(shape, tile=None, **plan_kwargs):
     return _geom.resolve_plan(shape, **plan_kwargs)["tile"]
 
 
+def _row_slice(beat_bits, slice_bits):
+    """Verilog expr for the sf_cnt-th SIMD-wide slice of ``arow_reg`` (``slice_bits`` =
+    SIMD * activation width, the lanes' packed width), zero-extended to the MVU's
+    byte-aligned input beat of ``beat_bits``."""
+    part = f"arow_reg[sf_cnt * {slice_bits} +: {slice_bits}]"
+    pad = beat_bits - slice_bits
+    return part if pad == 0 else f"{{{{{pad}{{1'b0}}}}, {part}}}"
+
+
 def _requant_lanes(t, n_lanes, raw_exprs, const_lists, reg_prefix, nf_cnt_expr="nf_cnt"):
     """Return Verilog for a bank of *n_lanes* per-column requantize stages: one
     pipeline stage each, sitting after the K-tile partial-sum adder (if the tile's
@@ -55,9 +64,12 @@ def _requant_lanes(t, n_lanes, raw_exprs, const_lists, reg_prefix, nf_cnt_expr="
     sum/(case)/shift + one register per lane) and the list of per-lane register
     names (each ``out_width`` bits wide) to slice into ``p_din``.
     """
-    accu = t["accu_width"]
+    # acc_lshift lifts the raw sum to a scale that holds the bias exactly (geometry.
+    # acc_lshift_for_bias); the requant shift and the add's width grow with it.
+    lsh = t.get("acc_lshift", 0)
+    accu = t["accu_width"] + lsh
     out_width = t["output_width"]
-    shift = t["product_frac"] - t["output_frac"]
+    shift = _geom.requant_shift(t)
     all_consts = [c for lst in (const_lists or []) if lst for c in lst]
     biased_w, const_w = _geom.requant_width(accu, all_consts)
     _wpack.assert_constants_fit(all_consts, const_w)
@@ -96,8 +108,13 @@ def _requant_lanes(t, n_lanes, raw_exprs, const_lists, reg_prefix, nf_cnt_expr="
                 lines.append(f"    wire signed [{const_w - 1}:0] {cname} = {romname}[{nf_cnt_expr}];")
                 const_expr = cname
             bias_term = f" + $signed({const_expr})"
-        biased = f"({sum_expr}){bias_term}"
         reg_names.append(reg)
+        if lsh:
+            # Sign-extend the raw sum to the requant width first, then shift: the shifted
+            # sum keeps its top bits.
+            lines.append(f"    wire signed [{biased_w - 1}:0] {reg}_acc = {sum_expr};")
+            sum_expr = f"{reg}_acc <<< {lsh}"
+        biased = f"({sum_expr}){bias_term}"
         lines.append(f"    wire signed [{biased_w - 1}:0] {reg}_biased = {biased};")
         # The round-half-up constant is already folded into `consts` (see
         # fold_requant_constants), so shifting is now a plain arithmetic shift --
@@ -434,7 +451,7 @@ def _generate_kt_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
         for pe_i in range(pe):
             raw_exprs.append([
                 f"out_tdata_{j * k_tiles + i}[{pe_i * accu} +: {accu}]" for i in range(k_tiles)])
-    shift = t["product_frac"] - t["output_frac"]
+    shift = _geom.requant_shift(t)
     folded = _wpack.fold_requant_constants(bias_codes, shift, N)
     if folded:
         buckets = [_wpack.bias_codes_for_tile(folded, j, ntile_real, t["mh"])
@@ -786,7 +803,10 @@ module {module_name} (
     wire need_load = ~row_valid | row_draining;
     wire can_load  = ap_ce & in_open & need_load & a_empty_n;
     assign a_read = can_load;
-    wire [{AB - 1}:0] cur_slice = arow_reg[sf_cnt * {AB} +: {AB}];
+    // one SIMD-wide slice of the row (lanes packed at AW bits), zero-extended to the
+    // core's byte-aligned beat: stepping by the byte-aligned width instead shifts every
+    // slice after the first whenever SIMD*AW isn't a multiple of 8
+    wire [{AB - 1}:0] cur_slice = {_row_slice(AB, SIMD * AW)};
     assign in_tvalid = ap_ce & row_valid;
 
     // ---- B side gearbox: hold the one arriving wide beat and hand it to the
@@ -970,7 +990,7 @@ def _generate_ws_shim(t, module_name, fb, wbits, abits, pbits, init_files, n_til
     # (=NF*PE) local lanes (bias_codes is real-column length; ntile_real derives
     # from it since all n_tiles are equal-width). fold_requant_constants handles
     # bias_codes=None (pure rounding, no real bias) too.
-    shift = t["product_frac"] - t["output_frac"]
+    shift = _geom.requant_shift(t)
     folded = _wpack.fold_requant_constants(bias_codes, shift, N)
     if folded:
         buckets = [_wpack.bias_codes_for_tile(folded, i, ntile_real, t["mh"])
@@ -1067,7 +1087,10 @@ module {module_name} (
     wire need_load = ~row_valid | row_draining;
     wire can_load  = ap_ce & in_open & need_load & a_empty_n;
     assign a_read = can_load;
-    wire [{abits - 1}:0] cur_slice = arow_reg[sf_cnt * {abits} +: {abits}];
+    // one SIMD-wide slice of the row (lanes packed at aw bits), zero-extended to the
+    // core's byte-aligned beat: stepping by the byte-aligned width instead shifts every
+    // slice after the first whenever simd*aw isn't a multiple of 8
+    wire [{abits - 1}:0] cur_slice = {_row_slice(abits, simd * aw)};
     wire in_tvalid = ap_ce & row_valid;
     // nf_cnt (0..{nf - 1}, advancing on accept_beat) -- needed whenever NF>1, both
     // to pick a dynamic bias code (in the per-lane requantize section below) and

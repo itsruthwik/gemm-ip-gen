@@ -145,12 +145,13 @@ def _ws_core_twin(p, t, func_name, B, bias_codes=None):
     NTILE_REAL = N // NT   # unpadded per-tile column count; the interface presents only these
     PB = N * p["output_width"]   # raw, unpadded result beat (one hls4ml row)
     outW = p["output_width"]
-    shift = p["product_frac"] - p["output_frac"]
+    shift = _geom.requant_shift(p)
+    lsh = p.get("acc_lshift", 0)   # raw sum lifted to the bias's scale (geometry.acc_lshift_for_bias)
     actt = _act_ctype(t["signed_activations"], AW)
     wlit = _w_matrix_literal(B, N, KPAD)
     pad = ' ' * (len(func_name) + 6)
     folded = _wpack.fold_requant_constants(bias_codes, shift, N)
-    biased_w, const_w = _geom.requant_width(ACCU, folded)
+    biased_w, const_w = _geom.requant_width(ACCU + lsh, folded)
     _wpack.assert_constants_fit(folded, const_w)
     if _wpack.has_real_add(folded):
         bias_decl = ("static const ap_int<%d> %s_bias[%d] = {%s};\n"
@@ -158,7 +159,7 @@ def _ws_core_twin(p, t, func_name, B, bias_codes=None):
         bias_add = f" + {func_name}_bias[oc]"
     else:
         bias_decl, bias_add = "", ""
-    req = _requant_block(shift, outW, biased_w, f"(ap_int<{biased_w}>)acc{bias_add}", "q", ' ' * 12)
+    req = _requant_block(shift, outW, biased_w, (f"((ap_int<{biased_w}>)acc << {lsh}){bias_add}" if lsh else f"(ap_int<{biased_w}>)acc{bias_add}"), "q", ' ' * 12)
     return f"""#include <hls_stream.h>
 #include <ap_int.h>
 
@@ -221,13 +222,14 @@ def _kt_core_twin(p, t, func_name, B, bias_codes=None):
     NTILE = N // NT
     PB = N * p["output_width"]   # raw, unpadded result beat (one hls4ml row)
     outW = p["output_width"]
-    shift = p["product_frac"] - p["output_frac"]
+    shift = _geom.requant_shift(p)
+    lsh = p.get("acc_lshift", 0)   # raw sum lifted to the bias's scale (geometry.acc_lshift_for_bias)
     actt = _act_ctype(t["signed_activations"], AW)
     wlit = _w_matrix_literal(B, N, KPAD)
     pad = ' ' * (len(func_name) + 6)
     apmax = max(1024, ((max(AB, PB) + 1023) // 1024 + 1) * 1024)
     folded = _wpack.fold_requant_constants(bias_codes, shift, N)
-    biased_w, const_w = _geom.requant_width(ACCU, folded)
+    biased_w, const_w = _geom.requant_width(ACCU + lsh, folded)
     _wpack.assert_constants_fit(folded, const_w)
     if _wpack.has_real_add(folded):
         bias_decl = ("static const ap_int<%d> %s_bias[%d] = {%s};\n"
@@ -235,7 +237,7 @@ def _kt_core_twin(p, t, func_name, B, bias_codes=None):
         bias_add = f" + {func_name}_bias[oc]"
     else:
         bias_decl, bias_add = "", ""
-    req = _requant_block(shift, outW, biased_w, f"(ap_int<{biased_w}>)raw{bias_add}", "q", ' ' * 12)
+    req = _requant_block(shift, outW, biased_w, (f"((ap_int<{biased_w}>)raw << {lsh}){bias_add}" if lsh else f"(ap_int<{biased_w}>)raw{bias_add}"), "q", ' ' * 12)
     return f"""#define AP_INT_MAX_W {apmax}   // raw K-wide activation row may exceed the 1024-bit default
 #include <hls_stream.h>
 #include <ap_int.h>
@@ -296,7 +298,9 @@ def _kt_tb(p, t, top_name, seed, bias_codes, B, n_nodes=6):
     K = p["k"]   # unpadded K -- the beat this TB's boundary actually carries
     AB = K * AW
     outW = p["output_width"]
-    req_shift = p["product_frac"] - p["output_frac"]
+    req_shift = _geom.requant_shift(p)
+    lsh = p.get("acc_lshift", 0)
+    acc_term = f"(acc << {lsh})" if lsh else "acc"
     CB = N * outW
     wlit = _w_matrix_literal(B, N, KPAD)
     if bias_codes:
@@ -348,7 +352,7 @@ int main() {{
             for (int o = 0; o < {N}; o++) {{
                 long acc = 0;
                 for (int k = 0; k < {K}; k++) acc += W[o][k] * X[n][v][k];   // pad columns of W are 0
-                golden[n][v][o] = requant_ref(acc{bias_add_tb});
+                golden[n][v][o] = requant_ref({acc_term}{bias_add_tb});
             }}
 
         for (int v = 0; v < {M}; v++) {{
@@ -598,7 +602,9 @@ def _ws_tb(p, t, top_name, seed, bias_codes, B, n_nodes=6):
     K = p["k"]   # unpadded K -- the beat this TB's boundary actually carries
     AB = K * AW
     outW = p["output_width"]
-    req_shift = p["product_frac"] - p["output_frac"]
+    req_shift = _geom.requant_shift(p)
+    lsh = p.get("acc_lshift", 0)
+    acc_term = f"(acc << {lsh})" if lsh else "acc"
     CB = N * outW
     wlit = _w_matrix_literal(B, N, KPAD)
     if bias_codes:
@@ -648,7 +654,7 @@ int main() {{
             for (int o = 0; o < {N}; o++) {{
                 long acc = 0;
                 for (int k = 0; k < {K}; k++) acc += W[o][k] * X[n][v][k];
-                golden[n][v][o] = requant_ref(acc{bias_add_tb});
+                golden[n][v][o] = requant_ref({acc_term}{bias_add_tb});
             }}
 
         for (int v = 0; v < {M}; v++) {{
@@ -696,7 +702,9 @@ def generate_tb(shape, top_name="mvau_top", func_name="mvau_core", seed=42, plan
     WB, AB = t["weight_stream_width_ba"], t["input_stream_width_ba"]
     M, K, N = p["num_input_vectors"], p["k_pad"], p["n"]
     outW = p["output_width"]
-    req_shift = p["product_frac"] - p["output_frac"]   # (fa+fb) - out_frac
+    req_shift = _geom.requant_shift(p)   # (fa+fb+acc_lshift) - out_frac
+    lsh = p.get("acc_lshift", 0)
+    acc_term = f"(acc << {lsh})" if lsh else "acc"
     CB = ((N * outW) + 7) // 8 * 8
     if bias_codes:
         bias_arr = "    long bias[%d] = {%s};\n" % (N, ", ".join(str(c) for c in bias_codes))
@@ -745,7 +753,7 @@ int main() {{
         for (int o = 0; o < {N}; o++) {{
             long acc = 0;
             for (int k = 0; k < {K}; k++) acc += W[o][k] * X[v][k];
-            golden[v][o] = requant_ref(acc{bias_add_tb});
+            golden[v][o] = requant_ref({acc_term}{bias_add_tb});
         }}
 
     for (int v = 0; v < {M}; v++) {{
