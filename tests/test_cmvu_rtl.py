@@ -269,7 +269,7 @@ def test_runtime_b_slot_sets(k, kf, dbuf):
     slots = g.resolve_geometry(4, k, 8, kf, 1)["slots_per_block"]
     assert f"SET_BASE = {slots + slots % 2};" in core
     assert f"DBUF = 1'b{1 if dbuf else 0};" in core
-    assert "rd_set*SET_BASE + np*K_PASSES + kp" in core
+    assert "rd_set*SET_BASE + np_slot_base + kp" in core
 
 
 def test_generate_runtime_b_multi_call_tb_structure():

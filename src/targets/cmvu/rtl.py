@@ -46,6 +46,22 @@ except ImportError:  # standalone/script import
     import golden as _golden
 
 
+def _const_mux(add, name, width, sel, n_vals, expr):
+    """Declare `name` as a mux over the runtime counter `sel` (values 0..n_vals-1), each arm a
+    constant-offset slice from expr(v). A single value needs no mux."""
+    if n_vals == 1:
+        add(f"    wire [{width}-1:0] {name} = {expr(0)};")
+        return
+    add(f"    reg  [{width}-1:0] {name};")
+    add("    always_comb begin")
+    add(f"        case ({sel})")
+    for v in range(n_vals):
+        add(f"            {v}: {name} = {expr(v)};")
+    add(f"            default: {name} = '0;")
+    add("        endcase")
+    add("    end")
+
+
 # ── Baked weights / init block (zero-cycle sim-only write, no load FSM) ───────
 
 
@@ -517,7 +533,8 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
                     add(f"        {last};")
         add("    // Write-side slot base: slot s = n_group*K_PASSES + k_pass, so")
         add("    // np*K_PASSES is the (even, when paired) base slot for this column.")
-        add("    wire [2:0] ld_tsel = wr_set * SET_BASE + tgt_np * K_PASSES;")
+        _const_mux(add, "tgt_slot_base", "3", "tgt_np", np_n, lambda v: f"3'd{(v * kp_n) & 7}")
+        add("    wire [2:0] ld_tsel = wr_set * SET_BASE + tgt_slot_base;")
         add("    // Per-column write data: kt = kp*K_SPATIAL+c. K_PASSES==1 loads a")
         add("    // single tile per column beat; K_PASSES==2 pairs kp=0/1 into one")
         add("    // beat (b_in[31:0]=kp0, b_in[63:32]=kp1).")
@@ -684,7 +701,8 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
             add("        end")
             add("    end")
             add("    assign in_ready = rb_ready;")
-            add("    wire [2:0] ld_tsel = wr_set * SET_BASE + tgt_npd * K_PASSES + tgt_kp;")
+            _const_mux(add, "tgt_slot_base", "3", "tgt_npd", np_n, lambda v: f"3'd{(v * kp_n) & 7}")
+            add("    wire [2:0] ld_tsel = wr_set * SET_BASE + tgt_slot_base + tgt_kp;")
             add(f"    wire [{extra_bits}-1:0] buf_sel = (tgt_i == 2'd0) ? buf_row0 :")
             add("                              (tgt_i == 2'd1) ? buf_row1 :")
             add("                              (tgt_i == 2'd2) ? buf_row2 : buf_row3;")
@@ -729,21 +747,28 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
     add("    // latch `done` permanently (the cmvu_array.sv single-pass bug).")
     add("    wire first_pulse = busy && (kp == '0);")
     add("    wire last_pulse  = busy && (kp == K_PASSES - 1);")
+    # Slot base np*K_PASSES as a constant per group (see _const_mux): with K_PASSES not a power
+    # of two the multiply becomes a DSP on the tile_sel path.
+    _const_mux(add, "np_slot_base", "3", "np", np_n, lambda v: f"3'd{(v * kp_n) & 7}")
     if runtime_b:
-        add("    wire [2:0] tsel_now = (rd_set*SET_BASE + np*K_PASSES + kp) & 3'h7;")
+        add("    wire [2:0] tsel_now = (rd_set*SET_BASE + np_slot_base + kp) & 3'h7;")
     else:
-        add("    wire [2:0] tsel_now = (np*K_PASSES + kp) & 3'h7;")
+        add("    wire [2:0] tsel_now = (np_slot_base + kp) & 3'h7;")
     add("")
     add("    // Per-column entry buses + cascade-alignment skew (c cycles).")
     for c in range(ks):
-        add(f"    wire [A_SLICE_W-1:0] a_slice_c{c} = "
-            f"a_row_buf[(kp*K_SPATIAL + {c})*A_SLICE_W +: A_SLICE_W];")
+        # Pass kp selects a constant slice, so emit a case over kp with literal offsets rather
+        # than a_row_buf[(kp*K_SPATIAL + c)*A_SLICE_W +: ...]: with K_SPATIAL not a power of two
+        # synthesis builds a real multiplier for kp*K_SPATIAL (VTR puts it on a DSP), and that
+        # multiply feeds a wide variable part-select, the critical path of those folds.
+        _const_mux(add, f"a_slice_c{c}", "A_SLICE_W", "kp", kp_n,
+                   lambda v, c=c: f"a_row_buf[{(v * ks + c) * _geometry.K_PHYS * _geometry.IN_WIDTH} +: A_SLICE_W]")
         if c == ks - 1:
             # Bias is owned by the cascade tail (the temporal accumulator);
             # upstream blocks run acc_term=0 every pass so their cascade_out
             # is that pass's local partial only.
-            add(f"    wire [{bgw}-1:0] bias_c{c} = "
-                f"BIAS_WORD[np*N_SPATIAL*BIAS_W +: {bgw}];")
+            _const_mux(add, f"bias_c{c}", str(bgw), "np", np_n,
+                       lambda v: f"BIAS_WORD[{v * geo['n_spatial'] * _geometry.N_PHYS * _geometry.BIAS_WIDTH} +: {bgw}]")
         else:
             add(f"    wire [{bgw}-1:0] bias_c{c} = {bgw}'h0;")
         entry = ("{" + f"bias_c{c}, tsel_now, last_pulse, first_pulse, valid, "
@@ -930,9 +955,13 @@ def generate_core(m, k, n, kfold, nfold, weight_matrix, bias_codes=None, shift=0
     add("                kp <= kp + 1'b1;")
     add("            end")
     add("            if (done_align) begin")
-    add("                for (ri = 0; ri < N_SPATIAL; ri = ri + 1)")
-    add(f"                    res_buf[(grp_pipe[{done_depth - 1}]*N_SPATIAL + ri)"
-        "*GROUP_W +: GROUP_W] <= y_align[ri];")
+    # Constant base per group (case over the group index), not grp*N_SPATIAL: see _const_mux.
+    add(f"                case (grp_pipe[{done_depth - 1}])")
+    for g in range(np_n):
+        add(f"                    {g}: for (ri = 0; ri < N_SPATIAL; ri = ri + 1)")
+        add(f"                        res_buf[({g * geo['n_spatial']} + ri)*GROUP_W +: GROUP_W] <= y_align[ri];")
+    add("                    default: ;")
+    add("                endcase")
     add(f"                if (grp_pipe[{done_depth - 1}] == N_GROUPS - 1) "
         "out_valid_r <= 1'b1;")
     add("            end")
